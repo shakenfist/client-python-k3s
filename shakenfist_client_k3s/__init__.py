@@ -37,10 +37,8 @@ def _get_k3s_release(ctx, namespace, force_cache_update=False,
             version_cache = {'updated': 0}
 
     updated = version_cache.get('updated', 0)
-
-    _emit_debug(ctx,
-                (f'Cached version information from {updated}: '
-                 f'{version_cache.get('releases', {})}'))
+    releases = version_cache.get('releases', {})
+    _emit_debug(ctx, f'Cached version information from {updated}: {releases}')
 
     if time.time() - updated > 24 * 3600:
         _emit_debug(ctx, 'Updating release version cache')
@@ -655,7 +653,6 @@ def k3s_delete(ctx, name=None, namespace=None):
 
 
 k3s.add_command(k3s_delete)
-
 
 
 def load(cli):
