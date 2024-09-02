@@ -83,7 +83,7 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
 
     _emit_debug(ctx, 'Looking up k3s versions')
     target_release = primitives.get_k3s_release(
-        ctx, namespace, force_cache_update=refresh_version_cache,
+        ctx, force_cache_update=refresh_version_cache,
         release_channel=release_channel)
 
     if namespace:
@@ -198,8 +198,9 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     # Setup workers
     primitives.install_workers(ctx)
 
-    # Install metallb
+    # Install metallb and longhorn
     primitives.setup_metallb(ctx, metal_address_count)
+    primitives.setup_longhorn(ctx)
 
     # Fetch the kubeconfig and install it
     with tempfile.TemporaryDirectory() as tempdir:
@@ -230,7 +231,8 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
 k3s.add_command(k3s_create)
 
 
-@k3s.command(name='query-version', help='Lookup the current version for a release channel')
+@k3s.command(name='query-k3s-version',
+             help='Lookup the current version for a k3s release channel')
 @click.argument('release_channel', type=click.STRING)
 @click.option('--namespace', type=click.STRING,
               help=('If you are an admin, you can control which namespace the '
@@ -238,13 +240,37 @@ k3s.add_command(k3s_create)
 @click.option('--refresh-version-cache/--no-refresh-version-cache', default=False,
               help=('Force a refresh of the k3s version cache.'))
 @click.pass_context
-def k3s_query_version(ctx, release_channel=None, namespace=None,
-                      refresh_version_cache=False):
+def k3s_query_k3s_version(ctx, release_channel=None, namespace=None,
+                          refresh_version_cache=False):
+    ctx.obj['namespace'] = namespace
+
     target_release = primitives.get_k3s_release(
-        ctx, namespace, force_cache_update=refresh_version_cache,
+        ctx, force_cache_update=refresh_version_cache,
         release_channel=release_channel)
     print(f'Release channel {release_channel} has {target_release} as its '
           'latest version.')
+
+
+k3s.add_command(k3s_query_k3s_version)
+
+
+@k3s.command(name='query-longhorn-version',
+             help='Lookup the current longhorn version')
+@click.option('--namespace', type=click.STRING,
+              help=('If you are an admin, you can control which namespace the '
+                    'version cache is retrieved from.'))
+@click.option('--refresh-version-cache/--no-refresh-version-cache', default=False,
+              help=('Force a refresh of the k3s version cache.'))
+@click.pass_context
+def k3s_query_longhorn_version(ctx, namespace=None, refresh_version_cache=False):
+    ctx.obj['namespace'] = namespace
+
+    target_release = primitives.get_longhorn_release(
+        ctx, force_cache_update=refresh_version_cache)
+    print(f'Longhorn has {target_release} as its latest version.')
+
+
+k3s.add_command(k3s_query_longhorn_version)
 
 
 @k3s.command(name='getconfig', help='Get kubeconfig for an existing k3s cluster')

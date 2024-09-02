@@ -4,10 +4,12 @@ import requests
 from shakenfist_client import apiclient
 import sys
 import time
+from versions import parse_version
 
 
 METADATA_KEY = 'orchestrated_k3s_cluster_%s'
-VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_version_cache'
+K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
+LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
 BASE_OS_VERSION = 'debian:12'
 
 
@@ -45,15 +47,16 @@ def delete_cluster_metadata(ctx):
     ctx.obj['CLIENT'].delete_namespace_metadata_item(namespace, md_key)
 
 
-def get_k3s_release(ctx, namespace, force_cache_update=False,
-                    release_channel=None):
+def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
+    namespace = ctx.obj['namespace']
+
     if force_cache_update:
         version_cache = {'updated': 0}
         _emit_debug(ctx, 'Forcing cache update')
     else:
         namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
-            VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
+            K3S_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
         if not isinstance(version_cache, dict):
             _emit_debug(ctx, 'Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
@@ -71,12 +74,12 @@ def get_k3s_release(ctx, namespace, force_cache_update=False,
         r = requests.request(
             'GET', url,
             headers={
-                'Accept': 'application/vnd.github+json',
+                'Accept': 'application/json',
                 'User-Agent': apiclient.get_user_agent()
             })
         if r.status_code not in [200, 201, 204]:
             print('Unable to determine latest k3s release version')
-            print('    GET https://api.github.com/repos/k3s-io/k3s/releases')
+            print('    GET {url}')
             print(f'    returned HTTP status code {r.status_code} with text:')
             print(f'    {r.text}')
             sys.exit(1)
@@ -91,7 +94,7 @@ def get_k3s_release(ctx, namespace, force_cache_update=False,
         version_cache['releases'] = releases
         version_cache['updated'] = time.time()
         ctx.obj['CLIENT'].set_namespace_metadata_item(
-            namespace, VERSION_CACHE_KEY, version_cache)
+            namespace, K3S_VERSION_CACHE_KEY, version_cache)
 
     most_recent = version_cache['releases'].get(release_channel, None)
     if not most_recent:
@@ -100,6 +103,76 @@ def get_k3s_release(ctx, namespace, force_cache_update=False,
 
     _emit_debug(ctx, f'Selected kubernetes version: {most_recent}')
     return most_recent
+
+
+def get_longhorn_release(ctx, force_cache_update=False):
+    namespace = ctx.obj['namespace']
+
+    if force_cache_update:
+        version_cache = {'updated': 0}
+        _emit_debug(ctx, 'Forcing cache update')
+    else:
+        namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
+        version_cache = namespace_md.get(
+            LONGHORN_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
+        if not isinstance(version_cache, dict):
+            _emit_debug(ctx, 'Version cache format invalid, clobbering')
+            version_cache = {'updated': 0}
+
+    updated = version_cache.get('updated', 0)
+
+    _emit_debug(ctx, (f'Cached version information from {updated}: '
+                      f'{version_cache.get('releases', {})}'))
+
+    if time.time() - updated > 24 * 3600:
+        _emit_debug(ctx, 'Updating release version cache')
+
+        releases = {}
+        for page in range(5):
+            url = f'https://api.github.com/repos/longhorn/longhorn/releases?page={
+                page}'
+            _emit_debug(ctx, f'Fetching {url}')
+            r = requests.request(
+                'GET', url,
+                headers={
+                    'Accept': 'application/vnd.github+json',
+                    'User-Agent': apiclient.get_user_agent()
+                })
+
+            if r.status_code not in [200, 201, 204]:
+                print(
+                    'Unable to determine latest k3s release version\n'
+                    f'    GET {url}\n'
+                    f'    returned HTTP status code {r.status_code} '
+                    'with text:\n'
+                    f'    {r.text}')
+                sys.exit(1)
+
+            d = r.json()
+            _emit_debug(ctx, 'Fetched release data:')
+            _emit_debug(ctx, json.dumps(d, indent=4, sort_keys=True))
+            for reldata in d:
+                if reldata['prerelease']:
+                    continue
+                tagname = reldata['tag_name'].lstrip('v')
+                releases[tagname] = reldata['tarball_url']
+
+        # Find the most recent version
+        latest = None
+        for tagname in list(releases.keys()):
+            parsed_version = parse_version(tagname)
+            if not latest:
+                latest = parsed_version
+            elif parsed_version > latest:
+                latest = parsed_version
+
+        version_cache['releases'] = releases
+        version_cache['latest'] = latest.to_string()
+        version_cache['updated'] = time.time()
+        ctx.obj['CLIENT'].set_namespace_metadata_item(
+            namespace, LONGHORN_VERSION_CACHE_KEY, version_cache)
+
+    return version_cache['latest']
 
 
 def create_instance(ctx):
@@ -406,3 +479,29 @@ def setup_metallb(ctx, metal_address_count):
 
     # Add addresses
     configure_metallb_addresses(ctx)
+
+
+def setup_longhorn(ctx):
+    md = get_cluster_metadata(ctx)
+
+    version = get_longhorn_release(ctx)
+    print(f'Setting up longhorn version {version}')
+
+    execute_and_await(
+        ctx, [md['control_plane_nodes'][0]],
+        [
+            'helm repo add longhorn https://charts.longhorn.io',
+            'helm repo update',
+            'kubectl create namespace longhorn-system || true',
+            (
+                'KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm '
+                'install longhorn longhorn/longhorn '
+                '--namespace longhorn-system '
+                f'--version {version}'
+            ),
+            (
+                'kubectl patch storageclass local-path -p '
+                '\'{"metadata": {"annotations":{'
+                '"storageclass.kubernetes.io/is-default-class":"false"}}}\''
+            )
+        ])
