@@ -1,10 +1,10 @@
 import copy
 import json
+from packaging.version import Version
 import requests
 from shakenfist_client import apiclient
 import sys
 import time
-from versions import parse_version
 
 
 METADATA_KEY = 'orchestrated_k3s_cluster_%s'
@@ -160,14 +160,14 @@ def get_longhorn_release(ctx, force_cache_update=False):
         # Find the most recent version
         latest = None
         for tagname in list(releases.keys()):
-            parsed_version = parse_version(tagname)
+            parsed_version = Version(tagname)
             if not latest:
                 latest = parsed_version
             elif parsed_version > latest:
                 latest = parsed_version
 
         version_cache['releases'] = releases
-        version_cache['latest'] = latest.to_string()
+        version_cache['latest'] = str(latest)
         version_cache['updated'] = time.time()
         ctx.obj['CLIENT'].set_namespace_metadata_item(
             namespace, LONGHORN_VERSION_CACHE_KEY, version_cache)
