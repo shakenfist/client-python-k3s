@@ -1,5 +1,0 @@
-click >= 8.0.0           # bsd
-prettytable              # bsd
-pbr                      # apache2
-shakenfist_client        # apache2
-packaging                # apache2 and bsd
