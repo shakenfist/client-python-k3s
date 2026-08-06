@@ -38,3 +38,9 @@ include = ["shakenfist_client_k3s*"]
 [tool.setuptools_scm]
 git_describe_command = "git describe --dirty --tags --match v* --first-parent"
 write_to = "shakenfist_client_k3s/_version.py"
+
+[project.optional-dependencies]
+test = [
+    "tox",                 # mit
+    "flake8",              # mit
+]

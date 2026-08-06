@@ -1,6 +1,5 @@
 import click
 import copy
-import json
 import os
 from shakenfist_client import apiclient
 import subprocess
@@ -502,7 +501,6 @@ def k3s_update_os(ctx, name=None, namespace=None):
 
 
 k3s.add_command(k3s_update_os)
-
 
 
 def load(cli):
