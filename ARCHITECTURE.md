@@ -73,10 +73,21 @@ rendered as one line per item, rewritten in place with ANSI cursor
 movement and truncated to the terminal width. Otherwise (pipes, CI,
 or `--verbose`, whose debug lines would interleave badly with cursor
 movement) a status line is printed only when it changes, with a
-heartbeat reprint every 60 seconds so logs still show liveness. All
-statuses include the elapsed time within the current phase, and idle
-waits describe the agent command currently executing rather than a
-bare operation count. The module is dependency free.
+heartbeat reprint every 60 seconds so logs still show liveness. Each
+status shows how long the item has been in that status, so a stalled
+command is visible as a growing elapsed time, and idle waits describe
+the agent command currently executing rather than a bare operation
+count. The module is dependency free.
+
+The wait loops also detect failure: an agent operation which enters
+the `error` state aborts the command immediately with the operation
+uuid, the command it was on, and a pointer to `sf-client instance
+events` for the server side detail (operations in the error state
+never complete, so waiting on them would hang forever). Errored
+operations which predate the current wait are ignored, so a historical
+failure does not prevent later commands like `expand-workers` from
+running. If a single agent command runs for more than five minutes a
+one-off note flags that it may be stalled.
 
 ## Python Version Compatibility
 

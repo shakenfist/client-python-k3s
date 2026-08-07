@@ -44,9 +44,9 @@ class Progress:
         self.interactive = not verbose and self.stream.isatty()
         self.started = time.time()
         self.phase_index = 0
-        self.phase_started = None
 
-        # Per wait block state: item key -> (status, time last printed)
+        # Per wait block state: item key -> (status, time the status first
+        # appeared, time last printed)
         self._statuses = {}
         self._rendered_lines = 0
 
@@ -54,15 +54,10 @@ class Progress:
         self.stream.write(msg + '\n')
         self.stream.flush()
 
-    def _elapsed(self):
-        base = self.phase_started if self.phase_started else self.started
-        return format_elapsed(time.time() - base)
-
     def phase(self, name):
         """Start a new named phase, printing a numbered header once."""
         self.wait_done()
         self.phase_index += 1
-        self.phase_started = time.time()
         if self.total_phases:
             self._println('[%d/%d] %s' % (self.phase_index, self.total_phases, name))
         else:
@@ -74,25 +69,32 @@ class Progress:
         self._println('  %s' % msg)
 
     def update(self, key, status):
-        """Report the current status of one item within a wait loop."""
+        """Report the current status of one item within a wait loop.
+
+        The elapsed time shown against each item is how long the item has
+        had its current status, so a stalled command is visible as a
+        growing elapsed time.
+        """
         now = time.time()
+        prev = self._statuses.get(key)
+        since = prev[1] if prev and prev[0] == status else now
+
         if self.interactive:
-            self._statuses[key] = (status, now)
+            self._statuses[key] = (status, since, now)
             self._render_block()
             return
 
-        prev = self._statuses.get(key)
-        if prev and prev[0] == status and now - prev[1] < HEARTBEAT_INTERVAL:
+        if prev and prev[0] == status and now - prev[2] < HEARTBEAT_INTERVAL:
             return
-        self._statuses[key] = (status, now)
-        self._println('  %s: %s (%s)' % (key, status, self._elapsed()))
+        self._statuses[key] = (status, since, now)
+        self._println('  %s: %s (%s)' % (key, status, format_elapsed(now - since)))
 
     def _render_block(self):
         columns = shutil.get_terminal_size().columns
-        elapsed = self._elapsed()
+        now = time.time()
         lines = []
-        for key in self._statuses:
-            line = '  %s: %s (%s)' % (key, self._statuses[key][0], elapsed)
+        for key, (status, since, _) in self._statuses.items():
+            line = '  %s: %s (%s)' % (key, status, format_elapsed(now - since))
             lines.append(line[:columns - 1])
 
         out = ''

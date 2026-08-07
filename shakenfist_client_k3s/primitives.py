@@ -14,6 +14,10 @@ K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
 LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
 BASE_OS_VERSION = 'debian:12'
 
+# How long, in seconds, a single agent command can run before the wait loop
+# notes that it might be stalled.
+STALL_WARNING_SECONDS = 300
+
 
 def _emit_debug(ctx, m):
     if ctx.obj['VERBOSE']:
@@ -231,7 +235,7 @@ def create_instance(ctx):
     return inst
 
 
-def _describe_agent_op(aop):
+def _describe_agent_op(aop, max_len=60):
     """Return a short human readable description of the command an agent operation is up to."""
     commands = aop.get('commands', [])
     results = aop.get('results', {}) or {}
@@ -248,9 +252,29 @@ def _describe_agent_op(aop):
         desc = c.get('command', 'unknown')
         if c.get('path'):
             desc += ' %s' % c['path']
-    if len(desc) > 60:
-        desc = desc[:57] + '...'
+    if max_len and len(desc) > max_len:
+        desc = desc[:max_len - 3] + '...'
     return desc
+
+
+def _abort_agent_op_error(ctx, aop):
+    """Report an agent operation which entered the error state, then exit."""
+    inst = ctx.obj['CLIENT'].get_instance(aop['instance_uuid'])
+
+    print('Agent operation failed!')
+    print('  instance: %s (uuid %s)' % (inst['name'], aop['instance_uuid']))
+    print('  operation: %s' % aop['uuid'])
+    desc = _describe_agent_op(aop, max_len=None)
+    if desc:
+        print('  command: %s' % desc)
+
+    results = aop.get('results', {}) or {}
+    if results:
+        print('  results: %s' % json.dumps(results, indent=4, sort_keys=True))
+    else:
+        print('  no results were recorded, so the command probably failed to start')
+    print("  the server side event log may have more detail: 'sf-client instance events %s'" % inst['name'])
+    sys.exit(1)
 
 
 def await_boot(ctx, instances):
@@ -273,23 +297,60 @@ def await_boot(ctx, instances):
 def await_idle(ctx, instances):
     p = progress.get_progress(ctx)
     waiting = copy.copy(instances)
+
+    # Agent operations stay associated with an instance forever, and an
+    # operation in the error state will never complete. Snapshot any which
+    # had already failed before this wait started so a historical failure
+    # can neither wedge this wait nor incorrectly abort it.
+    preexisting_errors = {}
+    for instance_uuid in waiting:
+        aops = ctx.obj['CLIENT'].get_instance_agentoperations(instance_uuid, all=True)
+        preexisting_errors[instance_uuid] = {
+            aop['uuid'] for aop in aops if aop['state'] == 'error'}
+
+    running_since = {}
+    stall_warned = set()
+
     while waiting:
         for instance_uuid in copy.copy(waiting):
             inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
             agent_ops = ctx.obj['CLIENT'].get_instance_agentoperations(
                 instance_uuid, all=True)
+            agent_ops = [aop for aop in agent_ops
+                         if aop['uuid'] not in preexisting_errors[instance_uuid]]
+
+            errored = [aop for aop in agent_ops if aop['state'] == 'error']
+            if errored:
+                _abort_agent_op_error(ctx, errored[0])
 
             incomplete = [aop for aop in agent_ops if aop['state'] != 'complete']
             if not incomplete:
                 p.update(inst['name'], 'idle')
                 waiting.remove(instance_uuid)
             else:
-                desc = _describe_agent_op(incomplete[0])
+                aop = incomplete[0]
+                desc = _describe_agent_op(aop)
                 remaining = progress.count_str(len(incomplete), 'operation')
                 if desc:
                     p.update(inst['name'], "running '%s' (%s remaining)" % (desc, remaining))
                 else:
                     p.update(inst['name'], '%s remaining' % remaining)
+
+                # Note once per command if it has been running suspiciously
+                # long. The progress elapsed times show the same thing, but
+                # this note includes the operation uuid and where to look
+                # for more detail, and persists in scrollback.
+                now = time.time()
+                command_key = (aop['uuid'], len(aop.get('results', {}) or {}))
+                running_since.setdefault(command_key, now)
+                if (now - running_since[command_key] >= STALL_WARNING_SECONDS
+                        and command_key not in stall_warned):
+                    stall_warned.add(command_key)
+                    p.note("%s has been running '%s' for %s and may be stalled; operation %s, "
+                           "'sf-client instance events %s' may show why" % (
+                               inst['name'], desc or 'a command',
+                               progress.format_elapsed(now - running_since[command_key]),
+                               aop['uuid'], inst['name']))
 
         if not waiting:
             break
@@ -306,10 +367,7 @@ def await_fetch(ctx, aop):
     p.wait_done()
 
     if aop['state'] == 'error':
-        print('File fetch failed:')
-        print('  path: %s' % aop['results']['0']['path'])
-        print('  message: %s' % aop['results']['0']['message'])
-        sys.exit(1)
+        _abort_agent_op_error(ctx, aop)
 
     blob_uuid = aop['results']['0']['content_blob']
     data = b''
@@ -319,9 +377,12 @@ def await_fetch(ctx, aop):
 
 
 def reap_execute(ctx, aop):
-    while aop['state'] != 'complete':
+    while aop['state'] not in ('complete', 'error'):
         time.sleep(1)
         aop = ctx.obj['CLIENT'].get_agent_operation(aop['uuid'])
+
+    if aop['state'] == 'error':
+        _abort_agent_op_error(ctx, aop)
 
     if aop['results']['0']['return-code'] != 0:
         inst = ctx.obj['CLIENT'].get_instance(aop['instance_uuid'])
@@ -528,7 +589,10 @@ def setup_metallb(ctx, metal_address_count):
         ctx, [md['control_plane_nodes'][0]],
         [
             'kubectl create ns metallb-system',
-            ('KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm '
+            # Note that we can't use the KUBECONFIG=... environment variable
+            # prefix idiom here: the in-guest agent validates the first token
+            # of the command line as an executable before running the command.
+            ('helm --kubeconfig /etc/rancher/k3s/k3s.yaml '
              'upgrade --install -n metallb-system metallb '
              'oci://registry-1.docker.io/bitnamicharts/metallb'),
         ])
@@ -554,7 +618,7 @@ def setup_longhorn(ctx):
             'helm repo update',
             'kubectl create namespace longhorn-system || true',
             (
-                'KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm '
+                'helm --kubeconfig /etc/rancher/k3s/k3s.yaml '
                 'install longhorn longhorn/longhorn '
                 '--namespace longhorn-system '
                 f'--version {version}'

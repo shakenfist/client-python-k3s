@@ -78,10 +78,12 @@ class ProgressLineModeTestCase(testtools.TestCase):
             self.clock.advance(5)
         p.update('node-001', 'state created')
 
+        # The elapsed time is per status, so it resets when the status
+        # changes.
         self.assertEqual(
             '[1] Booting\n'
             '  node-001: state initial (0s)\n'
-            '  node-001: state created (25s)\n',
+            '  node-001: state created (0s)\n',
             stream.getvalue())
 
     def test_unchanged_status_heartbeats(self):
@@ -117,7 +119,7 @@ class ProgressLineModeTestCase(testtools.TestCase):
             '[1] Booting\n'
             '  node-002: state initial (0s)\n'
             '  node-003: state initial (0s)\n'
-            '  node-002: state created (5s)\n',
+            '  node-002: state created (0s)\n',
             stream.getvalue())
 
     def test_wait_done_resets_change_detection(self):
@@ -165,11 +167,27 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
         p.update('node-001', 'state created')
 
         # The first update just draws a line; the second moves the cursor
-        # back up one line and redraws it.
+        # back up one line and redraws it. The elapsed time is per status,
+        # so it resets when the status changes.
         self.assertEqual(
             '[1] Booting\n'
             '\x1b[K  node-001: state initial (0s)\n'
-            '\x1b[1F\x1b[K  node-001: state created (5s)\n',
+            '\x1b[1F\x1b[K  node-001: state created (0s)\n',
+            stream.getvalue())
+
+    def test_unchanged_status_age_grows(self):
+        stream = FakeTty()
+        p = progress.Progress(stream=stream)
+        p.phase('Booting')
+
+        p.update('node-001', 'state initial')
+        self.clock.advance(5)
+        p.update('node-001', 'state initial')
+
+        self.assertEqual(
+            '[1] Booting\n'
+            '\x1b[K  node-001: state initial (0s)\n'
+            '\x1b[1F\x1b[K  node-001: state initial (5s)\n',
             stream.getvalue())
 
     def test_lines_truncated_to_terminal_width(self):
@@ -224,9 +242,14 @@ class FakeContext:
 class WaitLoopTestCase(testtools.TestCase):
     def setUp(self):
         super().setUp()
-        patcher = mock.patch('shakenfist_client_k3s.primitives.time.sleep')
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.clock = FakeClock()
+        for target, replacement in [
+                ('shakenfist_client_k3s.progress.time.time', self.clock),
+                ('shakenfist_client_k3s.primitives.time.sleep',
+                 lambda seconds: self.clock.advance(seconds))]:
+            patcher = mock.patch(target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _make_context(self, client, stream):
         return FakeContext({
@@ -253,7 +276,9 @@ class WaitLoopTestCase(testtools.TestCase):
         client = mock.MagicMock()
         client.get_instance.return_value = {'name': 'node-001'}
         client.get_instance_agentoperations.side_effect = [
+            [],
             [{
+                'uuid': 'aop-001',
                 'state': 'executing',
                 'commands': [{'command': 'execute', 'commandline': 'apt-get update'}],
                 'results': {}
@@ -269,3 +294,109 @@ class WaitLoopTestCase(testtools.TestCase):
             "  node-001: running 'apt-get update' (1 operation remaining) (0s)\n"
             '  node-001: idle (0s)\n',
             stream.getvalue())
+
+    def test_await_idle_aborts_on_errored_operation(self):
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'node-001'}
+        client.get_instance_agentoperations.side_effect = [
+            [],
+            [{
+                'uuid': 'aop-002',
+                'instance_uuid': 'uuid-001',
+                'state': 'error',
+                'commands': [{'command': 'execute', 'commandline': 'helm install banana'}],
+                'results': {}
+            }]
+        ]
+        ctx = self._make_context(client, io.StringIO())
+
+        captured = io.StringIO()
+        with mock.patch('sys.stdout', captured):
+            e = self.assertRaises(SystemExit, primitives.await_idle, ctx, ['uuid-001'])
+
+        self.assertEqual(1, e.code)
+        self.assertIn('operation: aop-002', captured.getvalue())
+        self.assertIn('helm install banana', captured.getvalue())
+        self.assertIn('failed to start', captured.getvalue())
+
+    def test_await_idle_ignores_preexisting_errors(self):
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'node-001'}
+        old_error = {
+            'uuid': 'aop-old',
+            'instance_uuid': 'uuid-001',
+            'state': 'error',
+            'commands': [{'command': 'execute', 'commandline': 'helm install banana'}],
+            'results': {}
+        }
+        client.get_instance_agentoperations.side_effect = [[old_error], [old_error]]
+        stream = io.StringIO()
+        ctx = self._make_context(client, stream)
+
+        # An operation which had already failed before the wait started must
+        # neither wedge the wait nor abort it.
+        primitives.await_idle(ctx, ['uuid-001'])
+        self.assertIn('node-001: idle', stream.getvalue())
+
+    def test_await_idle_notes_stalled_command(self):
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'node-001'}
+        running = {
+            'uuid': 'aop-001',
+            'instance_uuid': 'uuid-001',
+            'state': 'executing',
+            'commands': [{'command': 'execute', 'commandline': 'helm install banana'}],
+            'results': {}
+        }
+
+        # The loop polls every five seconds, so this is enough polls to pass
+        # the stall warning threshold with some slack to show the warning is
+        # only emitted once.
+        polls = primitives.STALL_WARNING_SECONDS // 5 + 10
+        client.get_instance_agentoperations.side_effect = [[]] + [[running]] * polls + [[]]
+        stream = io.StringIO()
+        ctx = self._make_context(client, stream)
+
+        primitives.await_idle(ctx, ['uuid-001'])
+
+        self.assertIn('may be stalled', stream.getvalue())
+        self.assertIn('aop-001', stream.getvalue())
+        self.assertEqual(1, stream.getvalue().count('may be stalled'))
+
+    def test_await_fetch_reports_errors_without_results(self):
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'node-001'}
+        aop = {
+            'uuid': 'aop-003',
+            'instance_uuid': 'uuid-001',
+            'state': 'error',
+            'commands': [{'command': 'get-file', 'path': '/missing'}],
+            'results': {}
+        }
+        ctx = self._make_context(client, io.StringIO())
+
+        captured = io.StringIO()
+        with mock.patch('sys.stdout', captured):
+            e = self.assertRaises(SystemExit, primitives.await_fetch, ctx, aop)
+
+        self.assertEqual(1, e.code)
+        self.assertIn('get-file /missing', captured.getvalue())
+
+    def test_reap_execute_aborts_on_errored_operation(self):
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'node-001'}
+        aop = {
+            'uuid': 'aop-004',
+            'instance_uuid': 'uuid-001',
+            'state': 'error',
+            'commands': [{'command': 'execute', 'commandline': 'apt-get update'}],
+            'results': {}
+        }
+        ctx = self._make_context(client, io.StringIO())
+
+        captured = io.StringIO()
+        with mock.patch('sys.stdout', captured):
+            e = self.assertRaises(SystemExit, primitives.reap_execute, ctx, aop)
+
+        self.assertEqual(1, e.code)
+        self.assertIn('operation: aop-004', captured.getvalue())

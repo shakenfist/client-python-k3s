@@ -105,3 +105,36 @@ CLI arguments, so no further documentation changes.
 4. Update AGENTS.md and ARCHITECTURE.md.
 5. Run `tox -epy3` and `pre-commit run --all-files`.
 6. Propose a commit for review.
+
+## Addendum: failure visibility
+
+A live `k3s create` run against a real cluster exposed a failure mode the
+first pass did not cover: the metallb `helm upgrade` agent operation entered
+the `error` state (the in-guest agent rejected the `KUBECONFIG=... helm`
+commandline because it validates the first token as an executable), and the
+create sat on `running 'KUBECONFIG=...helm upgrade...'` for a quarter of an
+hour because:
+
+- `await_idle()` treated any operation with `state != 'complete'` as still
+  in flight, and an errored operation never completes; and
+- the elapsed time shown was the per-phase timer, so there was no signal
+  distinguishing one slow command from a wedged one.
+
+Follow-up changes, on the same branch:
+
+1. **Fail fast on errored operations.** `await_idle()`, `await_fetch()` and
+   `reap_execute()` abort via a shared `_abort_agent_op_error()` which
+   reports the instance, operation uuid, the command it was on, any recorded
+   results, and points at `sf-client instance events` for the agent-side
+   error. `await_idle()` snapshots operations already in the error state
+   before it starts waiting and ignores them, so a historical failure can
+   neither wedge nor incorrectly abort a later wait.
+2. **Per-status elapsed times.** `Progress.update()` now shows how long each
+   item has had its *current* status (resetting on change) rather than the
+   phase elapsed time, so a stalled command reads as a growing number.
+3. **Stall notes.** If a single agent command runs for more than
+   `STALL_WARNING_SECONDS` (five minutes), `await_idle()` emits a one-off
+   note naming the operation uuid and the events command to inspect it.
+4. **Avoid the trigger.** The metallb and longhorn helm commandlines use
+   `helm --kubeconfig ...` instead of the environment-variable prefix the
+   agent rejects.
