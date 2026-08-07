@@ -1,6 +1,6 @@
 import copy
 import json
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 import requests
 from shakenfist_client import apiclient
 import sys
@@ -156,14 +156,24 @@ def get_longhorn_release(ctx, force_cache_update=False):
                 tagname = reldata['tag_name'].lstrip('v')
                 releases[tagname] = reldata['tarball_url']
 
-        # Find the most recent version
+        # Find the most recent version. Longhorn has occasionally
+        # published tags which are not valid PEP 440 versions (for
+        # example v1.4.0-hotfix1), so skip anything unparsable.
         latest = None
         for tagname in list(releases.keys()):
-            parsed_version = Version(tagname)
+            try:
+                parsed_version = Version(tagname)
+            except InvalidVersion:
+                _emit_debug(ctx, f'Skipping unparsable tag {tagname}')
+                continue
             if not latest:
                 latest = parsed_version
             elif parsed_version > latest:
                 latest = parsed_version
+
+        if latest is None:
+            print('Unable to determine the latest Longhorn release')
+            sys.exit(1)
 
         version_cache['releases'] = releases
         version_cache['latest'] = str(latest)
