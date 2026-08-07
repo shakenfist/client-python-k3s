@@ -6,6 +6,8 @@ from shakenfist_client import apiclient
 import sys
 import time
 
+from shakenfist_client_k3s import progress
+
 
 METADATA_KEY = 'orchestrated_k3s_cluster_%s'
 K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
@@ -229,53 +231,79 @@ def create_instance(ctx):
     return inst
 
 
+def _describe_agent_op(aop):
+    """Return a short human readable description of the command an agent operation is up to."""
+    commands = aop.get('commands', [])
+    results = aop.get('results', {}) or {}
+
+    # Results are recorded per command index as they complete, so the number
+    # of results is the index of the currently executing command.
+    idx = min(len(results), len(commands) - 1)
+    if idx < 0:
+        return None
+
+    c = commands[idx]
+    desc = c.get('commandline')
+    if not desc:
+        desc = c.get('command', 'unknown')
+        if c.get('path'):
+            desc += ' %s' % c['path']
+    if len(desc) > 60:
+        desc = desc[:57] + '...'
+    return desc
+
+
 def await_boot(ctx, instances):
+    p = progress.get_progress(ctx)
     waiting = copy.copy(instances)
     while waiting:
-        print('Waiting for %d instances to boot' % len(waiting))
         for instance_uuid in copy.copy(waiting):
             inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
-            print('...instance %s has state %s and agent state %s'
-                  % (inst['name'], inst['state'], inst['agent_state']))
+            agent_state = inst['agent_state'] if inst['agent_state'] else 'not yet contactable'
+            p.update(inst['name'], 'state %s, agent %s' % (inst['state'], agent_state))
             if inst['state'] == 'created' and inst['agent_state'] == 'ready':
                 waiting.remove(instance_uuid)
 
         if not waiting:
             break
         time.sleep(5)
-
-    instance_os_update(ctx, instances)
+    p.wait_done()
 
 
 def await_idle(ctx, instances):
+    p = progress.get_progress(ctx)
     waiting = copy.copy(instances)
     while waiting:
-        print('Waiting for %d instances to be idle' % len(waiting))
         for instance_uuid in copy.copy(waiting):
             inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
             agent_ops = ctx.obj['CLIENT'].get_instance_agentoperations(
                 instance_uuid, all=True)
 
-            incomplete = 0
-            for aop in agent_ops:
-                if aop['state'] != 'complete':
-                    incomplete += 1
-            print('...instance %s has %d incomplete agent operations'
-                  % (inst['name'], incomplete))
-
-            if incomplete == 0:
+            incomplete = [aop for aop in agent_ops if aop['state'] != 'complete']
+            if not incomplete:
+                p.update(inst['name'], 'idle')
                 waiting.remove(instance_uuid)
+            else:
+                desc = _describe_agent_op(incomplete[0])
+                remaining = progress.count_str(len(incomplete), 'operation')
+                if desc:
+                    p.update(inst['name'], "running '%s' (%s remaining)" % (desc, remaining))
+                else:
+                    p.update(inst['name'], '%s remaining' % remaining)
 
         if not waiting:
             break
         time.sleep(5)
+    p.wait_done()
 
 
 def await_fetch(ctx, aop):
+    p = progress.get_progress(ctx)
     while aop['state'] not in ['complete', 'error']:
-        print(f'...fetch operation has state {aop["state"]}')
+        p.update('fetch operation', 'state %s' % aop['state'])
         time.sleep(1)
         aop = ctx.obj['CLIENT'].get_agent_operation(aop['uuid'])
+    p.wait_done()
 
     if aop['state'] == 'error':
         print('File fetch failed:')
@@ -311,7 +339,11 @@ def reap_execute(ctx, aop):
 
 
 def create_and_await_instances(ctx, count, node_type):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
+
+    display_type = node_type.replace('_', ' ')
+    p.phase('Creating %s' % progress.count_str(count, '%s node' % display_type))
 
     new_nodes = []
     for i in range(count):
@@ -320,10 +352,11 @@ def create_and_await_instances(ctx, count, node_type):
         md['node_serial'] += 1
         md[f'{node_type}_nodes'].append(inst['uuid'])
         set_cluster_metadata(ctx, md)
-        print(f'Created {inst["name"]} as a {node_type} node '
-              f'(uuid {inst["uuid"]})')
+        p.note(f'created {inst["name"]} (uuid {inst["uuid"]})')
 
     await_boot(ctx, new_nodes)
+    p.note('updating base OS packages')
+    instance_os_update(ctx, new_nodes)
     set_cluster_metadata(ctx, md)
 
 
@@ -351,10 +384,11 @@ def instance_os_update(ctx, instance_uuids):
 
 
 def install_control_plane(ctx):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
     cmds = []
 
-    print('Setup first control plane node')
+    p.phase('Installing k3s on the first control plane node')
 
     # Write a configuration file with the external address to the first control
     # plane node. This is needed so that the SSL certificate includes this
@@ -381,13 +415,13 @@ def install_control_plane(ctx):
     execute_and_await(ctx, [md['control_plane_nodes'][0]], cmds)
 
     # Fetch the server and node tokens from the first control plane node
-    print('Fetching control plane registration token from first control plane node')
+    p.note('fetching control plane registration token')
     aop = ctx.obj['CLIENT'].instance_get(
         md['control_plane_nodes'][0], '/var/lib/rancher/k3s/server/token')
     md['server_token'] = await_fetch(ctx, aop).rstrip()
     set_cluster_metadata(ctx, md)
 
-    print('Fetching node registration token from first control plane node')
+    p.note('fetching node registration token')
     aop = ctx.obj['CLIENT'].instance_get(
         md['control_plane_nodes'][0], '/var/lib/rancher/k3s/server/node-token')
     md['node_token'] = await_fetch(ctx, aop).rstrip()
@@ -395,7 +429,6 @@ def install_control_plane(ctx):
 
     # If there is more than one control plane node, then install the others
     if len(md['control_plane_nodes']) > 1:
-        print('Setup other control plane nodes')
         install_extra_control_plane(ctx)
 
 
@@ -420,26 +453,33 @@ def install_k3s_component(ctx, instance_uuids, token, node_role):
 
 
 def install_extra_control_plane(ctx):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
+    p.phase('Installing k3s on the additional control plane nodes')
     install_k3s_component(
         ctx, md['control_plane_nodes'][1:], md['server_token'], 'server')
 
 
 def install_workers(ctx):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
+    p.phase('Installing k3s on the worker nodes')
     install_k3s_component(ctx, md['worker_nodes'], md['node_token'], 'agent')
 
 
 def allocate_metallb_addresses(ctx, metal_address_count):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
     node_network = ctx.obj['CLIENT'].get_network(md['node_network'])
 
+    allocated = []
     for i in range(metal_address_count):
         addr = ctx.obj['CLIENT'].route_network_address(node_network['uuid'])
         if addr:
             md['routed_addresses'].append(addr)
-            print('Allocated routed address %s' % addr)
-    print('Allocated %d routed addresses' % len(md['routed_addresses']))
+            allocated.append(addr)
+    p.note('allocated %s: %s' % (
+        progress.count_str(len(allocated), 'routed address'), ', '.join(allocated)))
     set_cluster_metadata(ctx, md)
 
 
@@ -479,9 +519,10 @@ def configure_metallb_addresses(ctx):
 
 
 def setup_metallb(ctx, metal_address_count):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
 
-    print('Setting up metallb')
+    p.phase('Setting up metallb')
     allocate_metallb_addresses(ctx, metal_address_count)
     execute_and_await(
         ctx, [md['control_plane_nodes'][0]],
@@ -500,10 +541,11 @@ def setup_metallb(ctx, metal_address_count):
 
 
 def setup_longhorn(ctx):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
 
     version = get_longhorn_release(ctx)
-    print(f'Setting up longhorn version {version}')
+    p.phase(f'Setting up longhorn version {version}')
 
     execute_and_await(
         ctx, [md['control_plane_nodes'][0]],

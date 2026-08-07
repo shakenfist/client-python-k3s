@@ -14,6 +14,7 @@ except ImportError:
     from importlib_metadata import version as distribution_version
 
 from shakenfist_client_k3s import primitives
+from shakenfist_client_k3s import progress
 
 
 CLUSTER_LIST = 'orchestrated_k3s_clusters'
@@ -84,6 +85,18 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     ctx.obj['CLIENT'] = apiclient.Client(
         async_strategy=apiclient.ASYNC_CONTINUE)
 
+    # Phases: create control plane nodes, create workers, install control
+    # plane, install workers, fetch credentials, metallb, longhorn, and
+    # update the local kubeconfig. Creating a node network and installing
+    # additional control plane nodes only sometimes happen.
+    total_phases = 8
+    if not network:
+        total_phases += 1
+    if control_plane_count > 1:
+        total_phases += 1
+    p = progress.Progress(total_phases=total_phases, verbose=ctx.obj['VERBOSE'])
+    ctx.obj['PROGRESS'] = p
+
     _emit_debug(ctx, 'Looking up k3s versions')
     target_release = primitives.get_k3s_release(
         ctx, force_cache_update=refresh_version_cache,
@@ -118,16 +131,17 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
             print('Specified network does not exist')
             sys.exit(1)
     else:
+        p.phase('Creating node network')
         node_network = ctx.obj['CLIENT'].allocate_network(
             '10.0.0.0/16', True, True, 'k3s-%s-node' % name, namespace=namespace)
-        print('Created %s as the node network (uuid %s)'
-              % (node_network['name'], node_network['uuid']))
+        p.note('created %s (uuid %s)' % (node_network['name'], node_network['uuid']))
         while True:
             node_network = ctx.obj['CLIENT'].get_network(node_network['uuid'])
+            p.update(node_network['name'], 'state %s' % node_network['state'])
             if node_network['state'] == 'created':
                 break
             time.sleep(1)
-        print('...Node network ready')
+        p.wait_done()
 
     # Read the ssh key if any
     ssh_key_content = None
@@ -161,8 +175,6 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
 
     # I'd prefer to wait for these as one thing, but that's not currently a thing
     # the code supports.
-    print(f'Creating {control_plane_count} control plane nodes and '
-          f'{worker_count} worker nodes')
     primitives.create_and_await_instances(
         ctx, control_plane_count, 'control_plane')
     primitives.create_and_await_instances(ctx, worker_count, 'worker')
@@ -174,14 +186,11 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     md['api_address_floating'] = interfaces[0]['floating']
     primitives.set_cluster_metadata(ctx, md)
 
-    print('Configuring and installing k3s control plane')
     primitives.install_control_plane(ctx)
-
-    print('Installing workers')
     primitives.install_workers(ctx)
 
     # Fetch kubecfg, correct IP, and include cluster name instead of "default"
-    print('Fetching kubecfg for cluster')
+    p.phase('Fetching cluster credentials')
     aop = ctx.obj['CLIENT'].instance_get(
         md['control_plane_nodes'][0], '/etc/rancher/k3s/k3s.yaml')
     kubeconfig = primitives.await_fetch(ctx, aop).replace(
@@ -198,14 +207,12 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     md['kubeconfig'] = yaml.dump(kc)
     primitives.set_cluster_metadata(ctx, md)
 
-    # Setup workers
-    primitives.install_workers(ctx)
-
     # Install metallb and longhorn
     primitives.setup_metallb(ctx, metal_address_count)
     primitives.setup_longhorn(ctx)
 
-    # Fetch the kubeconfig and install it
+    # Install the kubeconfig we fetched earlier
+    p.phase('Updating local kubeconfig')
     with tempfile.TemporaryDirectory() as tempdir:
         new_config_path = os.path.join(tempdir, 'config')
         kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
@@ -229,6 +236,7 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
 
     md['state'] = 'created'
     primitives.set_cluster_metadata(ctx, md)
+    p.finish(f'Cluster {name} is ready')
 
 
 k3s.add_command(k3s_create)
@@ -446,8 +454,11 @@ def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
         print('Cluster not found!')
         sys.exit(1)
 
+    p = progress.Progress(total_phases=2, verbose=ctx.obj['VERBOSE'])
+    ctx.obj['PROGRESS'] = p
     primitives.create_and_await_instances(ctx, worker_count, 'worker')
     primitives.install_workers(ctx)
+    p.finish(f'Added {worker_count} workers to cluster {name}')
 
 
 k3s.add_command(k3s_expand_workers)
@@ -473,8 +484,12 @@ def k3s_expand_addresses(ctx, name=None, address_count=None, namespace=None):
         print('Cluster not found!')
         sys.exit(1)
 
+    p = progress.Progress(total_phases=1, verbose=ctx.obj['VERBOSE'])
+    ctx.obj['PROGRESS'] = p
+    p.phase('Adding metallb addresses')
     primitives.allocate_metallb_addresses(ctx, address_count)
     primitives.configure_metallb_addresses(ctx)
+    p.finish(f'Added {address_count} metallb addresses to cluster {name}')
 
 
 k3s.add_command(k3s_expand_addresses)
@@ -497,8 +512,12 @@ def k3s_update_os(ctx, name=None, namespace=None):
         print('Cluster not found!')
         sys.exit(1)
 
+    p = progress.Progress(total_phases=1, verbose=ctx.obj['VERBOSE'])
+    ctx.obj['PROGRESS'] = p
+    p.phase('Updating the OS on all cluster nodes')
     primitives.instance_os_update(
         ctx, md['control_plane_nodes'] + md['worker_nodes'])
+    p.finish(f'Updated the OS on all nodes in cluster {name}')
 
 
 k3s.add_command(k3s_update_os)

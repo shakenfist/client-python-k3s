@@ -32,6 +32,7 @@ cluster is still tested manually.
 |------|---------|
 | `shakenfist_client_k3s/__init__.py` | Click command group (`k3s ...`), plugin entry point |
 | `shakenfist_client_k3s/primitives.py` | Cluster orchestration primitives and version caches |
+| `shakenfist_client_k3s/progress.py` | Phase and wait-loop progress reporting for long running commands |
 | `shakenfist_client_k3s/tests/` | Unit tests (stestr, see `.stestr.conf`) |
 | `pyproject.toml` | Package metadata and dependencies |
 

@@ -15,6 +15,7 @@ Click context.
 shakenfist_client_k3s/
 ├── __init__.py         # Click commands and the plugin entry point
 ├── primitives.py       # Orchestration primitives
+├── progress.py         # Phase and wait-loop progress reporting
 └── tests/              # Unit tests (testtools + stestr)
 ```
 
@@ -59,6 +60,23 @@ shakenfist_client_k3s/
   using the node token, MetalLB is installed and configured with
   floating addresses routed to the node network, and Longhorn is
   installed for persistent volumes
+
+### Progress reporting (`progress.py`)
+
+Long running commands construct a `Progress` reporter and place it in
+the Click context as `ctx.obj['PROGRESS']`; primitives retrieve it
+with `progress.get_progress(ctx)`. Work is announced as numbered
+phases (`[3/9] Setting up metallb`), and the polling wait loops
+(`await_boot`, `await_idle`, `await_fetch`) report per-item statuses
+through `Progress.update()`. When stdout is a TTY the statuses are
+rendered as one line per item, rewritten in place with ANSI cursor
+movement and truncated to the terminal width. Otherwise (pipes, CI,
+or `--verbose`, whose debug lines would interleave badly with cursor
+movement) a status line is printed only when it changes, with a
+heartbeat reprint every 60 seconds so logs still show liveness. All
+statuses include the elapsed time within the current phase, and idle
+waits describe the agent command currently executing rather than a
+bare operation count. The module is dependency free.
 
 ## Python Version Compatibility
 
