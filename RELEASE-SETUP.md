@@ -68,7 +68,12 @@ This prevents unauthorized users from creating release tags.
    - **Enforcement status**: `Active`
    - **Target tags**: Add pattern `v*`
    - **Rules**: Check **Restrict creations** and **Restrict deletions**
-   - **Bypass list**: Add repository admins or specific maintainers
+   - **Bypass list**: Add repository admins or specific maintainers,
+     **and GitHub Actions** (add the "GitHub Actions" app to the bypass
+     list). The release workflow's sign-tag job re-creates and
+     force-pushes the release tag as `github-actions[bot]` using
+     `GITHUB_TOKEN`; without the Actions bypass that push is rejected
+     by this ruleset and every release fails at the signing step.
 4. Click **Create**
 
 ### 4. Verify Sigstore/Rekor Access

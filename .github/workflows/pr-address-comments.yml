@@ -140,13 +140,18 @@ jobs:
             cp "${summary_file}" ${{ github.workspace }}/summary.md
           fi
 
-          # Extract counts from CI output
+          # Extract counts from CI output. The default has to be
+          # applied after the pipeline: when grep matches nothing its
+          # failure status is hidden by the pipe (cut still succeeds),
+          # so an || fallback on the pipeline itself never fires.
           addressed=$(grep "^items_addressed=" \
             ${{ github.workspace }}/address-log.txt | \
-            cut -d= -f2 || echo "0")
+            cut -d= -f2)
+          addressed=${addressed:-0}
           skipped=$(grep "^items_skipped=" \
             ${{ github.workspace }}/address-log.txt | \
-            cut -d= -f2 || echo "0")
+            cut -d= -f2)
+          skipped=${skipped:-0}
 
           echo "addressed=${addressed}" >> $GITHUB_OUTPUT
           echo "skipped=${skipped}" >> $GITHUB_OUTPUT
