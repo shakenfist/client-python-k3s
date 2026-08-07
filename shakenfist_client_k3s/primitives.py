@@ -64,7 +64,7 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
     updated = version_cache.get('updated', 0)
 
     _emit_debug(ctx, (f'Cached version information from {updated}: '
-                      f'{version_cache.get('releases', {})}'))
+                      f'{version_cache.get("releases", {})}'))
 
     if time.time() - updated > 24 * 3600:
         _emit_debug(ctx, 'Updating release version cache')
@@ -122,15 +122,14 @@ def get_longhorn_release(ctx, force_cache_update=False):
     updated = version_cache.get('updated', 0)
 
     _emit_debug(ctx, (f'Cached version information from {updated}: '
-                      f'{version_cache.get('releases', {})}'))
+                      f'{version_cache.get("releases", {})}'))
 
     if time.time() - updated > 24 * 3600:
         _emit_debug(ctx, 'Updating release version cache')
 
         releases = {}
         for page in range(5):
-            url = f'https://api.github.com/repos/longhorn/longhorn/releases?page={
-                page}'
+            url = f'https://api.github.com/repos/longhorn/longhorn/releases?page={page}'
             _emit_debug(ctx, f'Fetching {url}')
             r = requests.request(
                 'GET', url,
@@ -248,7 +247,7 @@ def await_idle(ctx, instances):
 
 def await_fetch(ctx, aop):
     while aop['state'] not in ['complete', 'error']:
-        print(f'...fetch operation has state {aop['state']}')
+        print(f'...fetch operation has state {aop["state"]}')
         time.sleep(1)
         aop = ctx.obj['CLIENT'].get_agent_operation(aop['uuid'])
 
@@ -295,8 +294,8 @@ def create_and_await_instances(ctx, count, node_type):
         md['node_serial'] += 1
         md[f'{node_type}_nodes'].append(inst['uuid'])
         set_cluster_metadata(ctx, md)
-        print(f'Created {inst['name']} as a {node_type} node '
-              f'(uuid {inst['uuid']})')
+        print(f'Created {inst["name"]} as a {node_type} node '
+              f'(uuid {inst["uuid"]})')
 
     await_boot(ctx, new_nodes)
     set_cluster_metadata(ctx, md)
@@ -391,8 +390,8 @@ def install_k3s_component(ctx, instance_uuids, token, node_role):
             'sudo apt-get install -y',
             (
                 'curl -sfL https://get.k3s.io | '
-                f'INSTALL_K3S_CHANNEL={md['k3s_version']} '
-                f'K3S_URL=https://{md['api_address_inner']}:6443 '
+                f'INSTALL_K3S_CHANNEL={md["k3s_version"]} '
+                f'K3S_URL=https://{md["api_address_inner"]}:6443 '
                 f'K3S_TOKEN={token} sh -s - {node_role}'
             )
         ]
