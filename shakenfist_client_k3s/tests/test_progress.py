@@ -400,3 +400,24 @@ class WaitLoopTestCase(testtools.TestCase):
 
         self.assertEqual(1, e.code)
         self.assertIn('operation: aop-004', captured.getvalue())
+
+    def test_reap_execute_formats_multiline_stderr(self):
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'node-001'}
+        aop = {
+            'uuid': 'aop-005',
+            'instance_uuid': 'uuid-001',
+            'state': 'complete',
+            'commands': [{'command': 'execute', 'commandline': 'kubectl wait pods'}],
+            'results': {'0': {'return-code': 1, 'stdout': '',
+                              'stderr': 'timed out on pod one\ntimed out on pod two'}}
+        }
+        ctx = self._make_context(client, io.StringIO())
+
+        captured = io.StringIO()
+        with mock.patch('sys.stdout', captured):
+            e = self.assertRaises(SystemExit, primitives.reap_execute, ctx, aop)
+
+        self.assertEqual(1, e.code)
+        self.assertIn('   stderr: timed out on pod one\n'
+                      '   stderr: timed out on pod two', captured.getvalue())

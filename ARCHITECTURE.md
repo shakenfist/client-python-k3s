@@ -57,9 +57,11 @@ shakenfist_client_k3s/
   channel
 - **Cluster assembly**: the first control plane node is installed
   with `k3s server`, additional control plane nodes and workers join
-  using the node token, MetalLB is installed and configured with
-  floating addresses routed to the node network, and Longhorn is
-  installed for persistent volumes
+  using the node token, MetalLB is installed (from the official
+  metallb helm chart -- the Bitnami chart references versioned
+  docker.io/bitnami images which stopped being published in 2025)
+  and configured with floating addresses routed to the node network,
+  and Longhorn is installed for persistent volumes
 
 ### Progress reporting (`progress.py`)
 

@@ -394,7 +394,7 @@ def reap_execute(ctx, aop):
         print('exit code: %s' % aop['results']['0']['return-code'])
         print('   stdout: %s' % '\n   stdout: '.join(
             aop['results']['0']['stdout'].split('\n')))
-        print('   stderr: %s' % '\n   stderr'.join(
+        print('   stderr: %s' % '\n   stderr: '.join(
             aop['results']['0']['stderr'].split('\n')))
         sys.exit(1)
 
@@ -589,12 +589,17 @@ def setup_metallb(ctx, metal_address_count):
         ctx, [md['control_plane_nodes'][0]],
         [
             'kubectl create ns metallb-system',
-            # Note that we can't use the KUBECONFIG=... environment variable
-            # prefix idiom here: the in-guest agent validates the first token
-            # of the command line as an executable before running the command.
+            # The official metallb chart is used here because Bitnami
+            # stopped publishing versioned images to docker.io/bitnami in
+            # 2025, so the bitnamicharts/metallb chart installs pods which
+            # can never pull their images. Note also that we can't use the
+            # KUBECONFIG=... environment variable prefix idiom: the
+            # in-guest agent validates the first token of the command line
+            # as an executable before running the command.
+            'helm repo add metallb https://metallb.github.io/metallb',
+            'helm repo update',
             ('helm --kubeconfig /etc/rancher/k3s/k3s.yaml '
-             'upgrade --install -n metallb-system metallb '
-             'oci://registry-1.docker.io/bitnamicharts/metallb'),
+             'upgrade --install -n metallb-system metallb metallb/metallb'),
         ])
 
     # Let the metallb pods start

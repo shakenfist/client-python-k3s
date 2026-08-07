@@ -138,3 +138,19 @@ Follow-up changes, on the same branch:
 4. **Avoid the trigger.** The metallb and longhorn helm commandlines use
    `helm --kubeconfig ...` instead of the environment-variable prefix the
    agent rejects.
+
+## Addendum 2: metallb image availability
+
+The next live run got past helm (and the new error reporting worked:
+the stall note fired at five minutes, and the `kubectl wait` timeout
+was reported with its stderr) but the metallb pods sat in
+ImagePullBackOff: the bitnamicharts/metallb chart references
+`docker.io/bitnami/metallb-*` versioned tags, and Bitnami stopped
+publishing versioned images to docker.io/bitnami in 2025 (the
+repository now has zero tags). Switch to the official metallb chart
+(`https://metallb.github.io/metallb`), whose images live on quay.io,
+whose pods carry the same `app.kubernetes.io/name=metallb` label the
+readiness wait matches, and which consumes the same `metallb.io/v1beta1`
+IPAddressPool and L2Advertisement resources the address configuration
+writes. Also fix a formatting bug this failure exposed: the multi-line
+stderr join in `reap_execute()` was missing its `: ` separator.
