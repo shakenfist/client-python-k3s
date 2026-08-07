@@ -88,10 +88,10 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
         releases = {}
         _emit_debug(ctx, 'Fetched release data:')
         _emit_debug(ctx, json.dumps(d, indent=4, sort_keys=True))
-        for reldata in d['data']:
+        for reldata in d.get('data', []):
             # Some channels (for example v1.16-testing) have no released
             # version and therefore no 'latest' key.
-            if 'latest' not in reldata:
+            if 'name' not in reldata or 'latest' not in reldata:
                 _emit_debug(ctx, (f'Channel {reldata.get("name")} has no latest release, '
                                   'skipping'))
                 continue

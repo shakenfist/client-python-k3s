@@ -2,6 +2,9 @@ import contextlib
 import io
 import time
 
+# The PyPI mock backport is used rather than unittest.mock because these
+# tests use call_args.args, which the stdlib version only gained in
+# Python 3.8, and the project supports Python >= 3.7.
 import mock
 import testtools
 
@@ -39,6 +42,9 @@ K3S_CHANNELS = {
         {'name': 'latest', 'latest': 'v1.34.1+k3s1'},
         {'name': 'v1.16-testing', 'latestRegexp': 'v1\\.16\\..*'},
         {'name': 'v1.33', 'latest': 'v1.33.4+k3s1'},
+        # Synthetic: an entry with no 'name' must be skipped, not stored
+        # under a None key.
+        {'latest': 'v1.99.0+k3s1'},
     ]
 }
 
@@ -113,6 +119,18 @@ class GetK3sReleaseTestCase(testtools.TestCase):
 
         self.assertEqual('v1.33.4+k3s1', release)
         mock_request.assert_called_once()
+
+    def test_response_missing_data_exits(self):
+        # An error envelope or schema change with no 'data' key must take
+        # the tidy 'Release channel not found' exit, not raise KeyError.
+        client = mock.MagicMock()
+        ctx = _make_context(client)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response({'error': 'nope'})):
+            self.assertRaises(
+                SystemExit, primitives.get_k3s_release,
+                ctx, force_cache_update=True, release_channel='stable')
 
     def test_cache_missing_releases_is_clobbered(self):
         # A cache dict with a fresh timestamp but no 'releases' key must be

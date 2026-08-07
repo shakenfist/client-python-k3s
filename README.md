@@ -18,6 +18,11 @@ pip install shakenfist_client_k3s
 The plugin registers itself with `sf-client` via an entry point, so once
 installed the commands appear automatically.
 
+Cluster nodes communicate with Shaken Fist over the `sf-agent2` side
+channel, so clusters require `shakenfist_client` >= 0.7.7 (installed
+automatically) and a Shaken Fist server and guest image recent enough
+to speak `sf-agent2`.
+
 ## Usage
 
 ```bash

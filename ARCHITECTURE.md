@@ -47,11 +47,13 @@ shakenfist_client_k3s/
   `debian:12` base image, await boot and agent-idle state via the
   Shaken Fist agent, and run installation commands through agent
   execute operations. Instances are created with the `sf-agent2`
-  side channel, which the current in-guest agent requires — the
-  client's `await_agent_ready()` refuses to wait on instances
-  without it. Clusters therefore require a Shaken Fist server and
-  guest image recent enough to speak `sf-agent2`; there is no
-  fallback to the legacy `sf-agent` channel
+  side channel, which the current in-guest agent requires: without
+  it the agent never connects, the instance's `agent_state` never
+  reaches `ready`, and the `await_boot()` polling loop waits
+  forever. Clusters therefore require `shakenfist_client` >= 0.7.7
+  and a Shaken Fist server and guest image recent enough to speak
+  `sf-agent2`; there is no fallback to the legacy `sf-agent`
+  channel
 - **Cluster assembly**: the first control plane node is installed
   with `k3s server`, additional control plane nodes and workers join
   using the node token, MetalLB is installed and configured with
