@@ -363,15 +363,8 @@ def install_control_plane(ctx):
     cmds.append('curl -sfL https://get.k3s.io | '
                 'INSTALL_K3S_CHANNEL=%s sh -s - server'
                 % md['k3s_version'])
-    cmds.append(
-        'curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | '
-        'sudo tee /usr/share/keyrings/helm.gpg')
-    cmds.append('sudo apt-get install -y apt-transport-https')
-    cmds.append(
-        'echo "deb [arch=$(dpkg --print-architecture) '
-        'signed-by=/usr/share/keyrings/helm.gpg] '
-        'https://baltocdn.com/helm/stable/debian/ all main" | '
-        'sudo tee /etc/apt/sources.list.d/helm-stable-debian.list')
+    cmds.append('sudo apt-get install -y extrepo')
+    cmds.append('sudo extrepo enable helm')
     cmds.append('sudo apt-get update')
     cmds.append('sudo apt-get install -y helm')
 
