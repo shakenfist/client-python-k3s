@@ -97,6 +97,16 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
                 continue
             releases[reldata['name']] = reldata['latest']
 
+        # Don't persist an empty parse result: a transient upstream error
+        # would otherwise poison the shared namespace cache until it next
+        # expires. This mirrors the 'latest is None' guard in
+        # get_longhorn_release().
+        if not releases:
+            print('No usable k3s release channels found')
+            print(f'    GET {url}')
+            print(f'    returned: {json.dumps(d)[:512]}')
+            sys.exit(1)
+
         version_cache['releases'] = releases
         version_cache['updated'] = time.time()
         ctx.obj['CLIENT'].set_namespace_metadata_item(

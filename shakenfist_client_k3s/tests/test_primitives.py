@@ -121,8 +121,10 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         mock_request.assert_called_once()
 
     def test_response_missing_data_exits(self):
-        # An error envelope or schema change with no 'data' key must take
-        # the tidy 'Release channel not found' exit, not raise KeyError.
+        # An error envelope or schema change with no 'data' key must exit
+        # tidily rather than raise KeyError, and must not persist an empty
+        # releases dict, which would poison the shared namespace cache
+        # until it next expires.
         client = mock.MagicMock()
         ctx = _make_context(client)
 
@@ -131,6 +133,8 @@ class GetK3sReleaseTestCase(testtools.TestCase):
             self.assertRaises(
                 SystemExit, primitives.get_k3s_release,
                 ctx, force_cache_update=True, release_channel='stable')
+
+        client.set_namespace_metadata_item.assert_not_called()
 
     def test_cache_missing_releases_is_clobbered(self):
         # A cache dict with a fresh timestamp but no 'releases' key must be
