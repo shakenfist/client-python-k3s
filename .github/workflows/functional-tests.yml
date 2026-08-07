@@ -1,0 +1,77 @@
+name: Functional tests
+
+# NOTE(mikal): git repos are checked out to /srv/github/_work/{repo}/{repo}
+# which is available as GITHUB_WORKSPACE. You can find other environment
+# variables at:
+# https://docs.github.com/en/actions/learn-github-actions/environment-variables
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - develop
+
+jobs:
+  sanity_checks:
+    runs-on: [self-hosted, vm, debian-12]
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-lint
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code with two commits
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Upgrade base test tools
+        timeout-minutes: 5
+        run: |
+          python3 -mvenv /tmp/venv-test
+          . /tmp/venv-test/bin/activate
+          pip3 install uv
+          uv pip install tox tox-uv
+
+      - name: Lint with flake8
+        timeout-minutes: 5
+        run: |
+          . /tmp/venv-test/bin/activate
+          tox -eflake8
+
+      - name: Run pre-commit hooks
+        timeout-minutes: 10
+        run: |
+          . /tmp/venv-test/bin/activate
+          uv pip install pre-commit
+          pre-commit run --all-files
+
+      - name: Attempt to install requirements
+        timeout-minutes: 5
+        run: |
+          python3 -mvenv /tmp/venv-reqs
+          . /tmp/venv-reqs/bin/activate
+          pip3 install uv
+          uv pip install -r pyproject.toml
+
+      - name: Verify the plugin imports cleanly
+        timeout-minutes: 5
+        run: |
+          . /tmp/venv-reqs/bin/activate
+          uv pip install .
+          python3 -c 'import shakenfist_client_k3s'
+
+  automated_reviewer:
+    name: "Automated reviewer"
+    needs: [sanity_checks]
+    # A cross-repository reusable workflow cannot grant itself more
+    # token scope than its caller has, so the permissions go here.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: shakenfist/actions/.github/workflows/pr-auto-review.yml@main
+    secrets: inherit

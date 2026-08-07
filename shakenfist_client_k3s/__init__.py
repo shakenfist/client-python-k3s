@@ -1,14 +1,17 @@
 import click
 import copy
-import json
 import os
-from pbr.version import VersionInfo
 from shakenfist_client import apiclient
 import subprocess
 import sys
 import tempfile
 import time
 import yaml
+
+try:
+    from importlib.metadata import version as distribution_version
+except ImportError:
+    from importlib_metadata import version as distribution_version
 
 from shakenfist_client_k3s import primitives
 
@@ -140,7 +143,7 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
         'type': 'k3s',
         'k3s_version': target_release,
         'k3s_version_history': [target_release],
-        'plugin_version': VersionInfo('shakenfist_client_k3s').version_string(),
+        'plugin_version': distribution_version('shakenfist_client_k3s'),
         'state': 'initial',
         'node_serial': 1,
         'node_network': node_network['uuid'],
@@ -498,7 +501,6 @@ def k3s_update_os(ctx, name=None, namespace=None):
 
 
 k3s.add_command(k3s_update_os)
-
 
 
 def load(cli):

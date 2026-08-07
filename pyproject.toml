@@ -1,0 +1,59 @@
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "setuptools_scm[simple]>=6.2",
+    "wheel",
+    "build",
+    "twine"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shakenfist_client_k3s"
+dynamic = ["version"]
+
+description = "A sf-client plugin which orchestrates k3s clusters on Shaken Fist"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Michael Still", email = "mikal@stillhq.com"},
+]
+classifiers = [
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+]
+requires-python = ">=3.7"
+dependencies = [
+    "click >= 8.0.0",           # bsd
+    "prettytable",              # bsd
+    "shakenfist_client",        # apache2
+    "packaging",                # apache2 and bsd
+    "pyyaml",                   # mit
+    "requests",                 # apache2
+    "importlib-metadata; python_version < '3.9'",  # apache2
+]
+
+[project.urls]
+"Homepage" = "https://shakenfist.com"
+"Bug Tracker" = "https://github.com/shakenfist/client-python-k3s/issues"
+
+[project.entry-points."shakenfist_client.plugin"]
+k3s = "shakenfist_client_k3s:load"
+
+[tool.setuptools.packages.find]
+include = ["shakenfist_client_k3s*"]
+
+[tool.setuptools_scm]
+git_describe_command = "git describe --dirty --tags --match v* --first-parent"
+write_to = "shakenfist_client_k3s/_version.py"
+
+[project.optional-dependencies]
+test = [
+    "tox",                 # mit
+    "flake8",              # mit
+]
