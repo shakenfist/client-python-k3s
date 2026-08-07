@@ -47,6 +47,13 @@ cluster is still tested manually.
   unconditionally by the plugin loader, so top-level imports must be
   cheap and reliable
 
+## Planning and Pre-push Review
+
+- Substantial work starts from a plan file in `docs/plans/`, based on
+  `PLAN-TEMPLATE.md`, committed on the branch that becomes the pull
+  request.
+- Before pushing, work through the checks in `PUSH-AUDIT.md`.
+
 ## When Making Changes
 
 - Run the unit tests with `tox -epy3` and add coverage for new
