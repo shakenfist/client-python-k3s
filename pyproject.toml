@@ -56,4 +56,7 @@ write_to = "shakenfist_client_k3s/_version.py"
 test = [
     "tox",                 # mit
     "flake8",              # mit
+    "testtools",           # mit
+    "mock",                # bsd
+    "stestr",              # apache2
 ]

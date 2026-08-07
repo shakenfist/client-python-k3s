@@ -1,0 +1,158 @@
+import time
+
+import mock
+import testtools
+
+from shakenfist_client_k3s import primitives
+
+
+class FakeContext:
+    """A minimal stand-in for a click context, which primitives only uses as a holder for the obj dict."""
+
+    def __init__(self, obj):
+        self.obj = obj
+
+
+def _make_context(client):
+    return FakeContext({
+        'namespace': 'testns',
+        'CLIENT': client,
+        'VERBOSE': False
+    })
+
+
+def _fake_response(payload, status_code=200):
+    resp = mock.MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = payload
+    return resp
+
+
+# A cut down version of real data from https://update.k3s.io/v1-release/channels.
+# Note that some channels (v1.16-testing here) have no 'latest' key, just a
+# 'latestRegexp', because no matching release is retained upstream.
+K3S_CHANNELS = {
+    'data': [
+        {'name': 'stable', 'latest': 'v1.33.4+k3s1'},
+        {'name': 'latest', 'latest': 'v1.34.1+k3s1'},
+        {'name': 'v1.16-testing', 'latestRegexp': 'v1\\.16\\..*'},
+        {'name': 'v1.33', 'latest': 'v1.33.4+k3s1'},
+    ]
+}
+
+
+class GetK3sReleaseTestCase(testtools.TestCase):
+    def test_channels_without_latest_are_skipped(self):
+        client = mock.MagicMock()
+        ctx = _make_context(client)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(K3S_CHANNELS)):
+            release = primitives.get_k3s_release(
+                ctx, force_cache_update=True, release_channel='stable')
+
+        self.assertEqual('v1.33.4+k3s1', release)
+
+        # The cache we write back should contain the resolvable channels and
+        # silently omit the ones without a latest release.
+        cache = client.set_namespace_metadata_item.call_args[0][2]
+        self.assertEqual(
+            {'stable': 'v1.33.4+k3s1', 'latest': 'v1.34.1+k3s1', 'v1.33': 'v1.33.4+k3s1'},
+            cache['releases'])
+
+    def test_unresolvable_channel_exits(self):
+        client = mock.MagicMock()
+        ctx = _make_context(client)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(K3S_CHANNELS)):
+            self.assertRaises(
+                SystemExit, primitives.get_k3s_release,
+                ctx, force_cache_update=True, release_channel='v1.16-testing')
+
+    def test_unknown_channel_exits(self):
+        client = mock.MagicMock()
+        ctx = _make_context(client)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(K3S_CHANNELS)):
+            self.assertRaises(
+                SystemExit, primitives.get_k3s_release,
+                ctx, force_cache_update=True, release_channel='banana')
+
+    def test_fresh_cache_avoids_fetch(self):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {
+            primitives.K3S_VERSION_CACHE_KEY: {
+                'updated': time.time(),
+                'releases': {'stable': 'v1.30.0+k3s1'}
+            }
+        }
+        ctx = _make_context(client)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request') as mock_request:
+            release = primitives.get_k3s_release(ctx, release_channel='stable')
+
+        self.assertEqual('v1.30.0+k3s1', release)
+        mock_request.assert_not_called()
+
+    def test_invalid_cache_is_clobbered(self):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {
+            primitives.K3S_VERSION_CACHE_KEY: 'this is not a dict'
+        }
+        ctx = _make_context(client)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(K3S_CHANNELS)) as mock_request:
+            release = primitives.get_k3s_release(ctx, release_channel='stable')
+
+        self.assertEqual('v1.33.4+k3s1', release)
+        mock_request.assert_called_once()
+
+    def test_http_error_exits(self):
+        client = mock.MagicMock()
+        ctx = _make_context(client)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(None, status_code=500)):
+            self.assertRaises(
+                SystemExit, primitives.get_k3s_release,
+                ctx, force_cache_update=True, release_channel='stable')
+
+
+# A cut down version of real data from the GitHub releases API for
+# longhorn/longhorn. Prereleases and tags which are not valid PEP 440
+# versions should both be handled gracefully.
+LONGHORN_RELEASES = [
+    {'prerelease': False, 'tag_name': 'v1.5.1',
+     'tarball_url': 'https://example.com/tarball/v1.5.1'},
+    {'prerelease': True, 'tag_name': 'v1.7.0-rc1',
+     'tarball_url': 'https://example.com/tarball/v1.7.0-rc1'},
+    {'prerelease': False, 'tag_name': 'v1.4.0-hotfix1',
+     'tarball_url': 'https://example.com/tarball/v1.4.0-hotfix1'},
+    {'prerelease': False, 'tag_name': 'v1.6.0',
+     'tarball_url': 'https://example.com/tarball/v1.6.0'},
+]
+
+
+class GetLonghornReleaseTestCase(testtools.TestCase):
+    def test_prereleases_and_unparsable_tags_are_skipped(self):
+        client = mock.MagicMock()
+        ctx = _make_context(client)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(LONGHORN_RELEASES)):
+            release = primitives.get_longhorn_release(ctx, force_cache_update=True)
+
+        self.assertEqual('1.6.0', release)
+
+    def test_no_valid_releases_exits(self):
+        client = mock.MagicMock()
+        ctx = _make_context(client)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response([])):
+            self.assertRaises(
+                SystemExit, primitives.get_longhorn_release,
+                ctx, force_cache_update=True)

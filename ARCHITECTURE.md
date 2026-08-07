@@ -14,7 +14,8 @@ Click context.
 ```
 shakenfist_client_k3s/
 ├── __init__.py         # Click commands and the plugin entry point
-└── primitives.py       # Orchestration primitives
+├── primitives.py       # Orchestration primitives
+└── tests/              # Unit tests (testtools + stestr)
 ```
 
 ### Commands (`__init__.py`)
@@ -37,8 +38,11 @@ shakenfist_client_k3s/
 - **Release caches**: the latest k3s release per channel is fetched
   from the k3s update API, and the latest Longhorn release from the
   GitHub releases API. Results are cached in namespace metadata and
-  refreshed when stale; Longhorn tags are compared with
-  `packaging.version.Version`
+  refreshed when stale. Both parsers are defensive about upstream data:
+  k3s channels without a `latest` release (for example `v1.16-testing`)
+  are skipped, and Longhorn tags which are prereleases or not valid
+  PEP 440 versions are ignored (`packaging.version.Version` is used
+  for comparison)
 - **Instance orchestration**: helpers create instances from a
   `debian:12` base image, await boot and agent-idle state via the
   Shaken Fist agent, and run installation commands through agent
