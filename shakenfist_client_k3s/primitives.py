@@ -57,7 +57,7 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
         namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             K3S_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
-        if not isinstance(version_cache, dict):
+        if not isinstance(version_cache, dict) or 'releases' not in version_cache:
             _emit_debug(ctx, 'Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
@@ -79,7 +79,7 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
             })
         if r.status_code not in [200, 201, 204]:
             print('Unable to determine latest k3s release version')
-            print('    GET {url}')
+            print(f'    GET {url}')
             print(f'    returned HTTP status code {r.status_code} with text:')
             print(f'    {r.text}')
             sys.exit(1)
@@ -121,7 +121,7 @@ def get_longhorn_release(ctx, force_cache_update=False):
         namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             LONGHORN_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
-        if not isinstance(version_cache, dict):
+        if not isinstance(version_cache, dict) or 'latest' not in version_cache:
             _emit_debug(ctx, 'Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
@@ -146,7 +146,7 @@ def get_longhorn_release(ctx, force_cache_update=False):
 
             if r.status_code not in [200, 201, 204]:
                 print(
-                    'Unable to determine latest k3s release version\n'
+                    'Unable to determine latest Longhorn release version\n'
                     f'    GET {url}\n'
                     f'    returned HTTP status code {r.status_code} '
                     'with text:\n'
