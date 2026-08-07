@@ -42,6 +42,13 @@ jobs:
           . /tmp/venv-test/bin/activate
           tox -eflake8
 
+      - name: Run pre-commit hooks
+        timeout-minutes: 10
+        run: |
+          . /tmp/venv-test/bin/activate
+          uv pip install pre-commit
+          pre-commit run --all-files
+
       - name: Attempt to install requirements
         timeout-minutes: 5
         run: |
