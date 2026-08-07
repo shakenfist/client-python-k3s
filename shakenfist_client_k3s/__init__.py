@@ -2,6 +2,7 @@ import click
 import copy
 import os
 from shakenfist_client import apiclient
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -213,26 +214,38 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
 
     # Install the kubeconfig we fetched earlier
     p.phase('Updating local kubeconfig')
-    with tempfile.TemporaryDirectory() as tempdir:
-        new_config_path = os.path.join(tempdir, 'config')
-        kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
-        main_config_path = os.path.join(kube_dir, 'config')
-        os.makedirs(kube_dir, exist_ok=True)
+    kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
+    main_config_path = os.path.join(kube_dir, 'config')
+    os.makedirs(kube_dir, exist_ok=True)
 
-        with open(new_config_path, 'w') as f:
+    if not os.path.exists(main_config_path):
+        # There is no existing configuration to preserve, so no merge is
+        # required and we don't need a local kubectl.
+        with open(main_config_path, 'w') as f:
             f.write(yaml.dump(kc))
-        p = subprocess.run(
-            'kubectl config view --flatten', shell=True, capture_output=True,
-            env={
-                'KUBECONFIG': ('%s/.kube/config:%s'
-                               % (os.path.expanduser('~'), new_config_path))
-                })
-        if p.returncode != 0:
-            print('Failed up update %s/.kube/config, return code %d'
-                  % (os.path.expanduser('~'), p.returncode))
+    else:
+        if not shutil.which('kubectl'):
+            print('A local kubectl binary is required to merge the new cluster into')
+            print('%s, but none was found. The new cluster credentials are' % main_config_path)
+            print(f"available from 'sf-client k3s getconfig {name}'.")
             sys.exit(1)
-        with open(main_config_path, 'wb') as f:
-            f.write(p.stdout)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            new_config_path = os.path.join(tempdir, 'config')
+            with open(new_config_path, 'w') as f:
+                f.write(yaml.dump(kc))
+            merged = subprocess.run(
+                'kubectl config view --flatten', shell=True, capture_output=True,
+                env={**os.environ,
+                     'KUBECONFIG': '%s:%s' % (main_config_path, new_config_path)})
+            if merged.returncode != 0:
+                print('Failed to update %s, return code %d'
+                      % (main_config_path, merged.returncode))
+                if merged.stderr:
+                    print(merged.stderr.decode('utf-8', errors='replace'))
+                sys.exit(1)
+            with open(main_config_path, 'wb') as f:
+                f.write(merged.stdout)
 
     md['state'] = 'created'
     primitives.set_cluster_metadata(ctx, md)

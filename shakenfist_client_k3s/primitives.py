@@ -252,6 +252,12 @@ def _describe_agent_op(aop, max_len=60):
         desc = c.get('command', 'unknown')
         if c.get('path'):
             desc += ' %s' % c['path']
+
+    # Multi-line commands (for example heredocs) would break the one line
+    # per item status display, so describe them by their first line.
+    if '\n' in desc:
+        desc = desc.split('\n', 1)[0] + ' ...'
+
     if max_len and len(desc) > max_len:
         desc = desc[:max_len - 3] + '...'
     return desc

@@ -230,6 +230,17 @@ class DescribeAgentOpTestCase(testtools.TestCase):
         self.assertEqual(60, len(desc))
         self.assertTrue(desc.endswith('...'))
 
+    def test_multiline_command_described_by_first_line(self):
+        aop = {
+            'commands': [{
+                'command': 'execute',
+                'commandline': 'cat - > /etc/sf/thing.yaml << EOF\nline: two\nEOF\n'
+            }],
+            'results': {}
+        }
+        self.assertEqual('cat - > /etc/sf/thing.yaml << EOF ...',
+                         primitives._describe_agent_op(aop))
+
     def test_no_commands(self):
         self.assertIsNone(primitives._describe_agent_op({'commands': [], 'results': {}}))
 
