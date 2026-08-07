@@ -31,7 +31,8 @@ requires-python = ">=3.7"
 dependencies = [
     "click >= 8.0.0",           # bsd
     "prettytable",              # bsd
-    "shakenfist_client",        # apache2
+    # 0.7.7 is the first release which supports the sf-agent2 side channel.
+    "shakenfist_client >= 0.7.7",  # apache2
     "packaging",                # apache2 and bsd
     "pyyaml",                   # mit
     "requests",                 # apache2
@@ -47,6 +48,7 @@ k3s = "shakenfist_client_k3s:load"
 
 [tool.setuptools.packages.find]
 include = ["shakenfist_client_k3s*"]
+exclude = ["shakenfist_client_k3s.tests*"]
 
 [tool.setuptools_scm]
 git_describe_command = "git describe --dirty --tags --match v* --first-parent"
@@ -56,4 +58,7 @@ write_to = "shakenfist_client_k3s/_version.py"
 test = [
     "tox",                 # mit
     "flake8",              # mit
+    "testtools",           # mit
+    "mock",                # bsd
+    "stestr",              # apache2
 ]

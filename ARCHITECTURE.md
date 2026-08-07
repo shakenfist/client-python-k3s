@@ -14,7 +14,8 @@ Click context.
 ```
 shakenfist_client_k3s/
 ├── __init__.py         # Click commands and the plugin entry point
-└── primitives.py       # Orchestration primitives
+├── primitives.py       # Orchestration primitives
+└── tests/              # Unit tests (testtools + stestr)
 ```
 
 ### Commands (`__init__.py`)
@@ -37,12 +38,22 @@ shakenfist_client_k3s/
 - **Release caches**: the latest k3s release per channel is fetched
   from the k3s update API, and the latest Longhorn release from the
   GitHub releases API. Results are cached in namespace metadata and
-  refreshed when stale; Longhorn tags are compared with
-  `packaging.version.Version`
+  refreshed when stale. Both parsers are defensive about upstream data:
+  k3s channels without a `latest` release (for example `v1.16-testing`)
+  are skipped, and Longhorn tags which are prereleases or not valid
+  PEP 440 versions are ignored (`packaging.version.Version` is used
+  for comparison)
 - **Instance orchestration**: helpers create instances from a
   `debian:12` base image, await boot and agent-idle state via the
   Shaken Fist agent, and run installation commands through agent
-  execute operations
+  execute operations. Instances are created with the `sf-agent2`
+  side channel, which the current in-guest agent requires: without
+  it the agent never connects, the instance's `agent_state` never
+  reaches `ready`, and the `await_boot()` polling loop waits
+  forever. Clusters therefore require `shakenfist_client` >= 0.7.7
+  and a Shaken Fist server and guest image recent enough to speak
+  `sf-agent2`; there is no fallback to the legacy `sf-agent`
+  channel
 - **Cluster assembly**: the first control plane node is installed
   with `k3s server`, additional control plane nodes and workers join
   using the node token, MetalLB is installed and configured with

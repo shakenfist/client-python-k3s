@@ -42,6 +42,12 @@ jobs:
           . /tmp/venv-test/bin/activate
           tox -eflake8
 
+      - name: Run python3 unit tests
+        timeout-minutes: 5
+        run: |
+          . /tmp/venv-test/bin/activate
+          tox -epy3
+
       - name: Run pre-commit hooks
         timeout-minutes: 10
         run: |

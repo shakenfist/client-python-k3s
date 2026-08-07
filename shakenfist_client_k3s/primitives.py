@@ -57,7 +57,7 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
         namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             K3S_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
-        if not isinstance(version_cache, dict):
+        if not isinstance(version_cache, dict) or 'releases' not in version_cache:
             _emit_debug(ctx, 'Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
@@ -79,7 +79,7 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
             })
         if r.status_code not in [200, 201, 204]:
             print('Unable to determine latest k3s release version')
-            print('    GET {url}')
+            print(f'    GET {url}')
             print(f'    returned HTTP status code {r.status_code} with text:')
             print(f'    {r.text}')
             sys.exit(1)
@@ -88,8 +88,24 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
         releases = {}
         _emit_debug(ctx, 'Fetched release data:')
         _emit_debug(ctx, json.dumps(d, indent=4, sort_keys=True))
-        for reldata in d['data']:
+        for reldata in d.get('data', []):
+            # Some channels (for example v1.16-testing) have no released
+            # version and therefore no 'latest' key.
+            if 'name' not in reldata or 'latest' not in reldata:
+                _emit_debug(ctx, (f'Channel {reldata.get("name")} has no latest release, '
+                                  'skipping'))
+                continue
             releases[reldata['name']] = reldata['latest']
+
+        # Don't persist an empty parse result: a transient upstream error
+        # would otherwise poison the shared namespace cache until it next
+        # expires. This mirrors the 'latest is None' guard in
+        # get_longhorn_release().
+        if not releases:
+            print('No usable k3s release channels found')
+            print(f'    GET {url}')
+            print(f'    returned: {json.dumps(d)[:512]}')
+            sys.exit(1)
 
         version_cache['releases'] = releases
         version_cache['updated'] = time.time()
@@ -115,7 +131,7 @@ def get_longhorn_release(ctx, force_cache_update=False):
         namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             LONGHORN_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
-        if not isinstance(version_cache, dict):
+        if not isinstance(version_cache, dict) or 'latest' not in version_cache:
             _emit_debug(ctx, 'Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
@@ -140,7 +156,7 @@ def get_longhorn_release(ctx, force_cache_update=False):
 
             if r.status_code not in [200, 201, 204]:
                 print(
-                    'Unable to determine latest k3s release version\n'
+                    'Unable to determine latest Longhorn release version\n'
                     f'    GET {url}\n'
                     f'    returned HTTP status code {r.status_code} '
                     'with text:\n'
@@ -207,7 +223,7 @@ def create_instance(ctx):
             }
         ],
         md.get('ssh_key'), None,
-        side_channels=['sf-agent'],
+        side_channels=['sf-agent2'],
         namespace=md['namespace']
     )
     return inst
@@ -357,15 +373,8 @@ def install_control_plane(ctx):
     cmds.append('curl -sfL https://get.k3s.io | '
                 'INSTALL_K3S_CHANNEL=%s sh -s - server'
                 % md['k3s_version'])
-    cmds.append(
-        'curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | '
-        'sudo tee /usr/share/keyrings/helm.gpg')
-    cmds.append('sudo apt-get install -y apt-transport-https')
-    cmds.append(
-        'echo "deb [arch=$(dpkg --print-architecture) '
-        'signed-by=/usr/share/keyrings/helm.gpg] '
-        'https://baltocdn.com/helm/stable/debian/ all main" | '
-        'sudo tee /etc/apt/sources.list.d/helm-stable-debian.list')
+    cmds.append('sudo apt-get install -y extrepo')
+    cmds.append('sudo extrepo enable helm')
     cmds.append('sudo apt-get update')
     cmds.append('sudo apt-get install -y helm')
 

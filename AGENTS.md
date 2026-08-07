@@ -21,8 +21,10 @@ pip install -e .
 sf-client k3s --help
 ```
 
-There are no unit tests yet; testing is manual against a live Shaken
-Fist cluster.
+Unit tests live in `shakenfist_client_k3s/tests/` and follow the
+client-python pattern (testtools + stestr, external APIs mocked). Run
+them with `tox -epy3`. Orchestration against a live Shaken Fist
+cluster is still tested manually.
 
 ## Key Files
 
@@ -30,6 +32,7 @@ Fist cluster.
 |------|---------|
 | `shakenfist_client_k3s/__init__.py` | Click command group (`k3s ...`), plugin entry point |
 | `shakenfist_client_k3s/primitives.py` | Cluster orchestration primitives and version caches |
+| `shakenfist_client_k3s/tests/` | Unit tests (stestr, see `.stestr.conf`) |
 | `pyproject.toml` | Package metadata and dependencies |
 
 ## Code Conventions
@@ -44,6 +47,9 @@ Fist cluster.
 
 ## When Making Changes
 
+- Run the unit tests with `tox -epy3` and add coverage for new
+  parsing or error-handling behavior, especially around external API
+  responses which can change shape over time
 - Ensure changes work with Python >= 3.7
 - Verify the plugin still imports cleanly (`python -c 'import
   shakenfist_client_k3s'`) -- a broken import takes the whole

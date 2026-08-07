@@ -32,7 +32,7 @@ def k3s():
 
 @k3s.command(name='list', help='List managed k3s clusters')
 @click.option('--namespace', type=click.STRING,
-              help=('If you are an admin, you can create this cluster in a '
+              help=('If you are an admin, you can list clusters in a '
                     'different namespace.'))
 @click.pass_context
 def k3s_list(ctx, namespace=None, ):
@@ -73,7 +73,7 @@ k3s.add_command(k3s_list)
                     'latest, and specific versions pre-pended with a v such as '
                     '"v1.26".'))
 @click.option('--sshkey', type=click.Path(exists=True),
-              help='An option ssh public key to place onto instances.')
+              help='An optional ssh public key to place onto instances.')
 @click.pass_context
 def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                metal_address_count=None,  namespace=None, network=None,
@@ -263,7 +263,7 @@ k3s.add_command(k3s_query_k3s_version)
               help=('If you are an admin, you can control which namespace the '
                     'version cache is retrieved from.'))
 @click.option('--refresh-version-cache/--no-refresh-version-cache', default=False,
-              help=('Force a refresh of the k3s version cache.'))
+              help=('Force a refresh of the longhorn version cache.'))
 @click.pass_context
 def k3s_query_longhorn_version(ctx, namespace=None, refresh_version_cache=False):
     ctx.obj['namespace'] = namespace
@@ -279,8 +279,8 @@ k3s.add_command(k3s_query_longhorn_version)
 @k3s.command(name='getconfig', help='Get kubeconfig for an existing k3s cluster')
 @click.argument('name', type=click.STRING)
 @click.option('--namespace', type=click.STRING,
-              help=('If you are an admin, you can create this cluster in a '
-                    'different namespace.'))
+              help=('If you are an admin, you can fetch the kubeconfig for a '
+                    'cluster in a different namespace.'))
 @click.pass_context
 def k3s_getconfig(ctx, name=None, namespace=None):
     ctx.obj['name'] = name
@@ -432,7 +432,7 @@ k3s.add_command(k3s_delete)
 @click.option('--worker-count', type=click.INT, help='The number of workers',
               default=2)
 @click.option('--namespace', type=click.STRING,
-              help=('If you are an admin, you can create this cluster in a '
+              help=('If you are an admin, you can alter clusters in a '
                     'different namespace.'))
 @click.pass_context
 def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
@@ -453,12 +453,13 @@ def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
 k3s.add_command(k3s_expand_workers)
 
 
-@k3s.command(name='expand-addresses', help='Add workers to a k3s cluster')
+@k3s.command(name='expand-addresses',
+             help='Add floating addresses for metallb to a k3s cluster')
 @click.argument('name', type=click.STRING)
 @click.option('--address-count', type=click.INT, help='The number of addresses to add',
               default=2)
 @click.option('--namespace', type=click.STRING,
-              help=('If you are an admin, you can create this cluster in a '
+              help=('If you are an admin, you can alter clusters in a '
                     'different namespace.'))
 @click.pass_context
 def k3s_expand_addresses(ctx, name=None, address_count=None, namespace=None):
@@ -482,7 +483,7 @@ k3s.add_command(k3s_expand_addresses)
 @k3s.command(name='update-os', help='Update the OS on all nodes')
 @click.argument('name', type=click.STRING)
 @click.option('--namespace', type=click.STRING,
-              help=('If you are an admin, you can create this cluster in a '
+              help=('If you are an admin, you can alter clusters in a '
                     'different namespace.'))
 @click.pass_context
 def k3s_update_os(ctx, name=None, namespace=None):
