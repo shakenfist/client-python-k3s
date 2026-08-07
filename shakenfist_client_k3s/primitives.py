@@ -213,7 +213,7 @@ def create_instance(ctx):
             }
         ],
         md.get('ssh_key'), None,
-        side_channels=['sf-agent'],
+        side_channels=['sf-agent2'],
         namespace=md['namespace']
     )
     return inst
