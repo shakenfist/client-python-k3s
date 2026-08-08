@@ -24,7 +24,10 @@ sf-client k3s --help
 Unit tests live in `shakenfist_client_k3s/tests/` and follow the
 client-python pattern (testtools + stestr, external APIs mocked). Run
 them with `tox -epy3`. Orchestration against a live Shaken Fist
-cluster is still tested manually.
+cluster is exercised by the merge tier of CI, which deploys a real
+cluster from an ephemeral runner via `tools/ci_deploy_test.sh` (see
+`docs/plans/functional-ci.md`); pull requests run the smoke tier
+(lint, unit tests, pre-commit) only.
 
 ## Key Files
 

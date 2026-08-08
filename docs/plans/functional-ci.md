@@ -58,12 +58,16 @@ Roll out shakenfist/shakenfist style two tier CI:
 
 ## Open questions
 
-* **Load balancer reachability.** The strongest assertion is an
-  HTTP request to a MetalLB `LoadBalancer` service address from
-  the runner. MetalLB addresses are under-cloud floating
-  addresses routed to the cluster's node network; whether they
-  are reachable from the runner VM's own job network needs a live
-  run to confirm. Fallback: perform the curl from a cluster node
+* **Load balancer reachability.** *(Mostly resolved.)* Live
+  testing on a local cluster confirmed MetalLB addresses are
+  reachable from hosts outside the under-cloud (an external host
+  got HTTP 200 from a `LoadBalancer` service in 2ms) and that only
+  clients *inside the cluster's own node network* are blocked (no
+  u-turn routing at the network node,
+  shakenfist/shakenfist#3662). The CI runner VM is on a different
+  virtual network to the cluster, which is expected to behave like
+  the external case, but is confirmed by the first live run.
+  Fallback if it does not: perform the curl from a cluster node
   via an agent execute operation, which stays within the node
   network.
 * **Merge queue enablement.** Turning on the merge queue and
@@ -76,19 +80,21 @@ Roll out shakenfist/shakenfist style two tier CI:
   cheap to chain on one cluster. `update-os` adds an apt
   dist-upgrade across all nodes (~5-10 minutes) for little new
   coverage -- proposed: leave it out initially.
-* **kubectl on the runner.** The assertions need a kubectl;
-  pinning a static binary download in the test script is simplest
-  and matches the cluster's k3s version only loosely. k3s ships a
-  kubectl on the control plane node, so an alternative is running
-  all kubectl assertions through agent execute operations and
-  keeping the runner dependency-free.
+* **kubectl on the runner.** *(Resolved.)* The test script
+  downloads a pinned static kubectl from dl.k8s.io with sha256
+  verification. The pin tracks the cluster's k3s channel only
+  loosely, which is fine for the simple operations the assertions
+  use. Note that `k3s delete` itself also needs a kubectl on the
+  runner (it unsets the cluster's local kubeconfig entries), and
+  `kubectl config unset` was verified to handle the dotted
+  `<cluster>.<namespace>` entry names correctly.
 
 ## Execution
 
 | Phase | Work | Status |
 |-------|------|--------|
-| 1. Workflow restructure | Add `merge_group` trigger, name the tiers, add collection jobs mirroring shakenfist/shakenfist | Not started |
-| 2. Deployment test | `tools/ci_deploy_test.sh` plus the merge-gated job on `[self-hosted, vm, debian-12]` | Not started |
+| 1. Workflow restructure | Add `merge_group` trigger, name the tiers, add collection jobs mirroring shakenfist/shakenfist | Implemented, awaiting live validation |
+| 2. Deployment test | `tools/ci_deploy_test.sh` plus the merge-gated job on `[self-hosted, vm, debian-12]` | Implemented, awaiting live validation |
 | 3. Queue enablement | Merge queue + required checks (operator, repo settings) | Not started |
 | 4. Live validation | `workflow_dispatch` runs until green, fix what they find | Not started |
 
@@ -118,11 +124,14 @@ backstop, and a concurrency group per ref. The job must not
 require secrets beyond what the runner already carries.
 
 **Ordering dependency**: the first merge-tier run can only pass
-once the `progress-ui-cleanup` branch has merged -- it carries
-the `helm --kubeconfig` fix for the agent command validation
-failure that currently breaks `setup_metallb()` (and the
-fail-fast error handling that makes CI hangs impossible). Land
-that branch first.
+once the `progress-ui-cleanup` branch (pull request 17) has
+merged -- it carries the `helm --kubeconfig` fix for the agent
+command validation failure that breaks `setup_metallb()`, the
+switch to the official metallb chart (the Bitnami images are no
+longer published), and the fail-fast error handling that makes
+CI hangs impossible. That branch has now survived a fully clean
+end to end local deployment, so land it first and then validate
+this workflow with `workflow_dispatch`.
 
 ## Administration and logistics
 

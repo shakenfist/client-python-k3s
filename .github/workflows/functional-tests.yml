@@ -5,12 +5,25 @@ name: Functional tests
 # variables at:
 # https://docs.github.com/en/actions/learn-github-actions/environment-variables
 
+# Two tier CI. Every pull request runs the smoke tier: sanity checks and
+# the automated reviewer. Merge queue entries and manual dispatches also
+# run the merge tier, which deploys a real k3s cluster into the ephemeral
+# VM runner's own per-job Shaken Fist namespace and verifies it works.
+#
+# The can_enqueue / can_merge collection job scheme is as described at:
+# https://boinkor.net/2023/11/neat-github-actions-patterns-for-github-merge-queues/
+# Both collection jobs are intended to be required status checks once the
+# merge queue is enabled: can_enqueue reports on pull requests, can_merge
+# on merge queue entries, and each is skipped (which GitHub treats as
+# success) for the other event.
+
 permissions:
   contents: read
   pull-requests: write
 
 on:
   workflow_dispatch:
+  merge_group:
   pull_request:
     branches:
       - develop
@@ -18,6 +31,7 @@ on:
 jobs:
   sanity_checks:
     runs-on: [self-hosted, vm, debian-12]
+    timeout-minutes: 45
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-lint
       cancel-in-progress: true
@@ -81,3 +95,67 @@ jobs:
       issues: write
     uses: shakenfist/actions/.github/workflows/pr-auto-review.yml@main
     secrets: inherit
+
+  # The merge tier: deploy a real k3s cluster into this runner's own
+  # per-job namespace on the under-cloud, verify it, expand it, and
+  # delete it. The runner already carries under-cloud credentials in
+  # ~/.shakenfist, and the namespace (and so anything the test leaks)
+  # dies with the runner.
+  cluster_deploy:
+    name: "Cluster deployment"
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, vm, debian-12]
+    # A full create is 15-25 minutes and the script carries its own
+    # per-phase timeouts; agent operation failures abort within one poll
+    # interval, so this is a backstop rather than an expected duration.
+    timeout-minutes: 90
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-cluster-deploy
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Deploy and verify a k3s cluster
+        timeout-minutes: 80
+        run: tools/ci_deploy_test.sh
+
+  can_enqueue:
+    name: "Can enqueue"
+    needs:
+      - sanity_checks
+    if: always() && github.event_name != 'merge_group'
+    permissions:
+      actions: read
+    runs-on: [self-hosted, static]
+    # A jq expression over the needs context.
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS_JSON: "${{toJSON(needs)}}"
+        name: Transform outcomes
+        run: |
+          echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >>$GITHUB_ENV
+      - name: Check outcomes
+        run: "[ $ALL_SUCCESS == true ]"
+
+  can_merge:
+    name: "Can merge"
+    needs:
+      - sanity_checks
+      - cluster_deploy
+    if: always() && github.event_name == 'merge_group'
+    permissions:
+      actions: read
+    runs-on: [self-hosted, static]
+    # A jq expression over the needs context.
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS_JSON: "${{toJSON(needs)}}"
+        name: Transform outcomes
+        run: |
+          echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >>$GITHUB_ENV
+      - name: Check outcomes
+        run: "[ $ALL_SUCCESS == true ]"
