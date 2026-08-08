@@ -58,18 +58,16 @@ Roll out shakenfist/shakenfist style two tier CI:
 
 ## Open questions
 
-* **Load balancer reachability.** *(Mostly resolved.)* Live
-  testing on a local cluster confirmed MetalLB addresses are
-  reachable from hosts outside the under-cloud (an external host
-  got HTTP 200 from a `LoadBalancer` service in 2ms) and that only
-  clients *inside the cluster's own node network* are blocked (no
-  u-turn routing at the network node,
-  shakenfist/shakenfist#3662). The CI runner VM is on a different
-  virtual network to the cluster, which is expected to behave like
-  the external case, but is confirmed by the first live run.
-  Fallback if it does not: perform the curl from a cluster node
-  via an agent execute operation, which stays within the node
-  network.
+* **Load balancer reachability.** *(Resolved.)* Live testing on
+  a local cluster confirmed MetalLB addresses are reachable from
+  hosts outside the under-cloud (an external host got HTTP 200
+  from a `LoadBalancer` service in 2ms) and that only clients
+  *inside the cluster's own node network* are blocked (no u-turn
+  routing at the network node, shakenfist/shakenfist#3662). The
+  first live CI run then confirmed the remaining case: the runner
+  VM, on a different virtual network to the cluster, fetched HTTP
+  from the MetalLB address directly. The agent-execute fallback
+  considered for this case is not needed.
 * **Merge queue enablement.** Turning on the merge queue and
   making the merge-tier collection job a required status check is
   a repository settings change (possibly via export-repo-config
@@ -93,10 +91,20 @@ Roll out shakenfist/shakenfist style two tier CI:
 
 | Phase | Work | Status |
 |-------|------|--------|
-| 1. Workflow restructure | Add `merge_group` trigger, name the tiers, add collection jobs mirroring shakenfist/shakenfist | Implemented, awaiting live validation |
-| 2. Deployment test | `tools/ci_deploy_test.sh` plus the merge-gated job on `[self-hosted, vm, debian-12]` | Implemented, awaiting live validation |
+| 1. Workflow restructure | Add `merge_group` trigger, name the tiers, add collection jobs mirroring shakenfist/shakenfist | Validated live |
+| 2. Deployment test | `tools/ci_deploy_test.sh` plus the merge-gated job on `[self-hosted, vm, debian-12]` | Validated live |
 | 3. Queue enablement | Merge queue + required checks (operator, repo settings) | Not started |
-| 4. Live validation | `workflow_dispatch` runs until green, fix what they find | Not started |
+| 4. Live validation | `workflow_dispatch` runs until green, fix what they find | Complete |
+
+The first `workflow_dispatch` run after the implementation merged
+(actions run 31281565829, 2026-08-08) was green end to end with no
+fixes required: the deployment job took 13.5 minutes, all create
+phases completed, the LoadBalancer service answered HTTP from the
+runner, and expand-workers, expand-addresses and delete all passed
+their assertions. Job dispositions matched the design: the
+automated reviewer and `can_merge` were skipped, `can_enqueue`
+succeeded. `can_merge` gets its first real exercise on the first
+`merge_group` event once phase 3 enables the queue.
 
 Phase 2 sketch, all logic in `tools/ci_deploy_test.sh` per the
 no-large-scripts-in-workflow-steps convention:
@@ -129,13 +137,12 @@ merged -- it carries the `helm --kubeconfig` fix for the agent
 command validation failure that breaks `setup_metallb()`, the
 switch to the official metallb chart (the Bitnami images are no
 longer published), and the fail-fast error handling that makes
-CI hangs impossible. That branch has now survived a fully clean
-end to end local deployment, so land it first and then validate
-this workflow with `workflow_dispatch`. The same ordering applies
-to the process documents: `PLAN-TEMPLATE.md` and `PUSH-AUDIT.md`
-on this branch describe the `progress.py` module and `Progress`
-reporter that pull request 17 introduces, so they are only
-accurate once that branch has merged.
+CI hangs impossible. The same ordering applied to the process
+documents: `PLAN-TEMPLATE.md` and `PUSH-AUDIT.md` on this branch
+describe the `progress.py` module and `Progress` reporter that
+pull request 17 introduces. This resolved as planned: pull
+request 17 merged first, then this work, and the first
+`workflow_dispatch` run was green.
 
 ## Administration and logistics
 
