@@ -251,8 +251,15 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                 if merged.stderr:
                     print(merged.stderr.decode('utf-8', errors='replace'))
                 sys.exit(1)
-            with open(main_config_path, 'wb') as f:
-                f.write(merged.stdout)
+
+            # kubectl's merge keeps the pre-existing file's current-context,
+            # which would leave kubectl pointed at whatever cluster was
+            # active before this create. Select the new cluster, matching
+            # the no-merge path above.
+            merged_kc = yaml.safe_load(merged.stdout)
+            merged_kc['current-context'] = fqcn
+            with open(main_config_path, 'w') as f:
+                f.write(yaml.dump(merged_kc))
 
     md['state'] = 'created'
     primitives.set_cluster_metadata(ctx, md)

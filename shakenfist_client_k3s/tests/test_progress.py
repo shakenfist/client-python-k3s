@@ -1,7 +1,10 @@
 import io
 import os
 import re
+import subprocess
 import tempfile
+
+import yaml
 
 from click.testing import CliRunner
 # The PyPI mock backport is used for consistency with the other tests in
@@ -716,6 +719,55 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
             kubeconfig = f.read()
         self.assertIn('192.168.10.100', kubeconfig)
         self.assertNotIn('127.0.0.1', kubeconfig)
+
+    def test_create_merges_into_existing_kubeconfig(self):
+        kube_dir = os.path.join(self.home, '.kube')
+        os.makedirs(kube_dir)
+        existing = {
+            'apiVersion': 'v1',
+            'kind': 'Config',
+            'clusters': [{'name': 'other',
+                          'cluster': {'server': 'https://192.168.10.1:6443'}}],
+            'contexts': [{'name': 'other',
+                          'context': {'cluster': 'other', 'user': 'other'}}],
+            'users': [{'name': 'other', 'user': {'token': 'x'}}],
+            'current-context': 'other'
+        }
+        with open(os.path.join(kube_dir, 'config'), 'w') as f:
+            f.write(yaml.dump(existing))
+
+        def fake_merge(cmd, shell=None, capture_output=None, env=None):
+            # kubectl config view --flatten merges the files listed in
+            # KUBECONFIG with the first file winning conflicting top level
+            # keys, including current-context.
+            merged = None
+            for path in env['KUBECONFIG'].split(':'):
+                with open(path) as f:
+                    kc = yaml.safe_load(f)
+                if merged is None:
+                    merged = kc
+                else:
+                    for key in ('clusters', 'contexts', 'users'):
+                        merged[key].extend(kc.get(key, []))
+            return subprocess.CompletedProcess(
+                cmd, 0, yaml.dump(merged).encode('utf-8'), b'')
+
+        with mock.patch('shakenfist_client_k3s.shutil.which',
+                        return_value='/usr/bin/kubectl'):
+            with mock.patch('shakenfist_client_k3s.subprocess.run',
+                            side_effect=fake_merge):
+                output = self._create(['banana'])
+        self._assert_phases_consistent(output)
+
+        # The pre-existing cluster must be preserved, but the current
+        # context must be the newly created cluster: kubectl's merge keeps
+        # the old file's current-context, which would leave kubectl talking
+        # to whatever cluster was active before the create.
+        with open(os.path.join(kube_dir, 'config')) as f:
+            kc = yaml.safe_load(f)
+        self.assertEqual(
+            ['other', 'banana.testns'], [c['name'] for c in kc['clusters']])
+        self.assertEqual('banana.testns', kc['current-context'])
 
     def test_create_with_extra_control_planes(self):
         output = self._create(['banana', '--control-plane-count', '2'])

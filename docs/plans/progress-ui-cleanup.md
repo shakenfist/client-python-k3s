@@ -192,3 +192,17 @@ the executing state forever, which wedged the instance's serial agent
 operation queue; deleting the operation did not unstick the
 dispatcher and recovery required a guest reboot. Recorded on that
 issue.
+
+## Addendum 4: the merged kubeconfig kept the old current-context
+
+The first fully successful end to end create exposed one last local
+kubeconfig bug: when merging the new cluster into an existing
+`~/.kube/config`, `kubectl config view --flatten` keeps the first
+file's `current-context`, so kubectl stayed pointed at whatever
+cluster was active before the create -- in this case a previously
+deleted cluster whose floating address no longer existed, which
+presented as "no route to host" against an address no instance
+held. The merge path now explicitly selects the new cluster's
+context, matching the no-merge path, and the create smoke tests
+grew a merge-path case using a fake kubectl that reproduces the
+first-file-wins merge semantics.
