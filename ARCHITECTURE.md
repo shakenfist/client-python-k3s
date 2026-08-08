@@ -15,6 +15,7 @@ Click context.
 shakenfist_client_k3s/
 ├── __init__.py         # Click commands and the plugin entry point
 ├── primitives.py       # Orchestration primitives
+├── progress.py         # Phase and wait-loop progress reporting
 └── tests/              # Unit tests (testtools + stestr)
 ```
 
@@ -56,9 +57,54 @@ shakenfist_client_k3s/
   channel
 - **Cluster assembly**: the first control plane node is installed
   with `k3s server`, additional control plane nodes and workers join
-  using the node token, MetalLB is installed and configured with
-  floating addresses routed to the node network, and Longhorn is
-  installed for persistent volumes
+  using the node token, MetalLB is installed (from the official
+  metallb helm chart -- the Bitnami chart references versioned
+  docker.io/bitnami images which stopped being published in 2025)
+  and configured with floating addresses routed to the node network,
+  and Longhorn is installed for persistent volumes
+- **Join address**: nodes register through the cluster's
+  `join_address` (namespace metadata), initially the first control
+  plane node's in-network address. It is mutable cluster state, not
+  a property of a particular node: k3s agents only need it at
+  registration time (they then maintain a client load balancer over
+  every server they discover), so a future control plane replacement
+  can join the new server via the old address, update
+  `join_address`, and reap the old node. The join address must be an
+  in-network address: the Shaken Fist network node neither hairpins
+  floating addresses nor routes in-network traffic to the network's
+  own routed addresses (shakenfist/shakenfist#3662), so neither is
+  reachable from a joining node
+
+### Progress reporting (`progress.py`)
+
+Long running commands construct a `Progress` reporter and place it in
+the Click context as `ctx.obj['PROGRESS']`; primitives retrieve it
+with `progress.get_progress(ctx)`. Work is announced as numbered
+phases (`[3/9] Setting up metallb`), and the polling wait loops
+(`await_boot`, `await_idle`, `await_fetch`) report per-item statuses
+through `Progress.update()`. When stdout is a TTY the statuses are
+rendered as one line per item, rewritten in place with ANSI cursor
+movement and truncated to the terminal width. Otherwise (pipes, CI,
+or `--verbose`, whose debug lines would interleave badly with cursor
+movement) a status line is printed only when it changes, with a
+heartbeat reprint every 60 seconds so logs still show liveness. Each
+status shows how long the item has been in that status, so a stalled
+command is visible as a growing elapsed time, and idle waits describe
+the agent command currently executing rather than a bare operation
+count. The module is dependency free.
+
+The wait loops also detect failure: an agent operation which enters
+the `error` state aborts the command immediately with the operation
+uuid, the command it was on, and a pointer to `sf-client instance
+events` for the server side detail (operations in the error state
+never complete, so waiting on them would hang forever). Errored
+operations which predate the current wait are ignored, so a historical
+failure does not prevent later commands like `expand-workers` from
+running. If a single agent command runs for more than five minutes a
+one-off note flags that it may be stalled. Notes emitted mid-wait
+leave the wait block's per-item timers intact (and, on a TTY, redraw
+the status block below the note), so a stall note does not reset the
+very elapsed counter it is drawing attention to.
 
 ## Python Version Compatibility
 

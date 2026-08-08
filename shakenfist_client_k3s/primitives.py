@@ -6,11 +6,17 @@ from shakenfist_client import apiclient
 import sys
 import time
 
+from shakenfist_client_k3s import progress
+
 
 METADATA_KEY = 'orchestrated_k3s_cluster_%s'
 K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
 LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
 BASE_OS_VERSION = 'debian:12'
+
+# How long, in seconds, a single agent command can run before the wait loop
+# notes that it might be stalled.
+STALL_WARNING_SECONDS = 300
 
 
 def _emit_debug(ctx, m):
@@ -229,59 +235,145 @@ def create_instance(ctx):
     return inst
 
 
+def _describe_agent_op(aop, max_len=60):
+    """Return a short human readable description of the command an agent operation is up to."""
+    commands = aop.get('commands', [])
+    results = aop.get('results', {}) or {}
+
+    # Results are recorded per command index as they complete, so the number
+    # of results is the index of the currently executing command.
+    idx = min(len(results), len(commands) - 1)
+    if idx < 0:
+        return None
+
+    c = commands[idx]
+    desc = c.get('commandline')
+    if not desc:
+        desc = c.get('command', 'unknown')
+        if c.get('path'):
+            desc += ' %s' % c['path']
+
+    # Multi-line commands (for example heredocs) would break the one line
+    # per item status display, so describe them by their first line.
+    if '\n' in desc:
+        desc = desc.split('\n', 1)[0] + ' ...'
+
+    if max_len and len(desc) > max_len:
+        desc = desc[:max_len - 3] + '...'
+    return desc
+
+
+def _abort_agent_op_error(ctx, aop):
+    """Report an agent operation which entered the error state, then exit."""
+    inst = ctx.obj['CLIENT'].get_instance(aop['instance_uuid'])
+
+    print('Agent operation failed!')
+    print('  instance: %s (uuid %s)' % (inst['name'], aop['instance_uuid']))
+    print('  operation: %s' % aop['uuid'])
+    desc = _describe_agent_op(aop, max_len=None)
+    if desc:
+        print('  command: %s' % desc)
+
+    results = aop.get('results', {}) or {}
+    if results:
+        print('  results: %s' % json.dumps(results, indent=4, sort_keys=True))
+    else:
+        print('  no results were recorded, so the command probably failed to start')
+    print("  the server side event log may have more detail: 'sf-client instance events %s'" % inst['name'])
+    sys.exit(1)
+
+
 def await_boot(ctx, instances):
+    p = progress.get_progress(ctx)
     waiting = copy.copy(instances)
     while waiting:
-        print('Waiting for %d instances to boot' % len(waiting))
         for instance_uuid in copy.copy(waiting):
             inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
-            print('...instance %s has state %s and agent state %s'
-                  % (inst['name'], inst['state'], inst['agent_state']))
+            agent_state = inst['agent_state'] if inst['agent_state'] else 'not yet contactable'
+            p.update(inst['name'], 'state %s, agent %s' % (inst['state'], agent_state))
             if inst['state'] == 'created' and inst['agent_state'] == 'ready':
                 waiting.remove(instance_uuid)
 
         if not waiting:
             break
         time.sleep(5)
-
-    instance_os_update(ctx, instances)
+    p.wait_done()
 
 
 def await_idle(ctx, instances):
+    p = progress.get_progress(ctx)
     waiting = copy.copy(instances)
+
+    # Agent operations stay associated with an instance forever, and an
+    # operation in the error state will never complete. Snapshot any which
+    # had already failed before this wait started so a historical failure
+    # can neither wedge this wait nor incorrectly abort it.
+    preexisting_errors = {}
+    for instance_uuid in waiting:
+        aops = ctx.obj['CLIENT'].get_instance_agentoperations(instance_uuid, all=True)
+        preexisting_errors[instance_uuid] = {
+            aop['uuid'] for aop in aops if aop['state'] == 'error'}
+
+    running_since = {}
+    stall_warned = set()
+
     while waiting:
-        print('Waiting for %d instances to be idle' % len(waiting))
         for instance_uuid in copy.copy(waiting):
             inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
             agent_ops = ctx.obj['CLIENT'].get_instance_agentoperations(
                 instance_uuid, all=True)
+            agent_ops = [aop for aop in agent_ops
+                         if aop['uuid'] not in preexisting_errors[instance_uuid]]
 
-            incomplete = 0
-            for aop in agent_ops:
-                if aop['state'] != 'complete':
-                    incomplete += 1
-            print('...instance %s has %d incomplete agent operations'
-                  % (inst['name'], incomplete))
+            errored = [aop for aop in agent_ops if aop['state'] == 'error']
+            if errored:
+                _abort_agent_op_error(ctx, errored[0])
 
-            if incomplete == 0:
+            incomplete = [aop for aop in agent_ops if aop['state'] != 'complete']
+            if not incomplete:
+                p.update(inst['name'], 'idle')
                 waiting.remove(instance_uuid)
+            else:
+                aop = incomplete[0]
+                desc = _describe_agent_op(aop)
+                remaining = progress.count_str(len(incomplete), 'operation')
+                if desc:
+                    p.update(inst['name'], "running '%s' (%s remaining)" % (desc, remaining))
+                else:
+                    p.update(inst['name'], '%s remaining' % remaining)
+
+                # Note once per command if it has been running suspiciously
+                # long. The progress elapsed times show the same thing, but
+                # this note includes the operation uuid and where to look
+                # for more detail, and persists in scrollback.
+                now = time.time()
+                command_key = (aop['uuid'], len(aop.get('results', {}) or {}))
+                running_since.setdefault(command_key, now)
+                if (now - running_since[command_key] >= STALL_WARNING_SECONDS
+                        and command_key not in stall_warned):
+                    stall_warned.add(command_key)
+                    p.note("%s has been running '%s' for %s and may be stalled; operation %s, "
+                           "'sf-client instance events %s' may show why" % (
+                               inst['name'], desc or 'a command',
+                               progress.format_elapsed(now - running_since[command_key]),
+                               aop['uuid'], inst['name']))
 
         if not waiting:
             break
         time.sleep(5)
+    p.wait_done()
 
 
 def await_fetch(ctx, aop):
+    p = progress.get_progress(ctx)
     while aop['state'] not in ['complete', 'error']:
-        print(f'...fetch operation has state {aop["state"]}')
+        p.update('fetch operation', 'state %s' % aop['state'])
         time.sleep(1)
         aop = ctx.obj['CLIENT'].get_agent_operation(aop['uuid'])
+    p.wait_done()
 
     if aop['state'] == 'error':
-        print('File fetch failed:')
-        print('  path: %s' % aop['results']['0']['path'])
-        print('  message: %s' % aop['results']['0']['message'])
-        sys.exit(1)
+        _abort_agent_op_error(ctx, aop)
 
     blob_uuid = aop['results']['0']['content_blob']
     data = b''
@@ -291,9 +383,12 @@ def await_fetch(ctx, aop):
 
 
 def reap_execute(ctx, aop):
-    while aop['state'] != 'complete':
+    while aop['state'] not in ('complete', 'error'):
         time.sleep(1)
         aop = ctx.obj['CLIENT'].get_agent_operation(aop['uuid'])
+
+    if aop['state'] == 'error':
+        _abort_agent_op_error(ctx, aop)
 
     if aop['results']['0']['return-code'] != 0:
         inst = ctx.obj['CLIENT'].get_instance(aop['instance_uuid'])
@@ -305,13 +400,17 @@ def reap_execute(ctx, aop):
         print('exit code: %s' % aop['results']['0']['return-code'])
         print('   stdout: %s' % '\n   stdout: '.join(
             aop['results']['0']['stdout'].split('\n')))
-        print('   stderr: %s' % '\n   stderr'.join(
+        print('   stderr: %s' % '\n   stderr: '.join(
             aop['results']['0']['stderr'].split('\n')))
         sys.exit(1)
 
 
 def create_and_await_instances(ctx, count, node_type):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
+
+    display_type = node_type.replace('_', ' ')
+    p.phase('Creating %s' % progress.count_str(count, '%s node' % display_type))
 
     new_nodes = []
     for i in range(count):
@@ -320,10 +419,11 @@ def create_and_await_instances(ctx, count, node_type):
         md['node_serial'] += 1
         md[f'{node_type}_nodes'].append(inst['uuid'])
         set_cluster_metadata(ctx, md)
-        print(f'Created {inst["name"]} as a {node_type} node '
-              f'(uuid {inst["uuid"]})')
+        p.note(f'created {inst["name"]} (uuid {inst["uuid"]})')
 
     await_boot(ctx, new_nodes)
+    p.note('updating base OS packages')
+    instance_os_update(ctx, new_nodes)
     set_cluster_metadata(ctx, md)
 
 
@@ -351,10 +451,11 @@ def instance_os_update(ctx, instance_uuids):
 
 
 def install_control_plane(ctx):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
     cmds = []
 
-    print('Setup first control plane node')
+    p.phase('Installing k3s on the first control plane node')
 
     # Write a configuration file with the external address to the first control
     # plane node. This is needed so that the SSL certificate includes this
@@ -381,13 +482,13 @@ def install_control_plane(ctx):
     execute_and_await(ctx, [md['control_plane_nodes'][0]], cmds)
 
     # Fetch the server and node tokens from the first control plane node
-    print('Fetching control plane registration token from first control plane node')
+    p.note('fetching control plane registration token')
     aop = ctx.obj['CLIENT'].instance_get(
         md['control_plane_nodes'][0], '/var/lib/rancher/k3s/server/token')
     md['server_token'] = await_fetch(ctx, aop).rstrip()
     set_cluster_metadata(ctx, md)
 
-    print('Fetching node registration token from first control plane node')
+    p.note('fetching node registration token')
     aop = ctx.obj['CLIENT'].instance_get(
         md['control_plane_nodes'][0], '/var/lib/rancher/k3s/server/node-token')
     md['node_token'] = await_fetch(ctx, aop).rstrip()
@@ -395,12 +496,18 @@ def install_control_plane(ctx):
 
     # If there is more than one control plane node, then install the others
     if len(md['control_plane_nodes']) > 1:
-        print('Setup other control plane nodes')
         install_extra_control_plane(ctx)
 
 
 def install_k3s_component(ctx, instance_uuids, token, node_role):
     md = get_cluster_metadata(ctx)
+
+    # Nodes must join via an address inside the node network: the network
+    # node neither hairpins floating addresses nor routes in-network
+    # traffic to the network's own routed addresses (see
+    # shakenfist/shakenfist#3662). Clusters created before join_address
+    # existed only have api_address_inner.
+    join_address = md.get('join_address', md['api_address_inner'])
 
     execute_and_await(
         ctx, instance_uuids,
@@ -410,7 +517,7 @@ def install_k3s_component(ctx, instance_uuids, token, node_role):
             (
                 'curl -sfL https://get.k3s.io | '
                 f'INSTALL_K3S_CHANNEL={md["k3s_version"]} '
-                f'K3S_URL=https://{md["api_address_inner"]}:6443 '
+                f'K3S_URL=https://{join_address}:6443 '
                 f'K3S_TOKEN={token} sh -s - {node_role}'
             )
         ]
@@ -420,26 +527,41 @@ def install_k3s_component(ctx, instance_uuids, token, node_role):
 
 
 def install_extra_control_plane(ctx):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
+    p.phase('Installing k3s on the additional control plane nodes')
     install_k3s_component(
         ctx, md['control_plane_nodes'][1:], md['server_token'], 'server')
 
 
 def install_workers(ctx):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
+    p.phase('Installing k3s on the worker nodes')
     install_k3s_component(ctx, md['worker_nodes'], md['node_token'], 'agent')
 
 
 def allocate_metallb_addresses(ctx, metal_address_count):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
     node_network = ctx.obj['CLIENT'].get_network(md['node_network'])
 
+    allocated = []
     for i in range(metal_address_count):
         addr = ctx.obj['CLIENT'].route_network_address(node_network['uuid'])
         if addr:
             md['routed_addresses'].append(addr)
-            print('Allocated routed address %s' % addr)
-    print('Allocated %d routed addresses' % len(md['routed_addresses']))
+            allocated.append(addr)
+
+    if not allocated:
+        p.note('no routed addresses were available (requested %d)' % metal_address_count)
+    else:
+        msg = 'allocated %s: %s' % (
+            progress.count_str(len(allocated), 'routed address'), ', '.join(allocated))
+        if len(allocated) < metal_address_count:
+            msg += ' (requested %d)' % metal_address_count
+        msg += '; the cluster now has %d' % len(md['routed_addresses'])
+        p.note(msg)
     set_cluster_metadata(ctx, md)
 
 
@@ -479,17 +601,26 @@ def configure_metallb_addresses(ctx):
 
 
 def setup_metallb(ctx, metal_address_count):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
 
-    print('Setting up metallb')
+    p.phase('Setting up metallb')
     allocate_metallb_addresses(ctx, metal_address_count)
     execute_and_await(
         ctx, [md['control_plane_nodes'][0]],
         [
             'kubectl create ns metallb-system',
-            ('KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm '
-             'upgrade --install -n metallb-system metallb '
-             'oci://registry-1.docker.io/bitnamicharts/metallb'),
+            # The official metallb chart is used here because Bitnami
+            # stopped publishing versioned images to docker.io/bitnami in
+            # 2025, so the bitnamicharts/metallb chart installs pods which
+            # can never pull their images. Note also that we can't use the
+            # KUBECONFIG=... environment variable prefix idiom: the
+            # in-guest agent validates the first token of the command line
+            # as an executable before running the command.
+            'helm repo add metallb https://metallb.github.io/metallb',
+            'helm repo update',
+            ('helm --kubeconfig /etc/rancher/k3s/k3s.yaml '
+             'upgrade --install -n metallb-system metallb metallb/metallb'),
         ])
 
     # Let the metallb pods start
@@ -500,10 +631,11 @@ def setup_metallb(ctx, metal_address_count):
 
 
 def setup_longhorn(ctx):
+    p = progress.get_progress(ctx)
     md = get_cluster_metadata(ctx)
 
     version = get_longhorn_release(ctx)
-    print(f'Setting up longhorn version {version}')
+    p.phase(f'Setting up longhorn version {version}')
 
     execute_and_await(
         ctx, [md['control_plane_nodes'][0]],
@@ -512,7 +644,7 @@ def setup_longhorn(ctx):
             'helm repo update',
             'kubectl create namespace longhorn-system || true',
             (
-                'KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm '
+                'helm --kubeconfig /etc/rancher/k3s/k3s.yaml '
                 'install longhorn longhorn/longhorn '
                 '--namespace longhorn-system '
                 f'--version {version}'
