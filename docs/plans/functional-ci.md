@@ -131,7 +131,11 @@ switch to the official metallb chart (the Bitnami images are no
 longer published), and the fail-fast error handling that makes
 CI hangs impossible. That branch has now survived a fully clean
 end to end local deployment, so land it first and then validate
-this workflow with `workflow_dispatch`.
+this workflow with `workflow_dispatch`. The same ordering applies
+to the process documents: `PLAN-TEMPLATE.md` and `PUSH-AUDIT.md`
+on this branch describe the `progress.py` module and `Progress`
+reporter that pull request 17 introduces, so they are only
+accurate once that branch has merged.
 
 ## Administration and logistics
 
@@ -164,12 +168,29 @@ because the following statements will be true:
 * Streaming agent operation output
   (shakenfist/shakenfist#3661) would make deployment CI logs
   far more diagnosable.
+* Teach `k3s show` to honour the client's `--json` output flag,
+  redacting secret metadata keys (`node_token`, `kubeconfig`,
+  `ssh_key`). That gives the CI assertions a stable format to
+  parse instead of grepping the human output, and stops
+  interactive `show` printing cluster admin credentials.
+* Redact the node token from the command line
+  `primitives.reap_execute()` echoes when an agent operation
+  fails; today a failed worker install prints `K3S_TOKEN=...` to
+  the log.
 
 ### Bugs fixed during this work
 
-None yet. Related context: shakenfist/agent-python#120 (agent
-rejects environment variable prefix command lines) is the bug
-class this CI exists to catch.
+* Every `k3s` subcommand except `list` passed the raw
+  `--namespace` option value (None when not given) into namespace
+  metadata API calls, which raise `TypeError` on None. All local
+  testing had passed `--namespace` explicitly, so `sf-client k3s
+  create ci` as documented in the README had never worked. The
+  commands now default the namespace to the client's own (found by
+  the automated reviewer on the pull request for this plan).
+
+Related context: shakenfist/agent-python#120 (agent rejects
+environment variable prefix command lines) is the bug class this
+CI exists to catch.
 
 ### Back brief
 

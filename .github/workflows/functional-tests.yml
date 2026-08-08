@@ -87,6 +87,9 @@ jobs:
   automated_reviewer:
     name: "Automated reviewer"
     needs: [sanity_checks]
+    # There is no pull request to review on merge_group or
+    # workflow_dispatch events.
+    if: github.event_name == 'pull_request'
     # A cross-repository reusable workflow cannot grant itself more
     # token scope than its caller has, so the permissions go here.
     permissions:
@@ -116,6 +119,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          # setuptools_scm needs the tag history to derive a real
+          # version, which the create records in the cluster's
+          # plugin_version metadata.
+          fetch-depth: 0
 
       - name: Deploy and verify a k3s cluster
         timeout-minutes: 80
@@ -123,6 +131,8 @@ jobs:
 
   can_enqueue:
     name: "Can enqueue"
+    # The automated reviewer is advisory and deliberately not in needs:
+    # it must not be able to block enqueueing on an API hiccup.
     needs:
       - sanity_checks
     if: always() && github.event_name != 'merge_group'

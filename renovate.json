@@ -29,6 +29,18 @@
       "automerge": false
     }
   ],
+  "customManagers": [
+    {
+      "description": "Update the kubectl pin in the CI deployment test",
+      "customType": "regex",
+      "fileMatch": [
+        "^tools/ci_deploy_test\\.sh$"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\nKUBECTL_VERSION=(?<currentValue>v[0-9.]+)"
+      ]
+    }
+  ],
   "minimumReleaseAge": "3 days",
   "rollbackPrs": true
 }

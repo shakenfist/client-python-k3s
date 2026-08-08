@@ -26,6 +26,21 @@ def _emit_debug(ctx, m):
         print(m)
 
 
+def _bind_cluster_context(ctx, name, namespace):
+    """Record the target cluster and namespace in ctx.obj for primitives.
+
+    The --namespace option is None unless the caller passed it, and the
+    primitives pass ctx.obj['namespace'] directly to API calls, so it must
+    be defaulted to the client's own namespace here.
+    """
+    ctx.obj['name'] = name
+    ctx.obj['CLIENT'] = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
+    if not namespace:
+        namespace = ctx.obj['CLIENT'].namespace
+    ctx.obj['namespace'] = namespace
+    return namespace
+
+
 @click.group(help=('k3s kubernetes cluster commands (via the '
                    'shakenfist-client-k3s plugin)'))
 def k3s():
@@ -38,9 +53,7 @@ def k3s():
                     'different namespace.'))
 @click.pass_context
 def k3s_list(ctx, namespace=None, ):
-    ctx.obj['CLIENT'] = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
-    if not namespace:
-        namespace = ctx.obj['CLIENT'].namespace
+    namespace = _bind_cluster_context(ctx, None, namespace)
 
     namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
     all_clusters = namespace_md.get(CLUSTER_LIST, [])
@@ -82,7 +95,6 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                refresh_version_cache=False, release_channel=None,
                sshkey=None):
     ctx.obj['name'] = name
-    ctx.obj['namespace'] = namespace
     ctx.obj['CLIENT'] = apiclient.Client(
         async_strategy=apiclient.ASYNC_CONTINUE)
 
@@ -98,11 +110,8 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     p = progress.Progress(total_phases=total_phases, verbose=ctx.obj['VERBOSE'])
     ctx.obj['PROGRESS'] = p
 
-    _emit_debug(ctx, 'Looking up k3s versions')
-    target_release = primitives.get_k3s_release(
-        ctx, force_cache_update=refresh_version_cache,
-        release_channel=release_channel)
-
+    # The namespace must be resolved (and exist) before anything looks up
+    # namespace metadata, including the version cache.
     if namespace:
         ns = ctx.obj['CLIENT'].get_namespace(namespace)
         if not ns:
@@ -110,6 +119,12 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
             print('Created namespace %s' % namespace)
     else:
         namespace = ctx.obj['CLIENT'].namespace
+    ctx.obj['namespace'] = namespace
+
+    _emit_debug(ctx, 'Looking up k3s versions')
+    target_release = primitives.get_k3s_release(
+        ctx, force_cache_update=refresh_version_cache,
+        release_channel=release_channel)
 
     # Ensure this name isn't already taken
     namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
@@ -280,7 +295,7 @@ k3s.add_command(k3s_create)
 @click.pass_context
 def k3s_query_k3s_version(ctx, release_channel=None, namespace=None,
                           refresh_version_cache=False):
-    ctx.obj['namespace'] = namespace
+    _bind_cluster_context(ctx, None, namespace)
 
     target_release = primitives.get_k3s_release(
         ctx, force_cache_update=refresh_version_cache,
@@ -301,7 +316,7 @@ k3s.add_command(k3s_query_k3s_version)
               help=('Force a refresh of the longhorn version cache.'))
 @click.pass_context
 def k3s_query_longhorn_version(ctx, namespace=None, refresh_version_cache=False):
-    ctx.obj['namespace'] = namespace
+    _bind_cluster_context(ctx, None, namespace)
 
     target_release = primitives.get_longhorn_release(
         ctx, force_cache_update=refresh_version_cache)
@@ -318,12 +333,7 @@ k3s.add_command(k3s_query_longhorn_version)
                     'cluster in a different namespace.'))
 @click.pass_context
 def k3s_getconfig(ctx, name=None, namespace=None):
-    ctx.obj['name'] = name
-    ctx.obj['namespace'] = namespace
-    ctx.obj['CLIENT'] = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
-
-    if not namespace:
-        namespace = ctx.obj['CLIENT'].namespace
+    _bind_cluster_context(ctx, name, namespace)
 
     md = primitives.get_cluster_metadata(ctx)
     if not md:
@@ -345,9 +355,7 @@ def k3s_getconfig(ctx, name=None, namespace=None):
                     'different namespace.'))
 @click.pass_context
 def k3s_show(ctx, name=None, namespace=None):
-    ctx.obj['name'] = name
-    ctx.obj['namespace'] = namespace
-    ctx.obj['CLIENT'] = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
+    _bind_cluster_context(ctx, name, namespace)
 
     md = primitives.get_cluster_metadata(ctx)
     if not md:
@@ -369,9 +377,7 @@ k3s.add_command(k3s_show)
                     'different namespace.'))
 @click.pass_context
 def k3s_delete(ctx, name=None, namespace=None):
-    ctx.obj['name'] = name
-    ctx.obj['namespace'] = namespace
-    ctx.obj['CLIENT'] = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
+    namespace = _bind_cluster_context(ctx, name, namespace)
 
     # Ensure this name exists
     md = primitives.get_cluster_metadata(ctx)
@@ -471,10 +477,7 @@ k3s.add_command(k3s_delete)
                     'different namespace.'))
 @click.pass_context
 def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
-    ctx.obj['name'] = name
-    ctx.obj['namespace'] = namespace
-    ctx.obj['CLIENT'] = apiclient.Client(
-        async_strategy=apiclient.ASYNC_CONTINUE)
+    _bind_cluster_context(ctx, name, namespace)
 
     md = primitives.get_cluster_metadata(ctx)
     if not md:
@@ -501,10 +504,7 @@ k3s.add_command(k3s_expand_workers)
                     'different namespace.'))
 @click.pass_context
 def k3s_expand_addresses(ctx, name=None, address_count=None, namespace=None):
-    ctx.obj['name'] = name
-    ctx.obj['namespace'] = namespace
-    ctx.obj['CLIENT'] = apiclient.Client(
-        async_strategy=apiclient.ASYNC_CONTINUE)
+    _bind_cluster_context(ctx, name, namespace)
 
     md = primitives.get_cluster_metadata(ctx)
     if not md:
@@ -529,10 +529,7 @@ k3s.add_command(k3s_expand_addresses)
                     'different namespace.'))
 @click.pass_context
 def k3s_update_os(ctx, name=None, namespace=None):
-    ctx.obj['name'] = name
-    ctx.obj['namespace'] = namespace
-    ctx.obj['CLIENT'] = apiclient.Client(
-        async_strategy=apiclient.ASYNC_CONTINUE)
+    _bind_cluster_context(ctx, name, namespace)
 
     md = primitives.get_cluster_metadata(ctx)
     if not md:
