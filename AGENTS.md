@@ -24,7 +24,12 @@ sf-client k3s --help
 Unit tests live in `shakenfist_client_k3s/tests/` and follow the
 client-python pattern (testtools + stestr, external APIs mocked). Run
 them with `tox -epy3`. Orchestration against a live Shaken Fist
-cluster is still tested manually.
+cluster is exercised by the merge tier of CI, which deploys a real
+cluster from an ephemeral runner via `tools/ci_deploy_test.sh` (see
+`docs/plans/functional-ci.md`); pull requests run the smoke tier
+(lint, unit tests, pre-commit) only. Until the merge queue is
+enabled the merge tier only runs via a manual `workflow_dispatch`
+of the Functional tests workflow.
 
 ## Key Files
 
@@ -46,6 +51,13 @@ cluster is still tested manually.
 - The plugin must never break `sf-client` startup: it is imported
   unconditionally by the plugin loader, so top-level imports must be
   cheap and reliable
+
+## Planning and Pre-push Review
+
+- Substantial work starts from a plan file in `docs/plans/`, based on
+  `PLAN-TEMPLATE.md`, committed on the branch that becomes the pull
+  request.
+- Before pushing, work through the checks in `PUSH-AUDIT.md`.
 
 ## When Making Changes
 
