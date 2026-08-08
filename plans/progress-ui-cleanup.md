@@ -154,3 +154,41 @@ readiness wait matches, and which consumes the same `metallb.io/v1beta1`
 IPAddressPool and L2Advertisement resources the address configuration
 writes. Also fix a formatting bug this failure exposed: the multi-line
 stderr join in `reap_execute()` was missing its `: ` separator.
+
+## Addendum 3: a mutable join address for control plane replacement
+
+The intended node lifecycle is replace-instead-of-upgrade, including
+for control plane nodes, but joins were hard-wired to
+`api_address_inner` -- the first control plane node's own interface
+address -- which dies with that node. Live experiments on
+k3s-test-006 established the constraints:
+
+- Floating addresses are not reachable from inside the node network
+  (no NAT hairpin): a worker curling the control plane float times
+  out.
+- Routed addresses (the metallb mechanism) are reachable locally and
+  externally when claimed with `ip addr add`, but in-network clients
+  are refused: the network node does not u-turn traffic from the
+  network to the network's own routed addresses. Filed as
+  shakenfist/shakenfist#3662; until fixed, no Shaken Fist address
+  type is both stable across replacement and in-network reachable,
+  so a true VIP is not currently possible.
+- k3s agents only need the registration address at join time: they
+  then maintain a client load balancer over all discovered servers,
+  so existing agents survive their registration address dying.
+
+The fix is therefore a mutable `join_address` in cluster metadata,
+set at create, used by all joins, with fallback to
+`api_address_inner` for clusters created before the key existed. The
+future replacement operation joins the new server via the old
+address, updates `join_address`, and reaps the old node. If
+shakenfist/shakenfist#3662 is fixed, a routed address claimed by the
+current control plane node becomes a cleaner join target and
+kubeconfig endpoint.
+
+The experiments also demonstrated an aggravated form of
+shakenfist/agent-python#120: a rejected command left its operation in
+the executing state forever, which wedged the instance's serial agent
+operation queue; deleting the operation did not unstick the
+dispatcher and recovery required a guest reboot. Recorded on that
+issue.

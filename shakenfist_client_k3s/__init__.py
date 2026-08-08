@@ -185,6 +185,13 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     interfaces = ctx.obj['CLIENT'].get_instance_interfaces(md['control_plane_nodes'][0])
     md['api_address_inner'] = interfaces[0]['ipv4']
     md['api_address_floating'] = interfaces[0]['floating']
+
+    # The join address is the address new nodes register through, and is
+    # deliberately mutable cluster state rather than "the first control
+    # plane node's address": a future control plane replacement joins the
+    # new server via the old address, updates join_address, and then reaps
+    # the old node. k3s agents only need this address at registration time.
+    md['join_address'] = interfaces[0]['ipv4']
     primitives.set_cluster_metadata(ctx, md)
 
     primitives.install_control_plane(ctx)

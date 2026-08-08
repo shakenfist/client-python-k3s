@@ -250,6 +250,37 @@ class FakeContext:
         self.obj = obj
 
 
+class InstallK3sComponentTestCase(testtools.TestCase):
+    def _install_commands(self, md):
+        ctx = FakeContext({
+            'name': 'banana',
+            'namespace': 'testns',
+            'CLIENT': mock.MagicMock(),
+            'VERBOSE': False,
+            primitives.METADATA_KEY % 'banana': md
+        })
+        with mock.patch('shakenfist_client_k3s.primitives.execute_and_await') as ea:
+            primitives.install_k3s_component(ctx, ['uuid-001'], 'token', 'agent')
+            return '\n'.join(ea.call_args[0][2])
+
+    def test_join_uses_join_address(self):
+        cmds = self._install_commands({
+            'k3s_version': 'stable',
+            'join_address': '10.0.0.5',
+            'api_address_inner': '10.0.0.4'
+        })
+        self.assertIn('K3S_URL=https://10.0.0.5:6443', cmds)
+
+    def test_join_falls_back_to_api_address_inner(self):
+        # Clusters created before join_address existed only carry the
+        # older api_address_inner key in their metadata.
+        cmds = self._install_commands({
+            'k3s_version': 'stable',
+            'api_address_inner': '10.0.0.4'
+        })
+        self.assertIn('K3S_URL=https://10.0.0.4:6443', cmds)
+
+
 class WaitLoopTestCase(testtools.TestCase):
     def setUp(self):
         super().setUp()

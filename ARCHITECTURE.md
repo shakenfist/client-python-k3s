@@ -62,6 +62,18 @@ shakenfist_client_k3s/
   docker.io/bitnami images which stopped being published in 2025)
   and configured with floating addresses routed to the node network,
   and Longhorn is installed for persistent volumes
+- **Join address**: nodes register through the cluster's
+  `join_address` (namespace metadata), initially the first control
+  plane node's in-network address. It is mutable cluster state, not
+  a property of a particular node: k3s agents only need it at
+  registration time (they then maintain a client load balancer over
+  every server they discover), so a future control plane replacement
+  can join the new server via the old address, update
+  `join_address`, and reap the old node. The join address must be an
+  in-network address: the Shaken Fist network node neither hairpins
+  floating addresses nor routes in-network traffic to the network's
+  own routed addresses (shakenfist/shakenfist#3662), so neither is
+  reachable from a joining node
 
 ### Progress reporting (`progress.py`)
 

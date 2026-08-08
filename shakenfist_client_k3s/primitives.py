@@ -502,6 +502,13 @@ def install_control_plane(ctx):
 def install_k3s_component(ctx, instance_uuids, token, node_role):
     md = get_cluster_metadata(ctx)
 
+    # Nodes must join via an address inside the node network: the network
+    # node neither hairpins floating addresses nor routes in-network
+    # traffic to the network's own routed addresses (see
+    # shakenfist/shakenfist#3662). Clusters created before join_address
+    # existed only have api_address_inner.
+    join_address = md.get('join_address', md['api_address_inner'])
+
     execute_and_await(
         ctx, instance_uuids,
         [
@@ -510,7 +517,7 @@ def install_k3s_component(ctx, instance_uuids, token, node_role):
             (
                 'curl -sfL https://get.k3s.io | '
                 f'INSTALL_K3S_CHANNEL={md["k3s_version"]} '
-                f'K3S_URL=https://{md["api_address_inner"]}:6443 '
+                f'K3S_URL=https://{join_address}:6443 '
                 f'K3S_TOKEN={token} sh -s - {node_role}'
             )
         ]
