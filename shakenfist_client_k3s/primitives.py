@@ -552,8 +552,16 @@ def allocate_metallb_addresses(ctx, metal_address_count):
         if addr:
             md['routed_addresses'].append(addr)
             allocated.append(addr)
-    p.note('allocated %s: %s' % (
-        progress.count_str(len(allocated), 'routed address'), ', '.join(allocated)))
+
+    if not allocated:
+        p.note('no routed addresses were available (requested %d)' % metal_address_count)
+    else:
+        msg = 'allocated %s: %s' % (
+            progress.count_str(len(allocated), 'routed address'), ', '.join(allocated))
+        if len(allocated) < metal_address_count:
+            msg += ' (requested %d)' % metal_address_count
+        msg += '; the cluster now has %d' % len(md['routed_addresses'])
+        p.note(msg)
     set_cluster_metadata(ctx, md)
 
 

@@ -64,8 +64,22 @@ class Progress:
             self._println('[%d] %s' % (self.phase_index, name))
 
     def note(self, msg):
-        """Print a one-off informational line within the current phase."""
-        self.wait_done()
+        """Print a one-off informational line within the current phase.
+
+        Notes can arrive in the middle of a wait block (for example the
+        stall warning), so the wait state must be preserved: discarding
+        it would reset the per-item elapsed timers, destroying the very
+        signal a stall note exists to highlight.
+        """
+        if self.interactive and self._rendered_lines:
+            # Print the note where the status block currently starts, then
+            # redraw the block below it.
+            self.stream.write('\x1b[%dF' % self._rendered_lines)
+            self.stream.write('\x1b[K  %s\n' % msg)
+            self.stream.flush()
+            self._rendered_lines = 0
+            self._render_block()
+            return
         self._println('  %s' % msg)
 
     def update(self, key, status):

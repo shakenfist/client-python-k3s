@@ -34,6 +34,7 @@ cluster is still tested manually.
 | `shakenfist_client_k3s/primitives.py` | Cluster orchestration primitives and version caches |
 | `shakenfist_client_k3s/progress.py` | Phase and wait-loop progress reporting for long running commands |
 | `shakenfist_client_k3s/tests/` | Unit tests (stestr, see `.stestr.conf`) |
+| `docs/plans/` | Implementation plans, committed with the work they describe |
 | `pyproject.toml` | Package metadata and dependencies |
 
 ## Code Conventions
@@ -57,3 +58,7 @@ cluster is still tested manually.
   `sf-client` CLI down with it
 - Update ARCHITECTURE.md if the orchestration flow changes
   significantly
+- Larger changes start with a plan in `docs/plans/`, committed on the
+  same branch as the work it describes. Plans are retained afterwards
+  as a historical record of intent -- durable design detail belongs in
+  ARCHITECTURE.md, with the plan recording how we got there

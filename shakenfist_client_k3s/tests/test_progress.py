@@ -1,11 +1,15 @@
 import io
 import os
+import re
+import tempfile
 
+from click.testing import CliRunner
 # The PyPI mock backport is used for consistency with the other tests in
 # this package, which support Python >= 3.7.
 import mock
 import testtools
 
+import shakenfist_client_k3s
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 
@@ -133,6 +137,27 @@ class ProgressLineModeTestCase(testtools.TestCase):
         # The same status is reprinted in a new wait block.
         self.assertEqual(2, stream.getvalue().count('node-001: idle'))
 
+    def test_note_mid_wait_preserves_elapsed(self):
+        stream = io.StringIO()
+        p = progress.Progress(stream=stream)
+        p.phase('Waiting')
+        p.update('node-001', 'running')
+        self.clock.advance(30)
+        p.note('node-001 may be stalled')
+        self.clock.advance(35)
+        p.update('node-001', 'running')
+
+        # The note must not reset the per-status timer: the second update
+        # is a heartbeat of the same status, 65 seconds after the status
+        # first appeared. A reset here would restart the elapsed counter at
+        # exactly the moment the stall note has flagged it as interesting.
+        self.assertEqual(
+            '[1] Waiting\n'
+            '  node-001: running (0s)\n'
+            '  node-001 may be stalled\n'
+            '  node-001: running (1m05s)\n',
+            stream.getvalue())
+
     def test_finish_reports_total_elapsed(self):
         stream = io.StringIO()
         p = progress.Progress(stream=stream)
@@ -188,6 +213,27 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
             '[1] Booting\n'
             '\x1b[K  node-001: state initial (0s)\n'
             '\x1b[1F\x1b[K  node-001: state initial (5s)\n',
+            stream.getvalue())
+
+    def test_note_mid_wait_redraws_block_without_duplicates(self):
+        stream = FakeTty()
+        p = progress.Progress(stream=stream)
+        p.phase('Waiting')
+        p.update('node-001', 'running')
+        self.clock.advance(5)
+        p.note('node-001 may be stalled')
+        p.update('node-001', 'running')
+
+        # The note is printed where the status block started and the block
+        # is redrawn immediately below it with its elapsed times intact, so
+        # no stale copy of the block is left on screen and the next update
+        # rewrites the redrawn block in place.
+        self.assertEqual(
+            '[1] Waiting\n'
+            '\x1b[K  node-001: running (0s)\n'
+            '\x1b[1F\x1b[K  node-001 may be stalled\n'
+            '\x1b[K  node-001: running (5s)\n'
+            '\x1b[1F\x1b[K  node-001: running (5s)\n',
             stream.getvalue())
 
     def test_lines_truncated_to_terminal_width(self):
@@ -463,3 +509,220 @@ class WaitLoopTestCase(testtools.TestCase):
         self.assertEqual(1, e.code)
         self.assertIn('   stderr: timed out on pod one\n'
                       '   stderr: timed out on pod two', captured.getvalue())
+
+
+class AllocateMetallbAddressesTestCase(testtools.TestCase):
+    def _allocate(self, route_results, count):
+        stream = io.StringIO()
+        client = mock.MagicMock()
+        client.get_network.return_value = {'uuid': 'net-1'}
+        client.route_network_address.side_effect = route_results
+        md = {'name': 'banana', 'node_network': 'net-1',
+              'routed_addresses': ['192.168.10.1']}
+        ctx = FakeContext({
+            'name': 'banana',
+            'namespace': 'testns',
+            'CLIENT': client,
+            'VERBOSE': False,
+            'PROGRESS': progress.Progress(stream=stream),
+            primitives.METADATA_KEY % 'banana': md
+        })
+        primitives.allocate_metallb_addresses(ctx, count)
+        return stream.getvalue()
+
+    def test_allocation_reports_new_addresses_and_cluster_total(self):
+        out = self._allocate(['192.168.10.2', '192.168.10.3'], 2)
+        self.assertIn('allocated 2 routed addresses: 192.168.10.2, 192.168.10.3', out)
+        self.assertIn('the cluster now has 3', out)
+
+    def test_partial_allocation_notes_shortfall(self):
+        out = self._allocate(['192.168.10.2', None, None], 3)
+        self.assertIn('allocated 1 routed address: 192.168.10.2', out)
+        self.assertIn('(requested 3)', out)
+        self.assertIn('the cluster now has 2', out)
+
+    def test_empty_allocation_reported_without_dangling_list(self):
+        out = self._allocate([None, None], 2)
+        self.assertIn('no routed addresses were available (requested 2)', out)
+        self.assertNotIn('allocated', out)
+
+
+# A minimal kubeconfig in the shape k3s writes, pointing at the loopback
+# address the way the real file does before k3s_create rewrites it.
+KUBECONFIG = """apiVersion: v1
+clusters:
+- cluster:
+    server: https://127.0.0.1:6443
+  name: default
+contexts:
+- context:
+    cluster: default
+    user: default
+  name: default
+current-context: default
+kind: Config
+users:
+- name: default
+  user:
+    token: banana
+"""
+
+
+class FakeCreateClient:
+    """Enough of the sf-client API surface for k3s create to run end to end.
+
+    Instances boot instantly, every agent operation completes successfully
+    at submission, and file fetches return canned content.
+    """
+
+    def __init__(self):
+        self.namespace = 'testns'
+        self.metadata = {}
+        self.instances = {}
+        self.instance_serial = 0
+        self.aop_serial = 0
+        self.routed_serial = 0
+
+    def get_namespace_metadata(self, namespace):
+        return dict(self.metadata)
+
+    def set_namespace_metadata_item(self, namespace, key, value):
+        self.metadata[key] = value
+
+    def delete_namespace_metadata_item(self, namespace, key):
+        self.metadata.pop(key, None)
+
+    def allocate_network(self, netblock, provide_dhcp, provide_nat, name,
+                         namespace=None):
+        return {'uuid': 'net-1', 'name': name, 'state': 'created'}
+
+    def get_network(self, network_ref):
+        return {'uuid': 'net-1', 'name': 'k3s-banana-node', 'state': 'created'}
+
+    def create_instance(self, name, cpus, memory, networks, disks, sshkey,
+                        userdata, side_channels=None, namespace=None):
+        self.instance_serial += 1
+        instance_uuid = 'inst-%03d' % self.instance_serial
+        self.instances[instance_uuid] = {
+            'uuid': instance_uuid, 'name': name, 'state': 'created',
+            'agent_state': 'ready'}
+        return self.instances[instance_uuid]
+
+    def get_instance(self, instance_ref):
+        return self.instances[instance_ref]
+
+    def get_instance_interfaces(self, instance_ref):
+        return [{'ipv4': '10.0.0.4', 'floating': '192.168.10.100'}]
+
+    def get_instance_agentoperations(self, instance_ref, all=False):
+        return []
+
+    def _complete_aop(self, instance_ref, commands, results):
+        self.aop_serial += 1
+        return {
+            'uuid': 'aop-%03d' % self.aop_serial,
+            'instance_uuid': instance_ref,
+            'state': 'complete',
+            'commands': commands,
+            'results': results
+        }
+
+    def instance_execute(self, instance_ref, commandline):
+        return self._complete_aop(
+            instance_ref,
+            [{'command': 'execute', 'commandline': commandline}],
+            {'0': {'return-code': 0, 'stdout': '', 'stderr': ''}})
+
+    def instance_get(self, instance_ref, path):
+        return self._complete_aop(
+            instance_ref,
+            [{'command': 'get-file', 'path': path}],
+            {'0': {'content_blob': path}})
+
+    def get_blob_data(self, blob_uuid):
+        if blob_uuid.endswith('k3s.yaml'):
+            yield KUBECONFIG.encode('utf-8')
+        else:
+            yield b'not-a-real-token\n'
+
+    def route_network_address(self, network_uuid):
+        self.routed_serial += 1
+        return '192.168.10.%d' % self.routed_serial
+
+
+class K3sCreateSmokeTestCase(testtools.TestCase):
+    """Drive k3s create end to end against a fake client.
+
+    This is command level wiring coverage: it catches crashes in the
+    create flow itself (for example the Progress reporter being shadowed
+    by a subprocess result), and it pins the phase total computed in
+    k3s_create() to the number of phase headers the primitives actually
+    emit, which nothing else keeps in sync.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client = FakeCreateClient()
+
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = home.name
+
+        for target, kwargs in [
+                ('shakenfist_client_k3s.apiclient.Client',
+                 {'return_value': self.client}),
+                ('shakenfist_client_k3s.primitives.get_k3s_release',
+                 {'return_value': 'stable'}),
+                ('shakenfist_client_k3s.primitives.get_longhorn_release',
+                 {'return_value': '1.6.0'}),
+                ('time.sleep', {'new': lambda seconds: None})]:
+            patcher = mock.patch(target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        patcher = mock.patch.dict('os.environ', {'HOME': self.home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _create(self, args):
+        runner = CliRunner()
+        result = runner.invoke(
+            shakenfist_client_k3s.k3s, ['create'] + args, obj={'VERBOSE': False})
+        self.assertEqual(
+            0, result.exit_code, '%s\n%s' % (result.output, result.exception))
+        return result.output
+
+    def _assert_phases_consistent(self, output):
+        # Every phase header must carry the same total, the phases must be
+        # numbered consecutively from one, and the total must equal the
+        # number of headers emitted.
+        headers = re.findall(r'^\[(\d+)/(\d+)\]', output, re.MULTILINE)
+        self.assertNotEqual([], headers)
+        totals = {int(total) for _, total in headers}
+        self.assertEqual(1, len(totals), output)
+        total = totals.pop()
+        self.assertEqual(
+            list(range(1, total + 1)), [int(index) for index, _ in headers],
+            output)
+
+    def test_create(self):
+        output = self._create(['banana'])
+        self._assert_phases_consistent(output)
+        self.assertIn('Cluster banana is ready', output)
+
+        # With no pre-existing local configuration the kubeconfig is
+        # written directly, pointing at the cluster's floating address.
+        with open(os.path.join(self.home, '.kube', 'config')) as f:
+            kubeconfig = f.read()
+        self.assertIn('192.168.10.100', kubeconfig)
+        self.assertNotIn('127.0.0.1', kubeconfig)
+
+    def test_create_with_extra_control_planes(self):
+        output = self._create(['banana', '--control-plane-count', '2'])
+        self._assert_phases_consistent(output)
+        self.assertIn('additional control plane nodes', output)
+
+    def test_create_with_existing_network(self):
+        output = self._create(['banana', '--network', 'net-1'])
+        self._assert_phases_consistent(output)
+        self.assertNotIn('Creating node network', output)

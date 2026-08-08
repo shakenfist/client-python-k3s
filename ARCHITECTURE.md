@@ -101,7 +101,10 @@ never complete, so waiting on them would hang forever). Errored
 operations which predate the current wait are ignored, so a historical
 failure does not prevent later commands like `expand-workers` from
 running. If a single agent command runs for more than five minutes a
-one-off note flags that it may be stalled.
+one-off note flags that it may be stalled. Notes emitted mid-wait
+leave the wait block's per-item timers intact (and, on a TTY, redraw
+the status block below the note), so a stall note does not reset the
+very elapsed counter it is drawing attention to.
 
 ## Python Version Compatibility
 
