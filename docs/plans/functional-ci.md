@@ -95,7 +95,7 @@ Roll out shakenfist/shakenfist style two tier CI:
 |-------|------|--------|
 | 1. Workflow restructure | Add `merge_group` trigger, name the tiers, add collection jobs mirroring shakenfist/shakenfist | Validated live |
 | 2. Deployment test | `tools/ci_deploy_test.sh` plus the merge-gated job on `[self-hosted, vm, debian-12]` | Validated live |
-| 3. Queue enablement | Merge queue + required checks (operator, repo settings) | Started; ruleset active, first `merge_group` run pending |
+| 3. Queue enablement | Merge queue + required checks (operator, repo settings) | Complete |
 | 4. Live validation | `workflow_dispatch` runs until green, fix what they find | Complete |
 
 The first `workflow_dispatch` run after the implementation merged
@@ -105,9 +105,22 @@ phases completed, the LoadBalancer service answered HTTP from the
 runner, and expand-workers, expand-addresses and delete all passed
 their assertions. Job dispositions matched the design: the
 automated reviewer and `can_merge` were skipped, `can_enqueue`
-succeeded. With the queue now enabled, `can_merge` and the
-merge-tier cluster deployment get their first real `merge_group`
-exercise when the pull request carrying this update is queued.
+succeeded.
+
+The queue itself was then validated by the pull request carrying
+this plan's status update (pull request 23). Its first
+`merge_group` run (actions run 31285741554) failed systemically:
+a ~12 second MariaDB outage on the under-cloud surfaced as an
+auth 503 mid-deployment, which the client treats as fatal
+(filed as shakenfist/client-python#360). Triage confirmed the
+failure was unrelated to the queued change and the entry was
+re-queued as-is; the second run (actions run 31288759648) was
+green end to end in 14.5 minutes and merged the pull request
+through the queue. The failure was itself useful validation:
+the queue correctly rejected the entry, the deployment script's
+EXIT trap ran its diagnostics, and fail-fast error handling
+ended the run within seconds of the API error rather than
+consuming the job timeout.
 
 Phase 2 sketch, all logic in `tools/ci_deploy_test.sh` per the
 no-large-scripts-in-workflow-steps convention:
