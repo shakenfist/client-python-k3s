@@ -27,9 +27,10 @@ them with `tox -epy3`. Orchestration against a live Shaken Fist
 cluster is exercised by the merge tier of CI, which deploys a real
 cluster from an ephemeral runner via `tools/ci_deploy_test.sh` (see
 `docs/plans/functional-ci.md`); pull requests run the smoke tier
-(lint, unit tests, pre-commit) only. Until the merge queue is
-enabled the merge tier only runs via a manual `workflow_dispatch`
-of the Functional tests workflow.
+(lint, unit tests, pre-commit) only. The merge tier runs on
+`merge_group` events from the develop branch's merge queue, and
+can also be run manually via a `workflow_dispatch` of the
+Functional tests workflow.
 
 ## Key Files
 
