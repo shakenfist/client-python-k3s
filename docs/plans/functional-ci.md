@@ -68,11 +68,13 @@ Roll out shakenfist/shakenfist style two tier CI:
   VM, on a different virtual network to the cluster, fetched HTTP
   from the MetalLB address directly. The agent-execute fallback
   considered for this case is not needed.
-* **Merge queue enablement.** Turning on the merge queue and
-  making the merge-tier collection job a required status check is
-  a repository settings change (possibly via export-repo-config
-  in shakenfist/development), not something this repository's
-  workflow files can do. Operator step.
+* **Merge queue enablement.** *(Resolved.)* The operator created
+  a "Develop branch" repository ruleset (id 20595671) mirroring
+  the shakenfist/shakenfist one: merge queue on develop (ALLGREEN
+  grouping, merge commits, up to 5 entries merged together) with
+  `Can enqueue` and `Can merge` as the required status checks.
+  The parent repository's `Can see status` check was deliberately
+  omitted because no such job exists in this workflow.
 * **Scope of command coverage.** `create`, `getconfig`,
   `expand-workers`, `expand-addresses`, `show` and `delete` are
   cheap to chain on one cluster. `update-os` adds an apt
@@ -93,7 +95,7 @@ Roll out shakenfist/shakenfist style two tier CI:
 |-------|------|--------|
 | 1. Workflow restructure | Add `merge_group` trigger, name the tiers, add collection jobs mirroring shakenfist/shakenfist | Validated live |
 | 2. Deployment test | `tools/ci_deploy_test.sh` plus the merge-gated job on `[self-hosted, vm, debian-12]` | Validated live |
-| 3. Queue enablement | Merge queue + required checks (operator, repo settings) | Not started |
+| 3. Queue enablement | Merge queue + required checks (operator, repo settings) | Started; ruleset active, first `merge_group` run pending |
 | 4. Live validation | `workflow_dispatch` runs until green, fix what they find | Complete |
 
 The first `workflow_dispatch` run after the implementation merged
@@ -103,8 +105,9 @@ phases completed, the LoadBalancer service answered HTTP from the
 runner, and expand-workers, expand-addresses and delete all passed
 their assertions. Job dispositions matched the design: the
 automated reviewer and `can_merge` were skipped, `can_enqueue`
-succeeded. `can_merge` gets its first real exercise on the first
-`merge_group` event once phase 3 enables the queue.
+succeeded. With the queue now enabled, `can_merge` and the
+merge-tier cluster deployment get their first real `merge_group`
+exercise when the pull request carrying this update is queued.
 
 Phase 2 sketch, all logic in `tools/ci_deploy_test.sh` per the
 no-large-scripts-in-workflow-steps convention:
