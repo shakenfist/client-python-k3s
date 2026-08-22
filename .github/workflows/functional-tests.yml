@@ -32,8 +32,28 @@ jobs:
   sanity_checks:
     runs-on: [self-hosted, vm, debian-12]
     timeout-minutes: 45
+    # github.ref is the right key on every event except merge_group,
+    # where it is the per-attempt queue branch
+    # gh-readonly-queue/develop/pr-<N>-<SHA> and GitHub mints a fresh
+    # SHA every time it rebuilds the group -- which it does on every
+    # push to develop. Keyed on that, every rebuild lands in a group of
+    # its own, cancel-in-progress never matches, and superseded merge
+    # groups run to completion holding runners the whole fleet shares.
+    # See shakenfist/kerbside#284 and shakenfist/development
+    # audits/merge-group-cancellation.md.
+    #
+    # Cancelling is safe because this queue is serial
+    # (max_entries_to_build: 1), so any other in-flight merge_group run
+    # is by definition superseded and its queue branch already
+    # abandoned. The merge_group- prefix keeps a queue run from sharing
+    # a group with a workflow_dispatch run on develop, whose github.ref
+    # is the same string.
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-lint
+      group: >-
+        ${{ github.workflow }}-lint-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
       cancel-in-progress: true
 
     steps:
@@ -112,7 +132,11 @@ jobs:
     # interval, so this is a backstop rather than an expected duration.
     timeout-minutes: 90
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-cluster-deploy
+      group: >-
+        ${{ github.workflow }}-cluster-deploy-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
       cancel-in-progress: true
 
     steps:
