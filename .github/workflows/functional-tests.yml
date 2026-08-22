@@ -97,7 +97,6 @@ jobs:
       pull-requests: write
       issues: write
     uses: shakenfist/actions/.github/workflows/pr-auto-review.yml@main
-    secrets: inherit
 
   # The merge tier: deploy a real k3s cluster into this runner's own
   # per-job namespace on the under-cloud, verify it, expand it, and
