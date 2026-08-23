@@ -15,7 +15,7 @@ CLUSTER=ci
 # This tracks the cluster's k3s channel only loosely, which is fine for
 # the simple kubectl operations used here.
 # renovate: datasource=github-releases depName=kubernetes/kubernetes
-KUBECTL_VERSION=v1.36.3
+KUBECTL_VERSION=v1.36.4
 VENV=/tmp/venv-k3s-ci
 
 status() {
