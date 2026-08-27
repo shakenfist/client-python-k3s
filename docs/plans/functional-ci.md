@@ -93,8 +93,8 @@ Roll out shakenfist/shakenfist style two tier CI:
 
 | Phase | Work | Status |
 |-------|------|--------|
-| 1. Workflow restructure | Add `merge_group` trigger, name the tiers, add collection jobs mirroring shakenfist/shakenfist | Validated live |
-| 2. Deployment test | `tools/ci_deploy_test.sh` plus the merge-gated job on `[self-hosted, vm, debian-12]` | Validated live |
+| 1. Workflow restructure | Add `merge_group` trigger, name the tiers, add collection jobs mirroring shakenfist/shakenfist | Complete |
+| 2. Deployment test | `tools/ci_deploy_test.sh` plus the merge-gated job on `[self-hosted, vm, debian-12]` | Complete |
 | 3. Queue enablement | Merge queue + required checks (operator, repo settings) | Complete |
 | 4. Live validation | `workflow_dispatch` runs until green, fix what they find | Complete |
 
