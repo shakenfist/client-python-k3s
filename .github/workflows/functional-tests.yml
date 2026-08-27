@@ -9,6 +9,8 @@ name: Functional tests
 # the automated reviewer. Merge queue entries and manual dispatches also
 # run the merge tier, which deploys a real k3s cluster into the ephemeral
 # VM runner's own per-job Shaken Fist namespace and verifies it works.
+# Both tiers are gated on the check_paths filter job below, so a change
+# touching only docs/ pays for neither.
 #
 # The can_enqueue / can_merge collection job scheme is as described at:
 # https://boinkor.net/2023/11/neat-github-actions-patterns-for-github-merge-queues/
@@ -29,7 +31,68 @@ on:
       - develop
 
 jobs:
+  # Detect changes touching only docs/ so the ephemeral VM lanes can
+  # skip. Both lanes below run on the `vm` pool, where a full cluster
+  # deployment is 15-25 minutes of capacity the whole fleet shares, and
+  # neither exercises a line of docs/.
+  #
+  # A filter job rather than trigger-level paths-ignore, because
+  # can_enqueue and can_merge are required status checks: a required
+  # check in a paths-ignore'd workflow never reports on a filtered pull
+  # request, and a required check that never reports blocks the merge
+  # forever, while a skipped one satisfies it. With a filter job the
+  # workflow always reports and the heavy jobs skip on its output.
+  #
+  # The filter runs on merge_group as well as pull_request, so a
+  # docs-only queue entry skips the cluster deployment too. On
+  # workflow_dispatch the filter step is skipped and code_changed
+  # defaults to true, so a manual run always tests.
+  #
+  # supply-chain.yml is deliberately not filtered this way: gitleaks
+  # and the skillsaw agent-context lint read exactly the human-written
+  # text this filter skips.
+  check_paths:
+    name: "Check paths"
+    runs-on: [self-hosted, static]
+    timeout-minutes: 10
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code || 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name != 'workflow_dispatch'
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          # On merge_group there is no pull request payload, so make
+          # the comparison base explicit rather than letting the action
+          # infer one. develop is the queue's target branch, which by
+          # definition does not yet contain the queued changes, so a
+          # wrong code_changed=false -- the outcome that would let "Can
+          # merge" go green having tested nothing -- is structurally
+          # impossible; if develop advances mid-queue the diff only
+          # grows, erring toward running the tier. On pull_request
+          # events the action ignores base and compares against the
+          # pull request's base branch.
+          base: develop
+          # By default a file matches if it matches ANY listed pattern,
+          # which makes '**' match everything and silently defeats the
+          # exclusions. 'every' requires a file to match ALL patterns,
+          # which is the correct semantics for an "everything except
+          # docs" filter.
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+      # Make the verdict visible in the log rather than inferred from
+      # which downstream jobs skipped.
+      - name: Report verdict
+        run: echo "code_changed=${{ steps.filter.outputs.code || 'true (defaulted)' }}"
+
   sanity_checks:
+    needs: check_paths
+    if: needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, vm, debian-12]
     timeout-minutes: 45
     # github.ref is the right key on every event except merge_group,
@@ -106,6 +169,11 @@ jobs:
 
   automated_reviewer:
     name: "Automated reviewer"
+    # The needs: list is the "review only once CI has passed" gate: a
+    # job skipped because a dependency failed never starts the reusable
+    # workflow. It also carries the path filter transitively -- a
+    # docs-only pull request skips sanity_checks, so it skips the
+    # review too, which is the same trade the vm lanes make.
     needs: [sanity_checks]
     # There is no pull request to review on merge_group or
     # workflow_dispatch events.
@@ -125,7 +193,10 @@ jobs:
   # dies with the runner.
   cluster_deploy:
     name: "Cluster deployment"
-    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    needs: check_paths
+    if: >-
+      needs.check_paths.outputs.code_changed != 'false' &&
+      (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, vm, debian-12]
     # A full create is 15-25 minutes and the script carries its own
     # per-phase timeouts; agent operation failures abort within one poll
@@ -157,6 +228,7 @@ jobs:
     # The automated reviewer is advisory and deliberately not in needs:
     # it must not be able to block enqueueing on an API hiccup.
     needs:
+      - check_paths
       - sanity_checks
     if: always() && github.event_name != 'merge_group'
     permissions:
@@ -176,6 +248,7 @@ jobs:
   can_merge:
     name: "Can merge"
     needs:
+      - check_paths
       - sanity_checks
       - cluster_deploy
     if: always() && github.event_name == 'merge_group'
