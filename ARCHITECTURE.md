@@ -9,6 +9,11 @@ Click command group. All communication with Shaken Fist happens
 through the `apiclient.Client` instance that `sf-client` places in the
 Click context.
 
+Unit tests mock every external API, so they cannot tell whether a
+cluster actually assembles; that is answered by the merge tier of CI,
+which deploys a real cluster from an ephemeral runner. See
+`docs/testing.md`.
+
 ## Module Structure
 
 ```

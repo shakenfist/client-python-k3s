@@ -25,12 +25,10 @@ Unit tests live in `shakenfist_client_k3s/tests/` and follow the
 client-python pattern (testtools + stestr, external APIs mocked). Run
 them with `tox -epy3`. Orchestration against a live Shaken Fist
 cluster is exercised by the merge tier of CI, which deploys a real
-cluster from an ephemeral runner via `tools/ci_deploy_test.sh` (see
-`docs/plans/functional-ci.md`); pull requests run the smoke tier
-(lint, unit tests, pre-commit) only. The merge tier runs on
-`merge_group` events from the develop branch's merge queue, and
-can also be run manually via a `workflow_dispatch` of the
-Functional tests workflow.
+cluster from an ephemeral runner via `tools/ci_deploy_test.sh`; pull
+requests run the smoke tier (lint, unit tests, pre-commit) only.
+Both tiers skip a change touching only `docs/`. See
+`docs/testing.md`.
 
 ## Key Files
 

@@ -39,6 +39,11 @@ sf-client k3s expand-workers mycluster --worker-count 2
 sf-client k3s delete mycluster
 ```
 
-`sf-client k3s --help` lists the full command set, including OS updates
-across the cluster and inspection of the cached k3s and Longhorn release
-versions.
+`sf-client k3s --help` lists the full command set.
+
+## Documentation
+
+* [Using the k3s command group](https://github.com/shakenfist/client-python-k3s/blob/develop/docs/usage.md)
+  -- every command, its options, and where cluster state lives.
+* [Testing and CI](https://github.com/shakenfist/client-python-k3s/blob/develop/docs/testing.md)
+  -- how to run the tests, and what the two CI tiers cover.
