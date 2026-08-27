@@ -1,4 +1,13 @@
 repos:
+  # Lints the agent context (AGENTS.md, PLAN-TEMPLATE.md, PUSH-AUDIT.md
+  # and anything else handed to an agent) for malformed skills,
+  # smuggled unicode and pasted secrets. The same hook is what CI runs,
+  # so this file's rev is the only place the version is written down.
+  - repo: https://github.com/stbenjam/skillsaw
+    rev: v0.18.0
+    hooks:
+      - id: skillsaw
+
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.7
     hooks:
