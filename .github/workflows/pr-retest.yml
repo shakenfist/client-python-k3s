@@ -22,8 +22,13 @@ jobs:
   trigger-retest:
     name: "Trigger retest"
     # Only run on PR comments (not issue comments)
+    # Never on a comment the bot itself posted. The automated review
+    # is model-generated text posted to the pull request, and a review
+    # quoting a trigger phrase would re-fire the lane -- contains()
+    # does not care that the phrase sits inside a quote.
     if: |
       github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
       contains(github.event.comment.body, '@shakenfist-bot please retest')
     runs-on: [self-hosted, static]
     # Just a few gh API calls, so anything beyond this is a hang.
@@ -46,9 +51,10 @@ jobs:
         run: |
           echo "Triggering functional tests on branch: ${PR_REF}"
 
-          # A fork PR's head branch does not exist in this repository,
-          # so the dispatch fails with "no ref found". Report that to
-          # the requester rather than claiming success.
+          # Report a failed dispatch rather than claiming success.
+          # Fork pull requests no longer reach this step -- pr-bot-trigger
+          # refuses them and says why -- so what is left is a workflow
+          # file that is missing, renamed or disabled.
           if gh workflow run functional-tests.yml \
             --repo "${{ github.repository }}" \
             --ref "${PR_REF}"; then
@@ -74,5 +80,5 @@ jobs:
           else
             gh pr comment "${{ github.event.issue.number }}" \
               --repo "${{ github.repository }}" \
-              --body "Unable to trigger functional tests on \`${PR_REF}\`. This usually means the PR is from a fork, whose branch does not exist in this repository -- please re-run the failed workflow from the Actions tab instead."
+              --body "Unable to trigger functional tests on \`${PR_REF}\`. Check that \`functional-tests.yml\` exists on the default branch, carries a \`workflow_dispatch\` trigger, and is not disabled -- or re-run the failed workflow from the Actions tab instead."
           fi
