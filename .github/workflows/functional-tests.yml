@@ -93,7 +93,14 @@ jobs:
   sanity_checks:
     needs: check_paths
     if: needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, vm, debian-12]
+    # xs is what this job has always had -- a runs-on which names no
+    # size is not unconstrained, it falls back to the first entry in
+    # the conductor's CI_SIZES table, which is xs. Linting and unit
+    # tests have run there happily for the life of this repository, so
+    # naming it changes nothing except making the choice a choice. It
+    # needs a vm rather than a static runner because it installs
+    # packages.
+    runs-on: [self-hosted, vm, debian-12, xs]
     timeout-minutes: 45
     # github.ref is the right key on every event except merge_group,
     # where it is the per-attempt queue branch
@@ -197,7 +204,25 @@ jobs:
     if: >-
       needs.check_paths.outputs.code_changed != 'false' &&
       (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch')
-    runs-on: [self-hosted, vm, debian-12]
+    # s (two vCPU, 4096 MB) rather than the xs a sizeless runs-on
+    # silently falls back to. This job builds a venv, installs
+    # shakenfist-client and this package into it, downloads kubectl and
+    # then drives a 15-25 minute cluster create, all from the runner.
+    # That is the same shape of work as the shakenfist deploy jobs
+    # measured at 2.54-2.72 GB in shakenfist/actions#44, against the
+    # ~1.85 GB an xs runner can actually reach with no swap device to
+    # absorb anything it cannot reclaim in time.
+    #
+    # Unlike those jobs this one has no per-instance cost samples of
+    # its own, because it never happened to land on a larger runner --
+    # so s is chosen by analogy rather than measured. It is lighter
+    # than they are (no wheel builds, no collection install, no ansible
+    # run), so xs may well be survivable; but an OOM here costs a
+    # 25-minute cluster create and looks like a flake rather than a
+    # sizing fault, which is exactly how shakenfist#3696 stayed
+    # invisible for months. 2 GB on at most one concurrent runner is
+    # the cheaper side of that trade.
+    runs-on: [self-hosted, vm, debian-12, s]
     # A full create is 15-25 minutes and the script carries its own
     # per-phase timeouts; agent operation failures abort within one poll
     # interval, so this is a backstop rather than an expected duration.

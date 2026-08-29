@@ -9,6 +9,7 @@ self-hosted-runner:
     - debian-13
     - static
     - vm
+    - xs
     - s
 
 # Ignore certain shellcheck rules from run: blocks in workflow files.
