@@ -19,64 +19,35 @@ BASE_OS_VERSION = 'debian:12'
 STALL_WARNING_SECONDS = 300
 
 
-def _emit_debug(ctx, m):
-    if ctx.obj['VERBOSE']:
+def _emit_debug(cluster, m):
+    if cluster.reporter.verbose:
         print(m)
 
 
-def get_cluster_metadata(ctx):
-    name = ctx.obj['name']
-    namespace = ctx.obj['namespace']
-
-    md_key = METADATA_KEY % name
-    if md_key not in ctx.obj:
-        namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
-        ctx.obj[md_key] = namespace_md.get(md_key)
-    return ctx.obj[md_key]
-
-
-def set_cluster_metadata(ctx, md):
-    name = ctx.obj['name']
-    namespace = ctx.obj['namespace']
-
-    md_key = METADATA_KEY % name
-    ctx.obj[md_key] = md
-    ctx.obj['CLIENT'].set_namespace_metadata_item(namespace, md_key, md)
-
-
-def delete_cluster_metadata(ctx):
-    name = ctx.obj['name']
-    namespace = ctx.obj['namespace']
-
-    md_key = METADATA_KEY % name
-    del ctx.obj[md_key]
-    ctx.obj['CLIENT'].delete_namespace_metadata_item(namespace, md_key)
-
-
-def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
-    namespace = ctx.obj['namespace']
+def get_k3s_release(cluster, force_cache_update=False, release_channel=None):
+    namespace = cluster.namespace
 
     if force_cache_update:
         version_cache = {'updated': 0}
-        _emit_debug(ctx, 'Forcing cache update')
+        _emit_debug(cluster, 'Forcing cache update')
     else:
-        namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
+        namespace_md = cluster.client.get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             K3S_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
         if not isinstance(version_cache, dict) or 'releases' not in version_cache:
-            _emit_debug(ctx, 'Version cache format invalid, clobbering')
+            _emit_debug(cluster, 'Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
     updated = version_cache.get('updated', 0)
 
-    _emit_debug(ctx, (f'Cached version information from {updated}: '
-                      f'{version_cache.get("releases", {})}'))
+    _emit_debug(cluster, (f'Cached version information from {updated}: '
+                          f'{version_cache.get("releases", {})}'))
 
     if time.time() - updated > 24 * 3600:
-        _emit_debug(ctx, 'Updating release version cache')
+        _emit_debug(cluster, 'Updating release version cache')
 
         url = 'https://update.k3s.io/v1-release/channels'
-        _emit_debug(ctx, f'Fetching {url}')
+        _emit_debug(cluster, f'Fetching {url}')
         r = requests.request(
             'GET', url,
             headers={
@@ -92,14 +63,14 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
 
         d = r.json()
         releases = {}
-        _emit_debug(ctx, 'Fetched release data:')
-        _emit_debug(ctx, json.dumps(d, indent=4, sort_keys=True))
+        _emit_debug(cluster, 'Fetched release data:')
+        _emit_debug(cluster, json.dumps(d, indent=4, sort_keys=True))
         for reldata in d.get('data', []):
             # Some channels (for example v1.16-testing) have no released
             # version and therefore no 'latest' key.
             if 'name' not in reldata or 'latest' not in reldata:
-                _emit_debug(ctx, (f'Channel {reldata.get("name")} has no latest release, '
-                                  'skipping'))
+                _emit_debug(cluster, (f'Channel {reldata.get("name")} has no latest release, '
+                                      'skipping'))
                 continue
             releases[reldata['name']] = reldata['latest']
 
@@ -115,7 +86,7 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
 
         version_cache['releases'] = releases
         version_cache['updated'] = time.time()
-        ctx.obj['CLIENT'].set_namespace_metadata_item(
+        cluster.client.set_namespace_metadata_item(
             namespace, K3S_VERSION_CACHE_KEY, version_cache)
 
     most_recent = version_cache['releases'].get(release_channel, None)
@@ -123,36 +94,36 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
         print(f'Release channel {release_channel} not found')
         sys.exit(1)
 
-    _emit_debug(ctx, f'Selected kubernetes version: {most_recent}')
+    _emit_debug(cluster, f'Selected kubernetes version: {most_recent}')
     return most_recent
 
 
-def get_longhorn_release(ctx, force_cache_update=False):
-    namespace = ctx.obj['namespace']
+def get_longhorn_release(cluster, force_cache_update=False):
+    namespace = cluster.namespace
 
     if force_cache_update:
         version_cache = {'updated': 0}
-        _emit_debug(ctx, 'Forcing cache update')
+        _emit_debug(cluster, 'Forcing cache update')
     else:
-        namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
+        namespace_md = cluster.client.get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             LONGHORN_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
         if not isinstance(version_cache, dict) or 'latest' not in version_cache:
-            _emit_debug(ctx, 'Version cache format invalid, clobbering')
+            _emit_debug(cluster, 'Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
     updated = version_cache.get('updated', 0)
 
-    _emit_debug(ctx, (f'Cached version information from {updated}: '
-                      f'{version_cache.get("releases", {})}'))
+    _emit_debug(cluster, (f'Cached version information from {updated}: '
+                          f'{version_cache.get("releases", {})}'))
 
     if time.time() - updated > 24 * 3600:
-        _emit_debug(ctx, 'Updating release version cache')
+        _emit_debug(cluster, 'Updating release version cache')
 
         releases = {}
         for page in range(5):
             url = f'https://api.github.com/repos/longhorn/longhorn/releases?page={page}'
-            _emit_debug(ctx, f'Fetching {url}')
+            _emit_debug(cluster, f'Fetching {url}')
             r = requests.request(
                 'GET', url,
                 headers={
@@ -170,8 +141,8 @@ def get_longhorn_release(ctx, force_cache_update=False):
                 sys.exit(1)
 
             d = r.json()
-            _emit_debug(ctx, 'Fetched release data:')
-            _emit_debug(ctx, json.dumps(d, indent=4, sort_keys=True))
+            _emit_debug(cluster, 'Fetched release data:')
+            _emit_debug(cluster, json.dumps(d, indent=4, sort_keys=True))
             for reldata in d:
                 if reldata['prerelease']:
                     continue
@@ -186,7 +157,7 @@ def get_longhorn_release(ctx, force_cache_update=False):
             try:
                 parsed_version = Version(tagname)
             except InvalidVersion:
-                _emit_debug(ctx, f'Skipping unparsable tag {tagname}')
+                _emit_debug(cluster, f'Skipping unparsable tag {tagname}')
                 continue
             if not latest:
                 latest = parsed_version
@@ -200,17 +171,17 @@ def get_longhorn_release(ctx, force_cache_update=False):
         version_cache['releases'] = releases
         version_cache['latest'] = str(latest)
         version_cache['updated'] = time.time()
-        ctx.obj['CLIENT'].set_namespace_metadata_item(
+        cluster.client.set_namespace_metadata_item(
             namespace, LONGHORN_VERSION_CACHE_KEY, version_cache)
 
     return version_cache['latest']
 
 
-def create_instance(ctx):
-    md = get_cluster_metadata(ctx)
+def create_instance(cluster):
+    md = cluster.get_metadata()
 
     node_name = 'k3s-%s-node-%03d' % (md['name'], md['node_serial'])
-    inst = ctx.obj['CLIENT'].create_instance(
+    inst = cluster.client.create_instance(
         node_name, 2, 2048,
         [
             {
@@ -263,9 +234,9 @@ def _describe_agent_op(aop, max_len=60):
     return desc
 
 
-def _abort_agent_op_error(ctx, aop):
+def _abort_agent_op_error(cluster, aop):
     """Report an agent operation which entered the error state, then exit."""
-    inst = ctx.obj['CLIENT'].get_instance(aop['instance_uuid'])
+    inst = cluster.client.get_instance(aop['instance_uuid'])
 
     print('Agent operation failed!')
     print('  instance: %s (uuid %s)' % (inst['name'], aop['instance_uuid']))
@@ -283,12 +254,12 @@ def _abort_agent_op_error(ctx, aop):
     sys.exit(1)
 
 
-def await_boot(ctx, instances):
-    p = progress.get_progress(ctx)
+def await_boot(cluster, instances):
+    p = cluster.get_progress()
     waiting = copy.copy(instances)
     while waiting:
         for instance_uuid in copy.copy(waiting):
-            inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
+            inst = cluster.client.get_instance(instance_uuid)
             agent_state = inst['agent_state'] if inst['agent_state'] else 'not yet contactable'
             p.update(inst['name'], 'state %s, agent %s' % (inst['state'], agent_state))
             if inst['state'] == 'created' and inst['agent_state'] == 'ready':
@@ -300,8 +271,8 @@ def await_boot(ctx, instances):
     p.wait_done()
 
 
-def await_idle(ctx, instances):
-    p = progress.get_progress(ctx)
+def await_idle(cluster, instances):
+    p = cluster.get_progress()
     waiting = copy.copy(instances)
 
     # Agent operations stay associated with an instance forever, and an
@@ -310,7 +281,7 @@ def await_idle(ctx, instances):
     # can neither wedge this wait nor incorrectly abort it.
     preexisting_errors = {}
     for instance_uuid in waiting:
-        aops = ctx.obj['CLIENT'].get_instance_agentoperations(instance_uuid, all=True)
+        aops = cluster.client.get_instance_agentoperations(instance_uuid, all=True)
         preexisting_errors[instance_uuid] = {
             aop['uuid'] for aop in aops if aop['state'] == 'error'}
 
@@ -319,15 +290,15 @@ def await_idle(ctx, instances):
 
     while waiting:
         for instance_uuid in copy.copy(waiting):
-            inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
-            agent_ops = ctx.obj['CLIENT'].get_instance_agentoperations(
+            inst = cluster.client.get_instance(instance_uuid)
+            agent_ops = cluster.client.get_instance_agentoperations(
                 instance_uuid, all=True)
             agent_ops = [aop for aop in agent_ops
                          if aop['uuid'] not in preexisting_errors[instance_uuid]]
 
             errored = [aop for aop in agent_ops if aop['state'] == 'error']
             if errored:
-                _abort_agent_op_error(ctx, errored[0])
+                _abort_agent_op_error(cluster, errored[0])
 
             incomplete = [aop for aop in agent_ops if aop['state'] != 'complete']
             if not incomplete:
@@ -364,34 +335,34 @@ def await_idle(ctx, instances):
     p.wait_done()
 
 
-def await_fetch(ctx, aop):
-    p = progress.get_progress(ctx)
+def await_fetch(cluster, aop):
+    p = cluster.get_progress()
     while aop['state'] not in ['complete', 'error']:
         p.update('fetch operation', 'state %s' % aop['state'])
         time.sleep(1)
-        aop = ctx.obj['CLIENT'].get_agent_operation(aop['uuid'])
+        aop = cluster.client.get_agent_operation(aop['uuid'])
     p.wait_done()
 
     if aop['state'] == 'error':
-        _abort_agent_op_error(ctx, aop)
+        _abort_agent_op_error(cluster, aop)
 
     blob_uuid = aop['results']['0']['content_blob']
     data = b''
-    for chunk in ctx.obj['CLIENT'].get_blob_data(blob_uuid):
+    for chunk in cluster.client.get_blob_data(blob_uuid):
         data += chunk
     return data.decode('utf-8')
 
 
-def reap_execute(ctx, aop):
+def reap_execute(cluster, aop):
     while aop['state'] not in ('complete', 'error'):
         time.sleep(1)
-        aop = ctx.obj['CLIENT'].get_agent_operation(aop['uuid'])
+        aop = cluster.client.get_agent_operation(aop['uuid'])
 
     if aop['state'] == 'error':
-        _abort_agent_op_error(ctx, aop)
+        _abort_agent_op_error(cluster, aop)
 
     if aop['results']['0']['return-code'] != 0:
-        inst = ctx.obj['CLIENT'].get_instance(aop['instance_uuid'])
+        inst = cluster.client.get_instance(aop['instance_uuid'])
 
         print('Command failed!')
         print('  instance: %s (UUID %s)'
@@ -405,44 +376,44 @@ def reap_execute(ctx, aop):
         sys.exit(1)
 
 
-def create_and_await_instances(ctx, count, node_type):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
+def create_and_await_instances(cluster, count, node_type):
+    p = cluster.get_progress()
+    md = cluster.get_metadata()
 
     display_type = node_type.replace('_', ' ')
     p.phase('Creating %s' % progress.count_str(count, '%s node' % display_type))
 
     new_nodes = []
     for i in range(count):
-        inst = create_instance(ctx)
+        inst = create_instance(cluster)
         new_nodes.append(inst['uuid'])
         md['node_serial'] += 1
         md[f'{node_type}_nodes'].append(inst['uuid'])
-        set_cluster_metadata(ctx, md)
+        cluster.set_metadata(md)
         p.note(f'created {inst["name"]} (uuid {inst["uuid"]})')
 
-    await_boot(ctx, new_nodes)
+    await_boot(cluster, new_nodes)
     p.note('updating base OS packages')
-    instance_os_update(ctx, new_nodes)
-    set_cluster_metadata(ctx, md)
+    instance_os_update(cluster, new_nodes)
+    cluster.set_metadata(md)
 
 
-def execute_and_await(ctx, instance_uuids, cmds):
+def execute_and_await(cluster, instance_uuids, cmds):
     aops = []
     for cmd in cmds:
         for instance_uuid in instance_uuids:
-            aops.append(ctx.obj['CLIENT'].instance_execute(
+            aops.append(cluster.client.instance_execute(
                 instance_uuid, cmd))
 
     # Wait for instances to be idle and check results
-    await_idle(ctx, instance_uuids)
+    await_idle(cluster, instance_uuids)
     for aop in aops:
-        reap_execute(ctx, aop)
+        reap_execute(cluster, aop)
 
 
-def instance_os_update(ctx, instance_uuids):
+def instance_os_update(cluster, instance_uuids):
     execute_and_await(
-        ctx, instance_uuids,
+        cluster, instance_uuids,
         [
             'apt-get update',
             'apt-get dist-upgrade -y'
@@ -450,9 +421,9 @@ def instance_os_update(ctx, instance_uuids):
     )
 
 
-def install_control_plane(ctx):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
+def install_control_plane(cluster):
+    p = cluster.get_progress()
+    md = cluster.get_metadata()
     cmds = []
 
     p.phase('Installing k3s on the first control plane node')
@@ -479,28 +450,28 @@ def install_control_plane(ctx):
     cmds.append('sudo apt-get update')
     cmds.append('sudo apt-get install -y helm')
 
-    execute_and_await(ctx, [md['control_plane_nodes'][0]], cmds)
+    execute_and_await(cluster, [md['control_plane_nodes'][0]], cmds)
 
     # Fetch the server and node tokens from the first control plane node
     p.note('fetching control plane registration token')
-    aop = ctx.obj['CLIENT'].instance_get(
+    aop = cluster.client.instance_get(
         md['control_plane_nodes'][0], '/var/lib/rancher/k3s/server/token')
-    md['server_token'] = await_fetch(ctx, aop).rstrip()
-    set_cluster_metadata(ctx, md)
+    md['server_token'] = await_fetch(cluster, aop).rstrip()
+    cluster.set_metadata(md)
 
     p.note('fetching node registration token')
-    aop = ctx.obj['CLIENT'].instance_get(
+    aop = cluster.client.instance_get(
         md['control_plane_nodes'][0], '/var/lib/rancher/k3s/server/node-token')
-    md['node_token'] = await_fetch(ctx, aop).rstrip()
-    set_cluster_metadata(ctx, md)
+    md['node_token'] = await_fetch(cluster, aop).rstrip()
+    cluster.set_metadata(md)
 
     # If there is more than one control plane node, then install the others
     if len(md['control_plane_nodes']) > 1:
-        install_extra_control_plane(ctx)
+        install_extra_control_plane(cluster)
 
 
-def install_k3s_component(ctx, instance_uuids, token, node_role):
-    md = get_cluster_metadata(ctx)
+def install_k3s_component(cluster, instance_uuids, token, node_role):
+    md = cluster.get_metadata()
 
     # Nodes must join via an address inside the node network: the network
     # node neither hairpins floating addresses nor routes in-network
@@ -510,7 +481,7 @@ def install_k3s_component(ctx, instance_uuids, token, node_role):
     join_address = md.get('join_address', md['api_address_inner'])
 
     execute_and_await(
-        ctx, instance_uuids,
+        cluster, instance_uuids,
         [
             'sudo apt-get update',
             'sudo apt-get install -y',
@@ -523,32 +494,32 @@ def install_k3s_component(ctx, instance_uuids, token, node_role):
         ]
     )
 
-    set_cluster_metadata(ctx, md)
+    cluster.set_metadata(md)
 
 
-def install_extra_control_plane(ctx):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
+def install_extra_control_plane(cluster):
+    p = cluster.get_progress()
+    md = cluster.get_metadata()
     p.phase('Installing k3s on the additional control plane nodes')
     install_k3s_component(
-        ctx, md['control_plane_nodes'][1:], md['server_token'], 'server')
+        cluster, md['control_plane_nodes'][1:], md['server_token'], 'server')
 
 
-def install_workers(ctx):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
+def install_workers(cluster):
+    p = cluster.get_progress()
+    md = cluster.get_metadata()
     p.phase('Installing k3s on the worker nodes')
-    install_k3s_component(ctx, md['worker_nodes'], md['node_token'], 'agent')
+    install_k3s_component(cluster, md['worker_nodes'], md['node_token'], 'agent')
 
 
-def allocate_metallb_addresses(ctx, metal_address_count):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
-    node_network = ctx.obj['CLIENT'].get_network(md['node_network'])
+def allocate_metallb_addresses(cluster, metal_address_count):
+    p = cluster.get_progress()
+    md = cluster.get_metadata()
+    node_network = cluster.client.get_network(md['node_network'])
 
     allocated = []
     for i in range(metal_address_count):
-        addr = ctx.obj['CLIENT'].route_network_address(node_network['uuid'])
+        addr = cluster.client.route_network_address(node_network['uuid'])
         if addr:
             md['routed_addresses'].append(addr)
             allocated.append(addr)
@@ -562,11 +533,11 @@ def allocate_metallb_addresses(ctx, metal_address_count):
             msg += ' (requested %d)' % metal_address_count
         msg += '; the cluster now has %d' % len(md['routed_addresses'])
         p.note(msg)
-    set_cluster_metadata(ctx, md)
+    cluster.set_metadata(md)
 
 
-def configure_metallb_addresses(ctx):
-    md = get_cluster_metadata(ctx)
+def configure_metallb_addresses(cluster):
+    md = cluster.get_metadata()
 
     # Setup metallb for traffic ingress, guided by
     # https://itnext.io/kubernetes-loadbalancer-service-for-on-premises-6b7f75187be8
@@ -589,7 +560,7 @@ def configure_metallb_addresses(ctx):
                        % '/32\n  - '.join(md['routed_addresses']))
 
     execute_and_await(
-        ctx, [md['control_plane_nodes'][0]],
+        cluster, [md['control_plane_nodes'][0]],
         [
             ('kubectl wait --kubeconfig /etc/rancher/k3s/k3s.yaml -n metallb-system pod '
              '--for=condition=Ready -l app.kubernetes.io/name=metallb --timeout=300s'),
@@ -600,14 +571,14 @@ def configure_metallb_addresses(ctx):
     )
 
 
-def setup_metallb(ctx, metal_address_count):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
+def setup_metallb(cluster, metal_address_count):
+    p = cluster.get_progress()
+    md = cluster.get_metadata()
 
     p.phase('Setting up metallb')
-    allocate_metallb_addresses(ctx, metal_address_count)
+    allocate_metallb_addresses(cluster, metal_address_count)
     execute_and_await(
-        ctx, [md['control_plane_nodes'][0]],
+        cluster, [md['control_plane_nodes'][0]],
         [
             'kubectl create ns metallb-system',
             # The official metallb chart is used here because Bitnami
@@ -627,18 +598,18 @@ def setup_metallb(ctx, metal_address_count):
     time.sleep(5)
 
     # Add addresses
-    configure_metallb_addresses(ctx)
+    configure_metallb_addresses(cluster)
 
 
-def setup_longhorn(ctx):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
+def setup_longhorn(cluster):
+    p = cluster.get_progress()
+    md = cluster.get_metadata()
 
-    version = get_longhorn_release(ctx)
+    version = get_longhorn_release(cluster)
     p.phase(f'Setting up longhorn version {version}')
 
     execute_and_await(
-        ctx, [md['control_plane_nodes'][0]],
+        cluster, [md['control_plane_nodes'][0]],
         [
             'helm repo add longhorn https://charts.longhorn.io',
             'helm repo update',

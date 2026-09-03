@@ -27,6 +27,92 @@ def count_str(count, noun):
     return '%d %ss' % (count, noun)
 
 
+class Reporter:
+    """Where library output goes, and whether debug output is emitted.
+
+    The command line wants output on stdout as it happens, and a library
+    caller (an Ansible module, say) wants it collected and handed back, so
+    the destination is an object the caller chooses rather than a bare
+    print(). Reporters are file like -- write(), flush() and isatty() --
+    because Progress already writes to a stream, so a reporter can be
+    passed as that stream and the library keeps a single output channel
+    rather than two.
+
+    This default implementation is backed by the real sys.stdout. It looks
+    the stream up on each call rather than caching it at construction so
+    that code which replaces sys.stdout after a reporter is built (the
+    Click test runner, contextlib.redirect_stdout) still sees the output.
+    """
+
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+
+    def write(self, text):
+        return sys.stdout.write(text)
+
+    def flush(self):
+        sys.stdout.flush()
+
+    def isatty(self):
+        """Report whether the underlying stream is a terminal.
+
+        Progress chooses between in place ANSI updates and line mode from
+        this, so answering without asking the real stream would silently
+        change the format of every long running command's output.
+        """
+        return sys.stdout.isatty()
+
+    def debug(self, msg):
+        """Emit a debug line, but only when verbose output was requested."""
+        if self.verbose:
+            self.write('%s\n' % msg)
+            self.flush()
+
+
+class CollectingReporter(Reporter):
+    """A reporter which accumulates output for its caller rather than printing it.
+
+    Written text is kept as arrived and split into lines only when asked
+    for, because a line can reach a stream in several writes: print()
+    writes its text and its newline separately, and Progress._println()
+    appends the newline itself. Splitting is on '\\n' alone, rather than
+    with splitlines(), so that a form feed or an exotic unicode separator
+    inside captured command output cannot invent a line boundary -- one
+    element of lines is exactly one line of what would have been printed.
+    A trailing incomplete line is returned rather than dropped, so nothing
+    written is ever lost from the list.
+
+    isatty() is False: a collector has no terminal to move a cursor
+    around, and Progress must therefore use its line mode.
+    """
+
+    def __init__(self, verbose=False):
+        super(CollectingReporter, self).__init__(verbose=verbose)
+        self._chunks = []
+
+    def write(self, text):
+        self._chunks.append(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+    def getvalue(self):
+        """Return everything written, as a single string."""
+        return ''.join(self._chunks)
+
+    @property
+    def lines(self):
+        """Return everything written, as a list of lines with no line endings."""
+        lines = self.getvalue().split('\n')
+        if lines and lines[-1] == '':
+            lines.pop()
+        return lines
+
+
 class Progress:
     """Phase and wait-loop progress reporting for long running commands.
 
@@ -133,12 +219,3 @@ class Progress:
         """Print a completion line with the total elapsed time."""
         self.wait_done()
         self._println('%s (%s total)' % (msg, format_elapsed(time.time() - self.started)))
-
-
-def get_progress(ctx):
-    """Fetch the Progress reporter from the click context, creating a default one if required."""
-    p = ctx.obj.get('PROGRESS')
-    if not p:
-        p = Progress(verbose=ctx.obj.get('VERBOSE', False))
-        ctx.obj['PROGRESS'] = p
-    return p

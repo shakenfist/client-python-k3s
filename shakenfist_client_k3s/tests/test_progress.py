@@ -15,6 +15,7 @@ import testtools
 import shakenfist_client_k3s
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
+from shakenfist_client_k3s.cluster import Cluster
 
 
 class FakeClock:
@@ -50,6 +51,114 @@ class CountStrTestCase(testtools.TestCase):
         self.assertEqual('2 instances', progress.count_str(2, 'instance'))
         self.assertEqual('0 operations', progress.count_str(0, 'operation'))
         self.assertEqual('3 routed addresses', progress.count_str(3, 'routed address'))
+
+
+class ReporterTestCase(testtools.TestCase):
+    def test_write_and_flush_reach_stdout(self):
+        stdout = io.StringIO()
+        r = progress.Reporter()
+        with mock.patch('sys.stdout', stdout):
+            r.write('hello\n')
+            r.flush()
+        self.assertEqual('hello\n', stdout.getvalue())
+
+    def test_isatty_delegates_to_stdout(self):
+        # Progress picks its output mode from this, so a reporter which
+        # answers without asking the real stream silently switches the CLI
+        # between in place updates and line mode.
+        r = progress.Reporter()
+        with mock.patch('sys.stdout', FakeTty()):
+            self.assertTrue(r.isatty())
+        with mock.patch('sys.stdout', io.StringIO()):
+            self.assertFalse(r.isatty())
+
+    def test_debug_respects_verbosity(self):
+        stdout = io.StringIO()
+        with mock.patch('sys.stdout', stdout):
+            progress.Reporter(verbose=False).debug('not shown')
+            self.assertEqual('', stdout.getvalue())
+            progress.Reporter(verbose=True).debug('shown')
+        self.assertEqual('shown\n', stdout.getvalue())
+
+
+class CollectingReporterTestCase(testtools.TestCase):
+    def test_collects_instead_of_printing(self):
+        stdout = io.StringIO()
+        r = progress.CollectingReporter()
+        with mock.patch('sys.stdout', stdout):
+            r.write('one\n')
+            r.write('two\n')
+            r.flush()
+
+        self.assertEqual('', stdout.getvalue())
+        self.assertEqual('one\ntwo\n', r.getvalue())
+        self.assertEqual(['one', 'two'], r.lines)
+
+    def test_is_never_a_tty(self):
+        with mock.patch('sys.stdout', FakeTty()):
+            self.assertFalse(progress.CollectingReporter().isatty())
+
+    def test_lines_are_split_across_writes(self):
+        # print() writes its text and its newline separately, so a line can
+        # arrive in several pieces and must not be split at the seams.
+        r = progress.CollectingReporter()
+        r.write('one')
+        r.write('\n')
+        r.write('two\nthree\n')
+        self.assertEqual(['one', 'two', 'three'], r.lines)
+
+    def test_trailing_partial_line_is_kept(self):
+        r = progress.CollectingReporter()
+        r.write('finished\nstill typing')
+        self.assertEqual(['finished', 'still typing'], r.lines)
+
+    def test_empty_collector_has_no_lines(self):
+        self.assertEqual([], progress.CollectingReporter().lines)
+
+    def test_debug_is_collected(self):
+        r = progress.CollectingReporter(verbose=True)
+        r.debug('a debug line')
+        self.assertEqual(['a debug line'], r.lines)
+
+
+class ProgressThroughCollectorTestCase(testtools.TestCase):
+    """A collected Progress must say exactly what a piped one would have."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = FakeClock()
+        patcher = mock.patch('shakenfist_client_k3s.progress.time.time', self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _drive(self, stream):
+        p = progress.Progress(total_phases=2, stream=stream)
+        p.phase('Booting')
+        p.update('node-001', 'state initial')
+        self.clock.advance(5)
+        p.note('node-001 may be stalled')
+        p.update('node-001', 'state created')
+        p.wait_done()
+        p.phase('Installing k3s on the worker nodes')
+        self.clock.advance(120)
+        p.finish('Cluster banana is ready')
+        return p
+
+    def test_collected_output_matches_a_non_tty_stream(self):
+        piped = io.StringIO()
+        self._drive(piped)
+
+        collector = progress.CollectingReporter()
+        self.assertFalse(self._drive(collector).interactive)
+
+        self.assertEqual(piped.getvalue(), collector.getvalue())
+        self.assertEqual(piped.getvalue().split('\n')[:-1], collector.lines)
+
+        # And it really is the line mode output, with no cursor movement
+        # for a caller's log to render.
+        self.assertNotIn('\x1b', collector.getvalue())
+        self.assertEqual('[1/2] Booting', collector.lines[0])
+        self.assertEqual('Cluster banana is ready (2m05s total)', collector.lines[-1])
 
 
 class ProgressLineModeTestCase(testtools.TestCase):
@@ -294,22 +403,14 @@ class DescribeAgentOpTestCase(testtools.TestCase):
         self.assertIsNone(primitives._describe_agent_op({'commands': [], 'results': {}}))
 
 
-class FakeContext:
-    def __init__(self, obj):
-        self.obj = obj
-
-
 class InstallK3sComponentTestCase(testtools.TestCase):
     def _install_commands(self, md):
-        ctx = FakeContext({
-            'name': 'banana',
-            'namespace': 'testns',
-            'CLIENT': mock.MagicMock(),
-            'VERBOSE': False,
-            primitives.METADATA_KEY % 'banana': md
-        })
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {
+            primitives.METADATA_KEY % 'banana': md}
+        cluster = Cluster(client, 'banana', 'testns')
         with mock.patch('shakenfist_client_k3s.primitives.execute_and_await') as ea:
-            primitives.install_k3s_component(ctx, ['uuid-001'], 'token', 'agent')
+            primitives.install_k3s_component(cluster, ['uuid-001'], 'token', 'agent')
             return '\n'.join(ea.call_args[0][2])
 
     def test_join_uses_join_address(self):
@@ -342,21 +443,20 @@ class WaitLoopTestCase(testtools.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _make_context(self, client, stream):
-        return FakeContext({
-            'namespace': 'testns',
-            'CLIENT': client,
-            'VERBOSE': False,
-            'PROGRESS': progress.Progress(stream=stream)
-        })
+    def _make_cluster(self, client, stream):
+        # The wait loops are cluster agnostic, so these clusters have no
+        # name and never read cluster metadata.
+        cluster = Cluster(client, None, 'testns')
+        cluster.progress = progress.Progress(stream=stream)
+        return cluster
 
     def test_await_boot_does_not_run_os_update(self):
         client = mock.MagicMock()
         client.get_instance.return_value = {
             'name': 'node-001', 'state': 'created', 'agent_state': 'ready'}
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
-        primitives.await_boot(ctx, ['uuid-001'])
+        primitives.await_boot(cluster, ['uuid-001'])
 
         # The OS update was previously triggered implicitly from within
         # await_boot(), which made the subsequent idle wait impossible to
@@ -377,9 +477,9 @@ class WaitLoopTestCase(testtools.TestCase):
             []
         ]
         stream = io.StringIO()
-        ctx = self._make_context(client, stream)
+        cluster = self._make_cluster(client, stream)
 
-        primitives.await_idle(ctx, ['uuid-001'])
+        primitives.await_idle(cluster, ['uuid-001'])
 
         self.assertEqual(
             "  node-001: running 'apt-get update' (1 operation remaining) (0s)\n"
@@ -399,11 +499,11 @@ class WaitLoopTestCase(testtools.TestCase):
                 'results': {}
             }]
         ]
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.await_idle, ctx, ['uuid-001'])
+            e = self.assertRaises(SystemExit, primitives.await_idle, cluster, ['uuid-001'])
 
         self.assertEqual(1, e.code)
         self.assertIn('operation: aop-002', captured.getvalue())
@@ -422,11 +522,11 @@ class WaitLoopTestCase(testtools.TestCase):
         }
         client.get_instance_agentoperations.side_effect = [[old_error], [old_error]]
         stream = io.StringIO()
-        ctx = self._make_context(client, stream)
+        cluster = self._make_cluster(client, stream)
 
         # An operation which had already failed before the wait started must
         # neither wedge the wait nor abort it.
-        primitives.await_idle(ctx, ['uuid-001'])
+        primitives.await_idle(cluster, ['uuid-001'])
         self.assertIn('node-001: idle', stream.getvalue())
 
     def test_await_idle_notes_stalled_command(self):
@@ -446,9 +546,9 @@ class WaitLoopTestCase(testtools.TestCase):
         polls = primitives.STALL_WARNING_SECONDS // 5 + 10
         client.get_instance_agentoperations.side_effect = [[]] + [[running]] * polls + [[]]
         stream = io.StringIO()
-        ctx = self._make_context(client, stream)
+        cluster = self._make_cluster(client, stream)
 
-        primitives.await_idle(ctx, ['uuid-001'])
+        primitives.await_idle(cluster, ['uuid-001'])
 
         self.assertIn('may be stalled', stream.getvalue())
         self.assertIn('aop-001', stream.getvalue())
@@ -464,11 +564,11 @@ class WaitLoopTestCase(testtools.TestCase):
             'commands': [{'command': 'get-file', 'path': '/missing'}],
             'results': {}
         }
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.await_fetch, ctx, aop)
+            e = self.assertRaises(SystemExit, primitives.await_fetch, cluster, aop)
 
         self.assertEqual(1, e.code)
         self.assertIn('get-file /missing', captured.getvalue())
@@ -483,11 +583,11 @@ class WaitLoopTestCase(testtools.TestCase):
             'commands': [{'command': 'execute', 'commandline': 'apt-get update'}],
             'results': {}
         }
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.reap_execute, ctx, aop)
+            e = self.assertRaises(SystemExit, primitives.reap_execute, cluster, aop)
 
         self.assertEqual(1, e.code)
         self.assertIn('operation: aop-004', captured.getvalue())
@@ -503,11 +603,11 @@ class WaitLoopTestCase(testtools.TestCase):
             'results': {'0': {'return-code': 1, 'stdout': '',
                               'stderr': 'timed out on pod one\ntimed out on pod two'}}
         }
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.reap_execute, ctx, aop)
+            e = self.assertRaises(SystemExit, primitives.reap_execute, cluster, aop)
 
         self.assertEqual(1, e.code)
         self.assertIn('   stderr: timed out on pod one\n'
@@ -522,15 +622,11 @@ class AllocateMetallbAddressesTestCase(testtools.TestCase):
         client.route_network_address.side_effect = route_results
         md = {'name': 'banana', 'node_network': 'net-1',
               'routed_addresses': ['192.168.10.1']}
-        ctx = FakeContext({
-            'name': 'banana',
-            'namespace': 'testns',
-            'CLIENT': client,
-            'VERBOSE': False,
-            'PROGRESS': progress.Progress(stream=stream),
-            primitives.METADATA_KEY % 'banana': md
-        })
-        primitives.allocate_metallb_addresses(ctx, count)
+        client.get_namespace_metadata.return_value = {
+            primitives.METADATA_KEY % 'banana': md}
+        cluster = Cluster(client, 'banana', 'testns')
+        cluster.progress = progress.Progress(stream=stream)
+        primitives.allocate_metallb_addresses(cluster, count)
         return stream.getvalue()
 
     def test_allocation_reports_new_addresses_and_cluster_total(self):

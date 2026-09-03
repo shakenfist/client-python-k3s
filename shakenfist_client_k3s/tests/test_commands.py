@@ -14,10 +14,11 @@ from shakenfist_client_k3s import primitives
 class NamespaceDefaultingTestCase(testtools.TestCase):
     """Commands must default --namespace to the client's own namespace.
 
-    Every command stores the --namespace option in ctx.obj['namespace'],
-    which the primitives pass directly to namespace metadata API calls. If
-    the option is not given the value must come from the client (and never
-    remain None, which the API client rejects with a TypeError).
+    Every command resolves the --namespace option onto the Cluster it
+    builds, whose namespace the primitives pass directly to namespace
+    metadata API calls. If the option is not given the value must come
+    from the client (and never remain None, which the API client rejects
+    with a TypeError).
     """
 
     def setUp(self):
