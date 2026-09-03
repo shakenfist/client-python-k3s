@@ -1,0 +1,8 @@
+Usage: k3s delete [OPTIONS] NAME
+
+  Destroy a k3s cluster
+
+Options:
+  --namespace TEXT  If you are an admin, you can alter clusters in a different
+                    namespace.
+  --help            Show this message and exit.

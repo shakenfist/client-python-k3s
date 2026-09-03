@@ -1,0 +1,22 @@
+Usage: k3s create [OPTIONS] NAME
+
+  Create a new k3s cluster
+
+Options:
+  --control-plane-count INTEGER   The number of control plane nodes
+  --worker-count INTEGER          The number of workers
+  --metal-address-count INTEGER   The number of floating addresses to route into
+                                  the virtual network for metallb to manage
+  --namespace TEXT                If you are an admin, you can create this
+                                  cluster in a different namespace.
+  --network TEXT                  Specify a network here to add these nodes to a
+                                  pre-existing network. Otherwise one will be
+                                  created for this cluster.
+  --refresh-version-cache / --no-refresh-version-cache
+                                  Force a refresh of the k3s version cache.
+  --release-channel TEXT          Select a k3s release channel. Common choices
+                                  include stable, latest, and specific versions
+                                  pre-pended with a v such as "v1.26".
+  --sshkey PATH                   An optional ssh public key to place onto
+                                  instances.
+  --help                          Show this message and exit.

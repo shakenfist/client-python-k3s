@@ -1,0 +1,10 @@
+Usage: k3s query-k3s-version [OPTIONS] RELEASE_CHANNEL
+
+  Lookup the current version for a k3s release channel
+
+Options:
+  --namespace TEXT                If you are an admin, you can control which
+                                  namespace the version cache is retrieved from.
+  --refresh-version-cache / --no-refresh-version-cache
+                                  Force a refresh of the k3s version cache.
+  --help                          Show this message and exit.

@@ -1,0 +1,9 @@
+Usage: k3s expand-workers [OPTIONS] NAME
+
+  Add workers to a k3s cluster
+
+Options:
+  --worker-count INTEGER  The number of workers
+  --namespace TEXT        If you are an admin, you can alter clusters in a
+                          different namespace.
+  --help                  Show this message and exit.

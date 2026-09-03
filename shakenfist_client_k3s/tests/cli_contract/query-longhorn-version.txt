@@ -1,0 +1,10 @@
+Usage: k3s query-longhorn-version [OPTIONS]
+
+  Lookup the current longhorn version
+
+Options:
+  --namespace TEXT                If you are an admin, you can control which
+                                  namespace the version cache is retrieved from.
+  --refresh-version-cache / --no-refresh-version-cache
+                                  Force a refresh of the longhorn version cache.
+  --help                          Show this message and exit.

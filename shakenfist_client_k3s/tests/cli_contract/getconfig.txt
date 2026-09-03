@@ -1,0 +1,8 @@
+Usage: k3s getconfig [OPTIONS] NAME
+
+  Get kubeconfig for an existing k3s cluster
+
+Options:
+  --namespace TEXT  If you are an admin, you can fetch the kubeconfig for a
+                    cluster in a different namespace.
+  --help            Show this message and exit.
