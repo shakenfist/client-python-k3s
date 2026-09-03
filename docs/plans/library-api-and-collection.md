@@ -76,19 +76,28 @@ Two consumers now want one:
   polling the cluster and adding or removing workers. Conductor is a
   Python daemon; it wants the library directly, not Ansible.
 
-The coupling is shallower than it looks. `ctx.obj` only ever carries
-five keys -- `CLIENT`, `PROGRESS`, `VERBOSE`, `name`, `namespace` --
-so those become explicit arguments rather than a context object. Two
-things are genuinely load-bearing, and both are fatal to a module that
-must own stdout for its JSON result and fail structurally:
+The coupling is shallower than it looks, though not as shallow as it
+first appears. `ctx.obj` carries five fixed keys -- `CLIENT`,
+`PROGRESS`, `VERBOSE`, `name`, `namespace` -- plus a sixth, dynamic
+one: `get_cluster_metadata()` caches the cluster's namespace metadata
+under `METADATA_KEY % name`, and `set_cluster_metadata()` writes
+through to it (`primitives.py:27-53`). Five arguments therefore do not
+replace the context object; a small state object does. Two things are
+genuinely load-bearing, and both are fatal to a module that must own
+stdout for its JSON result and fail structurally:
 
-- **31 bare `print()` calls** in `primitives.py`.
-- **`sys.exit(1)` on every failure path** (`primitives.py:91`, `:114`,
-  `:124`, `:170`, `:198`, `:283`, `:407`, and others).
+- **48 bare `print()` calls** -- 24 in `primitives.py` and 24 in
+  `__init__.py`.
+- **`sys.exit(1)` on every failure path**: seven in `primitives.py`
+  (`:91`, `:114`, `:124`, `:170`, `:198`, `:283`, `:405`) and thirteen
+  in `__init__.py` (`:136`, `:139`, `:148`, `:253`, `:268`, `:341`,
+  `:346`, `:363`, `:386`, `:465`, `:485`, `:512`, `:537`).
 
-`progress.Progress` already accepts a `stream` argument, so a
-collecting reporter drops straight into the `log` list that all four
-`sf_*` modules in `shakenfist.shakenfist` return.
+`progress.Progress` already accepts a `stream` argument
+(`progress.py:41`), so a collecting reporter can feed the `log` list
+that all four `sf_*` modules in `shakenfist.shakenfist` return. It has
+to be file-like rather than a list, because `Progress` decides between
+its interactive and line modes by calling `stream.isatty()`.
 
 Beyond the refactor, the plugin is missing verbs and carries
 behaviours a daemon cannot tolerate. Re-verified against `develop` on
@@ -148,7 +157,7 @@ Constraints:
 - **Python >= 3.7**, single quotes, 120 columns, per `AGENTS.md`.
 - **The plugin must never break `sf-client` startup.** It is imported
   unconditionally by the entry-point loader
-  (`client-python/shakenfist_client/main.py:138-148`, unguarded), so
+  (`client-python/shakenfist_client/main.py:259-269`, unguarded), so
   top-level imports stay cheap and reliable.
 
 ## Decisions
@@ -241,8 +250,8 @@ Constraints:
 
 | Phase | Work | Status | Merged |
 |-------|------|--------|--------|
-| 1. Library API | Extract orchestration from the Click command bodies into a callable layer taking a client, cluster name and namespace; replace `sys.exit(1)` with an exception hierarchy; route `print()` through a reporter; make the Click commands thin wrappers | Not started | |
-| 2. Client construction | Honour the root `--apiurl`/`--key`/`--namespace` in `_bind_cluster_context()` (`__init__.py:36-40` currently discards them), and add the `api_url`/`namespace`/`key` plus `suppress_configuration_lookup=True` path that `sf_namespace._make_client()` uses | Not started | |
+| 1. Library API | [library-api-and-collection-phase-01-library-api.md](library-api-and-collection-phase-01-library-api.md) -- extract orchestration from the Click command bodies into a callable `Cluster` layer; replace `sys.exit(1)` with an exception hierarchy; route `print()` through a reporter; make the Click commands thin wrappers | Not started | |
+| 2. Client construction | Honour the root `--apiurl`/`--key`/`--namespace` in `_bind_cluster_context()` (`__init__.py:36` and `:98` currently overwrite the root client, which already honours them at `client-python/shakenfist_client/main.py:228-237`; note the root's `--async` default is `pause` and this code needs `ASYNC_CONTINUE`), and add the `api_url`/`namespace`/`key` plus `suppress_configuration_lookup=True` path that `sf_namespace._make_client()` uses | Not started | |
 | 3. Missing verbs | `remove-worker`; make `install_workers()` incremental; reconcile/crash recovery for `state: initial`; a health verb; `--no-longhorn`/`--no-metallb`; kubeconfig side effects opt-out; manifest payload hook | Not started | |
 | 4. First release | Cut `v0.1.0` so `shakenfist-client-k3s` exists on PyPI and `setuptools_scm` has a real version to stamp | Not started | |
 | 5. The collection | `shakenfist.k3s` with `sf_k3s_cluster`; `tools/build-collection.py`; `build-collection` and `publish-collection` jobs in `release.yml`; ansible-lint in pre-commit and CI; docs | Not started | |
