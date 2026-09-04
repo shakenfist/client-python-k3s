@@ -14,6 +14,7 @@ import testtools
 
 import shakenfist_client_k3s
 from shakenfist_client_k3s import cluster as cluster_module
+from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.cluster import Cluster
@@ -474,14 +475,19 @@ class WaitLoopTestCase(testtools.TestCase):
         ]
         cluster = self._make_cluster(client, io.StringIO())
 
+        # The failure is raised rather than printed and exited: the text
+        # is now the exception's, and nothing reaches stdout.
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, cluster.await_idle, ['uuid-001'])
+            e = self.assertRaises(
+                exceptions.AgentOperationError, cluster.await_idle, ['uuid-001'])
 
-        self.assertEqual(1, e.code)
-        self.assertIn('operation: aop-002', captured.getvalue())
-        self.assertIn('helm install banana', captured.getvalue())
-        self.assertIn('failed to start', captured.getvalue())
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual('aop-002', e.operation_uuid)
+        self.assertEqual('node-001', e.instance_name)
+        self.assertIn('operation: aop-002', str(e))
+        self.assertIn('helm install banana', str(e))
+        self.assertIn('failed to start', str(e))
 
     def test_await_idle_ignores_preexisting_errors(self):
         client = mock.MagicMock()
@@ -541,10 +547,12 @@ class WaitLoopTestCase(testtools.TestCase):
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, cluster.await_fetch, aop)
+            e = self.assertRaises(
+                exceptions.AgentOperationError, cluster.await_fetch, aop)
 
-        self.assertEqual(1, e.code)
-        self.assertIn('get-file /missing', captured.getvalue())
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual({}, e.results)
+        self.assertIn('get-file /missing', str(e))
 
     def test_reap_execute_aborts_on_errored_operation(self):
         client = mock.MagicMock()
@@ -560,10 +568,12 @@ class WaitLoopTestCase(testtools.TestCase):
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, cluster.reap_execute, aop)
+            e = self.assertRaises(
+                exceptions.AgentOperationError, cluster.reap_execute, aop)
 
-        self.assertEqual(1, e.code)
-        self.assertIn('operation: aop-004', captured.getvalue())
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual('aop-004', e.operation_uuid)
+        self.assertIn('operation: aop-004', str(e))
 
     def test_reap_execute_formats_multiline_stderr(self):
         client = mock.MagicMock()
@@ -580,11 +590,14 @@ class WaitLoopTestCase(testtools.TestCase):
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, cluster.reap_execute, aop)
+            e = self.assertRaises(
+                exceptions.CommandFailedError, cluster.reap_execute, aop)
 
-        self.assertEqual(1, e.code)
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual(1, e.return_code)
+        self.assertEqual('kubectl wait pods', e.commandline)
         self.assertIn('   stderr: timed out on pod one\n'
-                      '   stderr: timed out on pod two', captured.getvalue())
+                      '   stderr: timed out on pod two', str(e))
 
 
 # A minimal kubeconfig in the shape k3s writes, pointing at the loopback

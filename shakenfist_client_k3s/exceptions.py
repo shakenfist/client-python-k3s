@@ -1,14 +1,16 @@
 """The exception hierarchy raised by the k3s library API.
 
-These replace the ``sys.exit(1)`` calls in ``primitives.py`` and
-``__init__.py``. Each exception stores the values the failing code used to
-interpolate into its ``print()`` calls as plain attributes, and its
-``__str__`` renders exactly the text the CLI prints today, so the Click
-layer can catch the common base once and print ``str(e)`` with no
-per-command formatting.
+These are raised where ``primitives.py``, ``cluster.py`` and
+``__init__.py`` used to print a message and exit the process. Each
+exception stores the
+values the failing code used to interpolate into its ``print()`` calls as
+plain attributes, and its ``__str__`` renders exactly the text the CLI
+prints today, so the Click layer can catch the common base once and print
+``str(e)`` with no per-command formatting.
 
-Nothing here is raised yet -- this module is inert until a later step in
-the phase 1 plan replaces the ``sys.exit(1)`` sites with raises. Because
+``GroupCatchClusterExceptions`` in ``__init__.py`` is that catch: it
+overrides ``click.Group.invoke()``, prints ``str(e)`` to stdout and exits
+1, and is the one place in this package which exits the process. Because
 ``shakenfist_client_k3s`` is imported unconditionally by the ``sf-client``
 plugin loader, this module must import nothing beyond the standard
 library.
@@ -31,7 +33,7 @@ class ClusterExistsError(K3sClusterException):
     """Raised when a cluster create is attempted with a name already in use.
 
     Corresponds to the two identical checks in ``k3s_create()``
-    (``__init__.py:134-139``): the name is already present in the
+    (``__init__.py:186-189``): the name is already present in the
     namespace's cluster list, or namespace metadata already exists for it.
     Both render the same text, so this class does not need to distinguish
     which check failed.
@@ -48,7 +50,7 @@ class ClusterExistsError(K3sClusterException):
 class NetworkNotFoundError(K3sClusterException):
     """Raised when ``--network`` names a network that does not exist.
 
-    Corresponds to ``__init__.py:146-148``.
+    Corresponds to ``__init__.py:196-197``.
     """
 
     def __init__(self, network):
@@ -68,15 +70,15 @@ class ClusterNotFoundError(K3sClusterException):
     Construct via the classmethods below, one per distinct message:
 
     - ``unknown_cluster()``: ``getconfig``, no cluster metadata at all
-      (``__init__.py:339-341``).
-    - ``does_not_exist()``: ``show`` (``__init__.py:361-363``) and
-      ``delete`` (``__init__.py:383-386``).
-    - ``not_found()``: ``expand-workers`` (``__init__.py:483-485``),
-      ``expand-addresses`` (``__init__.py:509-512``) and ``update-os``
-      (``__init__.py:534-537``).
+      (``__init__.py:389-390``).
+    - ``does_not_exist()``: ``show`` (``__init__.py:411-412``) and
+      ``delete`` (``__init__.py:434-435``).
+    - ``not_found()``: ``expand-workers`` (``__init__.py:531-532``),
+      ``expand-addresses`` (``__init__.py:557-558``) and ``update-os``
+      (``__init__.py:581-582``).
 
     The sixth original site, ``getconfig``'s "no kubeconfig" check
-    (``__init__.py:343-346``), is not here: that cluster does exist, so it
+    (``__init__.py:393-396``), is not here: that cluster does exist, so it
     is ``ClusterIncompleteError`` instead.
     """
 
@@ -106,7 +108,7 @@ class ClusterNotFoundError(K3sClusterException):
 class ClusterIncompleteError(K3sClusterException):
     """Raised when a cluster exists but has not finished being built.
 
-    Corresponds to ``getconfig``'s second check (``__init__.py:343-346``):
+    Corresponds to ``getconfig``'s second check (``__init__.py:393-396``):
     cluster metadata exists (unlike ``ClusterNotFoundError``), but the
     field being asked for -- here, the kubeconfig -- has not been recorded
     yet, because create has not reached that point. This is deliberately a
@@ -135,18 +137,18 @@ class ReleaseLookupError(K3sClusterException):
 
     - ``http_status(product, url, status_code, response_text)``: a
       non-2xx response fetching release data, for either product. Used
-      for the k3s channel fetch (``primitives.py:86-91``, with
+      for the k3s channel fetch (``primitives.py:62-64``, with
       ``product='k3s'``) and the Longhorn release fetch
-      (``primitives.py:165-170``, with ``product='Longhorn'``); both
+      (``primitives.py:131-133``, with ``product='Longhorn'``); both
       render identically apart from the product name.
     - ``no_usable_k3s_channels(url, response_snippet)``: the k3s channel
       response parsed but yielded no channels at all
-      (``primitives.py:110-114``). ``response_snippet`` is the caller's
+      (``primitives.py:83-85``). ``response_snippet`` is the caller's
       already-truncated ``json.dumps(d)[:512]``.
     - ``unknown_channel(release_channel)``: the requested channel is not
-      in the (possibly cached) release map (``primitives.py:122-124``).
+      in the (possibly cached) release map (``primitives.py:93-94``).
     - ``no_parsable_longhorn_release()``: every Longhorn tag failed to
-      parse as a PEP 440 version (``primitives.py:196-198``).
+      parse as a PEP 440 version (``primitives.py:159-160``).
     """
 
     def __init__(self, reason, message, **fields):
@@ -194,7 +196,10 @@ class ReleaseLookupError(K3sClusterException):
 class AgentOperationError(K3sClusterException):
     """Raised when a Shaken Fist agent operation enters the error state.
 
-    Corresponds to ``_abort_agent_op_error()`` (``primitives.py:266-283``).
+    Built by ``Cluster._agent_op_error()`` (``cluster.py:147-163``) and
+    raised by its three callers: ``await_idle()`` (``cluster.py:208``),
+    ``await_fetch()`` (``cluster.py:253``) and ``reap_execute()``
+    (``cluster.py:267``).
     ``command_description`` is the value ``_describe_agent_op(aop,
     max_len=None)`` returns, and is only rendered when truthy. ``results``
     is the agent operation's results dict; when it is empty (or falsy) a
@@ -232,8 +237,8 @@ class AgentOperationError(K3sClusterException):
 class CommandFailedError(K3sClusterException):
     """Raised when an agent command completes with a non-zero return code.
 
-    Corresponds to the return-code check in ``reap_execute()``
-    (``primitives.py:394-405``). ``stdout`` and ``stderr`` are the raw
+    Corresponds to the return-code check in ``Cluster.reap_execute()``
+    (``cluster.py:269-276``). ``stdout`` and ``stderr`` are the raw
     strings from the agent operation's results; ``__str__`` re-joins each
     on its own prefixed line exactly as the original ``print()`` calls did.
     """
@@ -267,15 +272,16 @@ class KubeconfigError(K3sClusterException):
 
     - ``missing_kubectl(main_config_path, name)``: create found an
       existing ``~/.kube/config`` to merge into but no local ``kubectl``
-      binary to do the merge with (``__init__.py:249-253``).
+      binary to do the merge with (``__init__.py:297-298``).
     - ``merge_failed(main_config_path, returncode, stderr)``: create's
       ``kubectl config view --flatten`` merge exited non-zero
-      (``__init__.py:264-268``); the second line is only rendered when
-      ``stderr`` is non-empty, matching the original's conditional
+      (``__init__.py:308-316``); ``stderr`` is decoded from the bytes
+      ``subprocess`` returns at the raise, and the second line is only
+      rendered when it is non-empty, matching the original's conditional
       ``print()``.
     - ``unset_failed(config_elem)``: delete's ``kubectl config unset``
       loop exited non-zero for one config element
-      (``__init__.py:461-465``). This is a separate rendering from the
+      (``__init__.py:512-513``). This is a separate rendering from the
       two above -- it names a config element, not a config file path --
       but it is still local-kubectl-state, so it lives on this class
       rather than on ``ClusterNotFoundError``.

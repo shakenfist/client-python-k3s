@@ -8,6 +8,7 @@ import time
 import mock
 import testtools
 
+from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 
@@ -67,25 +68,32 @@ class GetK3sReleaseTestCase(testtools.TestCase):
             {'stable': 'v1.33.4+k3s1', 'latest': 'v1.34.1+k3s1', 'v1.33': 'v1.33.4+k3s1'},
             cache['releases'])
 
-    def test_unresolvable_channel_exits(self):
+    def test_unresolvable_channel_raises(self):
         client = mock.MagicMock()
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(K3S_CHANNELS)):
-            self.assertRaises(
-                SystemExit, primitives.get_k3s_release,
+            e = self.assertRaises(
+                exceptions.ReleaseLookupError, primitives.get_k3s_release,
                 client, NAMESPACE, _reporter(), force_cache_update=True,
                 release_channel='v1.16-testing')
 
-    def test_unknown_channel_exits(self):
+        self.assertEqual('unknown_channel', e.reason)
+        self.assertEqual('v1.16-testing', e.release_channel)
+        self.assertEqual('Release channel v1.16-testing not found', str(e))
+
+    def test_unknown_channel_raises(self):
         client = mock.MagicMock()
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(K3S_CHANNELS)):
-            self.assertRaises(
-                SystemExit, primitives.get_k3s_release,
+            e = self.assertRaises(
+                exceptions.ReleaseLookupError, primitives.get_k3s_release,
                 client, NAMESPACE, _reporter(), force_cache_update=True,
                 release_channel='banana')
+
+        self.assertEqual('unknown_channel', e.reason)
+        self.assertEqual('Release channel banana not found', str(e))
 
     def test_fresh_cache_avoids_fetch(self):
         client = mock.MagicMock()
@@ -117,8 +125,8 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         self.assertEqual('v1.33.4+k3s1', release)
         mock_request.assert_called_once()
 
-    def test_response_missing_data_exits(self):
-        # An error envelope or schema change with no 'data' key must exit
+    def test_response_missing_data_raises(self):
+        # An error envelope or schema change with no 'data' key must fail
         # tidily rather than raise KeyError, and must not persist an empty
         # releases dict, which would poison the shared namespace cache
         # until it next expires.
@@ -126,11 +134,13 @@ class GetK3sReleaseTestCase(testtools.TestCase):
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response({'error': 'nope'})):
-            self.assertRaises(
-                SystemExit, primitives.get_k3s_release,
+            e = self.assertRaises(
+                exceptions.ReleaseLookupError, primitives.get_k3s_release,
                 client, NAMESPACE, _reporter(), force_cache_update=True,
                 release_channel='stable')
 
+        self.assertEqual('no_usable_k3s_channels', e.reason)
+        self.assertIn('No usable k3s release channels found', str(e))
         client.set_namespace_metadata_item.assert_not_called()
 
     def test_cache_missing_releases_is_clobbered(self):
@@ -149,22 +159,28 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         self.assertEqual('v1.33.4+k3s1', release)
         mock_request.assert_called_once()
 
-    def test_http_error_exits(self):
+    def test_http_error_raises(self):
         client = mock.MagicMock()
 
+        # The failure is carried by the exception now, so nothing at all
+        # should reach stdout: the Click layer does the printing.
         stdout = io.StringIO()
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(None, status_code=500)):
             with contextlib.redirect_stdout(stdout):
-                self.assertRaises(
-                    SystemExit, primitives.get_k3s_release,
+                e = self.assertRaises(
+                    exceptions.ReleaseLookupError, primitives.get_k3s_release,
                     client, NAMESPACE, _reporter(), force_cache_update=True,
                     release_channel='stable')
 
+        self.assertEqual('', stdout.getvalue())
+        self.assertEqual('http_status', e.reason)
+        self.assertEqual('k3s', e.product)
+        self.assertEqual(500, e.status_code)
+
         # The error must name the URL we actually fetched, not a literal
         # '{url}' from a missing f-string prefix.
-        self.assertIn('GET https://update.k3s.io/v1-release/channels',
-                      stdout.getvalue())
+        self.assertIn('GET https://update.k3s.io/v1-release/channels', str(e))
 
 
 # A cut down version of real data from the GitHub releases API for
@@ -193,14 +209,17 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
 
         self.assertEqual('1.6.0', release)
 
-    def test_no_valid_releases_exits(self):
+    def test_no_valid_releases_raises(self):
         client = mock.MagicMock()
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response([])):
-            self.assertRaises(
-                SystemExit, primitives.get_longhorn_release,
+            e = self.assertRaises(
+                exceptions.ReleaseLookupError, primitives.get_longhorn_release,
                 client, NAMESPACE, _reporter(), force_cache_update=True)
+
+        self.assertEqual('no_parsable_longhorn_release', e.reason)
+        self.assertEqual('Unable to determine the latest Longhorn release', str(e))
 
     def test_cache_missing_latest_is_refreshed(self):
         # Caches written before the 'latest' key existed have a fresh
@@ -222,19 +241,21 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
         self.assertEqual('1.6.0', release)
         mock_request.assert_called()
 
-    def test_http_error_exits(self):
+    def test_http_error_raises(self):
         client = mock.MagicMock()
 
         stdout = io.StringIO()
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(None, status_code=500)):
             with contextlib.redirect_stdout(stdout):
-                self.assertRaises(
-                    SystemExit, primitives.get_longhorn_release,
+                e = self.assertRaises(
+                    exceptions.ReleaseLookupError, primitives.get_longhorn_release,
                     client, NAMESPACE, _reporter(), force_cache_update=True)
 
+        self.assertEqual('', stdout.getvalue())
+        self.assertEqual('Longhorn', e.product)
+
         # The error must blame Longhorn, not k3s, and name the fetched URL.
-        self.assertIn('Unable to determine latest Longhorn release version',
-                      stdout.getvalue())
+        self.assertIn('Unable to determine latest Longhorn release version', str(e))
         self.assertIn('GET https://api.github.com/repos/longhorn/longhorn/releases',
-                      stdout.getvalue())
+                      str(e))

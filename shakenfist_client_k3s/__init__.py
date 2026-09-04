@@ -14,6 +14,7 @@ try:
 except ImportError:
     from importlib_metadata import version as distribution_version
 
+from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.cluster import Cluster
@@ -61,7 +62,34 @@ def _bind_cluster_context(ctx, name, namespace):
     return Cluster(client, name, namespace, reporter=reporter)
 
 
-@click.group(help=('k3s kubernetes cluster commands (via the '
+class GroupCatchClusterExceptions(click.Group):
+    """Turn this plugin's exceptions back into the CLI behaviour they replaced.
+
+    The orchestration raises K3sClusterException subclasses rather than
+    exiting the process, so that an in process caller -- the Ansible
+    module this plan exists for -- can fail structurally and keep stdout
+    for its own JSON result. The command line still has to behave exactly
+    as it did, so this is where the two meet: one handler which prints the
+    message the failing command used to print, on stdout where it has
+    always gone, and exits 1. Click's Group.invoke() is what resolves and
+    invokes the subcommand, so catching here covers every command,
+    including any added later.
+
+    Nothing from shakenfist_client.apiclient is caught here. The parent
+    CLI's GroupCatchExceptions already maps every API exception to its own
+    error line and exit code, and that behaviour must survive untouched.
+    """
+
+    def invoke(self, ctx):
+        try:
+            return super(GroupCatchClusterExceptions, self).invoke(ctx)
+        except exceptions.K3sClusterException as e:
+            print(str(e))
+            sys.exit(1)
+
+
+@click.group(cls=GroupCatchClusterExceptions,
+             help=('k3s kubernetes cluster commands (via the '
                    'shakenfist-client-k3s plugin)'))
 def k3s():
     ...
@@ -156,11 +184,9 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     md = c.get_metadata()
 
     if name in all_clusters:
-        print('Sorry, that cluster name is already taken')
-        sys.exit(1)
+        raise exceptions.ClusterExistsError(name)
     if md:
-        print('Sorry, that cluster name is already taken')
-        sys.exit(1)
+        raise exceptions.ClusterExistsError(name)
     all_clusters.append(name)
     ctx.obj['CLIENT'].set_namespace_metadata_item(namespace, CLUSTER_LIST, all_clusters)
 
@@ -168,8 +194,7 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     if network:
         node_network = ctx.obj['CLIENT'].get_network(network)
         if not node_network:
-            print('Specified network does not exist')
-            sys.exit(1)
+            raise exceptions.NetworkNotFoundError(network)
     else:
         p.phase('Creating node network')
         node_network = ctx.obj['CLIENT'].allocate_network(
@@ -270,10 +295,7 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
             f.write(yaml.dump(kc))
     else:
         if not shutil.which('kubectl'):
-            print('A local kubectl binary is required to merge the new cluster into')
-            print('%s, but none was found. The new cluster credentials are' % main_config_path)
-            print(f"available from 'sf-client k3s getconfig {name}'.")
-            sys.exit(1)
+            raise exceptions.KubeconfigError.missing_kubectl(main_config_path, name)
 
         with tempfile.TemporaryDirectory() as tempdir:
             new_config_path = os.path.join(tempdir, 'config')
@@ -284,11 +306,14 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                 env={**os.environ,
                      'KUBECONFIG': '%s:%s' % (main_config_path, new_config_path)})
             if merged.returncode != 0:
-                print('Failed to update %s, return code %d'
-                      % (main_config_path, merged.returncode))
+                # kubectl's stderr arrives as bytes, and was decoded at the
+                # point it was printed; decode it here so the exception
+                # renders exactly the same text.
+                stderr = None
                 if merged.stderr:
-                    print(merged.stderr.decode('utf-8', errors='replace'))
-                sys.exit(1)
+                    stderr = merged.stderr.decode('utf-8', errors='replace')
+                raise exceptions.KubeconfigError.merge_failed(
+                    main_config_path, merged.returncode, stderr)
 
             # kubectl's merge keeps the pre-existing file's current-context,
             # which would leave kubectl pointed at whatever cluster was
@@ -362,13 +387,13 @@ def k3s_getconfig(ctx, name=None, namespace=None):
 
     md = c.get_metadata()
     if not md:
-        print('Unknown cluster')
-        sys.exit(1)
+        raise exceptions.ClusterNotFoundError.unknown_cluster(name)
 
     kubeconfig = md.get('kubeconfig')
     if not kubeconfig:
-        print('No kubeconfig for this cluster. Is it fully installed?')
-        sys.exit(1)
+        # The cluster exists, it is just not finished, which is a
+        # different thing to it not existing at all.
+        raise exceptions.ClusterIncompleteError(name)
 
     print(kubeconfig)
 
@@ -384,8 +409,7 @@ def k3s_show(ctx, name=None, namespace=None):
 
     md = c.get_metadata()
     if not md:
-        print('Sorry, that cluster name does not appear to exist')
-        sys.exit(1)
+        raise exceptions.ClusterNotFoundError.does_not_exist(name)
 
     print('Cluster metadata:')
     for k in md:
@@ -408,8 +432,7 @@ def k3s_delete(ctx, name=None, namespace=None):
     # Ensure this name exists
     md = c.get_metadata()
     if not md:
-        print('Sorry, that cluster name does not appear to exist')
-        sys.exit(1)
+        raise exceptions.ClusterNotFoundError.does_not_exist(name)
 
     _emit_debug(ctx, 'Cluster metadata:')
     for k in md:
@@ -487,8 +510,7 @@ def k3s_delete(ctx, name=None, namespace=None):
         p = subprocess.run(
             'kubectl config unset %s' % config_elem, shell=True)
         if p.returncode != 0:
-            print('Could not unset kubectl config element %s' % config_elem)
-            sys.exit(1)
+            raise exceptions.KubeconfigError.unset_failed(config_elem)
 
 
 k3s.add_command(k3s_delete)
@@ -507,8 +529,7 @@ def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
 
     md = c.get_metadata()
     if not md:
-        print('Cluster not found!')
-        sys.exit(1)
+        raise exceptions.ClusterNotFoundError.not_found(name)
 
     p = progress.Progress(total_phases=2, verbose=ctx.obj['VERBOSE'])
     c.progress = p
@@ -534,8 +555,7 @@ def k3s_expand_addresses(ctx, name=None, address_count=None, namespace=None):
 
     md = c.get_metadata()
     if not md:
-        print('Cluster not found!')
-        sys.exit(1)
+        raise exceptions.ClusterNotFoundError.not_found(name)
 
     p = progress.Progress(total_phases=1, verbose=ctx.obj['VERBOSE'])
     c.progress = p
@@ -559,8 +579,7 @@ def k3s_update_os(ctx, name=None, namespace=None):
 
     md = c.get_metadata()
     if not md:
-        print('Cluster not found!')
-        sys.exit(1)
+        raise exceptions.ClusterNotFoundError.not_found(name)
 
     p = progress.Progress(total_phases=1, verbose=ctx.obj['VERBOSE'])
     c.progress = p

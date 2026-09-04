@@ -16,8 +16,9 @@ import json
 from packaging.version import InvalidVersion, Version
 import requests
 from shakenfist_client import apiclient
-import sys
 import time
+
+from shakenfist_client_k3s import exceptions
 
 
 K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
@@ -59,11 +60,8 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
                 'User-Agent': apiclient.get_user_agent()
             })
         if r.status_code not in [200, 201, 204]:
-            print('Unable to determine latest k3s release version')
-            print(f'    GET {url}')
-            print(f'    returned HTTP status code {r.status_code} with text:')
-            print(f'    {r.text}')
-            sys.exit(1)
+            raise exceptions.ReleaseLookupError.http_status(
+                'k3s', url, r.status_code, r.text)
 
         d = r.json()
         releases = {}
@@ -83,10 +81,8 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
         # expires. This mirrors the 'latest is None' guard in
         # get_longhorn_release().
         if not releases:
-            print('No usable k3s release channels found')
-            print(f'    GET {url}')
-            print(f'    returned: {json.dumps(d)[:512]}')
-            sys.exit(1)
+            raise exceptions.ReleaseLookupError.no_usable_k3s_channels(
+                url, json.dumps(d)[:512])
 
         version_cache['releases'] = releases
         version_cache['updated'] = time.time()
@@ -95,8 +91,7 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
 
     most_recent = version_cache['releases'].get(release_channel, None)
     if not most_recent:
-        print(f'Release channel {release_channel} not found')
-        sys.exit(1)
+        raise exceptions.ReleaseLookupError.unknown_channel(release_channel)
 
     _emit_debug(reporter, f'Selected kubernetes version: {most_recent}')
     return most_recent
@@ -134,13 +129,8 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
                 })
 
             if r.status_code not in [200, 201, 204]:
-                print(
-                    'Unable to determine latest Longhorn release version\n'
-                    f'    GET {url}\n'
-                    f'    returned HTTP status code {r.status_code} '
-                    'with text:\n'
-                    f'    {r.text}')
-                sys.exit(1)
+                raise exceptions.ReleaseLookupError.http_status(
+                    'Longhorn', url, r.status_code, r.text)
 
             d = r.json()
             _emit_debug(reporter, 'Fetched release data:')
@@ -167,8 +157,7 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
                 latest = parsed_version
 
         if latest is None:
-            print('Unable to determine the latest Longhorn release')
-            sys.exit(1)
+            raise exceptions.ReleaseLookupError.no_parsable_longhorn_release()
 
         version_cache['releases'] = releases
         version_cache['latest'] = str(latest)

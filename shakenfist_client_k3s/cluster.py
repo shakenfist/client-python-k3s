@@ -19,10 +19,9 @@ standard library and modules this package already imports.
 """
 
 import copy
-import json
-import sys
 import time
 
+from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 
@@ -145,24 +144,23 @@ class Cluster:
         )
         return inst
 
-    def _abort_agent_op_error(self, aop):
-        """Report an agent operation which entered the error state, then exit."""
+    def _agent_op_error(self, aop):
+        """Build the exception for an agent operation which entered the error state.
+
+        This builds the exception rather than raising it so that the
+        ``raise`` is visible at each of the three call sites. The previous
+        version of this method exited the process and so never returned,
+        and all three callers have code immediately after the call which is
+        only correct because it is never reached: the results dict they go
+        on to index is absent or unusable on an errored operation.
+        Returning the exception keeps that control flow explicit rather
+        than resting on a helper's promise not to come back.
+        """
         inst = self.client.get_instance(aop['instance_uuid'])
-
-        print('Agent operation failed!')
-        print('  instance: %s (uuid %s)' % (inst['name'], aop['instance_uuid']))
-        print('  operation: %s' % aop['uuid'])
-        desc = primitives._describe_agent_op(aop, max_len=None)
-        if desc:
-            print('  command: %s' % desc)
-
-        results = aop.get('results', {}) or {}
-        if results:
-            print('  results: %s' % json.dumps(results, indent=4, sort_keys=True))
-        else:
-            print('  no results were recorded, so the command probably failed to start')
-        print("  the server side event log may have more detail: 'sf-client instance events %s'" % inst['name'])
-        sys.exit(1)
+        return exceptions.AgentOperationError(
+            inst['name'], aop['instance_uuid'], aop['uuid'],
+            primitives._describe_agent_op(aop, max_len=None),
+            aop.get('results', {}) or {})
 
     def await_boot(self, instances):
         p = self.get_progress()
@@ -207,7 +205,7 @@ class Cluster:
 
                 errored = [aop for aop in agent_ops if aop['state'] == 'error']
                 if errored:
-                    self._abort_agent_op_error(errored[0])
+                    raise self._agent_op_error(errored[0])
 
                 incomplete = [aop for aop in agent_ops if aop['state'] != 'complete']
                 if not incomplete:
@@ -252,7 +250,7 @@ class Cluster:
         p.wait_done()
 
         if aop['state'] == 'error':
-            self._abort_agent_op_error(aop)
+            raise self._agent_op_error(aop)
 
         blob_uuid = aop['results']['0']['content_blob']
         data = b''
@@ -266,21 +264,16 @@ class Cluster:
             aop = self.client.get_agent_operation(aop['uuid'])
 
         if aop['state'] == 'error':
-            self._abort_agent_op_error(aop)
+            raise self._agent_op_error(aop)
 
         if aop['results']['0']['return-code'] != 0:
             inst = self.client.get_instance(aop['instance_uuid'])
-
-            print('Command failed!')
-            print('  instance: %s (UUID %s)'
-                  % (inst['name'], aop['instance_uuid']))
-            print('  command: %s' % aop['commands'][0]['commandline'])
-            print('exit code: %s' % aop['results']['0']['return-code'])
-            print('   stdout: %s' % '\n   stdout: '.join(
-                aop['results']['0']['stdout'].split('\n')))
-            print('   stderr: %s' % '\n   stderr: '.join(
-                aop['results']['0']['stderr'].split('\n')))
-            sys.exit(1)
+            raise exceptions.CommandFailedError(
+                inst['name'], aop['instance_uuid'],
+                aop['commands'][0]['commandline'],
+                aop['results']['0']['return-code'],
+                aop['results']['0']['stdout'],
+                aop['results']['0']['stderr'])
 
     def create_and_await_instances(self, count, node_type):
         p = self.get_progress()
