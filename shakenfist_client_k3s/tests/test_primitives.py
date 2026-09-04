@@ -259,3 +259,39 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
         self.assertIn('Unable to determine latest Longhorn release version', str(e))
         self.assertIn('GET https://api.github.com/repos/longhorn/longhorn/releases',
                       str(e))
+
+
+class DebugRoutingTestCase(testtools.TestCase):
+    """Debug output goes through the reporter, not a bare print().
+
+    This is the behaviour step 1d buys: a caller with a CollectingReporter
+    gets debug lines back through the reporter instead of them landing on
+    the process's own stdout, which is what happens when _emit_debug()
+    calls print() directly rather than reporter.debug().
+    """
+
+    def test_verbose_debug_reaches_collector_not_stdout(self):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {
+            primitives.K3S_VERSION_CACHE_KEY: {
+                'updated': time.time(),
+                'releases': {'stable': 'v1.30.0+k3s1'}
+            }
+        }
+        reporter = progress.CollectingReporter(verbose=True)
+
+        stdout = io.StringIO()
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request') as mock_request:
+            with contextlib.redirect_stdout(stdout):
+                release = primitives.get_k3s_release(
+                    client, NAMESPACE, reporter, release_channel='stable')
+
+        self.assertEqual('v1.30.0+k3s1', release)
+        mock_request.assert_not_called()
+
+        # Nothing reached the real stdout...
+        self.assertEqual('', stdout.getvalue())
+
+        # ...it all went to the collector instead.
+        self.assertIn('Cached version information from', reporter.getvalue())
+        self.assertIn('Selected kubernetes version: v1.30.0+k3s1', reporter.getvalue())

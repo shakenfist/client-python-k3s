@@ -25,34 +25,29 @@ K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
 LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
 
 
-def _emit_debug(reporter, m):
-    if reporter.verbose:
-        print(m)
-
-
 def get_k3s_release(client, namespace, reporter, force_cache_update=False,
                     release_channel=None):
     if force_cache_update:
         version_cache = {'updated': 0}
-        _emit_debug(reporter, 'Forcing cache update')
+        reporter.debug('Forcing cache update')
     else:
         namespace_md = client.get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             K3S_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
         if not isinstance(version_cache, dict) or 'releases' not in version_cache:
-            _emit_debug(reporter, 'Version cache format invalid, clobbering')
+            reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
     updated = version_cache.get('updated', 0)
 
-    _emit_debug(reporter, (f'Cached version information from {updated}: '
-                           f'{version_cache.get("releases", {})}'))
+    reporter.debug(f'Cached version information from {updated}: '
+                   f'{version_cache.get("releases", {})}')
 
     if time.time() - updated > 24 * 3600:
-        _emit_debug(reporter, 'Updating release version cache')
+        reporter.debug('Updating release version cache')
 
         url = 'https://update.k3s.io/v1-release/channels'
-        _emit_debug(reporter, f'Fetching {url}')
+        reporter.debug(f'Fetching {url}')
         r = requests.request(
             'GET', url,
             headers={
@@ -65,14 +60,14 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
 
         d = r.json()
         releases = {}
-        _emit_debug(reporter, 'Fetched release data:')
-        _emit_debug(reporter, json.dumps(d, indent=4, sort_keys=True))
+        reporter.debug('Fetched release data:')
+        reporter.debug(json.dumps(d, indent=4, sort_keys=True))
         for reldata in d.get('data', []):
             # Some channels (for example v1.16-testing) have no released
             # version and therefore no 'latest' key.
             if 'name' not in reldata or 'latest' not in reldata:
-                _emit_debug(reporter, (f'Channel {reldata.get("name")} has no latest release, '
-                                       'skipping'))
+                reporter.debug(f'Channel {reldata.get("name")} has no latest release, '
+                               'skipping')
                 continue
             releases[reldata['name']] = reldata['latest']
 
@@ -93,34 +88,34 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
     if not most_recent:
         raise exceptions.ReleaseLookupError.unknown_channel(release_channel)
 
-    _emit_debug(reporter, f'Selected kubernetes version: {most_recent}')
+    reporter.debug(f'Selected kubernetes version: {most_recent}')
     return most_recent
 
 
 def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
     if force_cache_update:
         version_cache = {'updated': 0}
-        _emit_debug(reporter, 'Forcing cache update')
+        reporter.debug('Forcing cache update')
     else:
         namespace_md = client.get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             LONGHORN_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
         if not isinstance(version_cache, dict) or 'latest' not in version_cache:
-            _emit_debug(reporter, 'Version cache format invalid, clobbering')
+            reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
     updated = version_cache.get('updated', 0)
 
-    _emit_debug(reporter, (f'Cached version information from {updated}: '
-                           f'{version_cache.get("releases", {})}'))
+    reporter.debug(f'Cached version information from {updated}: '
+                   f'{version_cache.get("releases", {})}')
 
     if time.time() - updated > 24 * 3600:
-        _emit_debug(reporter, 'Updating release version cache')
+        reporter.debug('Updating release version cache')
 
         releases = {}
         for page in range(5):
             url = f'https://api.github.com/repos/longhorn/longhorn/releases?page={page}'
-            _emit_debug(reporter, f'Fetching {url}')
+            reporter.debug(f'Fetching {url}')
             r = requests.request(
                 'GET', url,
                 headers={
@@ -133,8 +128,8 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
                     'Longhorn', url, r.status_code, r.text)
 
             d = r.json()
-            _emit_debug(reporter, 'Fetched release data:')
-            _emit_debug(reporter, json.dumps(d, indent=4, sort_keys=True))
+            reporter.debug('Fetched release data:')
+            reporter.debug(json.dumps(d, indent=4, sort_keys=True))
             for reldata in d:
                 if reldata['prerelease']:
                     continue
@@ -149,7 +144,7 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
             try:
                 parsed_version = Version(tagname)
             except InvalidVersion:
-                _emit_debug(reporter, f'Skipping unparsable tag {tagname}')
+                reporter.debug(f'Skipping unparsable tag {tagname}')
                 continue
             if not latest:
                 latest = parsed_version

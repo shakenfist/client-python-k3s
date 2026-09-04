@@ -23,11 +23,6 @@ from shakenfist_client_k3s.cluster import Cluster
 CLUSTER_LIST = 'orchestrated_k3s_clusters'
 
 
-def _emit_debug(ctx, m):
-    if ctx.obj['VERBOSE']:
-        print(m)
-
-
 def _bind_namespace_context(ctx, namespace):
     """Build what a namespace scoped command needs, and record it in ctx.obj.
 
@@ -84,6 +79,10 @@ class GroupCatchClusterExceptions(click.Group):
         try:
             return super(GroupCatchClusterExceptions, self).invoke(ctx)
         except exceptions.K3sClusterException as e:
+            # Terminal output, deliberately not routed through a reporter:
+            # this is the Click layer converting a raised exception back
+            # into the error line and exit code the command used to
+            # produce directly, on the process's own stdout.
             print(str(e))
             sys.exit(1)
 
@@ -107,6 +106,9 @@ def k3s_list(ctx, namespace=None, ):
     all_clusters = namespace_md.get(CLUSTER_LIST, [])
 
     for cluster in all_clusters:
+        # Terminal output: this command's job is formatting the cluster
+        # list for a human. A library caller wants the list itself, which
+        # step 1e returns instead of printing.
         print(cluster)
 
 
@@ -156,6 +158,7 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     if control_plane_count > 1:
         total_phases += 1
     p = progress.Progress(total_phases=total_phases, verbose=ctx.obj['VERBOSE'])
+    reporter = progress.Reporter(verbose=ctx.obj.get('VERBOSE', False))
 
     # The namespace must be resolved (and exist) before anything looks up
     # namespace metadata, including the version cache.
@@ -163,16 +166,15 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
         ns = ctx.obj['CLIENT'].get_namespace(namespace)
         if not ns:
             ctx.obj['CLIENT'].create_namespace(namespace)
-            print('Created namespace %s' % namespace)
+            reporter.write('Created namespace %s\n' % namespace)
     else:
         namespace = ctx.obj['CLIENT'].namespace
     ctx.obj['namespace'] = namespace
 
-    c = Cluster(ctx.obj['CLIENT'], name, namespace,
-                reporter=progress.Reporter(verbose=ctx.obj.get('VERBOSE', False)))
+    c = Cluster(ctx.obj['CLIENT'], name, namespace, reporter=reporter)
     c.progress = p
 
-    _emit_debug(ctx, 'Looking up k3s versions')
+    c.reporter.debug('Looking up k3s versions')
     target_release = primitives.get_k3s_release(
         c.client, c.namespace, c.reporter,
         force_cache_update=refresh_version_cache,
@@ -215,7 +217,7 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
             ssh_key_content = f.read()
 
     # Initialise the metadata
-    _emit_debug(ctx, 'Initialize cluster metadata')
+    c.reporter.debug('Initialize cluster metadata')
     md = {
         'name': name,
         'namespace': namespace,
@@ -349,6 +351,8 @@ def k3s_query_k3s_version(ctx, release_channel=None, namespace=None,
         client, namespace, reporter,
         force_cache_update=refresh_version_cache,
         release_channel=release_channel)
+    # Terminal output: presentation of the looked up value. A library
+    # caller wants target_release itself, which step 1e returns instead.
     print(f'Release channel {release_channel} has {target_release} as its '
           'latest version.')
 
@@ -370,6 +374,8 @@ def k3s_query_longhorn_version(ctx, namespace=None, refresh_version_cache=False)
     target_release = primitives.get_longhorn_release(
         client, namespace, reporter,
         force_cache_update=refresh_version_cache)
+    # Terminal output: presentation of the looked up value. A library
+    # caller wants target_release itself, which step 1e returns instead.
     print(f'Longhorn has {target_release} as its latest version.')
 
 
@@ -395,6 +401,8 @@ def k3s_getconfig(ctx, name=None, namespace=None):
         # different thing to it not existing at all.
         raise exceptions.ClusterIncompleteError(name)
 
+    # Terminal output: this command's result. A library caller wants the
+    # kubeconfig string itself, which step 1e returns instead of printing.
     print(kubeconfig)
 
 
@@ -411,6 +419,9 @@ def k3s_show(ctx, name=None, namespace=None):
     if not md:
         raise exceptions.ClusterNotFoundError.does_not_exist(name)
 
+    # Terminal output: this command's result, formatted for a human. A
+    # library caller wants the metadata dict itself, which step 1e returns
+    # instead of printing.
     print('Cluster metadata:')
     for k in md:
         print('    %s = %s' % (k, md[k]))
@@ -434,24 +445,24 @@ def k3s_delete(ctx, name=None, namespace=None):
     if not md:
         raise exceptions.ClusterNotFoundError.does_not_exist(name)
 
-    _emit_debug(ctx, 'Cluster metadata:')
+    c.reporter.debug('Cluster metadata:')
     for k in md:
-        _emit_debug(ctx, '    %s = %s' % (k, md[k]))
+        c.reporter.debug('    %s = %s' % (k, md[k]))
 
     # Delete instances
     waiting = []
     for instance_uuid in set(md['control_plane_nodes'] + md['worker_nodes']):
         try:
             inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
-            _emit_debug(ctx, '...Deleting instance %s with uuid %s'
-                        % (inst['name'], instance_uuid))
+            c.reporter.debug('...Deleting instance %s with uuid %s'
+                             % (inst['name'], instance_uuid))
             ctx.obj['CLIENT'].delete_instance(instance_uuid)
             waiting.append(instance_uuid)
         except apiclient.ResourceNotFoundException:
             pass
 
     while waiting:
-        _emit_debug(ctx, '...Waiting for %d instances to be deleted' % len(waiting))
+        c.reporter.debug('...Waiting for %d instances to be deleted' % len(waiting))
         for instance_uuid in copy.copy(waiting):
             try:
                 i = ctx.obj['CLIENT'].get_instance(instance_uuid)
@@ -476,13 +487,13 @@ def k3s_delete(ctx, name=None, namespace=None):
         # Free any routed ips
         for addr in md.get('routed_addresses', []):
             try:
-                _emit_debug(ctx, 'Unrouting address %s from network %s'
-                            % (addr, md['node_network']))
+                c.reporter.debug('Unrouting address %s from network %s'
+                                 % (addr, md['node_network']))
                 ctx.obj['CLIENT'].unroute_network_address(
                     md['node_network'], addr)
             except apiclient.UnauthorizedException:
-                _emit_debug(
-                    ctx, '...Address %s was not routed to this network' % addr)
+                c.reporter.debug(
+                    '...Address %s was not routed to this network' % addr)
 
         # Delete node network
         ctx.obj['CLIENT'].delete_network(md['node_network'])

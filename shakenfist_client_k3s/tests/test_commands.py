@@ -77,3 +77,42 @@ class NamespaceDefaultingTestCase(testtools.TestCase):
         self.assertEqual(0, result.exit_code, result.output)
         self.client.get_namespace_metadata.assert_called_once_with('clientns')
         self.assertIn('v1.33.4+k3s1', result.output)
+
+
+class CreateNamespaceNoticeTestCase(testtools.TestCase):
+    """create's 'Created namespace %s' notice now goes through a reporter.
+
+    Step 1d moves this off a bare print() and onto the reporter that is
+    also handed to the Cluster, so this pins the printed text exactly:
+    routing it must not have changed a single character.
+    """
+
+    def setUp(self):
+        super(CreateNamespaceNoticeTestCase, self).setUp()
+        self.client = mock.MagicMock()
+        self.client.namespace = 'clientns'
+        self.client.get_namespace.return_value = None
+        self.client.get_namespace_metadata.return_value = {
+            primitives.K3S_VERSION_CACHE_KEY: {
+                'updated': time.time(),
+                'releases': {'stable': 'v1.33.4+k3s1'}
+            },
+            # The name is already registered, so create fails fast right
+            # after the namespace-created notice, before touching instances.
+            shakenfist_client_k3s.CLUSTER_LIST: ['banana'],
+        }
+        patcher = mock.patch(
+            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.runner = CliRunner()
+
+    def test_namespace_created_notice_text_is_unchanged(self):
+        result = self.runner.invoke(
+            shakenfist_client_k3s.k3s,
+            ['create', 'banana', '--namespace', 'newns'],
+            obj={'VERBOSE': False})
+
+        self.client.create_namespace.assert_called_once_with('newns')
+        self.assertIn('Created namespace newns\n', result.output)
+        self.assertEqual(1, result.exit_code)
