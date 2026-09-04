@@ -9,13 +9,18 @@ import mock
 import testtools
 
 from shakenfist_client_k3s import primitives
-from shakenfist_client_k3s.cluster import Cluster
+from shakenfist_client_k3s import progress
 
 
-def _make_cluster(client):
-    # The release lookups are namespace scoped rather than cluster scoped,
-    # which is why these clusters have no name.
-    return Cluster(client, None, 'testns')
+# The release lookups are namespace scoped rather than cluster scoped:
+# their caches live in namespace metadata and the commands which use them
+# name no cluster, so they take a client, a namespace and a reporter
+# rather than a Cluster.
+NAMESPACE = 'testns'
+
+
+def _reporter():
+    return progress.Reporter()
 
 
 def _fake_response(payload, status_code=200):
@@ -44,12 +49,12 @@ K3S_CHANNELS = {
 class GetK3sReleaseTestCase(testtools.TestCase):
     def test_channels_without_latest_are_skipped(self):
         client = mock.MagicMock()
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(K3S_CHANNELS)):
             release = primitives.get_k3s_release(
-                cluster, force_cache_update=True, release_channel='stable')
+                client, NAMESPACE, _reporter(), force_cache_update=True,
+                release_channel='stable')
 
         self.assertEqual('v1.33.4+k3s1', release)
 
@@ -64,23 +69,23 @@ class GetK3sReleaseTestCase(testtools.TestCase):
 
     def test_unresolvable_channel_exits(self):
         client = mock.MagicMock()
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(K3S_CHANNELS)):
             self.assertRaises(
                 SystemExit, primitives.get_k3s_release,
-                cluster, force_cache_update=True, release_channel='v1.16-testing')
+                client, NAMESPACE, _reporter(), force_cache_update=True,
+                release_channel='v1.16-testing')
 
     def test_unknown_channel_exits(self):
         client = mock.MagicMock()
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(K3S_CHANNELS)):
             self.assertRaises(
                 SystemExit, primitives.get_k3s_release,
-                cluster, force_cache_update=True, release_channel='banana')
+                client, NAMESPACE, _reporter(), force_cache_update=True,
+                release_channel='banana')
 
     def test_fresh_cache_avoids_fetch(self):
         client = mock.MagicMock()
@@ -90,10 +95,10 @@ class GetK3sReleaseTestCase(testtools.TestCase):
                 'releases': {'stable': 'v1.30.0+k3s1'}
             }
         }
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request') as mock_request:
-            release = primitives.get_k3s_release(cluster, release_channel='stable')
+            release = primitives.get_k3s_release(
+                client, NAMESPACE, _reporter(), release_channel='stable')
 
         self.assertEqual('v1.30.0+k3s1', release)
         mock_request.assert_not_called()
@@ -103,11 +108,11 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         client.get_namespace_metadata.return_value = {
             primitives.K3S_VERSION_CACHE_KEY: 'this is not a dict'
         }
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(K3S_CHANNELS)) as mock_request:
-            release = primitives.get_k3s_release(cluster, release_channel='stable')
+            release = primitives.get_k3s_release(
+                client, NAMESPACE, _reporter(), release_channel='stable')
 
         self.assertEqual('v1.33.4+k3s1', release)
         mock_request.assert_called_once()
@@ -118,13 +123,13 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         # releases dict, which would poison the shared namespace cache
         # until it next expires.
         client = mock.MagicMock()
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response({'error': 'nope'})):
             self.assertRaises(
                 SystemExit, primitives.get_k3s_release,
-                cluster, force_cache_update=True, release_channel='stable')
+                client, NAMESPACE, _reporter(), force_cache_update=True,
+                release_channel='stable')
 
         client.set_namespace_metadata_item.assert_not_called()
 
@@ -135,18 +140,17 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         client.get_namespace_metadata.return_value = {
             primitives.K3S_VERSION_CACHE_KEY: {'updated': time.time()}
         }
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(K3S_CHANNELS)) as mock_request:
-            release = primitives.get_k3s_release(cluster, release_channel='stable')
+            release = primitives.get_k3s_release(
+                client, NAMESPACE, _reporter(), release_channel='stable')
 
         self.assertEqual('v1.33.4+k3s1', release)
         mock_request.assert_called_once()
 
     def test_http_error_exits(self):
         client = mock.MagicMock()
-        cluster = _make_cluster(client)
 
         stdout = io.StringIO()
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
@@ -154,7 +158,8 @@ class GetK3sReleaseTestCase(testtools.TestCase):
             with contextlib.redirect_stdout(stdout):
                 self.assertRaises(
                     SystemExit, primitives.get_k3s_release,
-                    cluster, force_cache_update=True, release_channel='stable')
+                    client, NAMESPACE, _reporter(), force_cache_update=True,
+                    release_channel='stable')
 
         # The error must name the URL we actually fetched, not a literal
         # '{url}' from a missing f-string prefix.
@@ -180,23 +185,22 @@ LONGHORN_RELEASES = [
 class GetLonghornReleaseTestCase(testtools.TestCase):
     def test_prereleases_and_unparsable_tags_are_skipped(self):
         client = mock.MagicMock()
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(LONGHORN_RELEASES)):
-            release = primitives.get_longhorn_release(cluster, force_cache_update=True)
+            release = primitives.get_longhorn_release(
+                client, NAMESPACE, _reporter(), force_cache_update=True)
 
         self.assertEqual('1.6.0', release)
 
     def test_no_valid_releases_exits(self):
         client = mock.MagicMock()
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response([])):
             self.assertRaises(
                 SystemExit, primitives.get_longhorn_release,
-                cluster, force_cache_update=True)
+                client, NAMESPACE, _reporter(), force_cache_update=True)
 
     def test_cache_missing_latest_is_refreshed(self):
         # Caches written before the 'latest' key existed have a fresh
@@ -209,18 +213,17 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
                 'releases': {'1.5.1': 'https://example.com/tarball/v1.5.1'}
             }
         }
-        cluster = _make_cluster(client)
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
                         return_value=_fake_response(LONGHORN_RELEASES)) as mock_request:
-            release = primitives.get_longhorn_release(cluster)
+            release = primitives.get_longhorn_release(
+                client, NAMESPACE, _reporter())
 
         self.assertEqual('1.6.0', release)
         mock_request.assert_called()
 
     def test_http_error_exits(self):
         client = mock.MagicMock()
-        cluster = _make_cluster(client)
 
         stdout = io.StringIO()
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
@@ -228,7 +231,7 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
             with contextlib.redirect_stdout(stdout):
                 self.assertRaises(
                     SystemExit, primitives.get_longhorn_release,
-                    cluster, force_cache_update=True)
+                    client, NAMESPACE, _reporter(), force_cache_update=True)
 
         # The error must blame Longhorn, not k3s, and name the fetched URL.
         self.assertIn('Unable to determine latest Longhorn release version',

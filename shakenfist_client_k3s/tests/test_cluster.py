@@ -5,12 +5,12 @@ import io
 import mock
 import testtools
 
-from shakenfist_client_k3s import primitives
+from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.cluster import Cluster
 
 
-MD_KEY = primitives.METADATA_KEY % 'banana'
+MD_KEY = cluster_module.METADATA_KEY % 'banana'
 
 
 class FakeTty(io.StringIO):
@@ -18,8 +18,8 @@ class FakeTty(io.StringIO):
         return True
 
 
-def _make_cluster(client, name='banana'):
-    return Cluster(client, name, 'testns',
+def _make_cluster(client):
+    return Cluster(client, 'banana', 'testns',
                    reporter=progress.CollectingReporter())
 
 
@@ -98,36 +98,6 @@ class ClusterMetadataTestCase(testtools.TestCase):
         client.delete_namespace_metadata_item.assert_not_called()
 
 
-class NamelessClusterTestCase(testtools.TestCase):
-    """A Cluster with no name is namespace scoped, not cluster scoped.
-
-    list, query-k3s-version and query-longhorn-version all bind with no
-    name, and the release lookups they call only need a client and a
-    namespace. Asking such a cluster for cluster metadata is a programming
-    error, so it raises ValueError rather than one of the exceptions the
-    click layer reports to the user.
-    """
-
-    def test_metadata_operations_are_programming_errors(self):
-        client = mock.MagicMock()
-        cluster = _make_cluster(client, name=None)
-
-        self.assertRaises(ValueError, cluster.get_metadata)
-        self.assertRaises(ValueError, cluster.set_metadata, {'name': 'banana'})
-        self.assertRaises(ValueError, cluster.delete_metadata)
-
-        client.get_namespace_metadata.assert_not_called()
-        client.set_namespace_metadata_item.assert_not_called()
-        client.delete_namespace_metadata_item.assert_not_called()
-
-    def test_namespace_scoped_attributes_still_work(self):
-        client = mock.MagicMock()
-        cluster = _make_cluster(client, name=None)
-
-        self.assertEqual('testns', cluster.namespace)
-        self.assertIs(client, cluster.client)
-
-
 class ClusterProgressTestCase(testtools.TestCase):
     def test_default_reporter_is_stdout_backed(self):
         cluster = Cluster(mock.MagicMock(), 'banana', 'testns')
@@ -165,3 +135,61 @@ class ClusterProgressTestCase(testtools.TestCase):
             noisy = Cluster(mock.MagicMock(), 'banana', 'testns',
                             reporter=progress.Reporter(verbose=True))
             self.assertFalse(noisy.get_progress().interactive)
+
+
+class InstallK3sComponentTestCase(testtools.TestCase):
+    def _install_commands(self, md):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {MD_KEY: md}
+        cluster = Cluster(client, 'banana', 'testns')
+        with mock.patch.object(Cluster, 'execute_and_await') as ea:
+            cluster.install_k3s_component(['uuid-001'], 'token', 'agent')
+            return '\n'.join(ea.call_args[0][1])
+
+    def test_join_uses_join_address(self):
+        cmds = self._install_commands({
+            'k3s_version': 'stable',
+            'join_address': '10.0.0.5',
+            'api_address_inner': '10.0.0.4'
+        })
+        self.assertIn('K3S_URL=https://10.0.0.5:6443', cmds)
+
+    def test_join_falls_back_to_api_address_inner(self):
+        # Clusters created before join_address existed only carry the
+        # older api_address_inner key in their metadata.
+        cmds = self._install_commands({
+            'k3s_version': 'stable',
+            'api_address_inner': '10.0.0.4'
+        })
+        self.assertIn('K3S_URL=https://10.0.0.4:6443', cmds)
+
+
+class AllocateMetallbAddressesTestCase(testtools.TestCase):
+    def _allocate(self, route_results, count):
+        stream = io.StringIO()
+        client = mock.MagicMock()
+        client.get_network.return_value = {'uuid': 'net-1'}
+        client.route_network_address.side_effect = route_results
+        md = {'name': 'banana', 'node_network': 'net-1',
+              'routed_addresses': ['192.168.10.1']}
+        client.get_namespace_metadata.return_value = {MD_KEY: md}
+        cluster = Cluster(client, 'banana', 'testns')
+        cluster.progress = progress.Progress(stream=stream)
+        cluster.allocate_metallb_addresses(count)
+        return stream.getvalue()
+
+    def test_allocation_reports_new_addresses_and_cluster_total(self):
+        out = self._allocate(['192.168.10.2', '192.168.10.3'], 2)
+        self.assertIn('allocated 2 routed addresses: 192.168.10.2, 192.168.10.3', out)
+        self.assertIn('the cluster now has 3', out)
+
+    def test_partial_allocation_notes_shortfall(self):
+        out = self._allocate(['192.168.10.2', None, None], 3)
+        self.assertIn('allocated 1 routed address: 192.168.10.2', out)
+        self.assertIn('(requested 3)', out)
+        self.assertIn('the cluster now has 2', out)
+
+    def test_empty_allocation_reported_without_dangling_list(self):
+        out = self._allocate([None, None], 2)
+        self.assertIn('no routed addresses were available (requested 2)', out)
+        self.assertNotIn('allocated', out)

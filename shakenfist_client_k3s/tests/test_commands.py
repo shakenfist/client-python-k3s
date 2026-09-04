@@ -8,6 +8,7 @@ import mock
 import testtools
 
 import shakenfist_client_k3s
+from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import primitives
 
 
@@ -36,7 +37,7 @@ class NamespaceDefaultingTestCase(testtools.TestCase):
             shakenfist_client_k3s.k3s, args, obj={'VERBOSE': False})
 
     def test_show_defaults_namespace_from_client(self):
-        md_key = primitives.METADATA_KEY % 'banana'
+        md_key = cluster_module.METADATA_KEY % 'banana'
         self.client.get_namespace_metadata.return_value = {
             md_key: {'name': 'banana', 'state': 'created'}}
 
@@ -46,7 +47,7 @@ class NamespaceDefaultingTestCase(testtools.TestCase):
         self.client.get_namespace_metadata.assert_called_once_with('clientns')
 
     def test_show_explicit_namespace_wins(self):
-        md_key = primitives.METADATA_KEY % 'banana'
+        md_key = cluster_module.METADATA_KEY % 'banana'
         self.client.get_namespace_metadata.return_value = {
             md_key: {'name': 'banana', 'state': 'created'}}
 

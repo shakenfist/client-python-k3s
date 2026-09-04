@@ -27,25 +27,38 @@ def _emit_debug(ctx, m):
         print(m)
 
 
-def _bind_cluster_context(ctx, name, namespace):
-    """Build the Cluster the primitives operate on, and record it in ctx.obj.
+def _bind_namespace_context(ctx, namespace):
+    """Build what a namespace scoped command needs, and record it in ctx.obj.
 
-    The --namespace option is None unless the caller passed it, and the
-    primitives pass the cluster's namespace directly to API calls, so it
-    must be defaulted to the client's own namespace here.
+    Returns the client, the resolved namespace and a reporter. The
+    --namespace option is None unless the caller passed it, and the
+    namespace is passed directly to API calls, so it must be defaulted to
+    the client's own namespace here.
+
+    list, query-k3s-version and query-longhorn-version are namespace
+    scoped rather than cluster scoped: they name no cluster, and the
+    release lookups they call cache in namespace metadata. They therefore
+    build no Cluster at all.
+    """
+    client = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
+    ctx.obj['CLIENT'] = client
+    if not namespace:
+        namespace = client.namespace
+    ctx.obj['namespace'] = namespace
+    return client, namespace, progress.Reporter(verbose=ctx.obj.get('VERBOSE', False))
+
+
+def _bind_cluster_context(ctx, name, namespace):
+    """Build the Cluster this command operates on, and record it in ctx.obj.
 
     ctx.obj is still populated because the command bodies in this module
-    read it directly. Only the primitives have moved onto the Cluster so
+    read it directly. Only the orchestration has moved onto the Cluster so
     far; the bodies follow in a later step of the phase 1 plan, which is
     what retires ctx.obj.
     """
+    client, namespace, reporter = _bind_namespace_context(ctx, namespace)
     ctx.obj['name'] = name
-    ctx.obj['CLIENT'] = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
-    if not namespace:
-        namespace = ctx.obj['CLIENT'].namespace
-    ctx.obj['namespace'] = namespace
-    return Cluster(ctx.obj['CLIENT'], name, namespace,
-                   reporter=progress.Reporter(verbose=ctx.obj.get('VERBOSE', False)))
+    return Cluster(client, name, namespace, reporter=reporter)
 
 
 @click.group(help=('k3s kubernetes cluster commands (via the '
@@ -60,8 +73,7 @@ def k3s():
                     'different namespace.'))
 @click.pass_context
 def k3s_list(ctx, namespace=None, ):
-    c = _bind_cluster_context(ctx, None, namespace)
-    namespace = c.namespace
+    _, namespace, _ = _bind_namespace_context(ctx, namespace)
 
     namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
     all_clusters = namespace_md.get(CLUSTER_LIST, [])
@@ -134,7 +146,8 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
 
     _emit_debug(ctx, 'Looking up k3s versions')
     target_release = primitives.get_k3s_release(
-        c, force_cache_update=refresh_version_cache,
+        c.client, c.namespace, c.reporter,
+        force_cache_update=refresh_version_cache,
         release_channel=release_channel)
 
     # Ensure this name isn't already taken
@@ -202,9 +215,8 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
 
     # I'd prefer to wait for these as one thing, but that's not currently a thing
     # the code supports.
-    primitives.create_and_await_instances(
-        c, control_plane_count, 'control_plane')
-    primitives.create_and_await_instances(c, worker_count, 'worker')
+    c.create_and_await_instances(control_plane_count, 'control_plane')
+    c.create_and_await_instances(worker_count, 'worker')
 
     # Record the node network address for the first control plane node as the API
     # address
@@ -220,14 +232,14 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     md['join_address'] = interfaces[0]['ipv4']
     c.set_metadata(md)
 
-    primitives.install_control_plane(c)
-    primitives.install_workers(c)
+    c.install_control_plane()
+    c.install_workers()
 
     # Fetch kubecfg, correct IP, and include cluster name instead of "default"
     p.phase('Fetching cluster credentials')
     aop = ctx.obj['CLIENT'].instance_get(
         md['control_plane_nodes'][0], '/etc/rancher/k3s/k3s.yaml')
-    kubeconfig = primitives.await_fetch(c, aop).replace(
+    kubeconfig = c.await_fetch(aop).replace(
         '127.0.0.1', md['api_address_floating'])
 
     kc = yaml.safe_load(kubeconfig)
@@ -242,8 +254,8 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     c.set_metadata(md)
 
     # Install metallb and longhorn
-    primitives.setup_metallb(c, metal_address_count)
-    primitives.setup_longhorn(c)
+    c.setup_metallb(metal_address_count)
+    c.setup_longhorn()
 
     # Install the kubeconfig we fetched earlier
     p.phase('Updating local kubeconfig')
@@ -306,10 +318,11 @@ k3s.add_command(k3s_create)
 @click.pass_context
 def k3s_query_k3s_version(ctx, release_channel=None, namespace=None,
                           refresh_version_cache=False):
-    c = _bind_cluster_context(ctx, None, namespace)
+    client, namespace, reporter = _bind_namespace_context(ctx, namespace)
 
     target_release = primitives.get_k3s_release(
-        c, force_cache_update=refresh_version_cache,
+        client, namespace, reporter,
+        force_cache_update=refresh_version_cache,
         release_channel=release_channel)
     print(f'Release channel {release_channel} has {target_release} as its '
           'latest version.')
@@ -327,10 +340,11 @@ k3s.add_command(k3s_query_k3s_version)
               help=('Force a refresh of the longhorn version cache.'))
 @click.pass_context
 def k3s_query_longhorn_version(ctx, namespace=None, refresh_version_cache=False):
-    c = _bind_cluster_context(ctx, None, namespace)
+    client, namespace, reporter = _bind_namespace_context(ctx, namespace)
 
     target_release = primitives.get_longhorn_release(
-        c, force_cache_update=refresh_version_cache)
+        client, namespace, reporter,
+        force_cache_update=refresh_version_cache)
     print(f'Longhorn has {target_release} as its latest version.')
 
 
@@ -498,8 +512,8 @@ def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
 
     p = progress.Progress(total_phases=2, verbose=ctx.obj['VERBOSE'])
     c.progress = p
-    primitives.create_and_await_instances(c, worker_count, 'worker')
-    primitives.install_workers(c)
+    c.create_and_await_instances(worker_count, 'worker')
+    c.install_workers()
     p.finish(f'Added {worker_count} workers to cluster {name}')
 
 
@@ -526,8 +540,8 @@ def k3s_expand_addresses(ctx, name=None, address_count=None, namespace=None):
     p = progress.Progress(total_phases=1, verbose=ctx.obj['VERBOSE'])
     c.progress = p
     p.phase('Adding metallb addresses')
-    primitives.allocate_metallb_addresses(c, address_count)
-    primitives.configure_metallb_addresses(c)
+    c.allocate_metallb_addresses(address_count)
+    c.configure_metallb_addresses()
     p.finish(f'Added {address_count} metallb addresses to cluster {name}')
 
 
@@ -551,8 +565,7 @@ def k3s_update_os(ctx, name=None, namespace=None):
     p = progress.Progress(total_phases=1, verbose=ctx.obj['VERBOSE'])
     c.progress = p
     p.phase('Updating the OS on all cluster nodes')
-    primitives.instance_os_update(
-        c, md['control_plane_nodes'] + md['worker_nodes'])
+    c.instance_os_update(md['control_plane_nodes'] + md['worker_nodes'])
     p.finish(f'Updated the OS on all nodes in cluster {name}')
 
 

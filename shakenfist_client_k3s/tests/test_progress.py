@@ -13,6 +13,7 @@ import mock
 import testtools
 
 import shakenfist_client_k3s
+from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.cluster import Cluster
@@ -403,50 +404,22 @@ class DescribeAgentOpTestCase(testtools.TestCase):
         self.assertIsNone(primitives._describe_agent_op({'commands': [], 'results': {}}))
 
 
-class InstallK3sComponentTestCase(testtools.TestCase):
-    def _install_commands(self, md):
-        client = mock.MagicMock()
-        client.get_namespace_metadata.return_value = {
-            primitives.METADATA_KEY % 'banana': md}
-        cluster = Cluster(client, 'banana', 'testns')
-        with mock.patch('shakenfist_client_k3s.primitives.execute_and_await') as ea:
-            primitives.install_k3s_component(cluster, ['uuid-001'], 'token', 'agent')
-            return '\n'.join(ea.call_args[0][2])
-
-    def test_join_uses_join_address(self):
-        cmds = self._install_commands({
-            'k3s_version': 'stable',
-            'join_address': '10.0.0.5',
-            'api_address_inner': '10.0.0.4'
-        })
-        self.assertIn('K3S_URL=https://10.0.0.5:6443', cmds)
-
-    def test_join_falls_back_to_api_address_inner(self):
-        # Clusters created before join_address existed only carry the
-        # older api_address_inner key in their metadata.
-        cmds = self._install_commands({
-            'k3s_version': 'stable',
-            'api_address_inner': '10.0.0.4'
-        })
-        self.assertIn('K3S_URL=https://10.0.0.4:6443', cmds)
-
-
 class WaitLoopTestCase(testtools.TestCase):
     def setUp(self):
         super().setUp()
         self.clock = FakeClock()
         for target, replacement in [
                 ('shakenfist_client_k3s.progress.time.time', self.clock),
-                ('shakenfist_client_k3s.primitives.time.sleep',
+                ('shakenfist_client_k3s.cluster.time.sleep',
                  lambda seconds: self.clock.advance(seconds))]:
             patcher = mock.patch(target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
 
     def _make_cluster(self, client, stream):
-        # The wait loops are cluster agnostic, so these clusters have no
-        # name and never read cluster metadata.
-        cluster = Cluster(client, None, 'testns')
+        # The wait loops never read cluster metadata, so the name here is
+        # only there because a Cluster is always a named cluster.
+        cluster = Cluster(client, 'banana', 'testns')
         cluster.progress = progress.Progress(stream=stream)
         return cluster
 
@@ -456,7 +429,7 @@ class WaitLoopTestCase(testtools.TestCase):
             'name': 'node-001', 'state': 'created', 'agent_state': 'ready'}
         cluster = self._make_cluster(client, io.StringIO())
 
-        primitives.await_boot(cluster, ['uuid-001'])
+        cluster.await_boot(['uuid-001'])
 
         # The OS update was previously triggered implicitly from within
         # await_boot(), which made the subsequent idle wait impossible to
@@ -479,7 +452,7 @@ class WaitLoopTestCase(testtools.TestCase):
         stream = io.StringIO()
         cluster = self._make_cluster(client, stream)
 
-        primitives.await_idle(cluster, ['uuid-001'])
+        cluster.await_idle(['uuid-001'])
 
         self.assertEqual(
             "  node-001: running 'apt-get update' (1 operation remaining) (0s)\n"
@@ -503,7 +476,7 @@ class WaitLoopTestCase(testtools.TestCase):
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.await_idle, cluster, ['uuid-001'])
+            e = self.assertRaises(SystemExit, cluster.await_idle, ['uuid-001'])
 
         self.assertEqual(1, e.code)
         self.assertIn('operation: aop-002', captured.getvalue())
@@ -526,7 +499,7 @@ class WaitLoopTestCase(testtools.TestCase):
 
         # An operation which had already failed before the wait started must
         # neither wedge the wait nor abort it.
-        primitives.await_idle(cluster, ['uuid-001'])
+        cluster.await_idle(['uuid-001'])
         self.assertIn('node-001: idle', stream.getvalue())
 
     def test_await_idle_notes_stalled_command(self):
@@ -543,12 +516,12 @@ class WaitLoopTestCase(testtools.TestCase):
         # The loop polls every five seconds, so this is enough polls to pass
         # the stall warning threshold with some slack to show the warning is
         # only emitted once.
-        polls = primitives.STALL_WARNING_SECONDS // 5 + 10
+        polls = cluster_module.STALL_WARNING_SECONDS // 5 + 10
         client.get_instance_agentoperations.side_effect = [[]] + [[running]] * polls + [[]]
         stream = io.StringIO()
         cluster = self._make_cluster(client, stream)
 
-        primitives.await_idle(cluster, ['uuid-001'])
+        cluster.await_idle(['uuid-001'])
 
         self.assertIn('may be stalled', stream.getvalue())
         self.assertIn('aop-001', stream.getvalue())
@@ -568,7 +541,7 @@ class WaitLoopTestCase(testtools.TestCase):
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.await_fetch, cluster, aop)
+            e = self.assertRaises(SystemExit, cluster.await_fetch, aop)
 
         self.assertEqual(1, e.code)
         self.assertIn('get-file /missing', captured.getvalue())
@@ -587,7 +560,7 @@ class WaitLoopTestCase(testtools.TestCase):
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.reap_execute, cluster, aop)
+            e = self.assertRaises(SystemExit, cluster.reap_execute, aop)
 
         self.assertEqual(1, e.code)
         self.assertIn('operation: aop-004', captured.getvalue())
@@ -607,43 +580,11 @@ class WaitLoopTestCase(testtools.TestCase):
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.reap_execute, cluster, aop)
+            e = self.assertRaises(SystemExit, cluster.reap_execute, aop)
 
         self.assertEqual(1, e.code)
         self.assertIn('   stderr: timed out on pod one\n'
                       '   stderr: timed out on pod two', captured.getvalue())
-
-
-class AllocateMetallbAddressesTestCase(testtools.TestCase):
-    def _allocate(self, route_results, count):
-        stream = io.StringIO()
-        client = mock.MagicMock()
-        client.get_network.return_value = {'uuid': 'net-1'}
-        client.route_network_address.side_effect = route_results
-        md = {'name': 'banana', 'node_network': 'net-1',
-              'routed_addresses': ['192.168.10.1']}
-        client.get_namespace_metadata.return_value = {
-            primitives.METADATA_KEY % 'banana': md}
-        cluster = Cluster(client, 'banana', 'testns')
-        cluster.progress = progress.Progress(stream=stream)
-        primitives.allocate_metallb_addresses(cluster, count)
-        return stream.getvalue()
-
-    def test_allocation_reports_new_addresses_and_cluster_total(self):
-        out = self._allocate(['192.168.10.2', '192.168.10.3'], 2)
-        self.assertIn('allocated 2 routed addresses: 192.168.10.2, 192.168.10.3', out)
-        self.assertIn('the cluster now has 3', out)
-
-    def test_partial_allocation_notes_shortfall(self):
-        out = self._allocate(['192.168.10.2', None, None], 3)
-        self.assertIn('allocated 1 routed address: 192.168.10.2', out)
-        self.assertIn('(requested 3)', out)
-        self.assertIn('the cluster now has 2', out)
-
-    def test_empty_allocation_reported_without_dangling_list(self):
-        out = self._allocate([None, None], 2)
-        self.assertIn('no routed addresses were available (requested 2)', out)
-        self.assertNotIn('allocated', out)
 
 
 # A minimal kubeconfig in the shape k3s writes, pointing at the loopback
