@@ -99,7 +99,7 @@ class CreateNamespaceNoticeTestCase(testtools.TestCase):
             },
             # The name is already registered, so create fails fast right
             # after the namespace-created notice, before touching instances.
-            shakenfist_client_k3s.CLUSTER_LIST: ['banana'],
+            primitives.CLUSTER_LIST: ['banana'],
         }
         patcher = mock.patch(
             'shakenfist_client_k3s.apiclient.Client', return_value=self.client)

@@ -275,6 +275,10 @@ Each of these is checkable, and most are one command:
   the group and all nine subcommands.
 - The step 1f test that drives `Cluster` create-through-delete against
   a mocked client asserts an empty `sys.stdout`, and passes.
+- That test asserts on `sys.stdout`, which is not the same as the
+  process's file descriptor 1, and one known path escapes it. See
+  "The kubectl unset leak" below; step 1f must pin that leak with a
+  test that names it, rather than leaving the stronger claim implied.
 - `tox -epy3`, `tox -eflake8`, `flake8 shakenfist_client_k3s` and
   `pre-commit run --all-files` all pass.
 - `python3 -c 'import shakenfist_client_k3s'` succeeds.
@@ -286,6 +290,32 @@ Each of these is checkable, and most are one command:
 - The master plan's Execution table records this phase's merge commit
   in its `Merged` column, because phase 6 audits the accumulated diff
   and that range is not recoverable afterwards.
+
+## The kubectl unset leak
+
+Found while verifying step 1e, by driving the whole lifecycle without
+mocking `subprocess`.
+
+`Cluster.delete()` runs `kubectl config unset` three times through
+`subprocess.run(..., shell=True)` with no `capture_output`
+(`cluster.py:862-863`). The child inherits the process's file
+descriptor 1, so kubectl's three `Property "..." unset.` lines go
+straight to the real stdout, bypassing Python's `sys.stdout` and
+therefore the reporter entirely. Every other side effect in the file
+is clean: the create-side merge at `cluster.py:712-715` passes
+`capture_output=True`, and the kubeconfig writes are file writes.
+
+This matters because it is exactly the property the phase exists to
+establish. An Ansible module must own stdout for its JSON result, and
+while `delete()` runs it does not. The phase's own empty-stdout test
+cannot see this, because it mocks `subprocess.run`.
+
+It is **not** fixed in this phase, for the reason decision 7 gives:
+capturing that output would remove three lines a `sf-client k3s
+delete` prints today, and this phase changes no user-visible output.
+It belongs with phase 3's "kubeconfig side effects opt-out" work in
+the master plan, which is already the row that owns this code, and it
+is recorded there.
 
 ## Back brief
 

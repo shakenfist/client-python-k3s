@@ -21,8 +21,26 @@ import time
 from shakenfist_client_k3s import exceptions
 
 
+# The namespace metadata key the list of managed clusters is stored under.
+# It lives here rather than in the package __init__ because it is namespace
+# scoped state, alongside the two version caches below, and because both
+# cluster.py and the CLI need to reach it without importing each other.
+CLUSTER_LIST = 'orchestrated_k3s_clusters'
+
 K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
 LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
+
+
+def list_clusters(client, namespace):
+    """Return the names of the managed k3s clusters in a namespace.
+
+    Namespace scoped rather than cluster scoped: there is no cluster to
+    build here, only the list in namespace metadata which create appends to
+    and delete removes from. This takes no reporter because it emits
+    nothing -- the caller decides what to do with the list.
+    """
+    namespace_md = client.get_namespace_metadata(namespace)
+    return namespace_md.get(CLUSTER_LIST, [])
 
 
 def get_k3s_release(client, namespace, reporter, force_cache_update=False,

@@ -169,7 +169,7 @@ class CommandExceptionTestCase(ClientTestCase):
     def test_delete_kubectl_unset_failure(self):
         completed = mock.MagicMock()
         completed.returncode = 1
-        with mock.patch('shakenfist_client_k3s.subprocess.run',
+        with mock.patch('subprocess.run',
                         return_value=completed):
             e = self._assert_raises(
                 shakenfist_client_k3s.k3s_delete, ['banana'],
@@ -274,7 +274,7 @@ class GroupHandlerTestCase(ClientTestCase):
     def test_delete_kubectl_unset_failure(self):
         completed = mock.MagicMock()
         completed.returncode = 1
-        with mock.patch('shakenfist_client_k3s.subprocess.run',
+        with mock.patch('subprocess.run',
                         return_value=completed):
             self._assert_cli_failure(
                 ['delete', 'banana'],

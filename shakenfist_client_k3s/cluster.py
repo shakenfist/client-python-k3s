@@ -15,11 +15,26 @@ one.
 
 Because ``shakenfist_client_k3s`` is imported unconditionally by the
 ``sf-client`` plugin loader, this module imports nothing beyond the
-standard library and modules this package already imports.
+standard library and modules this package already imports. That includes
+the ``importlib.metadata`` guard below, which moved here with
+``Cluster.create()``: it is the same try/except the package __init__
+carried, for the same reason (``importlib.metadata`` is only in the
+standard library from Python 3.8, and this package supports 3.7).
 """
 
 import copy
+import os
+from shakenfist_client import apiclient
+import shutil
+import subprocess
+import tempfile
 import time
+import yaml
+
+try:
+    from importlib.metadata import version as distribution_version
+except ImportError:
+    from importlib_metadata import version as distribution_version
 
 from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
@@ -516,3 +531,384 @@ class Cluster:
                     '"storageclass.kubernetes.io/is-default-class":"false"}}}\''
                 )
             ])
+
+    # The methods below are the whole of a k3s command: each one was the
+    # body of a Click command in shakenfist_client_k3s/__init__.py, and the
+    # command is now argument parsing plus one call into here. They return
+    # values rather than printing them, so that a library caller gets the
+    # result and the CLI keeps the formatting.
+    #
+    # Their arguments are what the corresponding command line options carry,
+    # minus the name and namespace, which are the Cluster's own. Where an
+    # argument is genuinely optional it keeps the option's default, so that
+    # omitting it gives the command line's behaviour; where it is not -- the
+    # three counts create needs -- it is required, because None is not a
+    # workable value for any of them and there is no sensible default for
+    # the shape of somebody else's cluster.
+
+    def create(self, control_plane_count, worker_count, metal_address_count,
+               network=None, refresh_version_cache=False,
+               release_channel='stable', sshkey=None):
+        """Build this cluster, from nothing to a working k3s.
+
+        The namespace must already exist. The command line creates it when
+        --namespace named one which does not, because only the command line
+        knows whether the option was passed at all; see
+        _bind_new_cluster_context() in this package's __init__.
+
+        Writing ~/.kube/config, and shelling out to kubectl to merge into
+        an existing one, are unconditional here because they are
+        unconditional in the command this replaces. Making them optional is
+        phase 3: doing it here would put a behaviour change inside a
+        refactor whose entire safety argument is that behaviour is
+        unchanged.
+        """
+        # Phases: create control plane nodes, create workers, install control
+        # plane, install workers, fetch credentials, metallb, longhorn, and
+        # update the local kubeconfig. Creating a node network and installing
+        # additional control plane nodes only sometimes happen.
+        total_phases = 8
+        if not network:
+            total_phases += 1
+        if control_plane_count > 1:
+            total_phases += 1
+        p = progress.Progress(
+            total_phases=total_phases, verbose=self.reporter.verbose,
+            stream=self.reporter)
+        self.progress = p
+
+        self.reporter.debug('Looking up k3s versions')
+        target_release = primitives.get_k3s_release(
+            self.client, self.namespace, self.reporter,
+            force_cache_update=refresh_version_cache,
+            release_channel=release_channel)
+
+        # Ensure this name isn't already taken
+        namespace_md = self.client.get_namespace_metadata(self.namespace)
+        all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
+        md = self.get_metadata()
+
+        if self.name in all_clusters:
+            raise exceptions.ClusterExistsError(self.name)
+        if md:
+            raise exceptions.ClusterExistsError(self.name)
+        all_clusters.append(self.name)
+        self.client.set_namespace_metadata_item(
+            self.namespace, primitives.CLUSTER_LIST, all_clusters)
+
+        # Create a network for nodes
+        if network:
+            node_network = self.client.get_network(network)
+            if not node_network:
+                raise exceptions.NetworkNotFoundError(network)
+        else:
+            p.phase('Creating node network')
+            node_network = self.client.allocate_network(
+                '10.0.0.0/16', True, True, 'k3s-%s-node' % self.name,
+                namespace=self.namespace)
+            p.note('created %s (uuid %s)' % (node_network['name'], node_network['uuid']))
+            while True:
+                node_network = self.client.get_network(node_network['uuid'])
+                p.update(node_network['name'], 'state %s' % node_network['state'])
+                if node_network['state'] == 'created':
+                    break
+                time.sleep(1)
+            p.wait_done()
+
+        # Read the ssh key if any
+        ssh_key_content = None
+        if sshkey:
+            with open(sshkey) as f:
+                ssh_key_content = f.read()
+
+        # Initialise the metadata
+        self.reporter.debug('Initialize cluster metadata')
+        md = {
+            'name': self.name,
+            'namespace': self.namespace,
+            'type': 'k3s',
+            'k3s_version': target_release,
+            'k3s_version_history': [target_release],
+            'plugin_version': distribution_version('shakenfist_client_k3s'),
+            'state': 'initial',
+            'node_serial': 1,
+            'node_network': node_network['uuid'],
+            'node_token': None,
+            'control_plane_nodes': [],
+            'worker_nodes': [],
+            'routed_addresses': [],
+            'ssh_key': ssh_key_content
+        }
+        self.set_metadata(md)
+
+        # We really should do a pre-fetch on the disk image and wait for it to
+        # download before starting instances. That way the point of slowness is
+        # more obvious. That requires cluster operations to exist though.
+
+        # I'd prefer to wait for these as one thing, but that's not currently a thing
+        # the code supports.
+        self.create_and_await_instances(control_plane_count, 'control_plane')
+        self.create_and_await_instances(worker_count, 'worker')
+
+        # Record the node network address for the first control plane node as the API
+        # address
+        interfaces = self.client.get_instance_interfaces(md['control_plane_nodes'][0])
+        md['api_address_inner'] = interfaces[0]['ipv4']
+        md['api_address_floating'] = interfaces[0]['floating']
+
+        # The join address is the address new nodes register through, and is
+        # deliberately mutable cluster state rather than "the first control
+        # plane node's address": a future control plane replacement joins the
+        # new server via the old address, updates join_address, and then reaps
+        # the old node. k3s agents only need this address at registration time.
+        md['join_address'] = interfaces[0]['ipv4']
+        self.set_metadata(md)
+
+        self.install_control_plane()
+        self.install_workers()
+
+        # Fetch kubecfg, correct IP, and include cluster name instead of "default"
+        p.phase('Fetching cluster credentials')
+        aop = self.client.instance_get(
+            md['control_plane_nodes'][0], '/etc/rancher/k3s/k3s.yaml')
+        kubeconfig = self.await_fetch(aop).replace(
+            '127.0.0.1', md['api_address_floating'])
+
+        kc = yaml.safe_load(kubeconfig)
+        fqcn = '%s.%s' % (self.name, self.namespace)
+        kc['clusters'][0]['name'] = fqcn
+        kc['contexts'][0]['name'] = fqcn
+        kc['contexts'][0]['context']['cluster'] = fqcn
+        kc['contexts'][0]['context']['user'] = fqcn
+        kc['users'][0]['name'] = fqcn
+        kc['current-context'] = fqcn
+        md['kubeconfig'] = yaml.dump(kc)
+        self.set_metadata(md)
+
+        # Install metallb and longhorn
+        self.setup_metallb(metal_address_count)
+        self.setup_longhorn()
+
+        # Install the kubeconfig we fetched earlier
+        p.phase('Updating local kubeconfig')
+        kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
+        main_config_path = os.path.join(kube_dir, 'config')
+        os.makedirs(kube_dir, exist_ok=True)
+
+        if not os.path.exists(main_config_path):
+            # There is no existing configuration to preserve, so no merge is
+            # required and we don't need a local kubectl.
+            with open(main_config_path, 'w') as f:
+                f.write(yaml.dump(kc))
+        else:
+            if not shutil.which('kubectl'):
+                raise exceptions.KubeconfigError.missing_kubectl(
+                    main_config_path, self.name)
+
+            with tempfile.TemporaryDirectory() as tempdir:
+                new_config_path = os.path.join(tempdir, 'config')
+                with open(new_config_path, 'w') as f:
+                    f.write(yaml.dump(kc))
+                merged = subprocess.run(
+                    'kubectl config view --flatten', shell=True, capture_output=True,
+                    env={**os.environ,
+                         'KUBECONFIG': '%s:%s' % (main_config_path, new_config_path)})
+                if merged.returncode != 0:
+                    # kubectl's stderr arrives as bytes, and was decoded at the
+                    # point it was printed; decode it here so the exception
+                    # renders exactly the same text.
+                    stderr = None
+                    if merged.stderr:
+                        stderr = merged.stderr.decode('utf-8', errors='replace')
+                    raise exceptions.KubeconfigError.merge_failed(
+                        main_config_path, merged.returncode, stderr)
+
+                # kubectl's merge keeps the pre-existing file's current-context,
+                # which would leave kubectl pointed at whatever cluster was
+                # active before this create. Select the new cluster, matching
+                # the no-merge path above.
+                merged_kc = yaml.safe_load(merged.stdout)
+                merged_kc['current-context'] = fqcn
+                with open(main_config_path, 'w') as f:
+                    f.write(yaml.dump(merged_kc))
+
+        md['state'] = 'created'
+        self.set_metadata(md)
+        p.finish(f'Cluster {self.name} is ready')
+
+    def get_kubeconfig(self):
+        """Return this cluster's kubeconfig, as a string.
+
+        This is the body of ``sf-client k3s getconfig``, which prints what
+        this returns.
+        """
+        md = self.get_metadata()
+        if not md:
+            raise exceptions.ClusterNotFoundError.unknown_cluster(self.name)
+
+        kubeconfig = md.get('kubeconfig')
+        if not kubeconfig:
+            # The cluster exists, it is just not finished, which is a
+            # different thing to it not existing at all.
+            raise exceptions.ClusterIncompleteError(self.name)
+
+        return kubeconfig
+
+    def show(self):
+        """Return this cluster's metadata, or raise if there is no such cluster.
+
+        This is the body of ``sf-client k3s show``, which formats what this
+        returns. It differs from get_metadata() only in insisting that the
+        cluster exists, and in the error it raises when it does not.
+        """
+        md = self.get_metadata()
+        if not md:
+            raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+        return md
+
+    def delete(self):
+        """Destroy this cluster and everything created alongside it.
+
+        This is the body of ``sf-client k3s delete``. Removing this
+        cluster's entries from the local ~/.kube/config with kubectl is
+        unconditional here because it is unconditional in the command this
+        replaces; phase 3 makes it optional.
+        """
+        # Ensure this name exists
+        md = self.get_metadata()
+        if not md:
+            raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+
+        self.reporter.debug('Cluster metadata:')
+        for k in md:
+            self.reporter.debug('    %s = %s' % (k, md[k]))
+
+        # Delete instances
+        waiting = []
+        for instance_uuid in set(md['control_plane_nodes'] + md['worker_nodes']):
+            try:
+                inst = self.client.get_instance(instance_uuid)
+                self.reporter.debug('...Deleting instance %s with uuid %s'
+                                    % (inst['name'], instance_uuid))
+                self.client.delete_instance(instance_uuid)
+                waiting.append(instance_uuid)
+            except apiclient.ResourceNotFoundException:
+                pass
+
+        while waiting:
+            self.reporter.debug(
+                '...Waiting for %d instances to be deleted' % len(waiting))
+            for instance_uuid in copy.copy(waiting):
+                try:
+                    i = self.client.get_instance(instance_uuid)
+                    if i['state'] == 'deleted':
+                        waiting.remove(instance_uuid)
+                except apiclient.ResourceNotFoundException:
+                    waiting.remove(instance_uuid)
+
+            if waiting:
+                time.sleep(1)
+
+        md['control_plane_nodes'] = []
+        md['worker_nodes'] = []
+        md['api_floating_address'] = None
+        md['api_inner_address'] = None
+        md['k3s_version'] = None
+        md['kubeconfig'] = None
+        md['node_token'] = None
+        self.set_metadata(md)
+
+        if md.get('node_network'):
+            # Free any routed ips
+            for addr in md.get('routed_addresses', []):
+                try:
+                    self.reporter.debug('Unrouting address %s from network %s'
+                                        % (addr, md['node_network']))
+                    self.client.unroute_network_address(
+                        md['node_network'], addr)
+                except apiclient.UnauthorizedException:
+                    self.reporter.debug(
+                        '...Address %s was not routed to this network' % addr)
+
+            # Delete node network. This deletes the node network whether or
+            # not create allocated it, so a network handed to
+            # "create --network" is destroyed along with the cluster which
+            # borrowed it. That is shakenfist/client-python-k3s#41, and it is
+            # preserved here deliberately: this step moves code without
+            # changing what it does, and the fix belongs in its own change.
+            self.client.delete_network(md['node_network'])
+            md['node_network'] = []
+
+        md['state'] = 'deleted'
+        self.set_metadata(md)
+
+        # Then remove the metadata
+        self.delete_metadata()
+        namespace_md = self.client.get_namespace_metadata(self.namespace)
+        all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
+        all_clusters.remove(self.name)
+        if not all_clusters:
+            self.client.delete_namespace_metadata_item(
+                self.namespace, primitives.CLUSTER_LIST)
+        else:
+            self.client.set_namespace_metadata_item(
+                self.namespace, primitives.CLUSTER_LIST, all_clusters)
+
+        # And remove the local config
+        fqcn = '%s.%s' % (self.name, self.namespace)
+        for config_elem in ['users.%s' % fqcn,
+                            'contexts.%s' % fqcn,
+                            'clusters.%s' % fqcn]:
+            p = subprocess.run(
+                'kubectl config unset %s' % config_elem, shell=True)
+            if p.returncode != 0:
+                raise exceptions.KubeconfigError.unset_failed(config_elem)
+
+    def expand_workers(self, worker_count):
+        """Add worker nodes to this cluster.
+
+        This is the body of ``sf-client k3s expand-workers``.
+        """
+        md = self.get_metadata()
+        if not md:
+            raise exceptions.ClusterNotFoundError.not_found(self.name)
+
+        p = progress.Progress(
+            total_phases=2, verbose=self.reporter.verbose, stream=self.reporter)
+        self.progress = p
+        self.create_and_await_instances(worker_count, 'worker')
+        self.install_workers()
+        p.finish(f'Added {worker_count} workers to cluster {self.name}')
+
+    def expand_addresses(self, address_count):
+        """Route more floating addresses into this cluster for metallb to hand out.
+
+        This is the body of ``sf-client k3s expand-addresses``.
+        """
+        md = self.get_metadata()
+        if not md:
+            raise exceptions.ClusterNotFoundError.not_found(self.name)
+
+        p = progress.Progress(
+            total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)
+        self.progress = p
+        p.phase('Adding metallb addresses')
+        self.allocate_metallb_addresses(address_count)
+        self.configure_metallb_addresses()
+        p.finish(f'Added {address_count} metallb addresses to cluster {self.name}')
+
+    def update_os(self):
+        """Update the base OS packages on every node in this cluster.
+
+        This is the body of ``sf-client k3s update-os``.
+        """
+        md = self.get_metadata()
+        if not md:
+            raise exceptions.ClusterNotFoundError.not_found(self.name)
+
+        p = progress.Progress(
+            total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)
+        self.progress = p
+        p.phase('Updating the OS on all cluster nodes')
+        self.instance_os_update(md['control_plane_nodes'] + md['worker_nodes'])
+        p.finish(f'Updated the OS on all nodes in cluster {self.name}')
