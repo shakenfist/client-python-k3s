@@ -272,7 +272,7 @@ Each of these is checkable, and most are one command:
   does the same for `cluster.py`. Every surviving `print()` in
   `__init__.py` has a comment saying why it is terminal formatting.
 - The golden `--help` fixtures from step 1a still pass unmodified, for
-  the group and all nine subcommands.
+  the group and all ten subcommands.
 - The step 1f test that drives `Cluster` create-through-delete against
   a mocked client asserts an empty `sys.stdout`, and passes.
 - That test asserts on `sys.stdout`, which is not the same as the
