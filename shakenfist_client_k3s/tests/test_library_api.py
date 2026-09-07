@@ -111,6 +111,10 @@ class ClusterLifecycleTestCase(LibraryTestCase):
         # because the wait loops compare dict values against literals such
         # as 'created' and 'ready'; a MagicMock equals none of them and
         # every wait would spin forever. See tests/fakes.py.
+        #
+        # sys.stdout is not the process's file descriptor 1, and delete's
+        # kubectl calls escape this assertion. That is a known defect, and
+        # it is pinned by KubectlUnsetLeakTestCase at the end of this file.
         c = self._cluster()
 
         captured = io.StringIO()
@@ -326,3 +330,137 @@ class ListClustersTestCase(testtools.TestCase):
         client = mock.MagicMock()
         client.get_namespace_metadata.return_value = {}
         self.assertEqual([], primitives.list_clusters(client, 'testns'))
+
+
+# Enough cluster metadata for delete to run straight to the local kubectl
+# cleanup: no nodes to wait for and no node network to unroute addresses
+# from.
+DELETABLE_MD = {
+    'name': 'banana', 'namespace': 'testns', 'state': 'created',
+    'control_plane_nodes': [], 'worker_nodes': [], 'routed_addresses': [],
+    'node_network': None,
+}
+
+
+class LocalKubeconfigFailureTestCase(LibraryTestCase):
+    """create's two local kubeconfig failures, raised where they happen.
+
+    Both only occur when there is an existing ~/.kube/config to merge
+    into, so each test writes one first. They are the last two exception
+    constructors in the hierarchy without a test which drives the code
+    that raises them, as opposed to constructing them directly.
+    """
+
+    def _write_existing_kubeconfig(self):
+        kube_dir = os.path.join(self.home, '.kube')
+        os.makedirs(kube_dir)
+        with open(os.path.join(kube_dir, 'config'), 'w') as f:
+            f.write(yaml.dump({
+                'apiVersion': 'v1',
+                'kind': 'Config',
+                'clusters': [{'name': 'other',
+                              'cluster': {'server': 'https://192.168.10.1:6443'}}],
+                'contexts': [{'name': 'other',
+                              'context': {'cluster': 'other', 'user': 'other'}}],
+                'users': [{'name': 'other', 'user': {'token': 'x'}}],
+                'current-context': 'other'}))
+        return os.path.join(kube_dir, 'config')
+
+    def test_create_without_a_local_kubectl(self):
+        main_config_path = self._write_existing_kubeconfig()
+        c = self._cluster()
+
+        captured = io.StringIO()
+        with mock.patch('shutil.which', return_value=None):
+            with mock.patch('sys.stdout', captured):
+                e = self.assertRaises(exceptions.KubeconfigError, c.create, 1, 1, 1)
+
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual('missing_kubectl', e.reason)
+        self.assertEqual(main_config_path, e.main_config_path)
+        self.assertEqual('banana', e.name)
+        self.assertIn("'sf-client k3s getconfig banana'", str(e))
+
+    def test_create_when_the_kubectl_merge_fails(self):
+        main_config_path = self._write_existing_kubeconfig()
+        # kubectl's stderr arrives as bytes and is decoded at the raise, so
+        # the exception has to render the text rather than a bytes repr.
+        self.subprocess_run.return_value.returncode = 1
+        self.subprocess_run.return_value.stderr = b'error: no such context\n'
+        c = self._cluster()
+
+        captured = io.StringIO()
+        with mock.patch('shutil.which', return_value='/usr/bin/kubectl'):
+            with mock.patch('sys.stdout', captured):
+                e = self.assertRaises(exceptions.KubeconfigError, c.create, 1, 1, 1)
+
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual('merge_failed', e.reason)
+        self.assertEqual(main_config_path, e.main_config_path)
+        self.assertEqual(1, e.returncode)
+        self.assertEqual('error: no such context\n', e.stderr)
+        self.assertEqual(
+            'Failed to update %s, return code 1\nerror: no such context\n'
+            % main_config_path, str(e))
+
+        # The pre-existing configuration must be left exactly as it was: a
+        # failed merge must not half-write the file it was merging into.
+        with open(main_config_path) as f:
+            self.assertEqual('other', yaml.safe_load(f)['current-context'])
+
+
+class KubectlUnsetLeakTestCase(testtools.TestCase):
+    """A known defect, pinned rather than fixed: delete escapes sys.stdout.
+
+    ClusterLifecycleTestCase's create-through-delete test asserts that
+    nothing was written to ``sys.stdout``, which is a Python object rather
+    than the process's file descriptor 1, and one path escapes it.
+    ``Cluster.delete()`` runs ``kubectl config unset`` three times through
+    ``subprocess.run(..., shell=True)`` with no ``capture_output``, so the
+    child process inherits fd 1 and kubectl's three ``Property "..."
+    unset.`` lines go straight to the real stdout, bypassing the reporter
+    entirely. The empty-stdout test cannot see this because it mocks
+    ``subprocess.run``, which is exactly why this test exists: to name the
+    leak in the test suite rather than leave the stronger claim implied.
+
+    Every other side effect in ``cluster.py`` is clean -- the create side
+    merge passes ``capture_output=True`` and the kubeconfig writes are file
+    writes -- so this is the whole of the gap.
+
+    It is asserted as current behaviour, not fixed here, because this phase
+    changes no user-visible output and capturing this output would remove
+    three lines ``sf-client k3s delete`` prints today. See "The kubectl
+    unset leak" in
+    ``docs/plans/library-api-and-collection-phase-01-library-api.md``; the
+    fix is owned by phase 3 of the master plan, alongside the kubeconfig
+    side effects opt-out. When phase 3 makes these calls capture their
+    output, this test fails, which is the intended alarm: delete it then,
+    and strengthen the empty-stdout assertion it qualifies.
+    """
+
+    def test_kubectl_unset_leaks_to_fd1_known_defect(self):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {
+            primitives.CLUSTER_LIST: ['banana'], MD_KEY: dict(DELETABLE_MD)}
+
+        # subprocess is mocked, as it must be: an unmocked run here would
+        # edit the operator's own ~/.kube/config, which has happened once
+        # already during this phase.
+        run = mock.MagicMock()
+        run.return_value.returncode = 0
+        with mock.patch('subprocess.run', run):
+            Cluster(client, 'banana', 'testns',
+                    reporter=progress.CollectingReporter()).delete()
+
+        unset_calls = [c for c in run.call_args_list
+                       if c.args and c.args[0].startswith('kubectl config unset')]
+        self.assertEqual(3, len(unset_calls))
+
+        for call in unset_calls:
+            self.assertEqual(
+                {'shell': True}, call.kwargs,
+                'The kubectl config unset calls in Cluster.delete() no longer '
+                'inherit file descriptor 1. If phase 3 has fixed the leak this '
+                'test documents, delete KubectlUnsetLeakTestCase and remove the '
+                'caveat from the create-through-delete stdout test. See "The '
+                'kubectl unset leak" in the phase 1 plan.')

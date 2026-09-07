@@ -322,6 +322,30 @@ class GroupHandlerScopeTestCase(testtools.TestCase):
         self.assertEqual('Cluster not found!\n', result.output)
         self.assertIsInstance(result.exception, SystemExit)
 
+    def test_multiline_message_is_printed_verbatim(self):
+        # The two agent failures carry the most fields and render the
+        # longest text, and they are the ones the pre-refactor code printed
+        # a line at a time. The handler prints str(e) once, so the whole
+        # block has to arrive unwrapped and unindented, with exactly one
+        # trailing newline, on stdout.
+        error = exceptions.CommandFailedError(
+            'node-001', 'uuid-001', 'kubectl wait pods', 1,
+            'still waiting', 'timed out on pod one\ntimed out on pod two')
+        group = self._group(error)
+
+        result = CliRunner().invoke(group, ['boom'], terminal_width=80)
+
+        self.assertEqual(1, result.exit_code)
+        self.assertEqual(
+            'Command failed!\n'
+            '  instance: node-001 (UUID uuid-001)\n'
+            '  command: kubectl wait pods\n'
+            'exit code: 1\n'
+            '   stdout: still waiting\n'
+            '   stderr: timed out on pod one\n'
+            '   stderr: timed out on pod two\n',
+            result.output)
+
     def test_apiclient_exceptions_are_left_alone(self):
         # The parent CLI's GroupCatchExceptions maps every apiclient
         # exception to its own error line and exit code. Catching one here

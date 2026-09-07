@@ -576,6 +576,34 @@ class WaitLoopTestCase(testtools.TestCase):
         self.assertEqual('aop-004', e.operation_uuid)
         self.assertIn('operation: aop-004', str(e))
 
+    def test_reap_execute_error_renders_the_results_it_captured(self):
+        # The other errored-operation tests all have empty results, which
+        # takes the "no results were recorded" branch. An operation which
+        # errored after producing output is the case decision 6 of the phase
+        # plan cares about: every field the old print() calls interpolated
+        # has to survive as a structured attribute and be rendered.
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'node-001'}
+        results = {'0': {'return-code': 137, 'stdout': 'starting',
+                         'stderr': 'killed'}}
+        aop = {
+            'uuid': 'aop-006',
+            'instance_uuid': 'uuid-001',
+            'state': 'error',
+            'commands': [{'command': 'execute', 'commandline': 'helm install banana'}],
+            'results': results
+        }
+        cluster = self._make_cluster(client, io.StringIO())
+
+        e = self.assertRaises(
+            exceptions.AgentOperationError, cluster.reap_execute, aop)
+
+        self.assertEqual(results, e.results)
+        self.assertEqual('uuid-001', e.instance_uuid)
+        self.assertEqual('helm install banana', e.command_description)
+        self.assertIn('"return-code": 137', str(e))
+        self.assertNotIn('failed to start', str(e))
+
     def test_reap_execute_formats_multiline_stderr(self):
         client = mock.MagicMock()
         client.get_instance.return_value = {'name': 'node-001'}
