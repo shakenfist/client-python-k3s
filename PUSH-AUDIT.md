@@ -76,10 +76,11 @@ canonical copy lives in shakenfist/development at
  * Does the code follow the project conventions in `AGENTS.md`?
    Check in particular:
    - Click command conventions (commands attached to the `k3s`
-     group, `--namespace` handling, state via `ctx.obj`).
+     group, `--namespace` handling, orchestration reached through
+     a `Cluster` rather than a click context).
    - Long running work reports through the `Progress` reporter
-     (`ctx.obj['PROGRESS']` / `progress.get_progress(ctx)`), not
-     bare prints.
+     (`Cluster.get_progress()`, backed by the reporter passed to
+     the `Cluster`), not bare prints.
  * The plugin must never break `sf-client` startup: top-level
    imports must remain cheap and reliable, and
    `python3 -c 'import shakenfist_client_k3s'` must succeed.
