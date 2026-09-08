@@ -178,17 +178,40 @@ class ClusterLifecycleTestCase(LibraryTestCase):
         self.assertEqual('banana.testns', kc['current-context'])
 
     def test_delete_unsets_the_local_kubeconfig_entries(self):
-        # Likewise the three kubectl config unset calls in delete.
+        # Likewise the three kubectl config unset calls in delete. They are
+        # argument lists rather than shell strings, because the cluster name
+        # interpolated into each element is caller supplied and unvalidated.
         c = self._cluster()
         c.create(1, 1, 1)
         self.subprocess_run.reset_mock()
         c.delete()
 
         self.assertEqual(
-            ['kubectl config unset users.banana.testns',
-             'kubectl config unset contexts.banana.testns',
-             'kubectl config unset clusters.banana.testns'],
+            [['kubectl', 'config', 'unset', 'users.banana.testns'],
+             ['kubectl', 'config', 'unset', 'contexts.banana.testns'],
+             ['kubectl', 'config', 'unset', 'clusters.banana.testns']],
             [call[0][0] for call in self.subprocess_run.call_args_list])
+
+    def test_delete_does_not_run_the_unsets_through_a_shell(self):
+        # A cluster name is a bare click.STRING on the CLI, and an Ansible
+        # variable or an API request field to the library callers this phase
+        # exists for, with no validation on any of those paths. Built into a
+        # shell command line, a name like 'foo; rm -rf ~' would execute. The
+        # calls must therefore stay a list of arguments with shell unset.
+        c = Cluster(self.client, 'foo; touch /tmp/pwned', 'testns',
+                    reporter=self.reporter)
+        self.client.metadata[cluster_module.METADATA_KEY
+                             % 'foo; touch /tmp/pwned'] = dict(DELETABLE_MD)
+        self.client.metadata[primitives.CLUSTER_LIST] = [
+            'foo; touch /tmp/pwned']
+        c.delete()
+
+        for call in self.subprocess_run.call_args_list:
+            self.assertIsInstance(call[0][0], list)
+            self.assertNotIn('shell', call[1])
+        self.assertEqual(
+            'clusters.foo; touch /tmp/pwned.testns',
+            self.subprocess_run.call_args_list[-1][0][0][-1])
 
     def test_delete_raises_when_kubectl_unset_fails(self):
         c = self._cluster()
@@ -409,6 +432,18 @@ class LocalKubeconfigFailureTestCase(LibraryTestCase):
             self.assertEqual('other', yaml.safe_load(f)['current-context'])
 
 
+def _is_kubectl_unset(command):
+    """Is this subprocess.run() first argument a 'kubectl config unset'?
+
+    The argument is a list rather than a shell string, so a prefix match on
+    a string does not work here. Matching on the list's leading elements
+    keeps this working whichever way a future change spells the call.
+    """
+    if isinstance(command, str):
+        return command.startswith('kubectl config unset')
+    return list(command[:3]) == ['kubectl', 'config', 'unset']
+
+
 class KubectlUnsetLeakTestCase(testtools.TestCase):
     """A known defect, pinned rather than fixed: delete escapes sys.stdout.
 
@@ -416,12 +451,18 @@ class KubectlUnsetLeakTestCase(testtools.TestCase):
     nothing was written to ``sys.stdout``, which is a Python object rather
     than the process's file descriptor 1, and one path escapes it.
     ``Cluster.delete()`` runs ``kubectl config unset`` three times through
-    ``subprocess.run(..., shell=True)`` with no ``capture_output``, so the
-    child process inherits fd 1 and kubectl's three ``Property "..."
-    unset.`` lines go straight to the real stdout, bypassing the reporter
-    entirely. The empty-stdout test cannot see this because it mocks
-    ``subprocess.run``, which is exactly why this test exists: to name the
-    leak in the test suite rather than leave the stronger claim implied.
+    ``subprocess.run()`` with no ``capture_output`` and no ``stdout``
+    redirection, so the child process inherits fd 1 and kubectl's three
+    ``Property "..." unset.`` lines go straight to the real stdout,
+    bypassing the reporter entirely. The empty-stdout test cannot see this
+    because it mocks ``subprocess.run``, which is exactly why this test
+    exists: to name the leak in the test suite rather than leave the
+    stronger claim implied.
+
+    What pins the leak is the *absence* of output redirection, not any
+    particular way of spelling the command: the calls stopped being shell
+    strings when the injection they allowed was fixed, and that changed
+    nothing about where fd 1 goes.
 
     Every other side effect in ``cluster.py`` is clean -- the create side
     merge passes ``capture_output=True`` and the kubeconfig writes are file
@@ -453,14 +494,18 @@ class KubectlUnsetLeakTestCase(testtools.TestCase):
                     reporter=progress.CollectingReporter()).delete()
 
         unset_calls = [c for c in run.call_args_list
-                       if c.args and c.args[0].startswith('kubectl config unset')]
+                       if c.args and _is_kubectl_unset(c.args[0])]
         self.assertEqual(3, len(unset_calls))
 
+        message = (
+            'The kubectl config unset calls in Cluster.delete() no longer '
+            'inherit file descriptor 1: one of them now redirects its child '
+            'output. If phase 3 has fixed the leak this test documents, '
+            'delete KubectlUnsetLeakTestCase and remove the caveat from the '
+            'create-through-delete stdout test. See "The kubectl unset leak" '
+            'in the phase 1 plan.')
         for call in unset_calls:
-            self.assertEqual(
-                {'shell': True}, call.kwargs,
-                'The kubectl config unset calls in Cluster.delete() no longer '
-                'inherit file descriptor 1. If phase 3 has fixed the leak this '
-                'test documents, delete KubectlUnsetLeakTestCase and remove the '
-                'caveat from the create-through-delete stdout test. See "The '
-                'kubectl unset leak" in the phase 1 plan.')
+            # Any of these three would stop the child writing to the real
+            # stdout, and any of them is therefore the fix landing.
+            for redirect in ['capture_output', 'stdout', 'stderr']:
+                self.assertNotIn(redirect, call.kwargs, message)

@@ -859,8 +859,16 @@ class Cluster:
         for config_elem in ['users.%s' % fqcn,
                             'contexts.%s' % fqcn,
                             'clusters.%s' % fqcn]:
-            p = subprocess.run(
-                'kubectl config unset %s' % config_elem, shell=True)
+            # An argument list, not a shell string: config_elem interpolates
+            # the cluster name, which arrives from a click.STRING argument,
+            # an Ansible playbook variable or an API request with no
+            # validation anywhere on the path, so a name containing shell
+            # metacharacters would otherwise run as a command. This is
+            # output neutral -- the child still inherits file descriptor 1,
+            # so kubectl's three 'Property "..." unset.' lines are printed
+            # exactly as before. See KubectlUnsetLeakTestCase, which pins
+            # that leak until phase 3 closes it.
+            p = subprocess.run(['kubectl', 'config', 'unset', config_elem])
             if p.returncode != 0:
                 raise exceptions.KubeconfigError.unset_failed(config_elem)
 
