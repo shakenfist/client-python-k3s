@@ -117,15 +117,19 @@ namespace and a reporter.
 
 ### The exception hierarchy (`exceptions.py`)
 
-Every failure `Cluster` and `primitives` can raise is a
+Every failure this library detects and reports is a
 `K3sClusterException` subclass, carrying the failure's details as
 attributes and rendering the CLI's historic error text from
-`__str__`. It deliberately shares no base class with
-`shakenfist_client.apiclient`'s exceptions, so catching one hierarchy
-never catches the other -- a caller can tell "the cluster API
-rejected this" apart from "Shaken Fist itself is unreachable". See
-`docs/library-api.md` for the exception list; this module's
-docstrings name the exact call site and attributes for each one.
+`__str__`. `apiclient` exceptions, and `OSError`/`yaml.YAMLError`
+from local file and subprocess work, propagate unchanged rather than
+being wrapped. `K3sClusterException` deliberately shares no base
+class with `shakenfist_client.apiclient`'s exceptions, so catching
+one hierarchy never catches the other -- a caller can tell "the
+cluster API rejected this" apart from "Shaken Fist itself is
+unreachable", though neither hierarchy catches the local
+`OSError`/`YAMLError` cases just mentioned. See `docs/library-api.md`
+for the exception list; this module's docstrings name the exact call
+site and attributes for each one.
 
 ### Progress reporting (`progress.py`)
 

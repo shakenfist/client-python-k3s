@@ -170,3 +170,58 @@ class KubeconfigErrorTestCase(testtools.TestCase):
         self.assertEqual('users.banana.testns', e.config_elem)
         self.assertEqual(
             'Could not unset kubectl config element users.banana.testns', str(e))
+
+
+class TotalAttributesTestCase(testtools.TestCase):
+    """The two **fields exceptions answer every field, whoever built them.
+
+    ReleaseLookupError and KubeconfigError take **fields and setattr them,
+    so before FIELDS was declared an instance only carried the attributes
+    the classmethod which built it happened to pass: e.status_code existed
+    on an http_status() instance and raised AttributeError on an
+    unknown_channel() one. docs/library-api.md advertises these attributes
+    as the failure's details and phase 5's fail_json() will read them
+    without knowing which constructor ran, so getattr has to be total.
+    """
+
+    def test_release_lookup_fields_are_all_present(self):
+        e = exceptions.ReleaseLookupError.unknown_channel('v1.26')
+        self.assertEqual('v1.26', e.release_channel)
+
+        # Fields belonging to the other three constructors.
+        self.assertIsNone(e.status_code)
+        self.assertIsNone(e.product)
+        self.assertIsNone(e.url)
+        self.assertIsNone(e.response_text)
+        self.assertIsNone(e.response_snippet)
+
+    def test_release_lookup_fields_from_the_other_direction(self):
+        e = exceptions.ReleaseLookupError.http_status(
+            'k3s', 'https://example.com', 500, 'boom')
+        self.assertEqual(500, e.status_code)
+        self.assertIsNone(e.release_channel)
+        self.assertIsNone(e.response_snippet)
+
+    def test_no_parsable_longhorn_release_carries_every_field(self):
+        # The constructor which passes no fields at all is the one most
+        # likely to strand a caller reading attributes off it.
+        e = exceptions.ReleaseLookupError.no_parsable_longhorn_release()
+        for field in exceptions.ReleaseLookupError.FIELDS:
+            self.assertIsNone(getattr(e, field))
+
+    def test_kubeconfig_fields_are_all_present(self):
+        e = exceptions.KubeconfigError.unset_failed('users.banana.testns')
+        self.assertEqual('users.banana.testns', e.config_elem)
+
+        # Fields belonging to missing_kubectl() and merge_failed().
+        self.assertIsNone(e.main_config_path)
+        self.assertIsNone(e.name)
+        self.assertIsNone(e.returncode)
+        self.assertIsNone(e.stderr)
+
+    def test_kubeconfig_fields_from_the_other_direction(self):
+        e = exceptions.KubeconfigError.missing_kubectl(
+            '/home/u/.kube/config', 'banana')
+        self.assertEqual('banana', e.name)
+        self.assertIsNone(e.config_elem)
+        self.assertIsNone(e.returncode)

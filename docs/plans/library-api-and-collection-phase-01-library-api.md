@@ -297,12 +297,12 @@ Found while verifying step 1e, by driving the whole lifecycle without
 mocking `subprocess`.
 
 `Cluster.delete()` runs `kubectl config unset` three times through
-`subprocess.run(..., shell=True)` with no `capture_output`
-(`cluster.py:862-863`). The child inherits the process's file
-descriptor 1, so kubectl's three `Property "..." unset.` lines go
-straight to the real stdout, bypassing Python's `sys.stdout` and
-therefore the reporter entirely. Every other side effect in the file
-is clean: the create-side merge at `cluster.py:712-715` passes
+`subprocess.run()` with no `capture_output` and no `stdout`
+redirection. The child inherits the process's file descriptor 1, so
+kubectl's three `Property "..." unset.` lines go straight to the real
+stdout, bypassing Python's `sys.stdout` and therefore the reporter
+entirely. Every other side effect in the file
+is clean: the create-side merge in `Cluster.create()` passes
 `capture_output=True`, and the kubeconfig writes are file writes.
 
 This matters because it is exactly the property the phase exists to
@@ -316,6 +316,34 @@ delete` prints today, and this phase changes no user-visible output.
 It belongs with phase 3's "kubeconfig side effects opt-out" work in
 the master plan, which is already the row that owns this code, and it
 is recorded there.
+
+## Two more findings deferred to phase 3
+
+Found during review of this phase's output, alongside the kubectl
+unset leak above. Neither is fixed here, for the same reason: decision
+7 changes no user-visible output in this phase, and both of these are
+user-visible if fixed. Both are recorded in the master plan's phase 3
+row.
+
+**Errors print to stdout, not stderr.**
+`GroupCatchClusterExceptions.invoke()` does `print(str(e))`, which
+inherited its stream from the `print()` calls it replaces. A failing
+`sf-client k3s getconfig mycluster > kubeconfig` therefore writes the
+error text into the redirected file instead of to the terminal. This
+is pre-existing CLI behaviour, not something this phase introduced;
+moving it to `sys.stderr` is a user-visible change and belongs in
+phase 3.
+
+**`Cluster.get_progress()`'s lazy default has no `total_phases`.**
+When a method builds no `Progress` of its own,
+`get_progress()` makes one with `total_phases=None`, so
+`Progress.phase()` renders `[1] Foo` instead of `[1/9] Foo`. No CLI
+path hits this today -- all four commands that call `get_progress()`
+indirectly (`create`, `expand-workers`, `expand-addresses`,
+`update-os`) assign a `Progress` with a real total first, and
+`delete()` never calls `get_progress()` at all -- but a library caller
+invoking a mid-level method (`install_control_plane()`, say) directly
+gets un-numbered headers.
 
 ## Back brief
 

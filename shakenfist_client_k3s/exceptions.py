@@ -32,9 +32,9 @@ class K3sClusterException(Exception):
 class ClusterExistsError(K3sClusterException):
     """Raised when a cluster create is attempted with a name already in use.
 
-    Corresponds to the two identical checks in ``Cluster.create()``
-    (``cluster.py:591-594``): the name is already present in the
-    namespace's cluster list, or namespace metadata already exists for it.
+    Raised by ``Cluster.create()``, from either of its two identical
+    checks: the name is already present in the namespace's cluster list,
+    or namespace metadata already exists for it.
     Both render the same text, so this class does not need to distinguish
     which check failed.
     """
@@ -50,7 +50,8 @@ class ClusterExistsError(K3sClusterException):
 class NetworkNotFoundError(K3sClusterException):
     """Raised when ``--network`` names a network that does not exist.
 
-    Corresponds to ``Cluster.create()`` (``cluster.py:602-603``).
+    Raised by ``Cluster.create()`` when it looks up the network named by
+    its ``network`` argument and finds nothing.
     """
 
     def __init__(self, network):
@@ -69,18 +70,16 @@ class ClusterNotFoundError(K3sClusterException):
     ``name`` is carried only as a structured attribute, not rendered.
     Construct via the classmethods below, one per distinct message:
 
-    - ``unknown_cluster()``: ``Cluster.get_kubeconfig()``, no cluster
-      metadata at all (``cluster.py:746-747``).
-    - ``does_not_exist()``: ``Cluster.show()`` (``cluster.py:765-766``)
-      and ``Cluster.delete()`` (``cluster.py:779-780``).
-    - ``not_found()``: ``Cluster.expand_workers()``
-      (``cluster.py:873-874``), ``Cluster.expand_addresses()``
-      (``cluster.py:889-890``) and ``Cluster.update_os()``
-      (``cluster.py:906-907``).
+    - ``unknown_cluster()``: raised by ``Cluster.get_kubeconfig()`` when
+      there is no cluster metadata at all.
+    - ``does_not_exist()``: raised by ``Cluster.show()`` and
+      ``Cluster.delete()``.
+    - ``not_found()``: raised by ``Cluster.expand_workers()``,
+      ``Cluster.expand_addresses()`` and ``Cluster.update_os()``.
 
-    The sixth original site, ``get_kubeconfig()``'s "no kubeconfig" check
-    (``cluster.py:750-753``), is not here: that cluster does exist, so it
-    is ``ClusterIncompleteError`` instead.
+    The sixth original site, ``Cluster.get_kubeconfig()``'s second check
+    -- metadata present but no kubeconfig recorded -- is not here: that
+    cluster does exist, so it raises ``ClusterIncompleteError`` instead.
     """
 
     def __init__(self, name, reason, message):
@@ -109,8 +108,7 @@ class ClusterNotFoundError(K3sClusterException):
 class ClusterIncompleteError(K3sClusterException):
     """Raised when a cluster exists but has not finished being built.
 
-    Corresponds to ``Cluster.get_kubeconfig()``'s second check
-    (``cluster.py:750-753``):
+    Raised by ``Cluster.get_kubeconfig()`` from its second check:
     cluster metadata exists (unlike ``ClusterNotFoundError``), but the
     field being asked for -- here, the kubeconfig -- has not been recorded
     yet, because create has not reached that point. This is deliberately a
@@ -138,24 +136,41 @@ class ReleaseLookupError(K3sClusterException):
     message shapes. Construct via the classmethods below:
 
     - ``http_status(product, url, status_code, response_text)``: a
-      non-2xx response fetching release data, for either product. Used
-      for the k3s channel fetch (``primitives.py:76-77``, with
-      ``product='k3s'``) and the Longhorn release fetch
-      (``primitives.py:145-146``, with ``product='Longhorn'``); both
-      render identically apart from the product name.
-    - ``no_usable_k3s_channels(url, response_snippet)``: the k3s channel
-      response parsed but yielded no channels at all
-      (``primitives.py:97-98``). ``response_snippet`` is the caller's
-      already-truncated ``json.dumps(d)[:512]``.
-    - ``unknown_channel(release_channel)``: the requested channel is not
-      in the (possibly cached) release map (``primitives.py:107``).
-    - ``no_parsable_longhorn_release()``: every Longhorn tag failed to
-      parse as a PEP 440 version (``primitives.py:173``).
+      non-2xx response fetching release data, for either product. Raised
+      by ``primitives.get_k3s_release()`` on its channel fetch (with
+      ``product='k3s'``) and by ``primitives.get_longhorn_release()`` on
+      its release fetch (with ``product='Longhorn'``); both render
+      identically apart from the product name.
+    - ``no_usable_k3s_channels(url, response_snippet)``: raised by
+      ``primitives.get_k3s_release()`` when the channel response parsed
+      but yielded no channels at all. ``response_snippet`` is the
+      caller's already-truncated ``json.dumps(d)[:512]``.
+    - ``unknown_channel(release_channel)``: raised by
+      ``primitives.get_k3s_release()`` when the requested channel is not
+      in the (possibly cached) release map.
+    - ``no_parsable_longhorn_release()``: raised by
+      ``primitives.get_longhorn_release()`` when every Longhorn tag
+      failed to parse as a PEP 440 version.
+
+    Which classmethod built an instance is recorded in ``reason``, but it
+    does not decide which attributes exist: every field any of them sets
+    is declared below, so ``getattr`` is total and an unset field answers
+    None rather than raising ``AttributeError``.
     """
+
+    #: The union of the fields the classmethods below set. A caller which
+    #: does not know which constructor ran -- ``docs/library-api.md``
+    #: describes these as the failure's details, and phase 5's
+    #: ``fail_json()`` will serialise them -- must be able to read any of
+    #: them off any instance.
+    FIELDS = ('product', 'url', 'status_code', 'response_text',
+              'response_snippet', 'release_channel')
 
     def __init__(self, reason, message, **fields):
         self.reason = reason
         self.message = message
+        for key in self.FIELDS:
+            setattr(self, key, None)
         for key, value in fields.items():
             setattr(self, key, value)
         super(ReleaseLookupError, self).__init__(message)
@@ -198,10 +213,9 @@ class ReleaseLookupError(K3sClusterException):
 class AgentOperationError(K3sClusterException):
     """Raised when a Shaken Fist agent operation enters the error state.
 
-    Built by ``Cluster._agent_op_error()`` (``cluster.py:162-178``) and
-    raised by its three callers: ``await_idle()`` (``cluster.py:223``),
-    ``await_fetch()`` (``cluster.py:268``) and ``reap_execute()``
-    (``cluster.py:282``).
+    Built by ``Cluster._agent_op_error()`` and raised by its three
+    callers: ``Cluster.await_idle()``, ``Cluster.await_fetch()`` and
+    ``Cluster.reap_execute()``.
     ``command_description`` is the value ``_describe_agent_op(aop,
     max_len=None)`` returns, and is only rendered when truthy. ``results``
     is the agent operation's results dict; when it is empty (or falsy) a
@@ -239,8 +253,9 @@ class AgentOperationError(K3sClusterException):
 class CommandFailedError(K3sClusterException):
     """Raised when an agent command completes with a non-zero return code.
 
-    Corresponds to the return-code check in ``Cluster.reap_execute()``
-    (``cluster.py:284-291``). ``stdout`` and ``stderr`` are the raw
+    Raised by ``Cluster.reap_execute()`` from its return-code check, as
+    distinct from its agent operation state check, which raises
+    ``AgentOperationError``. ``stdout`` and ``stderr`` are the raw
     strings from the agent operation's results; ``__str__`` re-joins each
     on its own prefixed line exactly as the original ``print()`` calls did.
     """
@@ -267,31 +282,44 @@ class CommandFailedError(K3sClusterException):
 
 
 class KubeconfigError(K3sClusterException):
-    """Raised when a local kubeconfig write, merge or cleanup fails.
+    """Raised when a local kubeconfig merge or cleanup fails.
 
-    Three distinct sites, all in ``cluster.py``, construct via the
-    classmethods below:
+    Not writes: the three ``open(main_config_path, 'w')`` calls in
+    ``Cluster.create()`` are unguarded, so a write which fails raises
+    ``OSError`` rather than anything from this hierarchy. Every
+    classmethod here is about invoking ``kubectl``.
 
-    - ``missing_kubectl(main_config_path, name)``: create found an
-      existing ``~/.kube/config`` to merge into but no local ``kubectl``
-      binary to do the merge with (``cluster.py:704-706``).
-    - ``merge_failed(main_config_path, returncode, stderr)``: create's
-      ``kubectl config view --flatten`` merge exited non-zero
-      (``cluster.py:716-724``); ``stderr`` is decoded from the bytes
+    - ``missing_kubectl(main_config_path, name)``: raised by
+      ``Cluster.create()`` when it finds an existing ``~/.kube/config``
+      to merge into but no local ``kubectl`` binary to do the merge with.
+    - ``merge_failed(main_config_path, returncode, stderr)``: raised by
+      ``Cluster.create()`` when its ``kubectl config view --flatten``
+      merge exits non-zero; ``stderr`` is decoded from the bytes
       ``subprocess`` returns at the raise, and the second line is only
       rendered when it is non-empty, matching the original's conditional
       ``print()``.
-    - ``unset_failed(config_elem)``: delete's ``kubectl config unset``
-      loop exited non-zero for one config element
-      (``cluster.py:864-865``). This is a separate rendering from the
-      two above -- it names a config element, not a config file path --
-      but it is still local-kubectl-state, so it lives on this class
-      rather than on ``ClusterNotFoundError``.
+    - ``unset_failed(config_elem)``: raised by ``Cluster.delete()`` when
+      its ``kubectl config unset`` loop exits non-zero for one config
+      element. This is a separate rendering from the two above -- it
+      names a config element, not a config file path -- but it is still
+      local-kubectl-state, so it lives on this class rather than on
+      ``ClusterNotFoundError``.
+
+    As with ``ReleaseLookupError``, the union of the fields the
+    classmethods set is declared explicitly, so which attributes an
+    instance answers to does not depend on which one built it.
     """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    FIELDS = ('main_config_path', 'name', 'returncode', 'stderr',
+              'config_elem')
 
     def __init__(self, reason, message, **fields):
         self.reason = reason
         self.message = message
+        for key in self.FIELDS:
+            setattr(self, key, None)
         for key, value in fields.items():
             setattr(self, key, value)
         super(KubeconfigError, self).__init__(message)

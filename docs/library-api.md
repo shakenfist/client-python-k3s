@@ -49,6 +49,25 @@ printing one:
 | `expand_addresses(address_count)` | `k3s expand-addresses` |
 | `update_os()` | `k3s update-os` |
 
+Only these seven methods, plus `get_metadata()`,
+`set_metadata(md)` and `delete_metadata()`, are this library's
+stable public surface. Phase 4 cuts `v0.1.0` to PyPI, so whatever
+is public at that point becomes a compatibility surface for
+external callers. Everything else `Cluster` exposes --
+`create_instance()`, `await_boot()`, `await_idle()`,
+`await_fetch()`, `reap_execute()`, `execute_and_await()`,
+`instance_os_update()`, `install_control_plane()`,
+`install_k3s_component()`, `install_extra_control_plane()`,
+`install_workers()`, `allocate_metallb_addresses()`,
+`configure_metallb_addresses()`, `setup_metallb()`,
+`setup_longhorn()`, `create_and_await_instances()` and
+`get_progress()` -- is internal orchestration the methods above
+are built from, not a supported entry point. Phase 3 intends to
+reshape several of them (an incremental `install_workers()`,
+conditional `setup_metallb()`/`setup_longhorn()`), so treat them
+as unstable even though nothing today stops a caller reaching
+them directly.
+
 `create()`'s remaining keyword arguments (`refresh_version_cache`,
 `release_channel`, `sshkey`) mirror the command's options of the same
 name; see its docstring in `cluster.py` for the full signature.
@@ -89,14 +108,22 @@ Both take `verbose=True` to also emit `debug()` lines; without it
 
 ## Exceptions
 
-Every failure this library raises is a `K3sClusterException`
-subclass, and every subclass's `__str__` renders exactly the text
+Every failure this library detects and reports is a
+`K3sClusterException` subclass; `apiclient` exceptions, and
+`OSError`/`yaml.YAMLError` from local file and subprocess work (an
+unreadable `sshkey` path, a `~/.kube/config` write, a malformed
+kubeconfig), propagate unchanged rather than being wrapped. Every
+`K3sClusterException` subclass's `__str__` renders exactly the text
 `sf-client k3s ...` printed before this line existed as an exception
 at all -- catching the base class and printing `str(e)` reproduces
-the CLI's own error output. `K3sClusterException` deliberately does
-not subclass anything in `shakenfist_client.apiclient`: catching one
-hierarchy never catches the other, so a caller can tell "the cluster
-API rejected this" apart from "Shaken Fist itself is unreachable".
+the CLI's own error output for the failures this library detects.
+`K3sClusterException` deliberately does not subclass anything in
+`shakenfist_client.apiclient`: catching one hierarchy never catches
+the other, so a caller can tell "the cluster API rejected this"
+apart from "Shaken Fist itself is unreachable" -- though neither
+hierarchy catches an `OSError` or `YAMLError` escaping from local
+work, so a caller that wants to catch everything needs a third
+`except` clause.
 
 | Exception | Raised when |
 |-----------|-------------|
@@ -134,15 +161,28 @@ cluster.create(control_plane_count=1, worker_count=1, metal_address_count=1)
 kubeconfig = cluster.get_kubeconfig()
 cluster.delete()
 
-# Nothing above wrote to sys.stdout -- everything is here instead.
+# create() and get_kubeconfig() wrote nothing to sys.stdout;
+# delete() is the one exception below. Everything else is here.
 print(reporter.getvalue())
 ```
 
-Not one line reaches `sys.stdout`; a caller that owns stdout for its
-own output (an Ansible module's JSON result, in particular) can run
-this and keep it that way. `reporter.getvalue()` holds the same
-numbered-phase, per-node progress text `sf-client k3s create` and
-`delete` print, for example:
+`create()` and `get_kubeconfig()` write nothing to `sys.stdout` at
+all; a caller that owns stdout for its own output (an Ansible
+module's JSON result, in particular) can run either and keep it
+that way. The same is true of `show()`, `expand_workers()`,
+`expand_addresses()` and `update_os()`. `delete()`, the third call
+in this example, is the one exception: its three `kubectl config
+unset` calls run with no captured output, so the child process
+inherits file descriptor 1 and kubectl's `Property "..." unset.`
+lines reach the real stdout directly, bypassing both `sys.stdout`
+and the reporter. This is a known, tracked gap, not an oversight --
+see `KubectlUnsetLeakTestCase` in
+`shakenfist_client_k3s/tests/test_library_api.py` and the phase 3
+row of `docs/plans/library-api-and-collection.md` -- and it is fixed
+by phase 3's kubeconfig side effects opt-out, not by this phase.
+`reporter.getvalue()` holds the same numbered-phase, per-node
+progress text `sf-client k3s create` and `delete` print, for
+example:
 
 ```
 [1/9] Creating node network
@@ -154,10 +194,16 @@ Cluster mycluster is ready (... total)
 
 This exact call sequence -- `Cluster(...)`, `create()`,
 `get_kubeconfig()`, `delete()`, with a `CollectingReporter` -- is
-verified against a scripted fake client with `subprocess.run` and
-`requests.request` mocked, the same way
-`shakenfist_client_k3s/tests/test_library_api.py` drives the
-create-through-delete lifecycle test. Running it against a real
-Shaken Fist namespace needs nothing more than the real
-`apiclient.Client()` shown above; there is no other setup and no
-Click context to fabricate.
+verified in `LibraryTestCase.setUp()` in
+`shakenfist_client_k3s/tests/test_library_api.py`, against a
+scripted fake client (`tests/fakes.py`) with `subprocess.run` and
+`time.sleep` mocked and `primitives.get_k3s_release()`/
+`get_longhorn_release()` patched directly. Mocking
+`requests.request` alone is not enough to reproduce this: those two
+release lookups are called as plain functions in the test, so
+patching them is what keeps the lookup from reaching the real k3s
+update API and GitHub releases API; `requests.request` itself is
+never touched. Running the sequence against a real Shaken Fist
+namespace needs nothing more than the real `apiclient.Client()`
+shown above; there is no other setup and no Click context to
+fabricate.
