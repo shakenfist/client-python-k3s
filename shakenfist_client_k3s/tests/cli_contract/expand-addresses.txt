@@ -1,0 +1,9 @@
+Usage: k3s expand-addresses [OPTIONS] NAME
+
+  Add floating addresses for metallb to a k3s cluster
+
+Options:
+  --address-count INTEGER  The number of addresses to add
+  --namespace TEXT         If you are an admin, you can alter clusters in a
+                           different namespace.
+  --help                   Show this message and exit.

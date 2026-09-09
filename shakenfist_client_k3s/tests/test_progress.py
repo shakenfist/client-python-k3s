@@ -13,8 +13,12 @@ import mock
 import testtools
 
 import shakenfist_client_k3s
+from shakenfist_client_k3s import cluster as cluster_module
+from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
+from shakenfist_client_k3s.cluster import Cluster
+from shakenfist_client_k3s.tests import fakes
 
 
 class FakeClock:
@@ -50,6 +54,114 @@ class CountStrTestCase(testtools.TestCase):
         self.assertEqual('2 instances', progress.count_str(2, 'instance'))
         self.assertEqual('0 operations', progress.count_str(0, 'operation'))
         self.assertEqual('3 routed addresses', progress.count_str(3, 'routed address'))
+
+
+class ReporterTestCase(testtools.TestCase):
+    def test_write_and_flush_reach_stdout(self):
+        stdout = io.StringIO()
+        r = progress.Reporter()
+        with mock.patch('sys.stdout', stdout):
+            r.write('hello\n')
+            r.flush()
+        self.assertEqual('hello\n', stdout.getvalue())
+
+    def test_isatty_delegates_to_stdout(self):
+        # Progress picks its output mode from this, so a reporter which
+        # answers without asking the real stream silently switches the CLI
+        # between in place updates and line mode.
+        r = progress.Reporter()
+        with mock.patch('sys.stdout', FakeTty()):
+            self.assertTrue(r.isatty())
+        with mock.patch('sys.stdout', io.StringIO()):
+            self.assertFalse(r.isatty())
+
+    def test_debug_respects_verbosity(self):
+        stdout = io.StringIO()
+        with mock.patch('sys.stdout', stdout):
+            progress.Reporter(verbose=False).debug('not shown')
+            self.assertEqual('', stdout.getvalue())
+            progress.Reporter(verbose=True).debug('shown')
+        self.assertEqual('shown\n', stdout.getvalue())
+
+
+class CollectingReporterTestCase(testtools.TestCase):
+    def test_collects_instead_of_printing(self):
+        stdout = io.StringIO()
+        r = progress.CollectingReporter()
+        with mock.patch('sys.stdout', stdout):
+            r.write('one\n')
+            r.write('two\n')
+            r.flush()
+
+        self.assertEqual('', stdout.getvalue())
+        self.assertEqual('one\ntwo\n', r.getvalue())
+        self.assertEqual(['one', 'two'], r.lines)
+
+    def test_is_never_a_tty(self):
+        with mock.patch('sys.stdout', FakeTty()):
+            self.assertFalse(progress.CollectingReporter().isatty())
+
+    def test_lines_are_split_across_writes(self):
+        # print() writes its text and its newline separately, so a line can
+        # arrive in several pieces and must not be split at the seams.
+        r = progress.CollectingReporter()
+        r.write('one')
+        r.write('\n')
+        r.write('two\nthree\n')
+        self.assertEqual(['one', 'two', 'three'], r.lines)
+
+    def test_trailing_partial_line_is_kept(self):
+        r = progress.CollectingReporter()
+        r.write('finished\nstill typing')
+        self.assertEqual(['finished', 'still typing'], r.lines)
+
+    def test_empty_collector_has_no_lines(self):
+        self.assertEqual([], progress.CollectingReporter().lines)
+
+    def test_debug_is_collected(self):
+        r = progress.CollectingReporter(verbose=True)
+        r.debug('a debug line')
+        self.assertEqual(['a debug line'], r.lines)
+
+
+class ProgressThroughCollectorTestCase(testtools.TestCase):
+    """A collected Progress must say exactly what a piped one would have."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = FakeClock()
+        patcher = mock.patch('shakenfist_client_k3s.progress.time.time', self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _drive(self, stream):
+        p = progress.Progress(total_phases=2, stream=stream)
+        p.phase('Booting')
+        p.update('node-001', 'state initial')
+        self.clock.advance(5)
+        p.note('node-001 may be stalled')
+        p.update('node-001', 'state created')
+        p.wait_done()
+        p.phase('Installing k3s on the worker nodes')
+        self.clock.advance(120)
+        p.finish('Cluster banana is ready')
+        return p
+
+    def test_collected_output_matches_a_non_tty_stream(self):
+        piped = io.StringIO()
+        self._drive(piped)
+
+        collector = progress.CollectingReporter()
+        self.assertFalse(self._drive(collector).interactive)
+
+        self.assertEqual(piped.getvalue(), collector.getvalue())
+        self.assertEqual(piped.getvalue().split('\n')[:-1], collector.lines)
+
+        # And it really is the line mode output, with no cursor movement
+        # for a caller's log to render.
+        self.assertNotIn('\x1b', collector.getvalue())
+        self.assertEqual('[1/2] Booting', collector.lines[0])
+        self.assertEqual('Cluster banana is ready (2m05s total)', collector.lines[-1])
 
 
 class ProgressLineModeTestCase(testtools.TestCase):
@@ -294,69 +406,32 @@ class DescribeAgentOpTestCase(testtools.TestCase):
         self.assertIsNone(primitives._describe_agent_op({'commands': [], 'results': {}}))
 
 
-class FakeContext:
-    def __init__(self, obj):
-        self.obj = obj
-
-
-class InstallK3sComponentTestCase(testtools.TestCase):
-    def _install_commands(self, md):
-        ctx = FakeContext({
-            'name': 'banana',
-            'namespace': 'testns',
-            'CLIENT': mock.MagicMock(),
-            'VERBOSE': False,
-            primitives.METADATA_KEY % 'banana': md
-        })
-        with mock.patch('shakenfist_client_k3s.primitives.execute_and_await') as ea:
-            primitives.install_k3s_component(ctx, ['uuid-001'], 'token', 'agent')
-            return '\n'.join(ea.call_args[0][2])
-
-    def test_join_uses_join_address(self):
-        cmds = self._install_commands({
-            'k3s_version': 'stable',
-            'join_address': '10.0.0.5',
-            'api_address_inner': '10.0.0.4'
-        })
-        self.assertIn('K3S_URL=https://10.0.0.5:6443', cmds)
-
-    def test_join_falls_back_to_api_address_inner(self):
-        # Clusters created before join_address existed only carry the
-        # older api_address_inner key in their metadata.
-        cmds = self._install_commands({
-            'k3s_version': 'stable',
-            'api_address_inner': '10.0.0.4'
-        })
-        self.assertIn('K3S_URL=https://10.0.0.4:6443', cmds)
-
-
 class WaitLoopTestCase(testtools.TestCase):
     def setUp(self):
         super().setUp()
         self.clock = FakeClock()
         for target, replacement in [
                 ('shakenfist_client_k3s.progress.time.time', self.clock),
-                ('shakenfist_client_k3s.primitives.time.sleep',
+                ('shakenfist_client_k3s.cluster.time.sleep',
                  lambda seconds: self.clock.advance(seconds))]:
             patcher = mock.patch(target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _make_context(self, client, stream):
-        return FakeContext({
-            'namespace': 'testns',
-            'CLIENT': client,
-            'VERBOSE': False,
-            'PROGRESS': progress.Progress(stream=stream)
-        })
+    def _make_cluster(self, client, stream):
+        # The wait loops never read cluster metadata, so the name here is
+        # only there because a Cluster is always a named cluster.
+        cluster = Cluster(client, 'banana', 'testns')
+        cluster.progress = progress.Progress(stream=stream)
+        return cluster
 
     def test_await_boot_does_not_run_os_update(self):
         client = mock.MagicMock()
         client.get_instance.return_value = {
             'name': 'node-001', 'state': 'created', 'agent_state': 'ready'}
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
-        primitives.await_boot(ctx, ['uuid-001'])
+        cluster.await_boot(['uuid-001'])
 
         # The OS update was previously triggered implicitly from within
         # await_boot(), which made the subsequent idle wait impossible to
@@ -377,9 +452,9 @@ class WaitLoopTestCase(testtools.TestCase):
             []
         ]
         stream = io.StringIO()
-        ctx = self._make_context(client, stream)
+        cluster = self._make_cluster(client, stream)
 
-        primitives.await_idle(ctx, ['uuid-001'])
+        cluster.await_idle(['uuid-001'])
 
         self.assertEqual(
             "  node-001: running 'apt-get update' (1 operation remaining) (0s)\n"
@@ -399,16 +474,21 @@ class WaitLoopTestCase(testtools.TestCase):
                 'results': {}
             }]
         ]
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
+        # The failure is raised rather than printed and exited: the text
+        # is now the exception's, and nothing reaches stdout.
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.await_idle, ctx, ['uuid-001'])
+            e = self.assertRaises(
+                exceptions.AgentOperationError, cluster.await_idle, ['uuid-001'])
 
-        self.assertEqual(1, e.code)
-        self.assertIn('operation: aop-002', captured.getvalue())
-        self.assertIn('helm install banana', captured.getvalue())
-        self.assertIn('failed to start', captured.getvalue())
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual('aop-002', e.operation_uuid)
+        self.assertEqual('node-001', e.instance_name)
+        self.assertIn('operation: aop-002', str(e))
+        self.assertIn('helm install banana', str(e))
+        self.assertIn('failed to start', str(e))
 
     def test_await_idle_ignores_preexisting_errors(self):
         client = mock.MagicMock()
@@ -422,11 +502,11 @@ class WaitLoopTestCase(testtools.TestCase):
         }
         client.get_instance_agentoperations.side_effect = [[old_error], [old_error]]
         stream = io.StringIO()
-        ctx = self._make_context(client, stream)
+        cluster = self._make_cluster(client, stream)
 
         # An operation which had already failed before the wait started must
         # neither wedge the wait nor abort it.
-        primitives.await_idle(ctx, ['uuid-001'])
+        cluster.await_idle(['uuid-001'])
         self.assertIn('node-001: idle', stream.getvalue())
 
     def test_await_idle_notes_stalled_command(self):
@@ -443,12 +523,12 @@ class WaitLoopTestCase(testtools.TestCase):
         # The loop polls every five seconds, so this is enough polls to pass
         # the stall warning threshold with some slack to show the warning is
         # only emitted once.
-        polls = primitives.STALL_WARNING_SECONDS // 5 + 10
+        polls = cluster_module.STALL_WARNING_SECONDS // 5 + 10
         client.get_instance_agentoperations.side_effect = [[]] + [[running]] * polls + [[]]
         stream = io.StringIO()
-        ctx = self._make_context(client, stream)
+        cluster = self._make_cluster(client, stream)
 
-        primitives.await_idle(ctx, ['uuid-001'])
+        cluster.await_idle(['uuid-001'])
 
         self.assertIn('may be stalled', stream.getvalue())
         self.assertIn('aop-001', stream.getvalue())
@@ -464,14 +544,16 @@ class WaitLoopTestCase(testtools.TestCase):
             'commands': [{'command': 'get-file', 'path': '/missing'}],
             'results': {}
         }
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.await_fetch, ctx, aop)
+            e = self.assertRaises(
+                exceptions.AgentOperationError, cluster.await_fetch, aop)
 
-        self.assertEqual(1, e.code)
-        self.assertIn('get-file /missing', captured.getvalue())
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual({}, e.results)
+        self.assertIn('get-file /missing', str(e))
 
     def test_reap_execute_aborts_on_errored_operation(self):
         client = mock.MagicMock()
@@ -483,14 +565,44 @@ class WaitLoopTestCase(testtools.TestCase):
             'commands': [{'command': 'execute', 'commandline': 'apt-get update'}],
             'results': {}
         }
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.reap_execute, ctx, aop)
+            e = self.assertRaises(
+                exceptions.AgentOperationError, cluster.reap_execute, aop)
 
-        self.assertEqual(1, e.code)
-        self.assertIn('operation: aop-004', captured.getvalue())
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual('aop-004', e.operation_uuid)
+        self.assertIn('operation: aop-004', str(e))
+
+    def test_reap_execute_error_renders_the_results_it_captured(self):
+        # The other errored-operation tests all have empty results, which
+        # takes the "no results were recorded" branch. An operation which
+        # errored after producing output is the case decision 6 of the phase
+        # plan cares about: every field the old print() calls interpolated
+        # has to survive as a structured attribute and be rendered.
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'node-001'}
+        results = {'0': {'return-code': 137, 'stdout': 'starting',
+                         'stderr': 'killed'}}
+        aop = {
+            'uuid': 'aop-006',
+            'instance_uuid': 'uuid-001',
+            'state': 'error',
+            'commands': [{'command': 'execute', 'commandline': 'helm install banana'}],
+            'results': results
+        }
+        cluster = self._make_cluster(client, io.StringIO())
+
+        e = self.assertRaises(
+            exceptions.AgentOperationError, cluster.reap_execute, aop)
+
+        self.assertEqual(results, e.results)
+        self.assertEqual('uuid-001', e.instance_uuid)
+        self.assertEqual('helm install banana', e.command_description)
+        self.assertIn('"return-code": 137', str(e))
+        self.assertNotIn('failed to start', str(e))
 
     def test_reap_execute_formats_multiline_stderr(self):
         client = mock.MagicMock()
@@ -503,154 +615,18 @@ class WaitLoopTestCase(testtools.TestCase):
             'results': {'0': {'return-code': 1, 'stdout': '',
                               'stderr': 'timed out on pod one\ntimed out on pod two'}}
         }
-        ctx = self._make_context(client, io.StringIO())
+        cluster = self._make_cluster(client, io.StringIO())
 
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
-            e = self.assertRaises(SystemExit, primitives.reap_execute, ctx, aop)
+            e = self.assertRaises(
+                exceptions.CommandFailedError, cluster.reap_execute, aop)
 
-        self.assertEqual(1, e.code)
+        self.assertEqual('', captured.getvalue())
+        self.assertEqual(1, e.return_code)
+        self.assertEqual('kubectl wait pods', e.commandline)
         self.assertIn('   stderr: timed out on pod one\n'
-                      '   stderr: timed out on pod two', captured.getvalue())
-
-
-class AllocateMetallbAddressesTestCase(testtools.TestCase):
-    def _allocate(self, route_results, count):
-        stream = io.StringIO()
-        client = mock.MagicMock()
-        client.get_network.return_value = {'uuid': 'net-1'}
-        client.route_network_address.side_effect = route_results
-        md = {'name': 'banana', 'node_network': 'net-1',
-              'routed_addresses': ['192.168.10.1']}
-        ctx = FakeContext({
-            'name': 'banana',
-            'namespace': 'testns',
-            'CLIENT': client,
-            'VERBOSE': False,
-            'PROGRESS': progress.Progress(stream=stream),
-            primitives.METADATA_KEY % 'banana': md
-        })
-        primitives.allocate_metallb_addresses(ctx, count)
-        return stream.getvalue()
-
-    def test_allocation_reports_new_addresses_and_cluster_total(self):
-        out = self._allocate(['192.168.10.2', '192.168.10.3'], 2)
-        self.assertIn('allocated 2 routed addresses: 192.168.10.2, 192.168.10.3', out)
-        self.assertIn('the cluster now has 3', out)
-
-    def test_partial_allocation_notes_shortfall(self):
-        out = self._allocate(['192.168.10.2', None, None], 3)
-        self.assertIn('allocated 1 routed address: 192.168.10.2', out)
-        self.assertIn('(requested 3)', out)
-        self.assertIn('the cluster now has 2', out)
-
-    def test_empty_allocation_reported_without_dangling_list(self):
-        out = self._allocate([None, None], 2)
-        self.assertIn('no routed addresses were available (requested 2)', out)
-        self.assertNotIn('allocated', out)
-
-
-# A minimal kubeconfig in the shape k3s writes, pointing at the loopback
-# address the way the real file does before k3s_create rewrites it.
-KUBECONFIG = """apiVersion: v1
-clusters:
-- cluster:
-    server: https://127.0.0.1:6443
-  name: default
-contexts:
-- context:
-    cluster: default
-    user: default
-  name: default
-current-context: default
-kind: Config
-users:
-- name: default
-  user:
-    token: banana
-"""
-
-
-class FakeCreateClient:
-    """Enough of the sf-client API surface for k3s create to run end to end.
-
-    Instances boot instantly, every agent operation completes successfully
-    at submission, and file fetches return canned content.
-    """
-
-    def __init__(self):
-        self.namespace = 'testns'
-        self.metadata = {}
-        self.instances = {}
-        self.instance_serial = 0
-        self.aop_serial = 0
-        self.routed_serial = 0
-
-    def get_namespace_metadata(self, namespace):
-        return dict(self.metadata)
-
-    def set_namespace_metadata_item(self, namespace, key, value):
-        self.metadata[key] = value
-
-    def delete_namespace_metadata_item(self, namespace, key):
-        self.metadata.pop(key, None)
-
-    def allocate_network(self, netblock, provide_dhcp, provide_nat, name,
-                         namespace=None):
-        return {'uuid': 'net-1', 'name': name, 'state': 'created'}
-
-    def get_network(self, network_ref):
-        return {'uuid': 'net-1', 'name': 'k3s-banana-node', 'state': 'created'}
-
-    def create_instance(self, name, cpus, memory, networks, disks, sshkey,
-                        userdata, side_channels=None, namespace=None):
-        self.instance_serial += 1
-        instance_uuid = 'inst-%03d' % self.instance_serial
-        self.instances[instance_uuid] = {
-            'uuid': instance_uuid, 'name': name, 'state': 'created',
-            'agent_state': 'ready'}
-        return self.instances[instance_uuid]
-
-    def get_instance(self, instance_ref):
-        return self.instances[instance_ref]
-
-    def get_instance_interfaces(self, instance_ref):
-        return [{'ipv4': '10.0.0.4', 'floating': '192.168.10.100'}]
-
-    def get_instance_agentoperations(self, instance_ref, all=False):
-        return []
-
-    def _complete_aop(self, instance_ref, commands, results):
-        self.aop_serial += 1
-        return {
-            'uuid': 'aop-%03d' % self.aop_serial,
-            'instance_uuid': instance_ref,
-            'state': 'complete',
-            'commands': commands,
-            'results': results
-        }
-
-    def instance_execute(self, instance_ref, commandline):
-        return self._complete_aop(
-            instance_ref,
-            [{'command': 'execute', 'commandline': commandline}],
-            {'0': {'return-code': 0, 'stdout': '', 'stderr': ''}})
-
-    def instance_get(self, instance_ref, path):
-        return self._complete_aop(
-            instance_ref,
-            [{'command': 'get-file', 'path': path}],
-            {'0': {'content_blob': path}})
-
-    def get_blob_data(self, blob_uuid):
-        if blob_uuid.endswith('k3s.yaml'):
-            yield KUBECONFIG.encode('utf-8')
-        else:
-            yield b'not-a-real-token\n'
-
-    def route_network_address(self, network_uuid):
-        self.routed_serial += 1
-        return '192.168.10.%d' % self.routed_serial
+                      '   stderr: timed out on pod two', str(e))
 
 
 class K3sCreateSmokeTestCase(testtools.TestCase):
@@ -659,13 +635,13 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
     This is command level wiring coverage: it catches crashes in the
     create flow itself (for example the Progress reporter being shadowed
     by a subprocess result), and it pins the phase total computed in
-    k3s_create() to the number of phase headers the primitives actually
-    emit, which nothing else keeps in sync.
+    Cluster.create() to the number of phase headers the orchestration
+    emits, which nothing else keeps in sync.
     """
 
     def setUp(self):
         super().setUp()
-        self.client = FakeCreateClient()
+        self.client = fakes.FakeClusterClient()
 
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
@@ -752,9 +728,9 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
             return subprocess.CompletedProcess(
                 cmd, 0, yaml.dump(merged).encode('utf-8'), b'')
 
-        with mock.patch('shakenfist_client_k3s.shutil.which',
+        with mock.patch('shutil.which',
                         return_value='/usr/bin/kubectl'):
-            with mock.patch('shakenfist_client_k3s.subprocess.run',
+            with mock.patch('subprocess.run',
                             side_effect=fake_merge):
                 output = self._create(['banana'])
         self._assert_phases_consistent(output)

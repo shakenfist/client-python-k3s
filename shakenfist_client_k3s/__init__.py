@@ -1,47 +1,97 @@
 import click
-import copy
-import os
 from shakenfist_client import apiclient
-import shutil
-import subprocess
 import sys
-import tempfile
-import time
-import yaml
 
-try:
-    from importlib.metadata import version as distribution_version
-except ImportError:
-    from importlib_metadata import version as distribution_version
-
+from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
+from shakenfist_client_k3s.cluster import Cluster
 
 
-CLUSTER_LIST = 'orchestrated_k3s_clusters'
+def _bind_namespace_context(ctx, namespace):
+    """Build what a namespace scoped command needs.
 
+    Returns the client, the resolved namespace and a reporter. The
+    --namespace option is None unless the caller passed it, and the
+    namespace is passed directly to API calls, so it must be defaulted to
+    the client's own namespace here.
 
-def _emit_debug(ctx, m):
-    if ctx.obj['VERBOSE']:
-        print(m)
+    list, query-k3s-version and query-longhorn-version are namespace
+    scoped rather than cluster scoped: they name no cluster, and the
+    release lookups they call cache in namespace metadata. They therefore
+    build no Cluster at all.
+    """
+    client = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
+    if not namespace:
+        namespace = client.namespace
+    return client, namespace, progress.Reporter(verbose=ctx.obj.get('VERBOSE', False))
 
 
 def _bind_cluster_context(ctx, name, namespace):
-    """Record the target cluster and namespace in ctx.obj for primitives.
+    """Build the Cluster this command operates on.
 
-    The --namespace option is None unless the caller passed it, and the
-    primitives pass ctx.obj['namespace'] directly to API calls, so it must
-    be defaulted to the client's own namespace here.
+    ctx.obj is read only now that the command bodies have moved onto
+    Cluster: nothing in this module reads the client, the name or the
+    namespace back out of the context, so they are no longer written into
+    it either. VERBOSE is all that is left, and only to build the reporter.
     """
-    ctx.obj['name'] = name
-    ctx.obj['CLIENT'] = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
-    if not namespace:
-        namespace = ctx.obj['CLIENT'].namespace
-    ctx.obj['namespace'] = namespace
-    return namespace
+    client, namespace, reporter = _bind_namespace_context(ctx, namespace)
+    return Cluster(client, name, namespace, reporter=reporter)
 
 
-@click.group(help=('k3s kubernetes cluster commands (via the '
+def _bind_new_cluster_context(ctx, name, namespace):
+    """Build the Cluster create will build, making its namespace if needed.
+
+    create is the only command which will create a namespace that does not
+    exist yet, and it does so only when --namespace named one: with the
+    option absent the namespace comes from the client and is known to
+    exist, so nothing is looked up at all. That distinction is Click
+    information -- whether an option was passed, rather than what it
+    resolved to -- which is why it stays here rather than moving onto
+    Cluster.create() with the rest of the body. A library caller creates
+    the namespace itself.
+    """
+    client, resolved_namespace, reporter = _bind_namespace_context(ctx, namespace)
+    if namespace:
+        ns = client.get_namespace(resolved_namespace)
+        if not ns:
+            client.create_namespace(resolved_namespace)
+            reporter.write('Created namespace %s\n' % resolved_namespace)
+    return Cluster(client, name, resolved_namespace, reporter=reporter)
+
+
+class GroupCatchClusterExceptions(click.Group):
+    """Turn this plugin's exceptions back into the CLI behaviour they replaced.
+
+    The orchestration raises K3sClusterException subclasses rather than
+    exiting the process, so that an in process caller -- the Ansible
+    module this plan exists for -- can fail structurally and keep stdout
+    for its own JSON result. The command line still has to behave exactly
+    as it did, so this is where the two meet: one handler which prints the
+    message the failing command used to print, on stdout where it has
+    always gone, and exits 1. Click's Group.invoke() is what resolves and
+    invokes the subcommand, so catching here covers every command,
+    including any added later.
+
+    Nothing from shakenfist_client.apiclient is caught here. The parent
+    CLI's GroupCatchExceptions already maps every API exception to its own
+    error line and exit code, and that behaviour must survive untouched.
+    """
+
+    def invoke(self, ctx):
+        try:
+            return super(GroupCatchClusterExceptions, self).invoke(ctx)
+        except exceptions.K3sClusterException as e:
+            # Terminal output, deliberately not routed through a reporter:
+            # this is the Click layer converting a raised exception back
+            # into the error line and exit code the command used to
+            # produce directly, on the process's own stdout.
+            print(str(e))
+            sys.exit(1)
+
+
+@click.group(cls=GroupCatchClusterExceptions,
+             help=('k3s kubernetes cluster commands (via the '
                    'shakenfist-client-k3s plugin)'))
 def k3s():
     ...
@@ -53,12 +103,12 @@ def k3s():
                     'different namespace.'))
 @click.pass_context
 def k3s_list(ctx, namespace=None, ):
-    namespace = _bind_cluster_context(ctx, None, namespace)
+    client, namespace, _ = _bind_namespace_context(ctx, namespace)
 
-    namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
-    all_clusters = namespace_md.get(CLUSTER_LIST, [])
-
-    for cluster in all_clusters:
+    for cluster in primitives.list_clusters(client, namespace):
+        # Terminal output: this command's job is formatting the cluster
+        # list for a human. A library caller calls
+        # primitives.list_clusters() and gets the list itself.
         print(cluster)
 
 
@@ -94,191 +144,10 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                metal_address_count=None,  namespace=None, network=None,
                refresh_version_cache=False, release_channel=None,
                sshkey=None):
-    ctx.obj['name'] = name
-    ctx.obj['CLIENT'] = apiclient.Client(
-        async_strategy=apiclient.ASYNC_CONTINUE)
-
-    # Phases: create control plane nodes, create workers, install control
-    # plane, install workers, fetch credentials, metallb, longhorn, and
-    # update the local kubeconfig. Creating a node network and installing
-    # additional control plane nodes only sometimes happen.
-    total_phases = 8
-    if not network:
-        total_phases += 1
-    if control_plane_count > 1:
-        total_phases += 1
-    p = progress.Progress(total_phases=total_phases, verbose=ctx.obj['VERBOSE'])
-    ctx.obj['PROGRESS'] = p
-
-    # The namespace must be resolved (and exist) before anything looks up
-    # namespace metadata, including the version cache.
-    if namespace:
-        ns = ctx.obj['CLIENT'].get_namespace(namespace)
-        if not ns:
-            ctx.obj['CLIENT'].create_namespace(namespace)
-            print('Created namespace %s' % namespace)
-    else:
-        namespace = ctx.obj['CLIENT'].namespace
-    ctx.obj['namespace'] = namespace
-
-    _emit_debug(ctx, 'Looking up k3s versions')
-    target_release = primitives.get_k3s_release(
-        ctx, force_cache_update=refresh_version_cache,
-        release_channel=release_channel)
-
-    # Ensure this name isn't already taken
-    namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
-    all_clusters = namespace_md.get(CLUSTER_LIST, [])
-    md = primitives.get_cluster_metadata(ctx)
-
-    if name in all_clusters:
-        print('Sorry, that cluster name is already taken')
-        sys.exit(1)
-    if md:
-        print('Sorry, that cluster name is already taken')
-        sys.exit(1)
-    all_clusters.append(name)
-    ctx.obj['CLIENT'].set_namespace_metadata_item(namespace, CLUSTER_LIST, all_clusters)
-
-    # Create a network for nodes
-    if network:
-        node_network = ctx.obj['CLIENT'].get_network(network)
-        if not node_network:
-            print('Specified network does not exist')
-            sys.exit(1)
-    else:
-        p.phase('Creating node network')
-        node_network = ctx.obj['CLIENT'].allocate_network(
-            '10.0.0.0/16', True, True, 'k3s-%s-node' % name, namespace=namespace)
-        p.note('created %s (uuid %s)' % (node_network['name'], node_network['uuid']))
-        while True:
-            node_network = ctx.obj['CLIENT'].get_network(node_network['uuid'])
-            p.update(node_network['name'], 'state %s' % node_network['state'])
-            if node_network['state'] == 'created':
-                break
-            time.sleep(1)
-        p.wait_done()
-
-    # Read the ssh key if any
-    ssh_key_content = None
-    if sshkey:
-        with open(sshkey) as f:
-            ssh_key_content = f.read()
-
-    # Initialise the metadata
-    _emit_debug(ctx, 'Initialize cluster metadata')
-    md = {
-        'name': name,
-        'namespace': namespace,
-        'type': 'k3s',
-        'k3s_version': target_release,
-        'k3s_version_history': [target_release],
-        'plugin_version': distribution_version('shakenfist_client_k3s'),
-        'state': 'initial',
-        'node_serial': 1,
-        'node_network': node_network['uuid'],
-        'node_token': None,
-        'control_plane_nodes': [],
-        'worker_nodes': [],
-        'routed_addresses': [],
-        'ssh_key': ssh_key_content
-    }
-    primitives.set_cluster_metadata(ctx, md)
-
-    # We really should do a pre-fetch on the disk image and wait for it to
-    # download before starting instances. That way the point of slowness is
-    # more obvious. That requires cluster operations to exist though.
-
-    # I'd prefer to wait for these as one thing, but that's not currently a thing
-    # the code supports.
-    primitives.create_and_await_instances(
-        ctx, control_plane_count, 'control_plane')
-    primitives.create_and_await_instances(ctx, worker_count, 'worker')
-
-    # Record the node network address for the first control plane node as the API
-    # address
-    interfaces = ctx.obj['CLIENT'].get_instance_interfaces(md['control_plane_nodes'][0])
-    md['api_address_inner'] = interfaces[0]['ipv4']
-    md['api_address_floating'] = interfaces[0]['floating']
-
-    # The join address is the address new nodes register through, and is
-    # deliberately mutable cluster state rather than "the first control
-    # plane node's address": a future control plane replacement joins the
-    # new server via the old address, updates join_address, and then reaps
-    # the old node. k3s agents only need this address at registration time.
-    md['join_address'] = interfaces[0]['ipv4']
-    primitives.set_cluster_metadata(ctx, md)
-
-    primitives.install_control_plane(ctx)
-    primitives.install_workers(ctx)
-
-    # Fetch kubecfg, correct IP, and include cluster name instead of "default"
-    p.phase('Fetching cluster credentials')
-    aop = ctx.obj['CLIENT'].instance_get(
-        md['control_plane_nodes'][0], '/etc/rancher/k3s/k3s.yaml')
-    kubeconfig = primitives.await_fetch(ctx, aop).replace(
-        '127.0.0.1', md['api_address_floating'])
-
-    kc = yaml.safe_load(kubeconfig)
-    fqcn = '%s.%s' % (name, namespace)
-    kc['clusters'][0]['name'] = fqcn
-    kc['contexts'][0]['name'] = fqcn
-    kc['contexts'][0]['context']['cluster'] = fqcn
-    kc['contexts'][0]['context']['user'] = fqcn
-    kc['users'][0]['name'] = fqcn
-    kc['current-context'] = fqcn
-    md['kubeconfig'] = yaml.dump(kc)
-    primitives.set_cluster_metadata(ctx, md)
-
-    # Install metallb and longhorn
-    primitives.setup_metallb(ctx, metal_address_count)
-    primitives.setup_longhorn(ctx)
-
-    # Install the kubeconfig we fetched earlier
-    p.phase('Updating local kubeconfig')
-    kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
-    main_config_path = os.path.join(kube_dir, 'config')
-    os.makedirs(kube_dir, exist_ok=True)
-
-    if not os.path.exists(main_config_path):
-        # There is no existing configuration to preserve, so no merge is
-        # required and we don't need a local kubectl.
-        with open(main_config_path, 'w') as f:
-            f.write(yaml.dump(kc))
-    else:
-        if not shutil.which('kubectl'):
-            print('A local kubectl binary is required to merge the new cluster into')
-            print('%s, but none was found. The new cluster credentials are' % main_config_path)
-            print(f"available from 'sf-client k3s getconfig {name}'.")
-            sys.exit(1)
-
-        with tempfile.TemporaryDirectory() as tempdir:
-            new_config_path = os.path.join(tempdir, 'config')
-            with open(new_config_path, 'w') as f:
-                f.write(yaml.dump(kc))
-            merged = subprocess.run(
-                'kubectl config view --flatten', shell=True, capture_output=True,
-                env={**os.environ,
-                     'KUBECONFIG': '%s:%s' % (main_config_path, new_config_path)})
-            if merged.returncode != 0:
-                print('Failed to update %s, return code %d'
-                      % (main_config_path, merged.returncode))
-                if merged.stderr:
-                    print(merged.stderr.decode('utf-8', errors='replace'))
-                sys.exit(1)
-
-            # kubectl's merge keeps the pre-existing file's current-context,
-            # which would leave kubectl pointed at whatever cluster was
-            # active before this create. Select the new cluster, matching
-            # the no-merge path above.
-            merged_kc = yaml.safe_load(merged.stdout)
-            merged_kc['current-context'] = fqcn
-            with open(main_config_path, 'w') as f:
-                f.write(yaml.dump(merged_kc))
-
-    md['state'] = 'created'
-    primitives.set_cluster_metadata(ctx, md)
-    p.finish(f'Cluster {name} is ready')
+    c = _bind_new_cluster_context(ctx, name, namespace)
+    c.create(control_plane_count, worker_count, metal_address_count,
+             network=network, refresh_version_cache=refresh_version_cache,
+             release_channel=release_channel, sshkey=sshkey)
 
 
 k3s.add_command(k3s_create)
@@ -295,11 +164,14 @@ k3s.add_command(k3s_create)
 @click.pass_context
 def k3s_query_k3s_version(ctx, release_channel=None, namespace=None,
                           refresh_version_cache=False):
-    _bind_cluster_context(ctx, None, namespace)
+    client, namespace, reporter = _bind_namespace_context(ctx, namespace)
 
     target_release = primitives.get_k3s_release(
-        ctx, force_cache_update=refresh_version_cache,
+        client, namespace, reporter,
+        force_cache_update=refresh_version_cache,
         release_channel=release_channel)
+    # Terminal output: presentation of the looked up value. A library
+    # caller calls primitives.get_k3s_release() and gets target_release.
     print(f'Release channel {release_channel} has {target_release} as its '
           'latest version.')
 
@@ -316,10 +188,14 @@ k3s.add_command(k3s_query_k3s_version)
               help=('Force a refresh of the longhorn version cache.'))
 @click.pass_context
 def k3s_query_longhorn_version(ctx, namespace=None, refresh_version_cache=False):
-    _bind_cluster_context(ctx, None, namespace)
+    client, namespace, reporter = _bind_namespace_context(ctx, namespace)
 
     target_release = primitives.get_longhorn_release(
-        ctx, force_cache_update=refresh_version_cache)
+        client, namespace, reporter,
+        force_cache_update=refresh_version_cache)
+    # Terminal output: presentation of the looked up value. A library
+    # caller calls primitives.get_longhorn_release() and gets
+    # target_release.
     print(f'Longhorn has {target_release} as its latest version.')
 
 
@@ -333,19 +209,11 @@ k3s.add_command(k3s_query_longhorn_version)
                     'cluster in a different namespace.'))
 @click.pass_context
 def k3s_getconfig(ctx, name=None, namespace=None):
-    _bind_cluster_context(ctx, name, namespace)
+    c = _bind_cluster_context(ctx, name, namespace)
 
-    md = primitives.get_cluster_metadata(ctx)
-    if not md:
-        print('Unknown cluster')
-        sys.exit(1)
-
-    kubeconfig = md.get('kubeconfig')
-    if not kubeconfig:
-        print('No kubeconfig for this cluster. Is it fully installed?')
-        sys.exit(1)
-
-    print(kubeconfig)
+    # Terminal output: this command's result. A library caller calls
+    # Cluster.get_kubeconfig() and gets the string itself.
+    print(c.get_kubeconfig())
 
 
 @k3s.command(name='show', help='Show details of a k3s cluster')
@@ -355,13 +223,11 @@ def k3s_getconfig(ctx, name=None, namespace=None):
                     'different namespace.'))
 @click.pass_context
 def k3s_show(ctx, name=None, namespace=None):
-    _bind_cluster_context(ctx, name, namespace)
+    c = _bind_cluster_context(ctx, name, namespace)
+    md = c.show()
 
-    md = primitives.get_cluster_metadata(ctx)
-    if not md:
-        print('Sorry, that cluster name does not appear to exist')
-        sys.exit(1)
-
+    # Terminal output: this command's result, formatted for a human. A
+    # library caller calls Cluster.show() and gets the metadata dict.
     print('Cluster metadata:')
     for k in md:
         print('    %s = %s' % (k, md[k]))
@@ -377,92 +243,7 @@ k3s.add_command(k3s_show)
                     'different namespace.'))
 @click.pass_context
 def k3s_delete(ctx, name=None, namespace=None):
-    namespace = _bind_cluster_context(ctx, name, namespace)
-
-    # Ensure this name exists
-    md = primitives.get_cluster_metadata(ctx)
-    if not md:
-        print('Sorry, that cluster name does not appear to exist')
-        sys.exit(1)
-
-    _emit_debug(ctx, 'Cluster metadata:')
-    for k in md:
-        _emit_debug(ctx, '    %s = %s' % (k, md[k]))
-
-    # Delete instances
-    waiting = []
-    for instance_uuid in set(md['control_plane_nodes'] + md['worker_nodes']):
-        try:
-            inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
-            _emit_debug(ctx, '...Deleting instance %s with uuid %s'
-                        % (inst['name'], instance_uuid))
-            ctx.obj['CLIENT'].delete_instance(instance_uuid)
-            waiting.append(instance_uuid)
-        except apiclient.ResourceNotFoundException:
-            pass
-
-    while waiting:
-        _emit_debug(ctx, '...Waiting for %d instances to be deleted' % len(waiting))
-        for instance_uuid in copy.copy(waiting):
-            try:
-                i = ctx.obj['CLIENT'].get_instance(instance_uuid)
-                if i['state'] == 'deleted':
-                    waiting.remove(instance_uuid)
-            except apiclient.ResourceNotFoundException:
-                waiting.remove(instance_uuid)
-
-        if waiting:
-            time.sleep(1)
-
-    md['control_plane_nodes'] = []
-    md['worker_nodes'] = []
-    md['api_floating_address'] = None
-    md['api_inner_address'] = None
-    md['k3s_version'] = None
-    md['kubeconfig'] = None
-    md['node_token'] = None
-    primitives.set_cluster_metadata(ctx, md)
-
-    if md.get('node_network'):
-        # Free any routed ips
-        for addr in md.get('routed_addresses', []):
-            try:
-                _emit_debug(ctx, 'Unrouting address %s from network %s'
-                            % (addr, md['node_network']))
-                ctx.obj['CLIENT'].unroute_network_address(
-                    md['node_network'], addr)
-            except apiclient.UnauthorizedException:
-                _emit_debug(
-                    ctx, '...Address %s was not routed to this network' % addr)
-
-        # Delete node network
-        ctx.obj['CLIENT'].delete_network(md['node_network'])
-        md['node_network'] = []
-
-    md['state'] = 'deleted'
-    primitives.set_cluster_metadata(ctx, md)
-
-    # Then remove the metadata
-    primitives.delete_cluster_metadata(ctx)
-    namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
-    all_clusters = namespace_md.get(CLUSTER_LIST, [])
-    all_clusters.remove(name)
-    if not all_clusters:
-        ctx.obj['CLIENT'].delete_namespace_metadata_item(namespace, CLUSTER_LIST)
-    else:
-        ctx.obj['CLIENT'].set_namespace_metadata_item(
-            namespace, CLUSTER_LIST, all_clusters)
-
-    # And remove the local config
-    fqcn = '%s.%s' % (name, namespace)
-    for config_elem in ['users.%s' % fqcn,
-                        'contexts.%s' % fqcn,
-                        'clusters.%s' % fqcn]:
-        p = subprocess.run(
-            'kubectl config unset %s' % config_elem, shell=True)
-        if p.returncode != 0:
-            print('Could not unset kubectl config element %s' % config_elem)
-            sys.exit(1)
+    _bind_cluster_context(ctx, name, namespace).delete()
 
 
 k3s.add_command(k3s_delete)
@@ -477,18 +258,7 @@ k3s.add_command(k3s_delete)
                     'different namespace.'))
 @click.pass_context
 def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
-    _bind_cluster_context(ctx, name, namespace)
-
-    md = primitives.get_cluster_metadata(ctx)
-    if not md:
-        print('Cluster not found!')
-        sys.exit(1)
-
-    p = progress.Progress(total_phases=2, verbose=ctx.obj['VERBOSE'])
-    ctx.obj['PROGRESS'] = p
-    primitives.create_and_await_instances(ctx, worker_count, 'worker')
-    primitives.install_workers(ctx)
-    p.finish(f'Added {worker_count} workers to cluster {name}')
+    _bind_cluster_context(ctx, name, namespace).expand_workers(worker_count)
 
 
 k3s.add_command(k3s_expand_workers)
@@ -504,19 +274,7 @@ k3s.add_command(k3s_expand_workers)
                     'different namespace.'))
 @click.pass_context
 def k3s_expand_addresses(ctx, name=None, address_count=None, namespace=None):
-    _bind_cluster_context(ctx, name, namespace)
-
-    md = primitives.get_cluster_metadata(ctx)
-    if not md:
-        print('Cluster not found!')
-        sys.exit(1)
-
-    p = progress.Progress(total_phases=1, verbose=ctx.obj['VERBOSE'])
-    ctx.obj['PROGRESS'] = p
-    p.phase('Adding metallb addresses')
-    primitives.allocate_metallb_addresses(ctx, address_count)
-    primitives.configure_metallb_addresses(ctx)
-    p.finish(f'Added {address_count} metallb addresses to cluster {name}')
+    _bind_cluster_context(ctx, name, namespace).expand_addresses(address_count)
 
 
 k3s.add_command(k3s_expand_addresses)
@@ -529,19 +287,7 @@ k3s.add_command(k3s_expand_addresses)
                     'different namespace.'))
 @click.pass_context
 def k3s_update_os(ctx, name=None, namespace=None):
-    _bind_cluster_context(ctx, name, namespace)
-
-    md = primitives.get_cluster_metadata(ctx)
-    if not md:
-        print('Cluster not found!')
-        sys.exit(1)
-
-    p = progress.Progress(total_phases=1, verbose=ctx.obj['VERBOSE'])
-    ctx.obj['PROGRESS'] = p
-    p.phase('Updating the OS on all cluster nodes')
-    primitives.instance_os_update(
-        ctx, md['control_plane_nodes'] + md['worker_nodes'])
-    p.finish(f'Updated the OS on all nodes in cluster {name}')
+    _bind_cluster_context(ctx, name, namespace).update_os()
 
 
 k3s.add_command(k3s_update_os)

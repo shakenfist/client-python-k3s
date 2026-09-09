@@ -1,0 +1,18 @@
+Usage: k3s [OPTIONS] COMMAND [ARGS]...
+
+  k3s kubernetes cluster commands (via the shakenfist-client-k3s plugin)
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  create                  Create a new k3s cluster
+  delete                  Destroy a k3s cluster
+  expand-addresses        Add floating addresses for metallb to a k3s cluster
+  expand-workers          Add workers to a k3s cluster
+  getconfig               Get kubeconfig for an existing k3s cluster
+  list                    List managed k3s clusters
+  query-k3s-version       Lookup the current version for a k3s release channel
+  query-longhorn-version  Lookup the current longhorn version
+  show                    Show details of a k3s cluster
+  update-os               Update the OS on all nodes

@@ -1,82 +1,71 @@
-import copy
+"""Namespace scoped lookups and stateless helpers.
+
+What is left here is deliberately not cluster scoped. The two release
+lookups cache their results in *namespace* metadata rather than in any
+one cluster's metadata, and the commands which use them
+(``query-k3s-version`` and ``query-longhorn-version``) have no cluster at
+all, so they take a client, a namespace and a reporter rather than a
+Cluster. Everything which reads or writes cluster metadata, or drives a
+cluster's nodes, is a method on ``cluster.Cluster``.
+
+This module must never import ``cluster``: the dependency runs the other
+way, so that a Cluster can call these lookups.
+"""
+
 import json
 from packaging.version import InvalidVersion, Version
 import requests
 from shakenfist_client import apiclient
-import sys
 import time
 
-from shakenfist_client_k3s import progress
+from shakenfist_client_k3s import exceptions
 
 
-METADATA_KEY = 'orchestrated_k3s_cluster_%s'
+# The namespace metadata key the list of managed clusters is stored under.
+# It lives here rather than in the package __init__ because it is namespace
+# scoped state, alongside the two version caches below, and because both
+# cluster.py and the CLI need to reach it without importing each other.
+CLUSTER_LIST = 'orchestrated_k3s_clusters'
+
 K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
 LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
-BASE_OS_VERSION = 'debian:12'
-
-# How long, in seconds, a single agent command can run before the wait loop
-# notes that it might be stalled.
-STALL_WARNING_SECONDS = 300
 
 
-def _emit_debug(ctx, m):
-    if ctx.obj['VERBOSE']:
-        print(m)
+def list_clusters(client, namespace):
+    """Return the names of the managed k3s clusters in a namespace.
+
+    Namespace scoped rather than cluster scoped: there is no cluster to
+    build here, only the list in namespace metadata which create appends to
+    and delete removes from. This takes no reporter because it emits
+    nothing -- the caller decides what to do with the list.
+    """
+    namespace_md = client.get_namespace_metadata(namespace)
+    return namespace_md.get(CLUSTER_LIST, [])
 
 
-def get_cluster_metadata(ctx):
-    name = ctx.obj['name']
-    namespace = ctx.obj['namespace']
-
-    md_key = METADATA_KEY % name
-    if md_key not in ctx.obj:
-        namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
-        ctx.obj[md_key] = namespace_md.get(md_key)
-    return ctx.obj[md_key]
-
-
-def set_cluster_metadata(ctx, md):
-    name = ctx.obj['name']
-    namespace = ctx.obj['namespace']
-
-    md_key = METADATA_KEY % name
-    ctx.obj[md_key] = md
-    ctx.obj['CLIENT'].set_namespace_metadata_item(namespace, md_key, md)
-
-
-def delete_cluster_metadata(ctx):
-    name = ctx.obj['name']
-    namespace = ctx.obj['namespace']
-
-    md_key = METADATA_KEY % name
-    del ctx.obj[md_key]
-    ctx.obj['CLIENT'].delete_namespace_metadata_item(namespace, md_key)
-
-
-def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
-    namespace = ctx.obj['namespace']
-
+def get_k3s_release(client, namespace, reporter, force_cache_update=False,
+                    release_channel=None):
     if force_cache_update:
         version_cache = {'updated': 0}
-        _emit_debug(ctx, 'Forcing cache update')
+        reporter.debug('Forcing cache update')
     else:
-        namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
+        namespace_md = client.get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             K3S_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
         if not isinstance(version_cache, dict) or 'releases' not in version_cache:
-            _emit_debug(ctx, 'Version cache format invalid, clobbering')
+            reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
     updated = version_cache.get('updated', 0)
 
-    _emit_debug(ctx, (f'Cached version information from {updated}: '
-                      f'{version_cache.get("releases", {})}'))
+    reporter.debug(f'Cached version information from {updated}: '
+                   f'{version_cache.get("releases", {})}')
 
     if time.time() - updated > 24 * 3600:
-        _emit_debug(ctx, 'Updating release version cache')
+        reporter.debug('Updating release version cache')
 
         url = 'https://update.k3s.io/v1-release/channels'
-        _emit_debug(ctx, f'Fetching {url}')
+        reporter.debug(f'Fetching {url}')
         r = requests.request(
             'GET', url,
             headers={
@@ -84,22 +73,19 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
                 'User-Agent': apiclient.get_user_agent()
             })
         if r.status_code not in [200, 201, 204]:
-            print('Unable to determine latest k3s release version')
-            print(f'    GET {url}')
-            print(f'    returned HTTP status code {r.status_code} with text:')
-            print(f'    {r.text}')
-            sys.exit(1)
+            raise exceptions.ReleaseLookupError.http_status(
+                'k3s', url, r.status_code, r.text)
 
         d = r.json()
         releases = {}
-        _emit_debug(ctx, 'Fetched release data:')
-        _emit_debug(ctx, json.dumps(d, indent=4, sort_keys=True))
+        reporter.debug('Fetched release data:')
+        reporter.debug(json.dumps(d, indent=4, sort_keys=True))
         for reldata in d.get('data', []):
             # Some channels (for example v1.16-testing) have no released
             # version and therefore no 'latest' key.
             if 'name' not in reldata or 'latest' not in reldata:
-                _emit_debug(ctx, (f'Channel {reldata.get("name")} has no latest release, '
-                                  'skipping'))
+                reporter.debug(f'Channel {reldata.get("name")} has no latest release, '
+                               'skipping')
                 continue
             releases[reldata['name']] = reldata['latest']
 
@@ -108,51 +94,46 @@ def get_k3s_release(ctx, force_cache_update=False, release_channel=None):
         # expires. This mirrors the 'latest is None' guard in
         # get_longhorn_release().
         if not releases:
-            print('No usable k3s release channels found')
-            print(f'    GET {url}')
-            print(f'    returned: {json.dumps(d)[:512]}')
-            sys.exit(1)
+            raise exceptions.ReleaseLookupError.no_usable_k3s_channels(
+                url, json.dumps(d)[:512])
 
         version_cache['releases'] = releases
         version_cache['updated'] = time.time()
-        ctx.obj['CLIENT'].set_namespace_metadata_item(
+        client.set_namespace_metadata_item(
             namespace, K3S_VERSION_CACHE_KEY, version_cache)
 
     most_recent = version_cache['releases'].get(release_channel, None)
     if not most_recent:
-        print(f'Release channel {release_channel} not found')
-        sys.exit(1)
+        raise exceptions.ReleaseLookupError.unknown_channel(release_channel)
 
-    _emit_debug(ctx, f'Selected kubernetes version: {most_recent}')
+    reporter.debug(f'Selected kubernetes version: {most_recent}')
     return most_recent
 
 
-def get_longhorn_release(ctx, force_cache_update=False):
-    namespace = ctx.obj['namespace']
-
+def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
     if force_cache_update:
         version_cache = {'updated': 0}
-        _emit_debug(ctx, 'Forcing cache update')
+        reporter.debug('Forcing cache update')
     else:
-        namespace_md = ctx.obj['CLIENT'].get_namespace_metadata(namespace)
+        namespace_md = client.get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             LONGHORN_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
         if not isinstance(version_cache, dict) or 'latest' not in version_cache:
-            _emit_debug(ctx, 'Version cache format invalid, clobbering')
+            reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
     updated = version_cache.get('updated', 0)
 
-    _emit_debug(ctx, (f'Cached version information from {updated}: '
-                      f'{version_cache.get("releases", {})}'))
+    reporter.debug(f'Cached version information from {updated}: '
+                   f'{version_cache.get("releases", {})}')
 
     if time.time() - updated > 24 * 3600:
-        _emit_debug(ctx, 'Updating release version cache')
+        reporter.debug('Updating release version cache')
 
         releases = {}
         for page in range(5):
             url = f'https://api.github.com/repos/longhorn/longhorn/releases?page={page}'
-            _emit_debug(ctx, f'Fetching {url}')
+            reporter.debug(f'Fetching {url}')
             r = requests.request(
                 'GET', url,
                 headers={
@@ -161,17 +142,12 @@ def get_longhorn_release(ctx, force_cache_update=False):
                 })
 
             if r.status_code not in [200, 201, 204]:
-                print(
-                    'Unable to determine latest Longhorn release version\n'
-                    f'    GET {url}\n'
-                    f'    returned HTTP status code {r.status_code} '
-                    'with text:\n'
-                    f'    {r.text}')
-                sys.exit(1)
+                raise exceptions.ReleaseLookupError.http_status(
+                    'Longhorn', url, r.status_code, r.text)
 
             d = r.json()
-            _emit_debug(ctx, 'Fetched release data:')
-            _emit_debug(ctx, json.dumps(d, indent=4, sort_keys=True))
+            reporter.debug('Fetched release data:')
+            reporter.debug(json.dumps(d, indent=4, sort_keys=True))
             for reldata in d:
                 if reldata['prerelease']:
                     continue
@@ -186,7 +162,7 @@ def get_longhorn_release(ctx, force_cache_update=False):
             try:
                 parsed_version = Version(tagname)
             except InvalidVersion:
-                _emit_debug(ctx, f'Skipping unparsable tag {tagname}')
+                reporter.debug(f'Skipping unparsable tag {tagname}')
                 continue
             if not latest:
                 latest = parsed_version
@@ -194,45 +170,15 @@ def get_longhorn_release(ctx, force_cache_update=False):
                 latest = parsed_version
 
         if latest is None:
-            print('Unable to determine the latest Longhorn release')
-            sys.exit(1)
+            raise exceptions.ReleaseLookupError.no_parsable_longhorn_release()
 
         version_cache['releases'] = releases
         version_cache['latest'] = str(latest)
         version_cache['updated'] = time.time()
-        ctx.obj['CLIENT'].set_namespace_metadata_item(
+        client.set_namespace_metadata_item(
             namespace, LONGHORN_VERSION_CACHE_KEY, version_cache)
 
     return version_cache['latest']
-
-
-def create_instance(ctx):
-    md = get_cluster_metadata(ctx)
-
-    node_name = 'k3s-%s-node-%03d' % (md['name'], md['node_serial'])
-    inst = ctx.obj['CLIENT'].create_instance(
-        node_name, 2, 2048,
-        [
-            {
-                'network_uuid': md['node_network'],
-                'macaddress': None,
-                'model': 'virtio',
-                'float': True
-            }
-        ],
-        [
-            {
-                'size': 50,
-                'base': BASE_OS_VERSION,
-                'bus': None,
-                'type': 'disk'
-            }
-        ],
-        md.get('ssh_key'), None,
-        side_channels=['sf-agent2'],
-        namespace=md['namespace']
-    )
-    return inst
 
 
 def _describe_agent_op(aop, max_len=60):
@@ -261,397 +207,3 @@ def _describe_agent_op(aop, max_len=60):
     if max_len and len(desc) > max_len:
         desc = desc[:max_len - 3] + '...'
     return desc
-
-
-def _abort_agent_op_error(ctx, aop):
-    """Report an agent operation which entered the error state, then exit."""
-    inst = ctx.obj['CLIENT'].get_instance(aop['instance_uuid'])
-
-    print('Agent operation failed!')
-    print('  instance: %s (uuid %s)' % (inst['name'], aop['instance_uuid']))
-    print('  operation: %s' % aop['uuid'])
-    desc = _describe_agent_op(aop, max_len=None)
-    if desc:
-        print('  command: %s' % desc)
-
-    results = aop.get('results', {}) or {}
-    if results:
-        print('  results: %s' % json.dumps(results, indent=4, sort_keys=True))
-    else:
-        print('  no results were recorded, so the command probably failed to start')
-    print("  the server side event log may have more detail: 'sf-client instance events %s'" % inst['name'])
-    sys.exit(1)
-
-
-def await_boot(ctx, instances):
-    p = progress.get_progress(ctx)
-    waiting = copy.copy(instances)
-    while waiting:
-        for instance_uuid in copy.copy(waiting):
-            inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
-            agent_state = inst['agent_state'] if inst['agent_state'] else 'not yet contactable'
-            p.update(inst['name'], 'state %s, agent %s' % (inst['state'], agent_state))
-            if inst['state'] == 'created' and inst['agent_state'] == 'ready':
-                waiting.remove(instance_uuid)
-
-        if not waiting:
-            break
-        time.sleep(5)
-    p.wait_done()
-
-
-def await_idle(ctx, instances):
-    p = progress.get_progress(ctx)
-    waiting = copy.copy(instances)
-
-    # Agent operations stay associated with an instance forever, and an
-    # operation in the error state will never complete. Snapshot any which
-    # had already failed before this wait started so a historical failure
-    # can neither wedge this wait nor incorrectly abort it.
-    preexisting_errors = {}
-    for instance_uuid in waiting:
-        aops = ctx.obj['CLIENT'].get_instance_agentoperations(instance_uuid, all=True)
-        preexisting_errors[instance_uuid] = {
-            aop['uuid'] for aop in aops if aop['state'] == 'error'}
-
-    running_since = {}
-    stall_warned = set()
-
-    while waiting:
-        for instance_uuid in copy.copy(waiting):
-            inst = ctx.obj['CLIENT'].get_instance(instance_uuid)
-            agent_ops = ctx.obj['CLIENT'].get_instance_agentoperations(
-                instance_uuid, all=True)
-            agent_ops = [aop for aop in agent_ops
-                         if aop['uuid'] not in preexisting_errors[instance_uuid]]
-
-            errored = [aop for aop in agent_ops if aop['state'] == 'error']
-            if errored:
-                _abort_agent_op_error(ctx, errored[0])
-
-            incomplete = [aop for aop in agent_ops if aop['state'] != 'complete']
-            if not incomplete:
-                p.update(inst['name'], 'idle')
-                waiting.remove(instance_uuid)
-            else:
-                aop = incomplete[0]
-                desc = _describe_agent_op(aop)
-                remaining = progress.count_str(len(incomplete), 'operation')
-                if desc:
-                    p.update(inst['name'], "running '%s' (%s remaining)" % (desc, remaining))
-                else:
-                    p.update(inst['name'], '%s remaining' % remaining)
-
-                # Note once per command if it has been running suspiciously
-                # long. The progress elapsed times show the same thing, but
-                # this note includes the operation uuid and where to look
-                # for more detail, and persists in scrollback.
-                now = time.time()
-                command_key = (aop['uuid'], len(aop.get('results', {}) or {}))
-                running_since.setdefault(command_key, now)
-                if (now - running_since[command_key] >= STALL_WARNING_SECONDS
-                        and command_key not in stall_warned):
-                    stall_warned.add(command_key)
-                    p.note("%s has been running '%s' for %s and may be stalled; operation %s, "
-                           "'sf-client instance events %s' may show why" % (
-                               inst['name'], desc or 'a command',
-                               progress.format_elapsed(now - running_since[command_key]),
-                               aop['uuid'], inst['name']))
-
-        if not waiting:
-            break
-        time.sleep(5)
-    p.wait_done()
-
-
-def await_fetch(ctx, aop):
-    p = progress.get_progress(ctx)
-    while aop['state'] not in ['complete', 'error']:
-        p.update('fetch operation', 'state %s' % aop['state'])
-        time.sleep(1)
-        aop = ctx.obj['CLIENT'].get_agent_operation(aop['uuid'])
-    p.wait_done()
-
-    if aop['state'] == 'error':
-        _abort_agent_op_error(ctx, aop)
-
-    blob_uuid = aop['results']['0']['content_blob']
-    data = b''
-    for chunk in ctx.obj['CLIENT'].get_blob_data(blob_uuid):
-        data += chunk
-    return data.decode('utf-8')
-
-
-def reap_execute(ctx, aop):
-    while aop['state'] not in ('complete', 'error'):
-        time.sleep(1)
-        aop = ctx.obj['CLIENT'].get_agent_operation(aop['uuid'])
-
-    if aop['state'] == 'error':
-        _abort_agent_op_error(ctx, aop)
-
-    if aop['results']['0']['return-code'] != 0:
-        inst = ctx.obj['CLIENT'].get_instance(aop['instance_uuid'])
-
-        print('Command failed!')
-        print('  instance: %s (UUID %s)'
-              % (inst['name'], aop['instance_uuid']))
-        print('  command: %s' % aop['commands'][0]['commandline'])
-        print('exit code: %s' % aop['results']['0']['return-code'])
-        print('   stdout: %s' % '\n   stdout: '.join(
-            aop['results']['0']['stdout'].split('\n')))
-        print('   stderr: %s' % '\n   stderr: '.join(
-            aop['results']['0']['stderr'].split('\n')))
-        sys.exit(1)
-
-
-def create_and_await_instances(ctx, count, node_type):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
-
-    display_type = node_type.replace('_', ' ')
-    p.phase('Creating %s' % progress.count_str(count, '%s node' % display_type))
-
-    new_nodes = []
-    for i in range(count):
-        inst = create_instance(ctx)
-        new_nodes.append(inst['uuid'])
-        md['node_serial'] += 1
-        md[f'{node_type}_nodes'].append(inst['uuid'])
-        set_cluster_metadata(ctx, md)
-        p.note(f'created {inst["name"]} (uuid {inst["uuid"]})')
-
-    await_boot(ctx, new_nodes)
-    p.note('updating base OS packages')
-    instance_os_update(ctx, new_nodes)
-    set_cluster_metadata(ctx, md)
-
-
-def execute_and_await(ctx, instance_uuids, cmds):
-    aops = []
-    for cmd in cmds:
-        for instance_uuid in instance_uuids:
-            aops.append(ctx.obj['CLIENT'].instance_execute(
-                instance_uuid, cmd))
-
-    # Wait for instances to be idle and check results
-    await_idle(ctx, instance_uuids)
-    for aop in aops:
-        reap_execute(ctx, aop)
-
-
-def instance_os_update(ctx, instance_uuids):
-    execute_and_await(
-        ctx, instance_uuids,
-        [
-            'apt-get update',
-            'apt-get dist-upgrade -y'
-        ]
-    )
-
-
-def install_control_plane(ctx):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
-    cmds = []
-
-    p.phase('Installing k3s on the first control plane node')
-
-    # Write a configuration file with the external address to the first control
-    # plane node. This is needed so that the SSL certificate includes this
-    # external name.
-    cmds.append('mkdir -p /etc/rancher/k3s/')
-    cmds.append(
-        'cat - > /etc/rancher/k3s/config.yaml << EOF\n'
-        'write-kubeconfig-mode: "0644"\n'
-        'tls-san:\n'
-        '  - "%s"\n'
-        'cluster-init: true\n'
-        'EOF\n'
-        % md['api_address_floating'])
-
-    # Instruct the first control plane node to install k3s and helm
-    cmds.append('curl -sfL https://get.k3s.io | '
-                'INSTALL_K3S_CHANNEL=%s sh -s - server'
-                % md['k3s_version'])
-    cmds.append('sudo apt-get install -y extrepo')
-    cmds.append('sudo extrepo enable helm')
-    cmds.append('sudo apt-get update')
-    cmds.append('sudo apt-get install -y helm')
-
-    execute_and_await(ctx, [md['control_plane_nodes'][0]], cmds)
-
-    # Fetch the server and node tokens from the first control plane node
-    p.note('fetching control plane registration token')
-    aop = ctx.obj['CLIENT'].instance_get(
-        md['control_plane_nodes'][0], '/var/lib/rancher/k3s/server/token')
-    md['server_token'] = await_fetch(ctx, aop).rstrip()
-    set_cluster_metadata(ctx, md)
-
-    p.note('fetching node registration token')
-    aop = ctx.obj['CLIENT'].instance_get(
-        md['control_plane_nodes'][0], '/var/lib/rancher/k3s/server/node-token')
-    md['node_token'] = await_fetch(ctx, aop).rstrip()
-    set_cluster_metadata(ctx, md)
-
-    # If there is more than one control plane node, then install the others
-    if len(md['control_plane_nodes']) > 1:
-        install_extra_control_plane(ctx)
-
-
-def install_k3s_component(ctx, instance_uuids, token, node_role):
-    md = get_cluster_metadata(ctx)
-
-    # Nodes must join via an address inside the node network: the network
-    # node neither hairpins floating addresses nor routes in-network
-    # traffic to the network's own routed addresses (see
-    # shakenfist/shakenfist#3662). Clusters created before join_address
-    # existed only have api_address_inner.
-    join_address = md.get('join_address', md['api_address_inner'])
-
-    execute_and_await(
-        ctx, instance_uuids,
-        [
-            'sudo apt-get update',
-            'sudo apt-get install -y',
-            (
-                'curl -sfL https://get.k3s.io | '
-                f'INSTALL_K3S_CHANNEL={md["k3s_version"]} '
-                f'K3S_URL=https://{join_address}:6443 '
-                f'K3S_TOKEN={token} sh -s - {node_role}'
-            )
-        ]
-    )
-
-    set_cluster_metadata(ctx, md)
-
-
-def install_extra_control_plane(ctx):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
-    p.phase('Installing k3s on the additional control plane nodes')
-    install_k3s_component(
-        ctx, md['control_plane_nodes'][1:], md['server_token'], 'server')
-
-
-def install_workers(ctx):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
-    p.phase('Installing k3s on the worker nodes')
-    install_k3s_component(ctx, md['worker_nodes'], md['node_token'], 'agent')
-
-
-def allocate_metallb_addresses(ctx, metal_address_count):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
-    node_network = ctx.obj['CLIENT'].get_network(md['node_network'])
-
-    allocated = []
-    for i in range(metal_address_count):
-        addr = ctx.obj['CLIENT'].route_network_address(node_network['uuid'])
-        if addr:
-            md['routed_addresses'].append(addr)
-            allocated.append(addr)
-
-    if not allocated:
-        p.note('no routed addresses were available (requested %d)' % metal_address_count)
-    else:
-        msg = 'allocated %s: %s' % (
-            progress.count_str(len(allocated), 'routed address'), ', '.join(allocated))
-        if len(allocated) < metal_address_count:
-            msg += ' (requested %d)' % metal_address_count
-        msg += '; the cluster now has %d' % len(md['routed_addresses'])
-        p.note(msg)
-    set_cluster_metadata(ctx, md)
-
-
-def configure_metallb_addresses(ctx):
-    md = get_cluster_metadata(ctx)
-
-    # Setup metallb for traffic ingress, guided by
-    # https://itnext.io/kubernetes-loadbalancer-service-for-on-premises-6b7f75187be8
-    metal_lb_config = ('cat - > /etc/sf/metallb-range-allocation.yaml << EOF\n'
-                       'apiVersion: metallb.io/v1beta1\n'
-                       'kind: IPAddressPool\n'
-                       'metadata:\n'
-                       '  name: empty\n'
-                       '  namespace: metallb-system\n'
-                       'spec:\n'
-                       '  addresses:\n'
-                       '  - %s/32\n'
-                       '---\n'
-                       'apiVersion: metallb.io/v1beta1\n'
-                       'kind: L2Advertisement\n'
-                       'metadata:\n'
-                       '  name: empty\n'
-                       '  namespace: metallb-system\n'
-                       'EOF\n'
-                       % '/32\n  - '.join(md['routed_addresses']))
-
-    execute_and_await(
-        ctx, [md['control_plane_nodes'][0]],
-        [
-            ('kubectl wait --kubeconfig /etc/rancher/k3s/k3s.yaml -n metallb-system pod '
-             '--for=condition=Ready -l app.kubernetes.io/name=metallb --timeout=300s'),
-            'mkdir -p /etc/sf',
-            metal_lb_config,
-            'kubectl apply -f /etc/sf/metallb-range-allocation.yaml'
-        ]
-    )
-
-
-def setup_metallb(ctx, metal_address_count):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
-
-    p.phase('Setting up metallb')
-    allocate_metallb_addresses(ctx, metal_address_count)
-    execute_and_await(
-        ctx, [md['control_plane_nodes'][0]],
-        [
-            'kubectl create ns metallb-system',
-            # The official metallb chart is used here because Bitnami
-            # stopped publishing versioned images to docker.io/bitnami in
-            # 2025, so the bitnamicharts/metallb chart installs pods which
-            # can never pull their images. Note also that we can't use the
-            # KUBECONFIG=... environment variable prefix idiom: the
-            # in-guest agent validates the first token of the command line
-            # as an executable before running the command.
-            'helm repo add metallb https://metallb.github.io/metallb',
-            'helm repo update',
-            ('helm --kubeconfig /etc/rancher/k3s/k3s.yaml '
-             'upgrade --install -n metallb-system metallb metallb/metallb'),
-        ])
-
-    # Let the metallb pods start
-    time.sleep(5)
-
-    # Add addresses
-    configure_metallb_addresses(ctx)
-
-
-def setup_longhorn(ctx):
-    p = progress.get_progress(ctx)
-    md = get_cluster_metadata(ctx)
-
-    version = get_longhorn_release(ctx)
-    p.phase(f'Setting up longhorn version {version}')
-
-    execute_and_await(
-        ctx, [md['control_plane_nodes'][0]],
-        [
-            'helm repo add longhorn https://charts.longhorn.io',
-            'helm repo update',
-            'kubectl create namespace longhorn-system || true',
-            (
-                'helm --kubeconfig /etc/rancher/k3s/k3s.yaml '
-                'install longhorn longhorn/longhorn '
-                '--namespace longhorn-system '
-                f'--version {version}'
-            ),
-            (
-                'kubectl patch storageclass local-path -p '
-                '\'{"metadata": {"annotations":{'
-                '"storageclass.kubernetes.io/is-default-class":"false"}}}\''
-            )
-        ])

@@ -18,37 +18,58 @@ which deploys a real cluster from an ephemeral runner. See
 
 ```
 shakenfist_client_k3s/
-├── __init__.py         # Click commands and the plugin entry point
-├── primitives.py       # Orchestration primitives
-├── progress.py         # Phase and wait-loop progress reporting
+├── __init__.py         # Click commands, the plugin entry point, and the group's error handling
+├── cluster.py          # Cluster: one named cluster's state and orchestration
+├── exceptions.py       # The K3sClusterException hierarchy this library raises
+├── primitives.py       # Namespace scoped lookups and stateless helpers
+├── progress.py         # Reporters, plus phase and wait-loop progress reporting
 └── tests/              # Unit tests (testtools + stestr)
 ```
 
-### Commands (`__init__.py`)
+### Three layers, not two
 
-- `k3s list` / `show` / `delete` -- inspect and remove managed
-  clusters
-- `k3s create` -- create a cluster: control plane nodes, workers,
-  MetalLB address allocation, and optionally Longhorn storage
-- `k3s getconfig` -- fetch a kubeconfig for a cluster
-- `k3s expand-workers` / `expand-addresses` -- grow a cluster
-- `k3s update-os` -- update the operating system on all nodes
-- `k3s query-k3s-version` / `query-longhorn-version` -- inspect the
-  release version caches
+Each Click command is argument parsing plus one call into a callable
+layer, so the same orchestration is reachable with no Click context
+at all -- a library caller (an Ansible module, a conductor reconcile
+loop) uses it directly. `docs/library-api.md` is the reference for
+that; this section is only the shape.
 
-### Primitives (`primitives.py`)
+- **Commands (`__init__.py`)** -- `k3s list` / `show` / `delete`
+  inspect and remove managed clusters; `k3s create` builds one:
+  control plane nodes, workers, MetalLB address allocation, and
+  Longhorn storage; `k3s getconfig` fetches a kubeconfig;
+  `k3s expand-workers` / `expand-addresses` grow a cluster;
+  `k3s update-os` updates every node's OS packages;
+  `k3s query-k3s-version` / `query-longhorn-version` inspect the
+  release version caches. `GroupCatchClusterExceptions`, a
+  `click.Group` subclass, is the single place that catches a
+  `K3sClusterException`, prints it and exits 1 -- every command
+  raises rather than exiting directly.
+- **`Cluster` (`cluster.py`)** -- everything scoped to one named
+  cluster: its namespace metadata cache (`get_metadata()` /
+  `set_metadata()` / `delete_metadata()`), the instance orchestration,
+  and the seven methods each command body above moved onto
+  (`create()`, `get_kubeconfig()`, `show()`, `delete()`,
+  `expand_workers()`, `expand_addresses()`, `update_os()`). Methods
+  return values instead of printing them, and raise
+  `exceptions.K3sClusterException` subclasses instead of exiting.
+- **Namespace scoped lookups and stateless helpers (`primitives.py`)**
+  -- work with no cluster identity: the two release lookups, whose
+  caches live in *namespace* metadata rather than any one cluster's,
+  and `_describe_agent_op()`. `list`, `query-k3s-version` and
+  `query-longhorn-version` call these directly rather than building a
+  `Cluster`. Imports run one way only -- `cluster.py` imports
+  `primitives`, never the reverse.
+
+### Cluster state and orchestration (`cluster.py`)
 
 - **Cluster state**: all cluster state is stored as Shaken Fist
   namespace metadata (`orchestrated_k3s_cluster_*` keys), so there is
-  no local state file and any client can manage the cluster
-- **Release caches**: the latest k3s release per channel is fetched
-  from the k3s update API, and the latest Longhorn release from the
-  GitHub releases API. Results are cached in namespace metadata and
-  refreshed when stale. Both parsers are defensive about upstream data:
-  k3s channels without a `latest` release (for example `v1.16-testing`)
-  are skipped, and Longhorn tags which are prereleases or not valid
-  PEP 440 versions are ignored (`packaging.version.Version` is used
-  for comparison)
+  no local state file and any client can manage the cluster. A
+  `Cluster` fetches its own document once and caches it for its
+  lifetime, writing through to the API on every change, to keep the
+  number of namespace reads the same regardless of how many methods
+  are called against one instance
 - **Instance orchestration**: helpers create instances from a
   `debian:12` base image, await boot and agent-idle state via the
   Shaken Fist agent, and run installation commands through agent
@@ -80,11 +101,42 @@ shakenfist_client_k3s/
   own routed addresses (shakenfist/shakenfist#3662), so neither is
   reachable from a joining node
 
+### Release lookups (`primitives.py`)
+
+The latest k3s release per channel is fetched from the k3s update
+API, and the latest Longhorn release from the GitHub releases API.
+Results are cached in namespace metadata and refreshed when stale.
+Both parsers are defensive about upstream data: k3s channels without
+a `latest` release (for example `v1.16-testing`) are skipped, and
+Longhorn tags which are prereleases or not valid PEP 440 versions are
+ignored (`packaging.version.Version` is used for comparison). These
+are namespace scoped rather than cluster scoped -- the commands behind
+them, `query-k3s-version` and `query-longhorn-version`, name no
+cluster -- so they stay module level functions taking a client, a
+namespace and a reporter.
+
+### The exception hierarchy (`exceptions.py`)
+
+Every failure this library detects and reports is a
+`K3sClusterException` subclass, carrying the failure's details as
+attributes and rendering the CLI's historic error text from
+`__str__`. `apiclient` exceptions, and `OSError`/`yaml.YAMLError`
+from local file and subprocess work, propagate unchanged rather than
+being wrapped. `K3sClusterException` deliberately shares no base
+class with `shakenfist_client.apiclient`'s exceptions, so catching
+one hierarchy never catches the other -- a caller can tell "the
+cluster API rejected this" apart from "Shaken Fist itself is
+unreachable", though neither hierarchy catches the local
+`OSError`/`YAMLError` cases just mentioned. See `docs/library-api.md`
+for the exception list; this module's docstrings name the exact call
+site and attributes for each one.
+
 ### Progress reporting (`progress.py`)
 
-Long running commands construct a `Progress` reporter and place it in
-the Click context as `ctx.obj['PROGRESS']`; primitives retrieve it
-with `progress.get_progress(ctx)`. Work is announced as numbered
+Every `Cluster` method that runs a long operation builds a `Progress`
+on demand via `Cluster.get_progress()`, writing to the `Cluster`'s own
+reporter (a `progress.Reporter` by default, or whatever a caller
+passed in -- see `docs/library-api.md`). Work is announced as numbered
 phases (`[3/9] Setting up metallb`), and the polling wait loops
 (`await_boot`, `await_idle`, `await_fetch`) report per-item statuses
 through `Progress.update()`. When stdout is a TTY the statuses are

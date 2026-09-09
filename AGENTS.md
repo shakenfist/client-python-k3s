@@ -35,8 +35,10 @@ Both tiers skip a change touching only `docs/`. See
 | File | Purpose |
 |------|---------|
 | `shakenfist_client_k3s/__init__.py` | Click command group (`k3s ...`), plugin entry point |
-| `shakenfist_client_k3s/primitives.py` | Cluster orchestration primitives and version caches |
-| `shakenfist_client_k3s/progress.py` | Phase and wait-loop progress reporting for long running commands |
+| `shakenfist_client_k3s/cluster.py` | `Cluster`: one cluster's state and orchestration, callable with no Click |
+| `shakenfist_client_k3s/exceptions.py` | The `K3sClusterException` hierarchy this library raises |
+| `shakenfist_client_k3s/primitives.py` | Namespace scoped lookups (release version caches) and stateless helpers |
+| `shakenfist_client_k3s/progress.py` | Reporters, plus phase and wait-loop progress reporting |
 | `shakenfist_client_k3s/tests/` | Unit tests (stestr, see `.stestr.conf`) |
 | `docs/plans/` | Implementation plans, committed with the work they describe |
 | `pyproject.toml` | Package metadata and dependencies |

@@ -1,0 +1,8 @@
+Usage: k3s update-os [OPTIONS] NAME
+
+  Update the OS on all nodes
+
+Options:
+  --namespace TEXT  If you are an admin, you can alter clusters in a different
+                    namespace.
+  --help            Show this message and exit.
