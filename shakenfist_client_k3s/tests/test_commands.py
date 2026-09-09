@@ -1,3 +1,4 @@
+import copy
 import tempfile
 import time
 
@@ -208,8 +209,12 @@ class CommandWiringTestCase(testtools.TestCase):
     def setUp(self):
         super(CommandWiringTestCase, self).setUp()
         self.client = RecordingClient()
-        self.client.metadata[cluster_module.METADATA_KEY % 'banana'] = dict(
-            EXISTING_MD)
+        # Deep, not shallow: expand-workers appends to worker_nodes and
+        # expand-addresses to routed_addresses, so a shallow copy would
+        # leave those lists shared with the module level constant and let
+        # each test grow the fixture for the tests which follow it.
+        self.client.metadata[cluster_module.METADATA_KEY % 'banana'] = (
+            copy.deepcopy(EXISTING_MD))
         self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
 
         # The two nodes the seeded metadata claims already exist. The wait

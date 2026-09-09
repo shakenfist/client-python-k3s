@@ -7,6 +7,7 @@ terminal -- the Ansible module this work exists for -- can drive a cluster
 and keep stdout for its own output.
 """
 
+import copy
 import io
 import os
 import re
@@ -201,7 +202,7 @@ class ClusterLifecycleTestCase(LibraryTestCase):
         c = Cluster(self.client, 'foo; touch /tmp/pwned', 'testns',
                     reporter=self.reporter)
         self.client.metadata[cluster_module.METADATA_KEY
-                             % 'foo; touch /tmp/pwned'] = dict(DELETABLE_MD)
+                             % 'foo; touch /tmp/pwned'] = copy.deepcopy(DELETABLE_MD)
         self.client.metadata[primitives.CLUSTER_LIST] = [
             'foo; touch /tmp/pwned']
         c.delete()
@@ -482,7 +483,7 @@ class KubectlUnsetLeakTestCase(testtools.TestCase):
     def test_kubectl_unset_leaks_to_fd1_known_defect(self):
         client = mock.MagicMock()
         client.get_namespace_metadata.return_value = {
-            primitives.CLUSTER_LIST: ['banana'], MD_KEY: dict(DELETABLE_MD)}
+            primitives.CLUSTER_LIST: ['banana'], MD_KEY: copy.deepcopy(DELETABLE_MD)}
 
         # subprocess is mocked, as it must be: an unmocked run here would
         # edit the operator's own ~/.kube/config, which has happened once

@@ -11,6 +11,7 @@ directly (which bypasses the group, so the exception escapes to the test)
 and the second by invoking through the group, where the handler catches it.
 """
 
+import copy
 import time
 
 import click
@@ -174,7 +175,7 @@ class CommandExceptionTestCase(ClientTestCase):
             e = self._assert_raises(
                 shakenfist_client_k3s.k3s_delete, ['banana'],
                 exceptions.KubeconfigError,
-                {CLUSTER_LIST: ['banana'], MD_KEY: dict(DELETABLE_MD)})
+                {CLUSTER_LIST: ['banana'], MD_KEY: copy.deepcopy(DELETABLE_MD)})
 
         self.assertEqual('unset_failed', e.reason)
         self.assertEqual('users.banana.clientns', e.config_elem)
@@ -279,7 +280,7 @@ class GroupHandlerTestCase(ClientTestCase):
             self._assert_cli_failure(
                 ['delete', 'banana'],
                 'Could not unset kubectl config element users.banana.clientns\n',
-                {CLUSTER_LIST: ['banana'], MD_KEY: dict(DELETABLE_MD)})
+                {CLUSTER_LIST: ['banana'], MD_KEY: copy.deepcopy(DELETABLE_MD)})
 
     def test_query_k3s_version_http_error(self):
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
