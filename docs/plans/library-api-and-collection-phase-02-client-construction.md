@@ -30,8 +30,10 @@ be migrated in the direction that makes the fix testable rather than
 the direction that makes them pass.
 
 **Review effort:** medium. The diff is small and the argument is
-local, but decision 2 mutates an object this package does not own and
-a reviewer should weigh that deliberately rather than by inspection.
+local. Decision 2 mutates an object this package does not own; that is
+settled rather than open, so the review question is not whether to do
+it but whether the comment on the assignment carries the reasoning and
+the pointer to `client-python#404` that a later reader will need.
 
 ## Scope
 
@@ -54,12 +56,14 @@ Out, and deliberately so:
   stderr.** Also phase 3's, also already recorded there. It is
   adjacent to this phase's file but it is a user-visible output
   change, and this phase makes none.
-- **Changing `apiclient` upstream.** The properly clean way to get a
+- **Changing `apiclient` upstream.** The clean way to get a
   per-operation async strategy is a `client-python` change, and it is
-  rejected in decision 2 and recorded under Future work: it would
-  couple this phase to a `client-python` release and a
-  `shakenfist_client >=` floor bump in `pyproject.toml:33` to buy an
-  isolation nothing in this process consumes.
+  filed as
+  [shakenfist/client-python#404](https://github.com/shakenfist/client-python/issues/404).
+  This phase deliberately does not wait for it: it would couple phase 2
+  to a `client-python` release and a `shakenfist_client >=` floor bump
+  in `pyproject.toml:33` to buy an isolation nothing in this process
+  consumes. Decision 7 is how we come back to it.
 - **The k3s `--namespace` option.** See decision 6; nothing about it
   changes, and that is worth stating because "honour the root
   `--namespace`" reads as though it might collapse the two meanings.
@@ -207,14 +211,19 @@ incidental churn: see decision 1.
    `ctx.obj['CLIENT']` after the plugin has it, and the process then
    exits.
 
-   **This is the decision a reviewer is most likely to argue with**,
-   because it mutates an object this package does not own. The honest
-   counter-argument is that the properly clean fix is upstream -- a
-   per-call `async_strategy` argument, or a copy-returning
-   `Client.with_async_strategy()`, in `client-python` -- and that it
-   would couple this phase to a `client-python` release and a
-   dependency floor bump for a behaviour the one-line assignment
-   already gets. Recorded under Future work rather than done.
+   **Settled by the operator on 2026-09-19, against the alternative
+   and with an obligation attached.** It mutates an object this
+   package does not own, and that is accepted because the clean fix
+   belongs upstream rather than here: a per-call `async_strategy`
+   argument, or a copy-returning `Client.with_async_strategy()`, in
+   `client-python`. That is now filed as
+   [shakenfist/client-python#404](https://github.com/shakenfist/client-python/issues/404),
+   which carries the argument and both candidate shapes. This phase
+   does not wait for it -- waiting would block phase 2 behind a
+   `client-python` release and a `shakenfist_client >=` floor bump in
+   `pyproject.toml:33`, for a behaviour the one line assignment
+   already gets -- but it does commit to migrating once it ships. How
+   that commitment is recorded is decision 7.
 
    A consequence to state plainly: the root `--async` is ignored for
    every `k3s` command. That is correct rather than regrettable.
@@ -265,17 +274,83 @@ incidental churn: see decision 1.
    changes is only that `client.namespace` now comes from the client
    the operator's own flags configured.
 
+7. **The obligation to migrate to the upstream API is recorded in
+   the code, not only here.** A plan file is a historical record, and
+   nobody greps one while editing `__init__.py`. So the comment on the
+   assignment names `shakenfist/client-python#404` and says what to
+   replace the line with once that API exists, and the master plan
+   gains a Future work entry saying the same at plan scope. Two
+   places, both of which a person changing this code will actually
+   meet: the line itself, and the plan that owns the phase. The
+   `client-python` issue carries the third leg, naming this plan from
+   the other side.
+
+## What the code looks like afterwards
+
+Both changes are small, and writing them out here is cheaper than
+describing them. `_bind_namespace_context()` in `__init__.py` becomes:
+
+```python
+def _bind_namespace_context(ctx, namespace):
+    """...docstring updated, see step 2a..."""
+    client = ctx.obj['CLIENT']
+
+    # The orchestration runs its own wait loops and reports progress as
+    # it goes, so this client must not block on our behalf.
+    # async_strategy is read per call rather than at construction --
+    # create_instance, delete_instance, allocate_network, _await_agentop
+    # and _request_url all consult it -- and under sf-client's "pause"
+    # default each of those would sit for up to a minute emitting
+    # nothing before our reporter ever ran. Setting it here, rather
+    # than building a second client, is what keeps the root's
+    # --apiurl, --key and --namespace. Replace this with the per call
+    # or copy returning API from shakenfist/client-python#404 once that
+    # ships, and raise the shakenfist_client floor in pyproject.toml.
+    client.async_strategy = apiclient.ASYNC_CONTINUE
+
+    if not namespace:
+        namespace = client.namespace
+    return client, namespace, progress.Reporter(verbose=ctx.obj.get('VERBOSE', False))
+```
+
+and the whole of `client.py`'s public surface is:
+
+```python
+def make_client(api_url=None, namespace=None, key=None):
+    """...docstring, see step 2c..."""
+    kwargs = {
+        'verbose': False,
+        'async_strategy': apiclient.ASYNC_CONTINUE,
+    }
+    if api_url and namespace and key:
+        kwargs.update({
+            'base_url': api_url,
+            'namespace': namespace,
+            'key': key,
+            'suppress_configuration_lookup': True,
+        })
+    return apiclient.Client(**kwargs)
+```
+
 ## Step plan
 
-Three steps. 2a is the fix and its tests, 2b is the factory and its
-tests, 2c is documentation. 2a and 2b touch disjoint files and could
-run in either order; 2c must be last because it describes both.
+Four steps, each its own commit, each self-contained: it builds and
+the suite passes at every step. The order is forced in one place only
+-- 2a changes `__init__.py` and the six tests that would otherwise
+break with it, so they are one commit rather than two. 2b then pins
+the behaviour, 2c is independent of both and could run at any point,
+and 2d is last because it describes all of them.
+
+The commit subject for each step is given in its brief. Subjects are
+capped at 50 characters and end with a period, per the repository's
+commit conventions.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 2a | medium | opus | none | Make the CLI use the client `sf-client` already built. In `shakenfist_client_k3s/__init__.py`, `_bind_namespace_context()` (`:11-27`) currently calls `apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)` at `:24`. Replace that with `client = ctx.obj['CLIENT']` followed by `client.async_strategy = apiclient.ASYNC_CONTINUE`, and comment the assignment with why: the strategy is read per call inside `apiclient` (`create_instance` at `apiclient.py:675`, `delete_instance` at `:830`, `allocate_network` at `:1104`, `_await_agentop` at `:1298`, `_request_url` at `:428`), the root's default is `pause`, and under `pause` each of those blocks for up to 60 seconds inside the client with no reporter output before this package's own wait loops run. No fallback construction if `'CLIENT'` is absent -- see decision 1 -- and do not add a try/except around the subscript. Update the function's docstring, which currently explains why it constructs a client. Then migrate the six tests which patch `shakenfist_client_k3s.apiclient.Client`: `tests/test_commands.py:33`, `:108`, `:140` and `:230`, `tests/test_cli_errors.py:71`, and `tests/test_progress.py:651`. In each, delete the patcher and pass the fake in the Click object instead -- `obj={'VERBOSE': False, 'CLIENT': self.client}` -- at every `runner.invoke()` in that test case, including `test_cli_errors.ClientTestCase._invoke()` (`:77-82`) and `test_progress`'s `_create()` (`:665-671`). Do not weaken any existing assertion to make something pass. Then add the two regression tests, in a new `tests/test_root_options.py`: first, that `apiclient.Client` is never constructed while a k3s command runs (patch `shakenfist_client_k3s.apiclient.Client` with a mock whose `side_effect` raises, invoke a cheap command such as `list`, assert exit code 0 and that the mock was not called); second, an end-to-end check through the real root group -- import `shakenfist_client.main`, patch `shakenfist_client.main.apiclient.Client` to return a `mock.MagicMock()` with `namespace` set, invoke `main.cli` with `['--apiurl', 'https://api.example.com', '--key', 'k', '--namespace', 'ns', 'k3s', 'list']`, and assert both that the patched constructor received those values as `base_url`, `key` and `namespace`, and that the k3s command used that same client object and left its `async_strategy` equal to `apiclient.ASYNC_CONTINUE`. That second test only works when this package is installed, because `main.py:259-269` attaches the group through the `shakenfist_client.plugin` entry point; `tox -epy3` installs it, so note that dependency in the test's docstring rather than working around it. Verification is unit tests only. Do not touch `cluster.py`, `primitives.py` or any golden `--help` fixture. |
-| 2b | medium | sonnet | none | Add `shakenfist_client_k3s/client.py`, a new module whose only public name is `make_client(api_url=None, namespace=None, key=None)`, returning an `apiclient.Client`. Mirror `_make_client()` in the server repository at `shakenfist/deploy/collection/plugins/modules/sf_namespace.py:92-117`: build a kwargs dict with `verbose=False` and `async_strategy=apiclient.ASYNC_CONTINUE`, and add `base_url=api_url`, `namespace=namespace`, `key=key` and `suppress_configuration_lookup=True` only when all three arguments are truthy, so that a caller supplying none of them gets the same environment, `~/.shakenfist` and `/etc/sf/shakenfist.json` discovery the CLI gets. Three deliberate differences from that function, each of which needs a comment saying so: `ASYNC_CONTINUE` not `ASYNC_BLOCK`, because this package's orchestration runs its own wait loops and a blocking strategy would swallow them (see the plan's survey finding 5); `sync_request_timeout` left at `apiclient`'s default rather than set to 1800, because with `ASYNC_CONTINUE` no single HTTP call waits for orchestration; and `apiclient.UnconfiguredException` allowed to propagate rather than translated, because an Ansible module turns it into `fail_json()` and a library caller wants the exception. The module docstring should say what the function is for -- phase 5's `sf_k3s_cluster` module and conductor -- and that the CLI does not use it, because the CLI is handed a client by `sf-client`. Add `tests/test_client.py` in the existing testtools/mock style, patching `shakenfist_client_k3s.client.apiclient.Client` and asserting on the kwargs: all three supplied gives `suppress_configuration_lookup=True` and the three values passed through; any one missing gives none of those four keys; `async_strategy` is `apiclient.ASYNC_CONTINUE` in both cases; and `UnconfiguredException` raised by the constructor reaches the caller unchanged. Do not import `cluster` or `primitives` from `client.py`, and do not call `make_client()` from `__init__.py`. |
-| 2c | low | sonnet | none | Documentation only; no code. In `docs/library-api.md`, replace both `client = apiclient.Client()` examples (`:14-17` and `:152-156`) with `from shakenfist_client_k3s.client import make_client` and `client = make_client()`, and add a short subsection under "Constructing a `Cluster`" saying that `make_client()` exists because `apiclient.Client()`'s default async strategy is `ASYNC_BLOCK`, under which the client does the waiting internally and the reporter sees nothing, and that a caller who brings their own client should set `async_strategy=apiclient.ASYNC_CONTINUE` on it. Mention the `api_url`/`namespace`/`key` arguments and that supplying all three suppresses configuration discovery, as the Shaken Fist Ansible collection's modules do. In `docs/usage.md`, extend the paragraph at `:8-10` to say that the root `sf-client` options -- `--apiurl`, `--key` and `--namespace` -- configure the client these commands use, and that the root `--async` does not apply to them because each command runs its own wait loops and reports progress as it goes. Add one row for `shakenfist_client_k3s/client.py` to the Key Files table in `AGENTS.md` (`:35-42`) and change nothing else in that file -- it is an index, not a reference. Do not edit `ARCHITECTURE.md`: its overview at `:8-10` already describes the behaviour this phase implements, and the phase makes it true. Do not touch `README.md`; the pitch, the install story and the documentation links are all unchanged. |
+| 2a | medium | opus | none | **Commit subject: `Use the client sf-client already built.`** Make the CLI use the client the root callback already built, and migrate the tests that would break with it -- one commit, because the suite must pass at every step. In `shakenfist_client_k3s/__init__.py`, `_bind_namespace_context()` (`:11-27`) calls `apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)` at `:24`; replace that with the body given verbatim under "What the code looks like afterwards" above. The comment is not optional and its content is not free: it must name the per-call reads that make the assignment safe, sf-client's `pause` default that makes it necessary, and `shakenfist/client-python#404` as what replaces the line later (decision 7). Rewrite the function's docstring, which currently explains why it constructs a client and will read as a lie. No fallback if `'CLIENT'` is absent, and no `try`/`except` around the subscript -- decision 1 argues that a `KeyError` naming the key is the right failure for a caller that is not `sf-client`. Then migrate the six tests which patch `shakenfist_client_k3s.apiclient.Client`: `tests/test_commands.py:33`, `:108`, `:140` and `:230`, `tests/test_cli_errors.py:71`, and `tests/test_progress.py:651`. In each, delete the patcher and its `addCleanup`, and pass the fake through the Click object instead -- `obj={'VERBOSE': False, 'CLIENT': self.client}` -- at every `runner.invoke()` in that test case, which includes the shared helpers `test_cli_errors.ClientTestCase._invoke()` (`:77-82`) and `test_progress`'s `_create()` (`:665-671`) as well as the direct calls. `NamespaceDefaultingTestCase` (`test_commands.py:18`) keeps working unchanged in substance, because the fake it now injects still carries `namespace = 'clientns'`. Do not weaken any existing assertion to make something pass, and do not touch `cluster.py`, `primitives.py` or any golden `--help` fixture. Verification is unit tests only; the credentials question this fixes can only be seen against a live cloud. |
+| 2b | medium | opus | none | **Commit subject: `Pin the root options to the client k3s uses.`** Add `shakenfist_client_k3s/tests/test_root_options.py` with the two tests that pin what step 2a fixed, in the existing testtools and `mock` style. First: `apiclient.Client` is never constructed while a k3s command runs. Patch `shakenfist_client_k3s.apiclient.Client` with a mock whose `side_effect` raises `AssertionError`, invoke a cheap command such as `list` through `CliRunner` with a fake client in `obj`, and assert both exit code 0 and `assert_not_called()`. Second, and this is the phase's real deliverable as a test: an end-to-end check through the actual root group. Import `shakenfist_client.main`, patch `shakenfist_client.main.apiclient.Client` to return a `mock.MagicMock()` whose `namespace` is set, invoke `main.cli` with `['--apiurl', 'https://api.example.com', '--key', 'k', '--namespace', 'ns', 'k3s', 'list']`, then assert three things: the patched constructor received those values as `base_url`, `key` and `namespace`; the object the k3s command used is that same mock (`get_namespace_metadata` was called on it); and its `async_strategy` is `apiclient.ASYNC_CONTINUE` afterwards. That test only works when this package is installed, because `main.py:259-269` attaches the group through the `shakenfist_client.plugin` entry point -- `tox -epy3` installs it, so say so in the test's docstring rather than working around it. Before committing, prove the tests detect the bug rather than merely passing beside it: temporarily put `client = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)` back in place of step 2a's two lines, run `stestr run test_root_options`, confirm both tests fail, then restore. Say in the commit message that you did this. |
+| 2c | medium | sonnet | none | **Commit subject: `Add make_client() for library callers.`** Add `shakenfist_client_k3s/client.py`, a new module whose only public name is `make_client(api_url=None, namespace=None, key=None)`; the body is given verbatim under "What the code looks like afterwards" above. It mirrors `_make_client()` in the server repository at `shakenfist/deploy/collection/plugins/modules/sf_namespace.py:92-117`, including its all-three-or-auto-discover rule, so that a caller supplying none of the three gets the same environment, `~/.shakenfist` and `/etc/sf/shakenfist.json` discovery the CLI gets. Three deliberate differences from that function, each needing a comment saying so: `ASYNC_CONTINUE` not `ASYNC_BLOCK`, because this package's orchestration runs its own wait loops and a blocking strategy swallows them (survey finding 5); `sync_request_timeout` left at `apiclient`'s default rather than set to 1800, because with `ASYNC_CONTINUE` no single HTTP call waits for orchestration; and `apiclient.UnconfiguredException` left to propagate rather than translated, because phase 5's Ansible module turns it into `fail_json()` and a library caller wants the exception. The module docstring says who it is for -- phase 5's `sf_k3s_cluster` and conductor -- and that the CLI does not use it, because `sf-client` hands the CLI a client already (decision 4). Add `tests/test_client.py` patching `shakenfist_client_k3s.client.apiclient.Client` and asserting on the kwargs it receives: all three arguments supplied gives `suppress_configuration_lookup=True` plus the three values; any one missing gives none of those four keys; `async_strategy` is `apiclient.ASYNC_CONTINUE` in both cases; and an `UnconfiguredException` raised by the constructor reaches the caller unchanged. Do not import `cluster` or `primitives` from `client.py`, and do not call `make_client()` from `__init__.py` -- decision 4 explains why the CLI must not acquire a construction path again. |
+| 2d | low | sonnet | none | **Commit subject: `Document client construction.`** Documentation only; no code. In `docs/library-api.md`, replace both `client = apiclient.Client()` examples (`:14-17` and `:152-156`) with `from shakenfist_client_k3s.client import make_client` and `client = make_client()`, and add a short subsection under "Constructing a `Cluster`" explaining that `make_client()` exists because `apiclient.Client()`'s default strategy is `ASYNC_BLOCK`, under which the client does the waiting internally and the reporter sees nothing at all -- and that a caller who brings their own client should set `async_strategy=apiclient.ASYNC_CONTINUE` on it. Mention the `api_url`/`namespace`/`key` arguments and that supplying all three suppresses configuration discovery, as the Shaken Fist Ansible collection's own modules do. In `docs/usage.md`, extend the paragraph at `:8-10` to say that the root `sf-client` options `--apiurl`, `--key` and `--namespace` configure the client these commands use, and that the root `--async` does not apply to them, because each command runs its own wait loops and reports progress as it goes. Add one row for `shakenfist_client_k3s/client.py` to the Key Files table in `AGENTS.md` (`:35-42`) and change nothing else in that file -- it is an index, not a reference. Do not edit `ARCHITECTURE.md`: its overview at `:8-10` already describes the behaviour this phase implements, and the phase is what makes it true. Do not touch `README.md`; the pitch, the install story and the documentation links are all unchanged. |
 
 ## Risks and mitigations
 
@@ -285,14 +360,25 @@ run in either order; 2c must be last because it describes both.
   process, it would inherit `ASYNC_CONTINUE`. Neither exists: Click
   dispatches one subcommand per invocation and the console script then
   exits. Mitigation: the assignment carries a comment saying why it is
-  safe and what would make it unsafe, and the reviewer weighs
-  decision 2 explicitly rather than by inspection -- the back brief
-  gates it.
+  safe and what would make it unsafe, and the reviewer checks that the
+  comment says those things rather than checking the choice itself,
+  which is settled.
+
+- **The migration to `client-python#404` is forgotten.** This is the
+  likelier failure of the two, because nothing breaks when it happens
+  -- the assignment keeps working indefinitely, and the reason to
+  remove it lives in an issue in another repository. Mitigation:
+  decision 7 puts the pointer in three places that a person will
+  actually meet, and only one of them is this plan: the comment on the
+  line itself, the master plan's Future work entry, and
+  `client-python#404`, which names this plan from the other side. The
+  reviewer checks all three exist, since a missing one is invisible
+  later.
 
 - **The test migration could silently weaken coverage.** Deleting six
   `mock.patch` calls removes the thing that guaranteed no real client
   was built, and a fake handed in through `obj=` does not replace it.
-  Mitigation: step 2a adds the explicit "never constructed"
+  Mitigation: step 2b adds the explicit "never constructed"
   assertion, which is a stronger statement than the patches made, and
   the plan forbids weakening existing assertions. The reviewer checks
   the diff for assertion changes, not just for a green run.
@@ -352,14 +438,26 @@ Each of these is checkable, and most are one command:
 - `docs/usage.md` says that the root `--async` does not apply to `k3s`
   commands, so the one behaviour this phase changes for an operator is
   written down where they will look.
+- The comment on the `async_strategy` assignment in `__init__.py`
+  names `client-python#404` and says what replaces the line:
+  `grep -n '404' shakenfist_client_k3s/__init__.py` returns it.
+- The master plan carries a Future work entry naming
+  `client-python#404` and this phase, so the obligation survives the
+  phase being marked `Complete`.
+- Both regression tests in `tests/test_root_options.py` were observed
+  to fail against the unmodified `_bind_namespace_context()` before
+  they were committed, and the commit message says so.
 - `tox -epy3`, `tox -eflake8`, `flake8 shakenfist_client_k3s` and
   `pre-commit run --all-files` all pass.
 - `python3 -c 'import shakenfist_client_k3s'` succeeds.
 - The merge tier of CI is green, which is the only check that
   exercises this against a live Shaken Fist cluster.
-- The master plan's Execution table records this phase's merge commit
-  in its `Merged` column, because phase 6 audits the accumulated diff
-  and that range is not recoverable afterwards.
+- The master plan's Execution table records **both** of this phase's
+  merge commits in its `Merged` column. Phase 2 is unusual in landing
+  in two pull requests -- `1c32d12` (#63) carried this plan alone, and
+  the implementation follows in a second -- and phase 6 audits the
+  accumulated diff from that column, so recording only the second
+  would silently drop the first from the audited range.
 
 ## Back brief
 
@@ -367,10 +465,17 @@ Before executing any step, back brief the operator on your
 understanding of this plan and how the work you intend to do aligns
 with it.
 
-One gate, before step 2a starts: **decision 2 needs agreement, not
-just reading.** Forcing the async strategy by assigning to the root
-client's attribute, rather than by constructing a second client from
-its connection parameters, is the phase's one contestable choice, and
-reversing it afterwards rewrites both the code and the tests step 2a
-writes. Say which of the two you are implementing and why before you
-edit anything.
+The gate this plan used to carry is discharged. Decision 2 -- forcing
+the async strategy by assigning to the root client's attribute rather
+than constructing a second client -- was put to the operator and
+settled on 2026-09-19, together with the obligation to migrate once
+[shakenfist/client-python#404](https://github.com/shakenfist/client-python/issues/404)
+ships. Do not reopen it in the back brief; implement it.
+
+What the back brief should cover instead is the part that is easy to
+get subtly wrong: which of the six migrated test cases you have
+checked still assert what they asserted before, and how you intend to
+show that step 2b's tests fail against the old code rather than merely
+passing against the new. If either answer is "I will check afterwards",
+say so plainly, because that is the point at which this phase stops
+being verifiable.
