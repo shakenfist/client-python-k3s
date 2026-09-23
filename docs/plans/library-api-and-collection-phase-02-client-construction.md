@@ -270,7 +270,9 @@ incidental churn: see decision 1.
    (`sf_namespace`, `sf_network`, `sf_claim`, `sf_instance`,
    `sf_snapshot`) are to be changed to fail the same way, with
    `module.fail_json()` rather than `ValueError` since they are Ansible
-   modules. Until that lands, this package and the collection disagree,
+   modules; that change is
+   [shakenfist/shakenfist#4311](https://github.com/shakenfist/shakenfist/pull/4311).
+   Until it lands, this package and the collection disagree,
    and the docstring says so rather than claiming a parity it no longer
    has.
 

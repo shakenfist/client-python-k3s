@@ -19,7 +19,16 @@ partial connection set as no connection set and fall back to discovery,
 which means a caller who passes api_url and namespace but forgets key
 is silently pointed at whatever cloud discovery finds -- the same
 failure this package just removed from the CLI, one layer up. Here that
-is a ValueError. The collection modules are being changed to match.
+is a ValueError.
+
+shakenfist/shakenfist#4311 makes the collection modules refuse a
+partial set too, but not identically, and the difference is not an
+oversight in either place. There, the namespace parameter names the
+namespace to operate in as well as the one to authenticate as, so
+passing it alone is ordinary and only api_url and key are held to the
+rule. Here namespace is nothing but the namespace to authenticate as --
+a Cluster is told separately which namespace it lives in -- so all
+three are connection parameters and all three are held to it.
 """
 
 from shakenfist_client import apiclient
@@ -58,7 +67,7 @@ def make_client(api_url=None, namespace=None, key=None):
         # single HTTP call waits for orchestration to finish.
         'async_strategy': apiclient.ASYNC_CONTINUE,
     }
-    if supplied:
+    if len(supplied) == 3:
         kwargs.update({
             'base_url': api_url,
             'namespace': namespace,

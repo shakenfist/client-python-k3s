@@ -169,6 +169,12 @@ hierarchy catches an `OSError` or `YAMLError` escaping from local
 work, so a caller that wants to catch everything needs a third
 `except` clause.
 
+`make_client()` can also raise `ValueError`, when some but not all of
+`api_url`, `namespace` and `key` are supplied (see "Constructing the
+client" above). That is a programming error in the caller rather than
+a cluster failure, which is why it is not a `K3sClusterException`, and
+a correct caller never needs to catch it.
+
 | Exception | Raised when |
 |-----------|-------------|
 | `ClusterExistsError` | `create()` is called for a name already in use |
