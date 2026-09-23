@@ -35,6 +35,7 @@ Both tiers skip a change touching only `docs/`. See
 | File | Purpose |
 |------|---------|
 | `shakenfist_client_k3s/__init__.py` | Click command group (`k3s ...`), plugin entry point |
+| `shakenfist_client_k3s/client.py` | `make_client()`: builds an API client for a caller with no Click context |
 | `shakenfist_client_k3s/cluster.py` | `Cluster`: one cluster's state and orchestration, callable with no Click |
 | `shakenfist_client_k3s/exceptions.py` | The `K3sClusterException` hierarchy this library raises |
 | `shakenfist_client_k3s/primitives.py` | Namespace scoped lookups (release version caches) and stateless helpers |

@@ -9,6 +9,14 @@ Every command takes `--namespace`. Without it the client's own
 namespace is used; an administrator can name a different one to work
 on a cluster they do not own.
 
+The root `sf-client` options are a separate thing, and two of them are
+worth knowing about here. `--apiurl`, `--key` and `--namespace`
+configure the client these commands use, so the cloud they talk to and
+the namespace referred to above both follow what you pass there. The
+root `--async` has no effect on `k3s` commands: each one runs its own
+wait loops and reports progress as it goes, so the client is always
+asked not to block on the command's behalf.
+
 ## Cluster lifecycle
 
 ### `create NAME`

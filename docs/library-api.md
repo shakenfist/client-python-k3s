@@ -11,10 +11,10 @@ the map.
 ## Constructing a `Cluster`
 
 ```python
-from shakenfist_client import apiclient
+from shakenfist_client_k3s.client import make_client
 from shakenfist_client_k3s.cluster import Cluster
 
-client = apiclient.Client()
+client = make_client()
 cluster = Cluster(client, 'mycluster', client.namespace)
 ```
 
@@ -34,6 +34,44 @@ namespace metadata is a single document conductor also writes, so
 every extra read widens the window for losing someone else's update.
 Build a fresh `Cluster` per operation rather than reusing one across
 unrelated clusters or a long-lived process.
+
+### Constructing the client
+
+`make_client()` exists because `apiclient.Client` on its own is the
+wrong thing to reach for here. Its default strategy is `ASYNC_BLOCK`,
+under which the client waits for each operation internally and returns
+only once it has finished -- so the orchestration's own wait loops
+never run and the reporter has nothing to report. `make_client()` sets
+`ASYNC_CONTINUE` instead, which is what makes progress visible at all.
+
+```python
+from shakenfist_client_k3s.client import make_client
+
+# Discover configuration the way the CLI does.
+client = make_client()
+
+# Or supply it, and skip discovery entirely.
+client = make_client(api_url='https://api.example.com',
+                     namespace='mynamespace', key='mykey')
+```
+
+With no arguments it finds configuration exactly as `sf-client` does,
+from the environment, `~/.shakenfist` and `/etc/sf/shakenfist.json`.
+Supplying all three of `api_url`, `namespace` and `key` uses them
+verbatim and suppresses that discovery, which is the rule the Shaken
+Fist Ansible collection's own modules follow; supplying only some of
+them is treated as supplying none, so a client is never configured
+with holes. `apiclient.UnconfiguredException` propagates when
+discovery finds nothing, rather than being translated into a message
+or an exit code -- that choice belongs to the caller.
+
+A caller which brings its own client instead must set
+`async_strategy=apiclient.ASYNC_CONTINUE` on it, for the same reason.
+
+The `sf-client k3s` commands do not use this factory. `sf-client`
+builds a client from its own `--apiurl`, `--key` and `--namespace`
+options and the plugin uses that one, which is what keeps those
+options meaningful (see `docs/usage.md`).
 
 Each command's body is now a method taking that command's options,
 minus `name` and `namespace`, and returning a value instead of
@@ -149,11 +187,11 @@ This creates a one-node cluster, fetches its kubeconfig, and deletes
 it again, with output collected rather than printed:
 
 ```python
-from shakenfist_client import apiclient
+from shakenfist_client_k3s.client import make_client
 from shakenfist_client_k3s.cluster import Cluster
 from shakenfist_client_k3s.progress import CollectingReporter
 
-client = apiclient.Client()
+client = make_client()
 reporter = CollectingReporter()
 cluster = Cluster(client, 'mycluster', client.namespace, reporter=reporter)
 
@@ -204,6 +242,6 @@ release lookups are called as plain functions in the test, so
 patching them is what keeps the lookup from reaching the real k3s
 update API and GitHub releases API; `requests.request` itself is
 never touched. Running the sequence against a real Shaken Fist
-namespace needs nothing more than the real `apiclient.Client()`
-shown above; there is no other setup and no Click context to
-fabricate.
+namespace needs nothing more than the real client `make_client()`
+returns, as shown above; there is no other setup and no Click
+context to fabricate.
