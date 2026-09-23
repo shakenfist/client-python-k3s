@@ -29,15 +29,11 @@ class NamespaceDefaultingTestCase(testtools.TestCase):
         super(NamespaceDefaultingTestCase, self).setUp()
         self.client = mock.MagicMock()
         self.client.namespace = 'clientns'
-        patcher = mock.patch(
-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.runner = CliRunner()
 
     def _invoke(self, args):
         return self.runner.invoke(
-            shakenfist_client_k3s.k3s, args, obj={'VERBOSE': False})
+            shakenfist_client_k3s.k3s, args, obj={'VERBOSE': False, 'CLIENT': self.client})
 
     def test_show_defaults_namespace_from_client(self):
         md_key = cluster_module.METADATA_KEY % 'banana'
@@ -104,17 +100,13 @@ class CreateNamespaceNoticeTestCase(testtools.TestCase):
             # after the namespace-created notice, before touching instances.
             primitives.CLUSTER_LIST: ['banana'],
         }
-        patcher = mock.patch(
-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.runner = CliRunner()
 
     def test_namespace_created_notice_text_is_unchanged(self):
         result = self.runner.invoke(
             shakenfist_client_k3s.k3s,
             ['create', 'banana', '--namespace', 'newns'],
-            obj={'VERBOSE': False})
+            obj={'VERBOSE': False, 'CLIENT': self.client})
 
         self.client.create_namespace.assert_called_once_with('newns')
         self.assertIn('Created namespace newns\n', result.output)
@@ -136,10 +128,6 @@ class ListOutputTestCase(testtools.TestCase):
         super(ListOutputTestCase, self).setUp()
         self.client = mock.MagicMock()
         self.client.namespace = 'clientns'
-        patcher = mock.patch(
-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.runner = CliRunner()
 
     def test_list_prints_one_cluster_per_line(self):
@@ -147,7 +135,7 @@ class ListOutputTestCase(testtools.TestCase):
             primitives.CLUSTER_LIST: ['banana', 'apple']}
 
         result = self.runner.invoke(
-            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False})
+            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False, 'CLIENT': self.client})
 
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual('banana\napple\n', result.output)
@@ -156,7 +144,7 @@ class ListOutputTestCase(testtools.TestCase):
         self.client.get_namespace_metadata.return_value = {}
 
         result = self.runner.invoke(
-            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False})
+            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False, 'CLIENT': self.client})
 
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual('', result.output)
@@ -226,11 +214,6 @@ class CommandWiringTestCase(testtools.TestCase):
                 'uuid': instance_uuid, 'name': name, 'state': 'created',
                 'agent_state': 'ready'}
 
-        patcher = mock.patch(
-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
         patcher = mock.patch('time.sleep', lambda seconds: None)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -266,7 +249,7 @@ class CommandWiringTestCase(testtools.TestCase):
         result = self.runner.invoke(
             shakenfist_client_k3s.k3s,
             ['expand-workers', 'banana', '--worker-count', '3'],
-            obj={'VERBOSE': False})
+            obj={'VERBOSE': False, 'CLIENT': self.client})
 
         self.assertEqual(0, result.exit_code, result.output)
         # Three new instances, and each recorded against the cluster
@@ -280,7 +263,7 @@ class CommandWiringTestCase(testtools.TestCase):
         result = self.runner.invoke(
             shakenfist_client_k3s.k3s,
             ['expand-addresses', 'banana', '--address-count', '3'],
-            obj={'VERBOSE': False})
+            obj={'VERBOSE': False, 'CLIENT': self.client})
 
         self.assertEqual(0, result.exit_code, result.output)
         # Three addresses routed, on top of the one the cluster had, and
@@ -295,7 +278,7 @@ class CommandWiringTestCase(testtools.TestCase):
     def test_update_os_updates_every_node(self):
         result = self.runner.invoke(
             shakenfist_client_k3s.k3s, ['update-os', 'banana'],
-            obj={'VERBOSE': False})
+            obj={'VERBOSE': False, 'CLIENT': self.client})
 
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual(
