@@ -58,10 +58,15 @@ client = make_client(api_url='https://api.example.com',
 With no arguments it finds configuration exactly as `sf-client` does,
 from the environment, `~/.shakenfist` and `/etc/sf/shakenfist.json`.
 Supplying all three of `api_url`, `namespace` and `key` uses them
-verbatim and suppresses that discovery, which is the rule the Shaken
-Fist Ansible collection's own modules follow; supplying only some of
-them is treated as supplying none, so a client is never configured
-with holes. `apiclient.UnconfiguredException` propagates when
+verbatim and suppresses that discovery.
+
+Supplying only some of them is a `ValueError`. Falling back to
+discovery in that case would hand back a client pointed at whatever
+cloud the environment names rather than the one the caller asked for,
+with nothing said about it -- which is the failure this package just
+removed from the CLI. A caller building its arguments from partially
+populated configuration is the likeliest one to hit it, so it fails
+loudly instead. `apiclient.UnconfiguredException` propagates when
 discovery finds nothing, rather than being translated into a message
 or an exit code -- that choice belongs to the caller.
 
@@ -73,9 +78,10 @@ builds a client from its own `--apiurl`, `--key` and `--namespace`
 options and the plugin uses that one, which is what keeps those
 options meaningful (see `docs/usage.md`).
 
-Each command's body is now a method taking that command's options,
-minus `name` and `namespace`, and returning a value instead of
-printing one:
+### The `Cluster` methods
+
+Each command's body is a method taking that command's options, minus
+`name` and `namespace`, and returning a value instead of printing one:
 
 | Method | Command it replaces |
 |--------|---------------------|
@@ -162,6 +168,12 @@ apart from "Shaken Fist itself is unreachable" -- though neither
 hierarchy catches an `OSError` or `YAMLError` escaping from local
 work, so a caller that wants to catch everything needs a third
 `except` clause.
+
+`make_client()` can also raise `ValueError`, when some but not all of
+`api_url`, `namespace` and `key` are supplied (see "Constructing the
+client" above). That is a programming error in the caller rather than
+a cluster failure, which is why it is not a `K3sClusterException`, and
+a correct caller never needs to catch it.
 
 | Exception | Raised when |
 |-----------|-------------|

@@ -8,10 +8,12 @@ so an operator who configures by environment variable got the right
 credentials by accident, and only one who passed the flags was silently
 pointed at another cloud. That is invisible to every test which invokes
 the k3s group directly, because the group never sees the root options at
-all, so the two tests here are deliberately the other shape: one asserts
-the construction is gone, and one drives the real root group end to end.
+all, so the three tests here are deliberately the other shape: one
+asserts the construction is gone, one asserts a caller which is not
+sf-client fails by name on the missing 'CLIENT' key rather than getting a
+second client, and one drives the real root group end to end.
 
-The second test reaches the k3s group through the shakenfist_client.plugin
+The last test reaches the k3s group through the shakenfist_client.plugin
 entry point, which means it only works when this package is installed.
 "tox -epy3" installs it and CI runs tox, so that is the supported way to
 run these; a bare stestr run in a tree where the package is not installed
@@ -59,6 +61,19 @@ class NoClientConstructionTestCase(testtools.TestCase):
         # about why.
         mock_client.assert_not_called()
         self.assertEqual(0, result.exit_code, result.output)
+
+    def test_a_missing_client_raises_keyerror(self):
+        # The subscript is deliberately fallback free, so that a caller
+        # which is not sf-client fails by name. A later ctx.obj.get(
+        # 'CLIENT') or a try/except around it would pass every other test
+        # here while restoring the second construction path this removed:
+        # a None client fails downstream with an AttributeError, which the
+        # test above cannot tell from success.
+        result = CliRunner().invoke(
+            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False})
+
+        self.assertIsInstance(result.exception, KeyError)
+        self.assertIn('CLIENT', str(result.exception))
 
 
 class RootOptionsTestCase(testtools.TestCase):

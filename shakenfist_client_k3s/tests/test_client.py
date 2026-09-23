@@ -1,11 +1,13 @@
 """make_client() builds the client a library caller needs.
 
 The CLI does not use this factory -- it is handed a client by sf-client --
-so nothing else in the suite covers it, and the behaviour it has to get
-right is the all-three-or-auto-discover rule the Shaken Fist Ansible
-collection's own modules follow. Getting that wrong half way, by passing
-two of the three connection parameters through with configuration lookup
-still suppressed, would produce a client pointed at nothing in particular.
+so nothing else in the suite covers it. The rule it has to get right is
+all three of api_url, namespace and key used verbatim, none of them
+meaning discovery, and anything in between a ValueError: falling back to
+discovery for a partial set would hand back a client pointed at whatever
+cloud the environment names, with nothing said about it. That departs
+deliberately from the Shaken Fist Ansible collection's _make_client(),
+which falls back; client.py's docstring says why.
 """
 
 # The PyPI mock backport is used rather than unittest.mock for consistency
@@ -47,18 +49,31 @@ class MakeClientTestCase(testtools.TestCase):
         for name in SUPPLIED:
             self.assertNotIn(name, kwargs)
 
-    def test_a_partial_set_auto_discovers_too(self):
-        # Each of the three omitted in turn. Passing the rest through with
-        # the lookup still suppressed is the failure this pins: the client
-        # would be configured with holes rather than falling back.
+    def test_a_partial_set_is_an_error(self):
+        # Each of the three omitted in turn. Falling back to discovery here
+        # would hand back a client pointed at whatever cloud the
+        # environment names, with nothing said about it. The last case
+        # records that an empty string counts as absent, not as supplied.
         for call in [{'namespace': 'ns', 'key': 'k'},
                      {'api_url': 'https://api.example.com', 'key': 'k'},
-                     {'api_url': 'https://api.example.com', 'namespace': 'ns'}]:
+                     {'api_url': 'https://api.example.com', 'namespace': 'ns'},
+                     {'api_url': 'https://api.example.com', 'namespace': 'ns',
+                      'key': ''}]:
             self.mock_client.reset_mock()
-            kwargs = self._kwargs(**call)
 
-            for name in SUPPLIED:
-                self.assertNotIn(name, kwargs, call)
+            error = self.assertRaises(
+                ValueError, client_module.make_client, **call)
+
+            # The message names exactly what was passed, so the caller can
+            # see which of the three it forgot. The check is against the
+            # variable clause only: the fixed prefix names all three.
+            detail = str(error).split('Got only ', 1)[1]
+            for name in ('api_url', 'namespace', 'key'):
+                if call.get(name):
+                    self.assertIn(name, detail, call)
+                else:
+                    self.assertNotIn(name, detail, call)
+            self.mock_client.assert_not_called()
 
     def test_the_strategy_is_continue_either_way(self):
         for call in [{}, {'api_url': 'https://api.example.com',
