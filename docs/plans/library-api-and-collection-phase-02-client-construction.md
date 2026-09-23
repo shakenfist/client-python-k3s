@@ -253,6 +253,27 @@ incidental churn: see decision 1.
    `shakenfist_client.apiclient`, which `__init__.py` imports already,
    so it adds nothing to the cost of the unguarded plugin load.
 
+   **Amended during review of the implementation, on 2026-09-23.** The
+   mirroring is no longer exact. `_make_client()` treats a partial
+   connection set as no connection set and falls back to discovery,
+   which silently hands back a client pointed at whatever cloud the
+   environment names rather than the one the caller asked for -- the
+   same failure this phase removes from the CLI, reappearing one layer
+   up in the library. The automated reviewer raised it, the operator
+   settled it, and `make_client()` now raises `ValueError` when some
+   but not all of `api_url`, `namespace` and `key` are supplied. Both
+   working paths are unchanged: all three still means verbatim, none
+   still means discovery.
+
+   The divergence is temporary by intent. The five copies of
+   `_make_client()` in the server repository's collection modules
+   (`sf_namespace`, `sf_network`, `sf_claim`, `sf_instance`,
+   `sf_snapshot`) are to be changed to fail the same way, with
+   `module.fail_json()` rather than `ValueError` since they are Ansible
+   modules. Until that lands, this package and the collection disagree,
+   and the docstring says so rather than claiming a parity it no longer
+   has.
+
 4. **`make_client()` is not called by the CLI.** Under decision 1 the
    CLI already has a client, and giving it a `make_client()` call
    would resurrect precisely the construction path decision 1

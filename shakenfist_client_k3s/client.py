@@ -8,11 +8,18 @@ the callers which have no Click context at all: the sf_k3s_cluster
 Ansible module, conductor, and anyone else importing Cluster as a
 library.
 
-It mirrors _make_client() in the Shaken Fist server repository at
-deploy/collection/plugins/modules/sf_namespace.py, so that a caller who
-supplies nothing gets the same environment, ~/.shakenfist and
-/etc/sf/shakenfist.json discovery the CLI gets, and one who supplies all
-three connection parameters gets them used verbatim.
+It follows _make_client() in the Shaken Fist server repository's
+collection modules, so that a caller who supplies nothing gets the same
+environment, ~/.shakenfist and /etc/sf/shakenfist.json discovery the CLI
+gets, and one who supplies all three connection parameters gets them
+used verbatim.
+
+It departs from those modules in one way, deliberately. They treat a
+partial connection set as no connection set and fall back to discovery,
+which means a caller who passes api_url and namespace but forgets key
+is silently pointed at whatever cloud discovery finds -- the same
+failure this package just removed from the CLI, one layer up. Here that
+is a ValueError. The collection modules are being changed to match.
 """
 
 from shakenfist_client import apiclient
@@ -23,11 +30,21 @@ def make_client(api_url=None, namespace=None, key=None):
 
     Supply all three of api_url, namespace and key to use them verbatim, or
     none of them to auto-discover configuration the way the CLI does.
-    Supplying only some is treated as supplying none, which is the rule the
-    Shaken Fist Ansible collection's own modules follow.
+    Supplying only some of them raises ValueError rather than quietly
+    discovering the rest, because the client that would produce can be
+    pointed at an entirely different cloud than the caller named.
 
     apiclient.UnconfiguredException propagates when discovery finds nothing.
     """
+    supplied = [name for name, value in (('api_url', api_url),
+                                         ('namespace', namespace),
+                                         ('key', key)) if value]
+    if supplied and len(supplied) != 3:
+        raise ValueError(
+            'make_client() takes all of api_url, namespace and key, or none '
+            'of them. Got only %s, which would be discarded in favour of '
+            'discovered configuration.' % ', '.join(supplied))
+
     kwargs = {
         'verbose': False,
         # ASYNC_CONTINUE rather than the collection's ASYNC_BLOCK: this
@@ -41,7 +58,7 @@ def make_client(api_url=None, namespace=None, key=None):
         # single HTTP call waits for orchestration to finish.
         'async_strategy': apiclient.ASYNC_CONTINUE,
     }
-    if api_url and namespace and key:
+    if supplied:
         kwargs.update({
             'base_url': api_url,
             'namespace': namespace,

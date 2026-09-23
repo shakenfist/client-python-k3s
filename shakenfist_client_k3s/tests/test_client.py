@@ -47,18 +47,23 @@ class MakeClientTestCase(testtools.TestCase):
         for name in SUPPLIED:
             self.assertNotIn(name, kwargs)
 
-    def test_a_partial_set_auto_discovers_too(self):
-        # Each of the three omitted in turn. Passing the rest through with
-        # the lookup still suppressed is the failure this pins: the client
-        # would be configured with holes rather than falling back.
+    def test_a_partial_set_is_an_error(self):
+        # Each of the three omitted in turn. Falling back to discovery here
+        # would hand back a client pointed at whatever cloud the
+        # environment names, with nothing said about it.
         for call in [{'namespace': 'ns', 'key': 'k'},
                      {'api_url': 'https://api.example.com', 'key': 'k'},
                      {'api_url': 'https://api.example.com', 'namespace': 'ns'}]:
             self.mock_client.reset_mock()
-            kwargs = self._kwargs(**call)
 
-            for name in SUPPLIED:
-                self.assertNotIn(name, kwargs, call)
+            error = self.assertRaises(
+                ValueError, client_module.make_client, **call)
+
+            # The message names what was passed, so the caller can see
+            # which of the three it forgot.
+            for name in call:
+                self.assertIn(name, str(error), call)
+            self.mock_client.assert_not_called()
 
     def test_the_strategy_is_continue_either_way(self):
         for call in [{}, {'api_url': 'https://api.example.com',

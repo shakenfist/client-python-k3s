@@ -60,6 +60,19 @@ class NoClientConstructionTestCase(testtools.TestCase):
         mock_client.assert_not_called()
         self.assertEqual(0, result.exit_code, result.output)
 
+    def test_a_missing_client_raises_keyerror(self):
+        # The subscript is deliberately fallback free, so that a caller
+        # which is not sf-client fails by name. A later ctx.obj.get(
+        # 'CLIENT') or a try/except around it would pass every other test
+        # here while restoring the second construction path this removed:
+        # a None client fails downstream with an AttributeError, which the
+        # test above cannot tell from success.
+        result = CliRunner().invoke(
+            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False})
+
+        self.assertIsInstance(result.exception, KeyError)
+        self.assertIn('CLIENT', str(result.exception))
+
 
 class RootOptionsTestCase(testtools.TestCase):
     """The client built from --apiurl, --key and --namespace is the one used.
