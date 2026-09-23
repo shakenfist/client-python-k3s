@@ -67,17 +67,13 @@ class ClientTestCase(testtools.TestCase):
         super(ClientTestCase, self).setUp()
         self.client = mock.MagicMock()
         self.client.namespace = 'clientns'
-        patcher = mock.patch(
-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.runner = CliRunner()
 
     def _invoke(self, target, args, namespace_metadata=None):
         if namespace_metadata is not None:
             self.client.get_namespace_metadata.return_value = namespace_metadata
         return self.runner.invoke(
-            target, args, obj={'VERBOSE': False}, terminal_width=80)
+            target, args, obj={'VERBOSE': False, 'CLIENT': self.client}, terminal_width=80)
 
 
 class CommandExceptionTestCase(ClientTestCase):

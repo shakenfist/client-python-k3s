@@ -11,17 +11,40 @@ from shakenfist_client_k3s.cluster import Cluster
 def _bind_namespace_context(ctx, namespace):
     """Build what a namespace scoped command needs.
 
-    Returns the client, the resolved namespace and a reporter. The
-    --namespace option is None unless the caller passed it, and the
+    Returns the client, the resolved namespace and a reporter. The client
+    is the one sf-client's root callback already built from --apiurl,
+    --key and --namespace and left in the Click context. This plugin must
+    not build its own: doing so discarded those options silently, leaving
+    the configuration lookup to find credentials which may be for another
+    cloud entirely. A KeyError on 'CLIENT' therefore means the group was
+    invoked by something which is not sf-client, and naming the missing
+    key is a better failure than quietly constructing a second client.
+
+    The --namespace option is None unless the caller passed it, and the
     namespace is passed directly to API calls, so it must be defaulted to
-    the client's own namespace here.
+    the client's own namespace here. That default now follows the
+    operator's --namespace, because the client does.
 
     list, query-k3s-version and query-longhorn-version are namespace
     scoped rather than cluster scoped: they name no cluster, and the
     release lookups they call cache in namespace metadata. They therefore
     build no Cluster at all.
     """
-    client = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
+    client = ctx.obj['CLIENT']
+
+    # The orchestration runs its own wait loops and reports progress as
+    # it goes, so this client must not block on our behalf.
+    # async_strategy is read per call rather than at construction --
+    # create_instance, delete_instance, allocate_network, _await_agentop
+    # and _request_url all consult it -- and under sf-client's "pause"
+    # default each of those would sit for up to a minute emitting
+    # nothing before our reporter ever ran. Setting it here, rather than
+    # building a second client, is what keeps the root's --apiurl, --key
+    # and --namespace. Replace this with the per call or copy returning
+    # API from shakenfist/client-python#404 once that ships, and raise
+    # the shakenfist_client floor in pyproject.toml.
+    client.async_strategy = apiclient.ASYNC_CONTINUE
+
     if not namespace:
         namespace = client.namespace
     return client, namespace, progress.Reporter(verbose=ctx.obj.get('VERBOSE', False))

@@ -648,8 +648,6 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
         self.home = home.name
 
         for target, kwargs in [
-                ('shakenfist_client_k3s.apiclient.Client',
-                 {'return_value': self.client}),
                 ('shakenfist_client_k3s.primitives.get_k3s_release',
                  {'return_value': 'stable'}),
                 ('shakenfist_client_k3s.primitives.get_longhorn_release',
@@ -666,7 +664,7 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
     def _create(self, args):
         runner = CliRunner()
         result = runner.invoke(
-            shakenfist_client_k3s.k3s, ['create'] + args, obj={'VERBOSE': False})
+            shakenfist_client_k3s.k3s, ['create'] + args, obj={'VERBOSE': False, 'CLIENT': self.client})
         self.assertEqual(
             0, result.exit_code, '%s\n%s' % (result.output, result.exception))
         return result.output
