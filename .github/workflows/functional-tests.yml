@@ -100,7 +100,7 @@ jobs:
     # naming it changes nothing except making the choice a choice. It
     # needs a vm rather than a static runner because it installs
     # packages.
-    runs-on: [self-hosted, vm, debian-12, xs]
+    runs-on: [self-hosted, vm, debian-13, xs]
     timeout-minutes: 45
     # github.ref is the right key on every event except merge_group,
     # where it is the per-attempt queue branch
@@ -222,7 +222,7 @@ jobs:
     # sizing fault, which is exactly how shakenfist#3696 stayed
     # invisible for months. 2 GB on at most one concurrent runner is
     # the cheaper side of that trade.
-    runs-on: [self-hosted, vm, debian-12, s]
+    runs-on: [self-hosted, vm, debian-13, s]
     # A full create is 15-25 minutes and the script carries its own
     # per-phase timeouts; agent operation failures abort within one poll
     # interval, so this is a backstop rather than an expected duration.
