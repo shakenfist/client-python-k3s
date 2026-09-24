@@ -8,6 +8,7 @@ import testtools
 
 from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import exceptions
+from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.cluster import Cluster
 from shakenfist_client_k3s.tests import fakes
@@ -257,14 +258,21 @@ class ExpandWorkersTestCase(testtools.TestCase):
 class CreateInstallsWorkersTestCase(testtools.TestCase):
     """Creating a cluster installs k3s on every worker it just created.
 
-    create() hands install_workers() md['worker_nodes'], and that is the
-    right list only by aliasing: get_metadata() caches the metadata
-    dictionary and set_metadata() stores that same object, so the list
-    create() is holding is the one create_and_await_instances() appended
-    the new workers to. Nothing at the call site says so. Make the cache
-    copy on read and create() would pass the empty list it initialised the
-    metadata with, install k3s on no workers at all, and still report a
-    cluster as ready. This is the test which notices.
+    create() hands install_workers() md['worker_nodes'], and when this test
+    was written in step 3a that was the right list only by aliasing:
+    get_metadata() caches the metadata dictionary and set_metadata() stores
+    that same object, so the list create() was holding was the one
+    create_and_await_instances() had appended the new workers to. Nothing
+    at the call site said so, and making the cache copy on read would have
+    had create() install k3s on no workers at all and still report the
+    cluster ready.
+
+    Step 3c closed that: create() now picks the metadata up again after
+    each method which writes to it, so this assertion no longer rests on
+    the cache's identity semantics and holds whether the cache aliases or
+    copies. What is pinned here is the outcome rather than the mechanism --
+    the workers create() built are the workers it installs k3s on -- which
+    is the claim worth keeping either way.
 
     A scripted fake rather than a MagicMock because create() drives wait
     loops which compare dictionary values against literals; see
@@ -546,3 +554,361 @@ class RemoveWorkerTestCase(testtools.TestCase):
         self.assertRaises(
             exceptions.ClusterNotFoundError, cluster.remove_worker,
             ['inst-w1'])
+
+
+# A cluster which create() started and never finished: the metadata
+# document exists and says 'initial', the name is in the namespace cluster
+# list, and none of the things the later phases of a create record -- the
+# node token, the api addresses, the kubeconfig -- are present at all. This
+# is the exact shape create() writes at cluster.py's "Initialise the
+# metadata", which is why the keys it does not write are absent here rather
+# than present and None.
+def _interrupted_md(state='initial', control_plane_nodes=None,
+                    worker_nodes=None):
+    md = {
+        'name': 'banana',
+        'namespace': 'testns',
+        'type': 'k3s',
+        'k3s_version': 'stable',
+        'k3s_version_history': ['stable'],
+        'plugin_version': '0.0.1',
+        'state': state,
+        'node_serial': 1,
+        'node_network': 'net-1',
+        'node_token': None,
+        'control_plane_nodes': list(control_plane_nodes or []),
+        'worker_nodes': list(worker_nodes or []),
+        'routed_addresses': [],
+        'ssh_key': None
+    }
+    if state is None:
+        del md['state']
+    return md
+
+
+class InterruptedStateTestCase(testtools.TestCase):
+    """Which recorded states mean "this cluster was never finished".
+
+    md['state'] has been written since this package's first commit and read
+    nowhere until now, so this is the first code which has an opinion about
+    what its values mean. Everything else in this file depends on that
+    opinion being the one written down in the phase 3 plan's decision 5.
+    """
+
+    def _state_of(self, md):
+        return _make_cluster(mock.MagicMock()).interrupted_state(md)
+
+    def test_a_finished_cluster_is_not_interrupted(self):
+        self.assertIsNone(self._state_of(_interrupted_md(state='created')))
+
+    def test_initial_is_interrupted(self):
+        self.assertEqual('initial', self._state_of(_interrupted_md()))
+
+    def test_deleted_is_interrupted(self):
+        # delete() writes 'deleted' and then removes the metadata document,
+        # so metadata which still says 'deleted' is a delete which died in
+        # between. Rerunning delete is the way out of that too.
+        self.assertEqual('deleted', self._state_of(_interrupted_md(state='deleted')))
+
+    def test_metadata_with_no_state_is_unknown_rather_than_finished(self):
+        # This package has always written the key, so a document without one
+        # came from something else. Guessing "finished" would guess in the
+        # direction which drives k3s installs at half built clusters.
+        self.assertEqual('unknown', self._state_of(_interrupted_md(state=None)))
+
+
+class CreateOverInterruptedClusterTestCase(testtools.TestCase):
+    """create() tells an interrupted cluster apart from a finished one.
+
+    Both used to be ClusterExistsError: "Sorry, that cluster name is
+    already taken", which is true but useless, because the two have
+    opposite answers. A finished cluster of that name is someone's working
+    cluster and the caller should pick another name. An unfinished one is
+    the wreckage of an earlier create, and the caller can delete it and try
+    again -- which, per decision 5 of the phase 3 plan, is the only
+    recovery there is, so the error has to say so.
+    """
+
+    def setUp(self):
+        super(CreateOverInterruptedClusterTestCase, self).setUp()
+        self.client = fakes.FakeClusterClient()
+        # An interrupted create leaves the name in the namespace cluster
+        # list as well as in its own metadata document: create() registers
+        # the name before it writes anything else, which is what makes the
+        # order of create()'s two guards matter.
+        self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
+
+        # create() looks up the k3s release before it looks at the name.
+        patcher = mock.patch(
+            'shakenfist_client_k3s.primitives.get_k3s_release',
+            return_value='stable')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.cluster = _make_cluster(self.client)
+
+    def _create(self, md):
+        self.client.metadata[MD_KEY] = md
+        return self.cluster.create(1, 1, 1)
+
+    def test_an_interrupted_cluster_raises_and_names_the_delete_command(self):
+        e = self.assertRaises(
+            exceptions.ClusterInterruptedError, self._create, _interrupted_md())
+
+        self.assertEqual('mid_create', e.reason)
+        self.assertEqual('banana', e.name)
+        self.assertEqual('initial', e.state)
+
+        message = str(e)
+        self.assertIn("'sf-client k3s delete banana'", message)
+        self.assertIn("'initial'", message)
+
+    def test_nothing_is_built_over_the_wreckage(self):
+        self.assertRaises(
+            exceptions.ClusterInterruptedError, self._create, _interrupted_md())
+
+        self.assertEqual({}, self.client.instances)
+        self.assertEqual(_interrupted_md(), self.client.metadata[MD_KEY])
+
+    def test_a_half_deleted_cluster_is_also_interrupted(self):
+        e = self.assertRaises(
+            exceptions.ClusterInterruptedError, self._create,
+            _interrupted_md(state='deleted'))
+        self.assertEqual('deleted', e.state)
+
+    def test_a_finished_cluster_still_reports_that_the_name_is_taken(self):
+        # The old error, unchanged, for the case it was always right about.
+        e = self.assertRaises(
+            exceptions.ClusterExistsError, self._create,
+            _interrupted_md(state='created'))
+        self.assertEqual('Sorry, that cluster name is already taken', str(e))
+
+    def test_a_name_in_the_cluster_list_with_no_metadata_is_still_taken(self):
+        # The second of create()'s two original checks. There is no
+        # metadata to read a state out of, so there is nothing more useful
+        # to say than that the name is taken.
+        self.assertRaises(exceptions.ClusterExistsError, self.cluster.create,
+                          1, 1, 1)
+
+
+class DeleteInterruptedClusterTestCase(testtools.TestCase):
+    """delete() is the way out of an interrupted create, so it has to work.
+
+    create() now refuses a name whose metadata says the cluster was never
+    finished and points at delete, which makes delete the only exit from
+    that state (decision 5 of the phase 3 plan: detection and teardown, not
+    resume). If delete failed on the same clusters create refuses, the name
+    would be unusable forever.
+
+    Reading the code found that it already does work, and that the three
+    things which looked like they would break do not: md['kubeconfig'] is
+    only ever written by delete, never read; an empty control_plane_nodes
+    makes the instance loop a no-op rather than an IndexError; and
+    'kubectl config unset' on an entry which was never written exits zero.
+    These tests exist so that stays true, because it is true by accident
+    rather than by design.
+    """
+
+    def setUp(self):
+        super(DeleteInterruptedClusterTestCase, self).setUp()
+        self.client = RecordingClient()
+        self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # Unmocked, delete's three 'kubectl config unset' calls would edit
+        # the operator's own ~/.kube/config.
+        self.subprocess_run = mock.MagicMock()
+        self.subprocess_run.return_value.returncode = 0
+        patcher = mock.patch('subprocess.run', self.subprocess_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.reporter = progress.CollectingReporter()
+        self.cluster = Cluster(self.client, 'banana', 'testns',
+                               reporter=self.reporter)
+
+    def _seed(self, md, instances=()):
+        self.client.metadata[MD_KEY] = md
+        for instance_uuid, name in instances:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+
+    def test_a_cluster_with_one_node_and_no_kubeconfig_is_deleted(self):
+        # The shape an interrupted create most often leaves: the control
+        # plane node was made, and nothing after it happened, so there is no
+        # node token, no api address and no 'kubeconfig' key at all.
+        md = _interrupted_md(control_plane_nodes=['inst-001'])
+        self.assertNotIn('kubeconfig', md)
+        self._seed(md, [('inst-001', 'k3s-banana-node-001')])
+
+        self.cluster.delete()
+
+        self.assertEqual([('delete_instance', 'inst-001', None)],
+                         self.client.actions)
+        self.assertEqual(['net-1'], self.client.deleted_networks)
+
+        # Both halves of the cluster's record are gone, which is what makes
+        # the name usable again.
+        self.assertNotIn(MD_KEY, self.client.metadata)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_a_cluster_with_no_nodes_at_all_is_deleted(self):
+        # Interrupted between writing the metadata and creating the first
+        # instance, so both node lists are empty.
+        self._seed(_interrupted_md())
+
+        self.cluster.delete()
+
+        self.assertEqual([], self.client.actions)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_the_operator_is_told_the_cluster_never_finished(self):
+        self._seed(_interrupted_md(control_plane_nodes=['inst-001']),
+                   [('inst-001', 'k3s-banana-node-001')])
+
+        self.cluster.delete()
+
+        out = self.reporter.getvalue()
+        self.assertIn("state 'initial'", out)
+        self.assertIn('never finished being built', out)
+
+    def test_a_finished_cluster_is_deleted_without_the_note(self):
+        # The normal case must be unchanged: nothing new is printed for a
+        # cluster which reached 'created'.
+        self._seed(_interrupted_md(state='created',
+                                   control_plane_nodes=['inst-001']),
+                   [('inst-001', 'k3s-banana-node-001')])
+
+        self.cluster.delete()
+
+        self.assertEqual('', self.reporter.getvalue())
+        self.assertNotIn(MD_KEY, self.client.metadata)
+
+
+class ShowReportsStateTestCase(testtools.TestCase):
+    """show() reports the cluster state, and says what an unusable one means.
+
+    The state has always been one of the keys show() returns, because show
+    returns the whole metadata document. What it did not do was read it:
+    'state = initial' sat in a screenful of key/value pairs with nothing to
+    say that it was the line which mattered, or that the answer to it is a
+    delete.
+    """
+
+    def _show(self, md):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {MD_KEY: md}
+        reporter = progress.CollectingReporter()
+        cluster = Cluster(client, 'banana', 'testns', reporter=reporter)
+        return cluster.show(), reporter.getvalue()
+
+    def test_the_state_is_in_the_returned_metadata(self):
+        md, _ = self._show(_interrupted_md())
+        self.assertEqual('initial', md['state'])
+
+    def test_an_interrupted_cluster_is_called_out_and_the_way_out_named(self):
+        _, out = self._show(_interrupted_md())
+        self.assertIn("state 'initial'", out)
+        self.assertIn("'sf-client k3s delete banana'", out)
+
+    def test_a_finished_cluster_says_nothing_new(self):
+        md, out = self._show(_interrupted_md(state='created'))
+        self.assertEqual('created', md['state'])
+        self.assertEqual('', out)
+
+    def test_show_does_not_refuse_an_interrupted_cluster(self):
+        # show is the verb for looking at a cluster which is not working.
+        # Raising here would take away the only tool which can say why.
+        md, _ = self._show(_interrupted_md(state='deleted'))
+        self.assertEqual('banana', md['name'])
+
+
+class InterruptedClusterVerbsTestCase(testtools.TestCase):
+    """The verbs which need a built cluster refuse an interrupted one.
+
+    Each of these reaches for something only a finished create records:
+    md['control_plane_nodes'][0] to run kubectl on, or md['node_token'] to
+    join a new worker with. On a cluster interrupted before those existed
+    they fail with an IndexError, or -- worse, because it is silent --
+    build instances which run 'sh -s - agent' with a K3S_TOKEN of None and
+    can never join anything. Now that create() refuses to build over an
+    interrupted cluster, these are the remaining ways to reach one.
+    """
+
+    def _cluster(self, md):
+        client = RecordingClient()
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        client.metadata[MD_KEY] = md
+        client.instances['inst-w1'] = {
+            'uuid': 'inst-w1', 'name': 'k3s-banana-node-002',
+            'state': 'created', 'agent_state': 'ready'}
+        return Cluster(client, 'banana', 'testns',
+                       reporter=progress.CollectingReporter()), client
+
+    def _assert_refused(self, verb, call, *args):
+        cluster, client = self._cluster(
+            _interrupted_md(control_plane_nodes=[], worker_nodes=['inst-w1']))
+
+        e = self.assertRaises(exceptions.ClusterInterruptedError,
+                              getattr(cluster, call), *args)
+
+        self.assertEqual('not_usable', e.reason)
+        self.assertEqual('initial', e.state)
+        self.assertEqual(verb, e.verb)
+        self.assertIn(verb, str(e))
+        self.assertIn("'sf-client k3s delete banana'", str(e))
+
+        self.assertEqual(
+            [], client.actions,
+            '%s acted on a cluster which was never finished being built. '
+            'The client was asked to:\n    %s'
+            % (verb, '\n    '.join(repr(a) for a in client.actions)))
+        # And the metadata is exactly as it was found: a refusal must not
+        # be a partial run.
+        self.assertEqual(
+            _interrupted_md(control_plane_nodes=[], worker_nodes=['inst-w1']),
+            client.metadata[MD_KEY])
+        return e
+
+    def test_expand_workers_is_refused(self):
+        self._assert_refused('expand-workers', 'expand_workers', 1)
+
+    def test_remove_worker_is_refused(self):
+        # The uuid asked for is genuinely one of this cluster's workers, so
+        # it is the cluster's state which refuses this and not the worker
+        # lookup which 3b added.
+        self._assert_refused('remove-worker', 'remove_worker', ['inst-w1'])
+
+    def test_expand_addresses_is_refused(self):
+        self._assert_refused('expand-addresses', 'expand_addresses', 1)
+
+    def test_update_os_is_allowed(self):
+        # update-os talks to the instances in the metadata and nothing
+        # else, so on an interrupted cluster it truthfully updates whatever
+        # nodes exist. Refusing it would be a rule for its own sake.
+        cluster, client = self._cluster(
+            _interrupted_md(control_plane_nodes=[], worker_nodes=['inst-w1']))
+        cluster.update_os()
+
+        self.assertEqual(
+            [('execute', 'inst-w1', 'apt-get update'),
+             ('execute', 'inst-w1', 'apt-get dist-upgrade -y')],
+            client.actions)
+
+    def test_a_finished_cluster_is_not_refused(self):
+        # The guard must not fire on the clusters these verbs exist for.
+        cluster, client = self._cluster(
+            _interrupted_md(state='created', control_plane_nodes=['inst-cp1'],
+                            worker_nodes=['inst-w1']))
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        cluster.remove_worker(['inst-w1'])
+
+        self.assertEqual([], client.metadata[MD_KEY]['worker_nodes'])

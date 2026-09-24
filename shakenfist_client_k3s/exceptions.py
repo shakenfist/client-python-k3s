@@ -113,12 +113,16 @@ class ClusterIncompleteError(K3sClusterException):
     field being asked for -- here, the kubeconfig -- has not been recorded
     yet, because create has not reached that point. This is deliberately a
     distinct class from ``ClusterNotFoundError`` rather than another of its
-    classmethods: a caller (in particular the reconcile verb phase 3 adds
-    for the ``state: initial`` case, and the Ansible module and conductor
-    that motivate this plan) needs to tell "no such cluster, create one"
-    apart from "cluster exists but is incomplete, wait or reconcile", and
-    that distinction has to survive as the exception's type, not just its
-    text.
+    classmethods: a caller (the Ansible module and conductor that motivate
+    this plan) needs to tell "no such cluster, create one" apart from
+    "cluster exists but is incomplete, wait or tear it down", and that
+    distinction has to survive as the exception's type, not just its text.
+
+    Phase 3 decided there is no reconcile verb: an incomplete cluster is
+    torn down and rebuilt rather than resumed (decision 5). A caller which
+    wants to know whether the cluster as a whole ever finished, rather than
+    whether one field of it is present, reads ``md['state']`` or catches
+    ``ClusterInterruptedError``.
     """
 
     def __init__(self, name):
@@ -127,6 +131,82 @@ class ClusterIncompleteError(K3sClusterException):
 
     def __str__(self):
         return 'No kubeconfig for this cluster. Is it fully installed?'
+
+
+class ClusterInterruptedError(K3sClusterException):
+    """Raised when a cluster's own metadata says it never finished being built.
+
+    ``md['state']`` is written by ``Cluster.create()`` and
+    ``Cluster.delete()`` and, until phase 3, was read nowhere at all (survey
+    finding 2 of
+    ``docs/plans/library-api-and-collection-phase-03-missing-verbs.md``).
+    Anything other than ``created`` means a create or a delete stopped part
+    way through, so the cluster's nodes, tokens and kubeconfig are in an
+    unknown combination of present and absent.
+
+    Per decision 5 of that plan the answer is always teardown rather than
+    resume, so every message here names ``sf-client k3s delete <name>``.
+    There are two distinct messages, hence the classmethod constructors
+    rather than ``WorkerNotFoundError``'s plain one:
+
+    - ``mid_create(name, state)``: raised by ``Cluster.create()`` when the
+      name it was asked for already holds the metadata of an unfinished
+      cluster. This is deliberately distinguished from
+      ``ClusterExistsError``, which says only that the name is taken: a
+      name held by a finished cluster belongs to a working cluster, and a
+      name held by an unfinished one belongs to rubbish the caller can
+      remove.
+    - ``not_usable(name, state, verb)``: raised by the verbs which need a
+      built cluster to work on -- ``Cluster.expand_workers()``,
+      ``Cluster.remove_worker()`` and ``Cluster.expand_addresses()``. All
+      three reach for ``md['control_plane_nodes'][0]`` or for a node token
+      which an interrupted create may never have recorded, and would
+      otherwise fail with an ``IndexError`` or install k3s against a token
+      of ``None``.
+
+    This is not ``ClusterIncompleteError``, which is about one absent field
+    of a cluster that may still be being built successfully right now
+    (``get_kubeconfig()`` called against a create which has not reached its
+    credentials phase). This one is about the recorded state of the cluster
+    as a whole, and carries that state as an attribute so a caller --
+    conductor, or phase 5's Ansible module -- can branch on it rather than
+    on the message text.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    FIELDS = ('name', 'state', 'verb')
+
+    def __init__(self, reason, message, **fields):
+        self.reason = reason
+        self.message = message
+        for key in self.FIELDS:
+            setattr(self, key, None)
+        for key, value in fields.items():
+            setattr(self, key, value)
+        super(ClusterInterruptedError, self).__init__(message)
+
+    def __str__(self):
+        return self.message
+
+    @classmethod
+    def mid_create(cls, name, state):
+        message = (
+            'Cluster %s was interrupted while it was being built: its state is\n'
+            "'%s' rather than 'created'. Resuming a half built cluster is not\n"
+            'supported, so remove what is left of it with\n'
+            "'sf-client k3s delete %s' and then create it again."
+        ) % (name, state, name)
+        return cls('mid_create', message, name=name, state=state)
+
+    @classmethod
+    def not_usable(cls, name, state, verb):
+        message = (
+            'Cluster %s was interrupted while it was being built: its state is\n'
+            "'%s' rather than 'created', so %s cannot run against it.\n"
+            "Remove what is left of it with 'sf-client k3s delete %s'."
+        ) % (name, state, verb, name)
+        return cls('not_usable', message, name=name, state=state, verb=verb)
 
 
 class WorkerNotFoundError(K3sClusterException):

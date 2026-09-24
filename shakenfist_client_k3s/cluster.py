@@ -118,6 +118,51 @@ class Cluster:
         del self._metadata[md_key]
         self.client.delete_namespace_metadata_item(self.namespace, md_key)
 
+    def interrupted_state(self, md):
+        """Return md's cluster state if it never finished being built, else None.
+
+        ``md['state']`` has been written since this package's first commit
+        and, until now, read nowhere: every other ``['state']`` in the
+        package is an instance or agent operation state from the API. It is
+        ``initial`` from the moment ``create()`` writes the metadata
+        document, ``created`` once ``create()`` has finished, and
+        ``deleted`` for the few lines between ``delete()`` destroying
+        everything and removing the metadata. Anything which is not
+        ``created`` therefore describes a cluster some earlier run stopped
+        in the middle of, whose nodes, tokens and kubeconfig are in an
+        unknown combination of present and absent.
+
+        Metadata carrying no state at all answers ``'unknown'`` rather than
+        None. This package has always written the key, so its absence means
+        the document was written by something which is not this package,
+        and guessing "finished" would be guessing in the direction which
+        drives k3s installs at half built clusters.
+
+        This returns the state rather than a boolean because every caller
+        names it: an error a human can act on has to say which of the three
+        it found.
+        """
+        state = md.get('state', 'unknown')
+        if state == 'created':
+            return None
+        return state
+
+    def require_usable(self, md, verb):
+        """Refuse to run verb against a cluster which never finished being built.
+
+        The verbs which change a built cluster all assume the things
+        ``create()`` records on its way through: a first control plane node
+        to run kubectl on, and a node token to join new workers with. On an
+        interrupted cluster those are an empty list and None, which fail as
+        an ``IndexError`` and as a k3s agent install against the literal
+        token ``None``. Both are worse than being told the cluster is
+        rubbish and how to remove it, which is all this does.
+        """
+        state = self.interrupted_state(md)
+        if state:
+            raise exceptions.ClusterInterruptedError.not_usable(
+                self.name, state, verb)
+
     def get_progress(self):
         """Return the Progress reporter for this operation, making a default if needed.
 
@@ -604,9 +649,21 @@ class Cluster:
         all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
         md = self.get_metadata()
 
-        if self.name in all_clusters:
-            raise exceptions.ClusterExistsError(self.name)
+        # The metadata is consulted before the cluster list, which is a
+        # change of order rather than of behaviour: both checks raised the
+        # same ClusterExistsError, so which fired first did not matter
+        # until now. It matters now because only the metadata knows whether
+        # the cluster holding this name ever finished being built, and an
+        # interrupted create leaves the name in the cluster list too. Asking
+        # the list first would answer "that name is taken" for the one case
+        # which has a more useful answer than that.
         if md:
+            interrupted = self.interrupted_state(md)
+            if interrupted:
+                raise exceptions.ClusterInterruptedError.mid_create(
+                    self.name, interrupted)
+            raise exceptions.ClusterExistsError(self.name)
+        if self.name in all_clusters:
             raise exceptions.ClusterExistsError(self.name)
         all_clusters.append(self.name)
         self.client.set_namespace_metadata_item(
@@ -666,6 +723,21 @@ class Cluster:
         self.create_and_await_instances(control_plane_count, 'control_plane')
         self.create_and_await_instances(worker_count, 'worker')
 
+        # Pick the metadata up again, here and at the two other points
+        # below where a method this function called has written to it.
+        # These three lines are no-ops today and deliberately so:
+        # get_metadata() caches the dictionary, set_metadata() stores that
+        # same object, so the md this function is holding is already the
+        # one create_and_await_instances() appended the new nodes to. That
+        # aliasing is what makes the control_plane_nodes read below and the
+        # worker_nodes argument to install_workers() correct, and nothing
+        # said so. Re-reading costs no API call -- the cache answers -- and
+        # leaves this function correct whether the cache aliases or copies,
+        # which the alternative (one md held across the whole create, with
+        # a set_metadata() at the end writing it back over everybody else's
+        # work) is not. Recorded for this step by 3a's commit message.
+        md = self.get_metadata()
+
         # Record the node network address for the first control plane node as the API
         # address
         interfaces = self.client.get_instance_interfaces(md['control_plane_nodes'][0])
@@ -682,6 +754,9 @@ class Cluster:
 
         self.install_control_plane()
         self.install_workers(md['worker_nodes'])
+
+        # install_control_plane() recorded the two registration tokens.
+        md = self.get_metadata()
 
         # Fetch kubecfg, correct IP, and include cluster name instead of "default"
         p.phase('Fetching cluster credentials')
@@ -748,6 +823,10 @@ class Cluster:
                 with open(main_config_path, 'w') as f:
                     f.write(yaml.dump(merged_kc))
 
+        # setup_metallb() recorded the routed addresses it allocated, and
+        # this is the write which would otherwise put a stale local
+        # dictionary back over them.
+        md = self.get_metadata()
         md['state'] = 'created'
         self.set_metadata(md)
         p.finish(f'Cluster {self.name} is ready')
@@ -776,10 +855,28 @@ class Cluster:
         This is the body of ``sf-client k3s show``, which formats what this
         returns. It differs from get_metadata() only in insisting that the
         cluster exists, and in the error it raises when it does not.
+
+        A cluster which never finished being built is reported rather than
+        refused: show is the verb for looking at a cluster which is not
+        working, so raising here would take away the one tool which can say
+        why. The state is in the returned metadata as ``state``, and is all
+        a library caller needs; the note this writes to the reporter is for
+        the human running ``sf-client k3s show``, who would otherwise have
+        to know that ``state = initial`` in a screenful of key/value pairs
+        is the line that matters and that the answer to it is a delete.
         """
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+
+        interrupted = self.interrupted_state(md)
+        if interrupted:
+            self.reporter.write(
+                "Cluster %s is in state '%s' rather than 'created': it was "
+                'interrupted while it was being built, and is not usable.\n'
+                "Remove what is left of it with 'sf-client k3s delete %s'.\n"
+                % (self.name, interrupted, self.name))
+
         return md
 
     def delete(self):
@@ -788,12 +885,32 @@ class Cluster:
         This is the body of ``sf-client k3s delete``. Removing this
         cluster's entries from the local ~/.kube/config with kubectl is
         unconditional here because it is unconditional in the command this
-        replaces; phase 3 makes it optional.
+        replaces; step 3e of the phase 3 plan makes it optional.
+
+        This works on a cluster which never reached ``created``, and that
+        is the only way out of an interrupted create: decision 5 of the
+        phase 3 plan scopes the state machine to detection and teardown, so
+        ``create()`` refuses such a name and points here. Nothing below
+        assumes the cluster was ever finished -- the node lists are empty
+        rather than absent, the network teardown is already guarded, and
+        the local kubectl cleanup is idempotent -- so the only change this
+        needed was to say what it is doing.
         """
         # Ensure this name exists
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+
+        # Not a debug line: a delete which follows a failed create is the
+        # supported recovery, and an operator running it wants to be told
+        # that this is the cluster they think it is before their instances
+        # go away. A cluster which reached 'created' says nothing new.
+        interrupted = self.interrupted_state(md)
+        if interrupted:
+            self.reporter.write(
+                "Cluster %s is in state '%s' rather than 'created': it never "
+                'finished being built.\nRemoving whatever it did create.\n'
+                % (self.name, interrupted))
 
         self.reporter.debug('Cluster metadata:')
         for k in md:
@@ -891,11 +1008,16 @@ class Cluster:
     def expand_workers(self, worker_count):
         """Add worker nodes to this cluster.
 
-        This is the body of ``sf-client k3s expand-workers``.
+        This is the body of ``sf-client k3s expand-workers``. The cluster
+        must have finished being built: the new workers join with
+        ``md['node_token']``, which an interrupted create may never have
+        fetched, and a k3s agent install carrying a token of None builds
+        instances which are charged for and can never join anything.
         """
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
+        self.require_usable(md, 'expand-workers')
 
         p = progress.Progress(
             total_phases=2, verbose=self.reporter.verbose, stream=self.reporter)
@@ -914,6 +1036,11 @@ class Cluster:
         are only rescheduled once the node controller's eviction timeout
         expires. See decision 3 in
         ``docs/plans/library-api-and-collection-phase-03-missing-verbs.md``.
+
+        The drain needs a cluster to drain the node out of, so a cluster
+        which never finished being built is refused rather than allowed to
+        fail on ``md['control_plane_nodes'][0]``, or on a drain aimed at a
+        node where k3s was never installed.
 
         Every uuid is checked against this cluster's worker list before
         anything is drained or deleted, so a typo in the third of three
@@ -938,6 +1065,7 @@ class Cluster:
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
+        self.require_usable(md, 'remove-worker')
 
         # Repeating --worker with the same uuid would otherwise drain a node
         # which has already been removed, and then fail on the second
@@ -1016,11 +1144,16 @@ class Cluster:
     def expand_addresses(self, address_count):
         """Route more floating addresses into this cluster for metallb to hand out.
 
-        This is the body of ``sf-client k3s expand-addresses``.
+        This is the body of ``sf-client k3s expand-addresses``. The cluster
+        must have finished being built: the new addresses are written into
+        metallb's configuration through the first control plane node, which
+        an interrupted create may not have made, let alone installed
+        metallb on.
         """
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
+        self.require_usable(md, 'expand-addresses')
 
         p = progress.Progress(
             total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)
@@ -1033,7 +1166,12 @@ class Cluster:
     def update_os(self):
         """Update the base OS packages on every node in this cluster.
 
-        This is the body of ``sf-client k3s update-os``.
+        This is the body of ``sf-client k3s update-os``. Unlike the other
+        expansion verbs this does not require a cluster which finished
+        being built: it talks to the instances in the metadata and nothing
+        else, so on an interrupted cluster it updates whichever nodes exist
+        and does nothing at all when none do. That is a truthful answer
+        rather than a failure, so it is left alone.
         """
         md = self.get_metadata()
         if not md:
