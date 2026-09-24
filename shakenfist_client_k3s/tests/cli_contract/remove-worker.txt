@@ -1,0 +1,10 @@
+Usage: k3s remove-worker [OPTIONS] NAME
+
+  Remove workers from a k3s cluster
+
+Options:
+  --worker TEXT     The instance UUID of a worker to remove. Repeat the option
+                    to remove more than one.  [required]
+  --namespace TEXT  If you are an admin, you can alter clusters in a different
+                    namespace.
+  --help            Show this message and exit.

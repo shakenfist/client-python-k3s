@@ -7,6 +7,7 @@ import mock
 import testtools
 
 from shakenfist_client_k3s import cluster as cluster_module
+from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.cluster import Cluster
 from shakenfist_client_k3s.tests import fakes
@@ -347,3 +348,201 @@ class CreateInstallsWorkersTestCase(testtools.TestCase):
     def test_a_single_worker_cluster_still_installs_its_worker(self):
         _, workers, agent_calls = self._create(1, 1)
         self._assert_installed_on(workers, agent_calls)
+
+
+class RecordingClient(fakes.FakeClusterClient):
+    """A scripted client which records executes and deletes in one ordered log.
+
+    The assertion this class exists for -- that a worker is drained and
+    removed from k3s before its instance is destroyed -- cannot be made
+    from two separate call lists, because neither of them knows where in
+    the other its own calls fell. One log, in the order the client was
+    asked, is the only shape which can answer "before".
+    """
+
+    def __init__(self):
+        super(RecordingClient, self).__init__()
+        self.actions = []
+
+    def instance_execute(self, instance_ref, commandline):
+        self.actions.append(('execute', instance_ref, commandline))
+        return super(RecordingClient, self).instance_execute(
+            instance_ref, commandline)
+
+    def delete_instance(self, instance_ref):
+        self.actions.append(('delete_instance', instance_ref, None))
+        return super(RecordingClient, self).delete_instance(instance_ref)
+
+
+class RemoveWorkerTestCase(testtools.TestCase):
+    """remove-worker drains a worker out of k3s before it destroys it.
+
+    Deleting the Shaken Fist instance first leaves a NotReady node object
+    in the cluster forever and strands the pods which were running on it
+    until the node controller's eviction timeout expires, so the order of
+    those two operations is the verb's entire safety argument (decision 3
+    of the phase 3 plan). The other half is that a run which is going to
+    fail fails before it has destroyed anything.
+    """
+
+    def setUp(self):
+        super(RemoveWorkerTestCase, self).setUp()
+        self.client = RecordingClient()
+
+        self.md = {
+            'name': 'banana',
+            'namespace': 'testns',
+            'state': 'created',
+            'node_serial': 5,
+            'node_network': 'net-1',
+            'node_token': 'node-token',
+            'k3s_version': 'v1.33',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'],
+            'worker_nodes': ['inst-w1', 'inst-w2', 'inst-w3'],
+            'routed_addresses': []
+        }
+        self.client.metadata[MD_KEY] = self.md
+
+        # The nodes the seeded metadata claims exist. The instance names
+        # matter: the k3s node name is the instance's hostname, which
+        # Shaken Fist derives from the instance name, so these are the
+        # names the drain has to use.
+        for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                    ('inst-w1', 'k3s-banana-node-002'),
+                                    ('inst-w2', 'k3s-banana-node-003'),
+                                    ('inst-w3', 'k3s-banana-node-004')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.cluster = _make_cluster(self.client)
+
+    def _index_of(self, predicate, description):
+        for i, action in enumerate(self.client.actions):
+            if predicate(action):
+                return i
+        self.fail('%s never happened. The client was asked to:\n    %s'
+                  % (description,
+                     '\n    '.join(repr(a) for a in self.client.actions)
+                     or '(nothing at all)'))
+
+    def test_a_worker_is_drained_and_removed_before_it_is_deleted(self):
+        self.cluster.remove_worker(['inst-w2'])
+
+        drain = self._index_of(
+            lambda a: a[0] == 'execute' and a[2].startswith('kubectl drain'),
+            'the drain of k3s-banana-node-003')
+        delete_node = self._index_of(
+            lambda a: a[0] == 'execute' and a[2].startswith('kubectl delete node'),
+            'the k3s node deletion of k3s-banana-node-003')
+        delete_instance = self._index_of(
+            lambda a: a[0] == 'delete_instance',
+            'the deletion of instance inst-w2')
+
+        self.assertTrue(
+            drain < delete_instance,
+            'the instance was deleted before the node was drained, which '
+            'strands its pods until the eviction timeout expires. The client '
+            'was asked to:\n    %s'
+            % '\n    '.join(repr(a) for a in self.client.actions))
+        self.assertTrue(
+            delete_node < delete_instance,
+            'the instance was deleted before the node was removed from k3s, '
+            'which leaves a NotReady node object behind forever. The client '
+            'was asked to:\n    %s'
+            % '\n    '.join(repr(a) for a in self.client.actions))
+
+    def test_the_commands_name_the_node_and_run_on_the_control_plane(self):
+        self.cluster.remove_worker(['inst-w2'])
+
+        self.assertEqual(
+            [('execute', 'inst-cp1',
+              'kubectl drain k3s-banana-node-003 --ignore-daemonsets '
+              '--delete-emptydir-data --kubeconfig /etc/rancher/k3s/k3s.yaml'),
+             ('execute', 'inst-cp1',
+              'kubectl delete node k3s-banana-node-003 '
+              '--kubeconfig /etc/rancher/k3s/k3s.yaml'),
+             ('delete_instance', 'inst-w2', None)],
+            self.client.actions)
+
+    def test_the_survivors_keep_their_original_order(self):
+        self.cluster.remove_worker(['inst-w2'])
+
+        self.assertEqual(['inst-w1', 'inst-w3'],
+                         self.client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_several_workers_are_removed_in_the_order_they_were_asked_for(self):
+        self.cluster.remove_worker(['inst-w3', 'inst-w1'])
+
+        self.assertEqual(
+            [('delete_instance', 'inst-w3', None),
+             ('delete_instance', 'inst-w1', None)],
+            [a for a in self.client.actions if a[0] == 'delete_instance'])
+        self.assertEqual(['inst-w2'],
+                         self.client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_a_repeated_uuid_removes_that_worker_once(self):
+        self.cluster.remove_worker(['inst-w2', 'inst-w2'])
+
+        self.assertEqual(
+            [('delete_instance', 'inst-w2', None)],
+            [a for a in self.client.actions if a[0] == 'delete_instance'])
+        self.assertEqual(['inst-w1', 'inst-w3'],
+                         self.client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_an_unknown_uuid_raises_before_anything_is_destroyed(self):
+        # The typo is deliberately last: the point of validating the whole
+        # list up front is that the two good uuids in front of it are
+        # untouched when it fails.
+        self.assertRaises(
+            exceptions.WorkerNotFoundError, self.cluster.remove_worker,
+            ['inst-w1', 'inst-w2', 'inst-w9'])
+
+        self.assertEqual(
+            [], self.client.actions,
+            'remove_worker() drained or deleted something despite being '
+            'given a worker uuid which is not in this cluster. It was asked '
+            'to:\n    %s'
+            % '\n    '.join(repr(a) for a in self.client.actions))
+        self.assertEqual(['inst-w1', 'inst-w2', 'inst-w3'],
+                         self.client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_the_error_names_every_uuid_which_did_not_match(self):
+        e = self.assertRaises(
+            exceptions.WorkerNotFoundError, self.cluster.remove_worker,
+            ['inst-w9', 'inst-w8'])
+
+        self.assertEqual(['inst-w9', 'inst-w8'], e.instance_uuids)
+        self.assertIn('inst-w9', str(e))
+        self.assertIn('inst-w8', str(e))
+        self.assertIn('banana', str(e))
+
+    def test_a_control_plane_node_is_not_a_worker(self):
+        # Removing a control plane node is shrinking the control plane,
+        # which the master plan puts out of scope. Asking for one by uuid
+        # must not quietly work because the instance happens to exist.
+        self.assertRaises(
+            exceptions.WorkerNotFoundError, self.cluster.remove_worker,
+            ['inst-cp1'])
+        self.assertEqual([], self.client.actions)
+
+    def test_the_last_worker_may_be_removed(self):
+        # A k3s server node is schedulable, so a cluster with no workers is
+        # still a working cluster, and conductor's ephemeral CI runners
+        # legitimately go to zero. This is deliberately allowed.
+        self.cluster.remove_worker(['inst-w1', 'inst-w2', 'inst-w3'])
+
+        self.assertEqual([], self.client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_an_unknown_cluster_raises(self):
+        client = RecordingClient()
+        cluster = _make_cluster(client)
+
+        self.assertRaises(
+            exceptions.ClusterNotFoundError, cluster.remove_worker,
+            ['inst-w1'])

@@ -287,6 +287,26 @@ def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
 k3s.add_command(k3s_expand_workers)
 
 
+@k3s.command(name='remove-worker', help='Remove workers from a k3s cluster')
+@click.argument('name', type=click.STRING)
+@click.option('--worker', 'workers', type=click.STRING, multiple=True,
+              required=True,
+              help=('The instance UUID of a worker to remove. Repeat the '
+                    'option to remove more than one.'))
+@click.option('--namespace', type=click.STRING,
+              help=('If you are an admin, you can alter clusters in a '
+                    'different namespace.'))
+@click.pass_context
+def k3s_remove_worker(ctx, name=None, workers=None, namespace=None):
+    # workers is a tuple, because the option is multiple=True. The library
+    # API takes a list, so that a caller reading one back out of a result
+    # and passing it straight in does the obvious thing.
+    _bind_cluster_context(ctx, name, namespace).remove_worker(list(workers))
+
+
+k3s.add_command(k3s_remove_worker)
+
+
 @k3s.command(name='expand-addresses',
              help='Add floating addresses for metallb to a k3s cluster')
 @click.argument('name', type=click.STRING)

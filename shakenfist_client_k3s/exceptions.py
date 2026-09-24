@@ -129,6 +129,36 @@ class ClusterIncompleteError(K3sClusterException):
         return 'No kubeconfig for this cluster. Is it fully installed?'
 
 
+class WorkerNotFoundError(K3sClusterException):
+    """Raised when a worker asked for by uuid is not one of this cluster's workers.
+
+    Raised by ``Cluster.remove_worker()``, which validates every uuid it
+    was handed against ``md['worker_nodes']`` before it drains or deletes
+    anything: a typo in the third of three arguments must not leave the
+    first two destroyed. It therefore carries every uuid which did not
+    match, not just the first, so that one run reports every typo.
+
+    A single message shape, so this is a plain constructor rather than the
+    classmethods ``ClusterNotFoundError`` and ``KubeconfigError`` use --
+    those exist to give several distinct messages one class, and there is
+    only one here. The uuids are rendered, unlike the cluster names the
+    older exceptions carry but do not print, because a caller removing
+    three workers cannot otherwise tell which argument was wrong.
+    """
+
+    def __init__(self, name, instance_uuids):
+        self.name = name
+        self.instance_uuids = list(instance_uuids)
+        super(WorkerNotFoundError, self).__init__(name)
+
+    def __str__(self):
+        if len(self.instance_uuids) == 1:
+            return ('Cluster %s has no worker node with uuid %s'
+                    % (self.name, self.instance_uuids[0]))
+        return ('Cluster %s has no worker nodes with uuids %s'
+                % (self.name, ', '.join(self.instance_uuids)))
+
+
 class ReleaseLookupError(K3sClusterException):
     """Raised when looking up a k3s or Longhorn release fails.
 

@@ -904,6 +904,115 @@ class Cluster:
         self.install_workers(new_workers)
         p.finish(f'Added {worker_count} workers to cluster {self.name}')
 
+    def remove_worker(self, instance_uuids):
+        """Remove worker nodes from this cluster, draining each one first.
+
+        This is the body of ``sf-client k3s remove-worker``. Each worker is
+        drained and removed from k3s before its Shaken Fist instance is
+        destroyed: deleting the instance first leaves a NotReady node object
+        in the cluster forever, and the workloads which were running on it
+        are only rescheduled once the node controller's eviction timeout
+        expires. See decision 3 in
+        ``docs/plans/library-api-and-collection-phase-03-missing-verbs.md``.
+
+        Every uuid is checked against this cluster's worker list before
+        anything is drained or deleted, so a typo in the third of three
+        arguments fails the call rather than destroying the first two.
+        Workers are then removed one at a time, each committed to metadata
+        before the next is started, so an interrupted run leaves the
+        metadata describing the cluster which actually exists.
+
+        Removing the last worker is allowed, and is the caller's business:
+        a k3s server node is schedulable, so a cluster with no workers is a
+        working cluster, and conductor's workers are ephemeral CI runners
+        which legitimately go to zero. Note though that ``kubectl drain``
+        blocks while a pod has nowhere else to go, so draining the last
+        worker of a cluster with workloads pinned to it will wait until the
+        agent operation times out. That surfaces as an
+        ``AgentOperationError``, which is the right failure.
+
+        This does not wait for the instances to reach the deleted state.
+        The drain is what makes the removal safe for the cluster, and it
+        has already completed by the time the instance is destroyed.
+        """
+        md = self.get_metadata()
+        if not md:
+            raise exceptions.ClusterNotFoundError.not_found(self.name)
+
+        # Repeating --worker with the same uuid would otherwise drain a node
+        # which has already been removed, and then fail on the second
+        # list.remove(). Deduplicate rather than reject: the caller asked
+        # for that worker to be gone, and it will be.
+        wanted = []
+        for instance_uuid in instance_uuids:
+            if instance_uuid not in wanted:
+                wanted.append(instance_uuid)
+
+        # Validate all of them before touching anything. This is the whole
+        # reason the loop below is not the only loop in this method.
+        unknown = [instance_uuid for instance_uuid in wanted
+                   if instance_uuid not in md['worker_nodes']]
+        if unknown:
+            raise exceptions.WorkerNotFoundError(self.name, unknown)
+
+        p = progress.Progress(
+            total_phases=len(wanted), verbose=self.reporter.verbose,
+            stream=self.reporter)
+        self.progress = p
+
+        for instance_uuid in wanted:
+            # k3s names a node after the hostname of the machine it runs on,
+            # and Shaken Fist derives the guest's hostname from the
+            # instance's name: the config drive it builds sets
+            # meta_data.json's "hostname" to "<instance name>.local" (see
+            # shakenfist/instance.py), which cloud-init applies as the short
+            # hostname. There is no separate hostname field in the instance
+            # API representation to read instead, so 'name' is the field,
+            # and it is read from the instance rather than rebuilt from
+            # md['node_serial'] so that a node this plugin did not name is
+            # still drained by the name k3s knows it by.
+            inst = self.client.get_instance(instance_uuid)
+            node_name = inst['name']
+
+            p.phase('Removing worker %s (uuid %s)' % (node_name, instance_uuid))
+
+            # Two agent operations rather than one, so that a drain which
+            # fails raises before the node object is removed and the
+            # instance destroyed. A single execute_and_await() submits both
+            # commands and only then checks their return codes, which would
+            # delete a node still running the pods the drain could not move.
+            #
+            # Both commands carry --kubeconfig explicitly, even though bare
+            # kubectl already works on these nodes today (setup_metallb()
+            # and setup_longhorn() run kubectl without it, against real
+            # clusters, in this repo's functional CI). The two commands here
+            # would otherwise differ only in whether they name the
+            # kubeconfig, which invites the next reader to wonder which
+            # spelling is load-bearing. Being explicit keeps this working
+            # if these are ever run as a user whose default kubeconfig is
+            # not k3s's.
+            self.execute_and_await(
+                [md['control_plane_nodes'][0]],
+                ['kubectl drain %s --ignore-daemonsets --delete-emptydir-data '
+                 '--kubeconfig /etc/rancher/k3s/k3s.yaml' % node_name])
+            self.execute_and_await(
+                [md['control_plane_nodes'][0]],
+                ['kubectl delete node %s --kubeconfig /etc/rancher/k3s/k3s.yaml'
+                 % node_name])
+
+            p.note('drained %s and removed it from k3s' % node_name)
+            self.client.delete_instance(instance_uuid)
+
+            # list.remove() rather than a rebuilt list: the survivors keep
+            # the order they were created in, which is the order every other
+            # reader of md['worker_nodes'] sees them in.
+            md['worker_nodes'].remove(instance_uuid)
+            self.set_metadata(md)
+            p.note('deleted instance %s' % instance_uuid)
+
+        p.finish('Removed %s from cluster %s' % (
+            progress.count_str(len(wanted), 'worker'), self.name))
+
     def expand_addresses(self, address_count):
         """Route more floating addresses into this cluster for metallb to hand out.
 

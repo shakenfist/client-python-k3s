@@ -289,3 +289,93 @@ class CommandWiringTestCase(testtools.TestCase):
             self.client.executed)
         self.assertIn('Updated the OS on all nodes in cluster banana',
                       result.output)
+
+
+class DeleteRecordingClient(RecordingClient):
+    """A scripted client which also records the instances it was asked to delete."""
+
+    def __init__(self):
+        super(DeleteRecordingClient, self).__init__()
+        self.deleted_instances = []
+
+    def delete_instance(self, instance_ref):
+        self.deleted_instances.append(instance_ref)
+        return super(DeleteRecordingClient, self).delete_instance(instance_ref)
+
+
+class RemoveWorkerCommandTestCase(testtools.TestCase):
+    """remove-worker's option parsing, and what it does with what it parsed.
+
+    --worker is repeatable and required, and the library method takes a
+    list of uuids, so there are three ways for this wiring to be wrong
+    which the golden --help fixture cannot see: the tuple Click builds
+    reaching the method unconverted, only the first or last --worker being
+    forwarded, and the command name resolving to some other verb entirely.
+    The error path is here too, because turning a raised
+    WorkerNotFoundError back into an exit code is the Click layer's job.
+    """
+
+    def setUp(self):
+        super(RemoveWorkerCommandTestCase, self).setUp()
+        self.client = DeleteRecordingClient()
+
+        md = copy.deepcopy(EXISTING_MD)
+        md['worker_nodes'] = ['inst-w1', 'inst-w2', 'inst-w3']
+        self.client.metadata[cluster_module.METADATA_KEY % 'banana'] = md
+        self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
+
+        for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                    ('inst-w1', 'k3s-banana-node-002'),
+                                    ('inst-w2', 'k3s-banana-node-003'),
+                                    ('inst-w3', 'k3s-banana-node-004')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.runner = CliRunner()
+
+    def _invoke(self, args):
+        return self.runner.invoke(
+            shakenfist_client_k3s.k3s, args,
+            obj={'VERBOSE': False, 'CLIENT': self.client})
+
+    def _md(self):
+        return self.client.metadata[cluster_module.METADATA_KEY % 'banana']
+
+    def test_one_worker_is_removed(self):
+        result = self._invoke(['remove-worker', 'banana', '--worker', 'inst-w2'])
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(['inst-w2'], self.client.deleted_instances)
+        self.assertEqual(['inst-w1', 'inst-w3'], self._md()['worker_nodes'])
+        self.assertIn('Removed 1 worker from cluster banana', result.output)
+
+    def test_the_option_may_be_repeated(self):
+        result = self._invoke(['remove-worker', 'banana',
+                               '--worker', 'inst-w1', '--worker', 'inst-w3'])
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(['inst-w1', 'inst-w3'], self.client.deleted_instances)
+        self.assertEqual(['inst-w2'], self._md()['worker_nodes'])
+        self.assertIn('Removed 2 workers from cluster banana', result.output)
+
+    def test_the_option_is_required(self):
+        result = self._invoke(['remove-worker', 'banana'])
+
+        self.assertEqual(2, result.exit_code, result.output)
+        self.assertIn("Missing option '--worker'", result.output)
+        self.assertEqual([], self.client.deleted_instances)
+
+    def test_an_unknown_worker_fails_the_command_and_deletes_nothing(self):
+        result = self._invoke(['remove-worker', 'banana',
+                               '--worker', 'inst-w1', '--worker', 'inst-w9'])
+
+        self.assertEqual(1, result.exit_code, result.output)
+        self.assertIn('inst-w9', result.output)
+        self.assertEqual([], self.client.deleted_instances)
+        self.assertEqual(['inst-w1', 'inst-w2', 'inst-w3'],
+                         self._md()['worker_nodes'])
