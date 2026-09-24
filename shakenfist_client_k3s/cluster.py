@@ -291,6 +291,13 @@ class Cluster:
                 aop['results']['0']['stderr'])
 
     def create_and_await_instances(self, count, node_type):
+        """Create count nodes of node_type, wait for them, and return their UUIDs.
+
+        The returned list is the instances this call created, which is not
+        the same thing as the cluster's node list for that type: an expand
+        appends to metadata which already holds nodes. Callers which go on
+        to install software must use the returned list, not the metadata.
+        """
         p = self.get_progress()
         md = self.get_metadata()
 
@@ -310,6 +317,7 @@ class Cluster:
         p.note('updating base OS packages')
         self.instance_os_update(new_nodes)
         self.set_metadata(md)
+        return new_nodes
 
     def execute_and_await(self, instance_uuids, cmds):
         aops = []
@@ -413,11 +421,19 @@ class Cluster:
         self.install_k3s_component(
             md['control_plane_nodes'][1:], md['server_token'], 'server')
 
-    def install_workers(self):
+    def install_workers(self, instance_uuids):
+        """Install the k3s agent on the worker instances named by instance_uuids.
+
+        There is deliberately no default. Running the installer on a worker
+        which is already in the cluster re-runs the k3s agent install on a
+        node carrying workloads, so a caller which means "every worker" has
+        to say so: create() does, because at create time every worker is
+        new, and expand_workers() passes only the instances it just made.
+        """
         p = self.get_progress()
         md = self.get_metadata()
         p.phase('Installing k3s on the worker nodes')
-        self.install_k3s_component(md['worker_nodes'], md['node_token'], 'agent')
+        self.install_k3s_component(instance_uuids, md['node_token'], 'agent')
 
     def allocate_metallb_addresses(self, metal_address_count):
         p = self.get_progress()
@@ -665,7 +681,7 @@ class Cluster:
         self.set_metadata(md)
 
         self.install_control_plane()
-        self.install_workers()
+        self.install_workers(md['worker_nodes'])
 
         # Fetch kubecfg, correct IP, and include cluster name instead of "default"
         p.phase('Fetching cluster credentials')
@@ -884,8 +900,8 @@ class Cluster:
         p = progress.Progress(
             total_phases=2, verbose=self.reporter.verbose, stream=self.reporter)
         self.progress = p
-        self.create_and_await_instances(worker_count, 'worker')
-        self.install_workers()
+        new_workers = self.create_and_await_instances(worker_count, 'worker')
+        self.install_workers(new_workers)
         p.finish(f'Added {worker_count} workers to cluster {self.name}')
 
     def expand_addresses(self, address_count):
