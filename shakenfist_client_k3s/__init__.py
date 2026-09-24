@@ -146,7 +146,8 @@ k3s.add_command(k3s_list)
               default=2)
 @click.option('--metal-address-count', type=click.INT,
               help=('The number of floating addresses to route into the virtual '
-                    'network for metallb to manage'),
+                    'network for metallb to manage. Ignored if --no-metallb is '
+                    'passed.'),
               default=5)
 @click.option('--namespace', type=click.STRING,
               help=('If you are an admin, you can create this cluster in a '
@@ -162,15 +163,21 @@ k3s.add_command(k3s_list)
                     '"v1.26".'))
 @click.option('--sshkey', type=click.Path(exists=True),
               help='An optional ssh public key to place onto instances.')
+@click.option('--metallb/--no-metallb', default=True,
+              help=('Install metallb for load balancer addresses. --metal-address-count '
+                    'is ignored when this is off.'))
+@click.option('--longhorn/--no-longhorn', default=True,
+              help='Install longhorn for persistent storage.')
 @click.pass_context
 def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                metal_address_count=None,  namespace=None, network=None,
                refresh_version_cache=False, release_channel=None,
-               sshkey=None):
+               sshkey=None, metallb=True, longhorn=True):
     c = _bind_new_cluster_context(ctx, name, namespace)
     c.create(control_plane_count, worker_count, metal_address_count,
              network=network, refresh_version_cache=refresh_version_cache,
-             release_channel=release_channel, sshkey=sshkey)
+             release_channel=release_channel, sshkey=sshkey,
+             install_metallb=metallb, install_longhorn=longhorn)
 
 
 k3s.add_command(k3s_create)

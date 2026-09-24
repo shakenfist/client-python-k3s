@@ -6,7 +6,8 @@ Options:
   --control-plane-count INTEGER   The number of control plane nodes
   --worker-count INTEGER          The number of workers
   --metal-address-count INTEGER   The number of floating addresses to route into
-                                  the virtual network for metallb to manage
+                                  the virtual network for metallb to manage.
+                                  Ignored if --no-metallb is passed.
   --namespace TEXT                If you are an admin, you can create this
                                   cluster in a different namespace.
   --network TEXT                  Specify a network here to add these nodes to a
@@ -19,4 +20,8 @@ Options:
                                   pre-pended with a v such as "v1.26".
   --sshkey PATH                   An optional ssh public key to place onto
                                   instances.
+  --metallb / --no-metallb        Install metallb for load balancer addresses.
+                                  --metal-address-count is ignored when this is
+                                  off.
+  --longhorn / --no-longhorn      Install longhorn for persistent storage.
   --help                          Show this message and exit.

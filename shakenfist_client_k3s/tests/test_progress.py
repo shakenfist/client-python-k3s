@@ -752,3 +752,31 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
         output = self._create(['banana', '--network', 'net-1'])
         self._assert_phases_consistent(output)
         self.assertNotIn('Creating node network', output)
+
+    def test_create_with_no_metallb(self):
+        output = self._create(['banana', '--no-metallb'])
+        self._assert_phases_consistent(output)
+        self.assertNotIn('Setting up metallb', output)
+        self.assertIn('Setting up longhorn', output)
+
+    def test_create_with_no_longhorn(self):
+        output = self._create(['banana', '--no-longhorn'])
+        self._assert_phases_consistent(output)
+        self.assertIn('Setting up metallb', output)
+        self.assertNotIn('Setting up longhorn', output)
+
+    def test_create_with_neither_metallb_nor_longhorn(self):
+        output = self._create(['banana', '--no-metallb', '--no-longhorn'])
+        self._assert_phases_consistent(output)
+        self.assertNotIn('Setting up metallb', output)
+        self.assertNotIn('Setting up longhorn', output)
+        self.assertIn('Cluster banana is ready', output)
+
+    def test_create_with_no_metallb_ignores_metal_address_count(self):
+        # --metal-address-count is meaningless without metallb; the CLI
+        # accepts the combination rather than rejecting it, per the option
+        # help on --metal-address-count and --metallb/--no-metallb.
+        output = self._create(
+            ['banana', '--no-metallb', '--metal-address-count', '99'])
+        self._assert_phases_consistent(output)
+        self.assertNotIn('Setting up metallb', output)

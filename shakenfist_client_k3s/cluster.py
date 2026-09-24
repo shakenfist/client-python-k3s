@@ -609,7 +609,8 @@ class Cluster:
 
     def create(self, control_plane_count, worker_count, metal_address_count,
                network=None, refresh_version_cache=False,
-               release_channel='stable', sshkey=None):
+               release_channel='stable', sshkey=None, install_metallb=True,
+               install_longhorn=True):
         """Build this cluster, from nothing to a working k3s.
 
         The namespace must already exist. The command line creates it when
@@ -623,16 +624,29 @@ class Cluster:
         phase 3: doing it here would put a behaviour change inside a
         refactor whose entire safety argument is that behaviour is
         unchanged.
+
+        install_metallb and install_longhorn default to True, matching the
+        behaviour before this parameter existed. metal_address_count is
+        still a required positional argument even when install_metallb is
+        False, in which case it is accepted and ignored -- see
+        k3s_create()'s --metal-address-count help in __init__.py for why
+        that combination is not an error.
         """
         # Phases: create control plane nodes, create workers, install control
         # plane, install workers, fetch credentials, metallb, longhorn, and
         # update the local kubeconfig. Creating a node network and installing
-        # additional control plane nodes only sometimes happen.
+        # additional control plane nodes only sometimes happen, and metallb
+        # and longhorn are each skipped -- and their phase uncounted -- when
+        # the corresponding install_* flag is False.
         total_phases = 8
         if not network:
             total_phases += 1
         if control_plane_count > 1:
             total_phases += 1
+        if not install_metallb:
+            total_phases -= 1
+        if not install_longhorn:
+            total_phases -= 1
         p = progress.Progress(
             total_phases=total_phases, verbose=self.reporter.verbose,
             stream=self.reporter)
@@ -776,9 +790,12 @@ class Cluster:
         md['kubeconfig'] = yaml.dump(kc)
         self.set_metadata(md)
 
-        # Install metallb and longhorn
-        self.setup_metallb(metal_address_count)
-        self.setup_longhorn()
+        # Install metallb and longhorn, unless the caller opted out of one
+        # or both of them.
+        if install_metallb:
+            self.setup_metallb(metal_address_count)
+        if install_longhorn:
+            self.setup_longhorn()
 
         # Install the kubeconfig we fetched earlier
         p.phase('Updating local kubeconfig')

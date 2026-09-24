@@ -242,8 +242,9 @@ class CreatePhaseCountTestCase(LibraryTestCase):
 
     Progress prints '[n/total]' headers, so a total which does not match
     the number of phases actually run is visible in every line of a
-    create's output. The arithmetic depends on two of create's arguments,
-    and moving it out of the Click layer is exactly where it could have
+    create's output. The arithmetic depends on four of create's arguments
+    -- network, control_plane_count, install_metallb and install_longhorn
+    -- and moving it out of the Click layer is exactly where it could have
     been lost.
     """
 
@@ -273,6 +274,68 @@ class CreatePhaseCountTestCase(LibraryTestCase):
 
     def test_both_adjustments_together(self):
         self._assert_phases(9, 2, 1, 1, network='net-1')
+
+    def test_no_metallb_removes_a_phase(self):
+        self._assert_phases(8, 1, 1, 1, install_metallb=False)
+
+    def test_no_longhorn_removes_a_phase(self):
+        self._assert_phases(8, 1, 1, 1, install_longhorn=False)
+
+    def test_no_metallb_and_no_longhorn_removes_two_phases(self):
+        self._assert_phases(
+            7, 1, 1, 1, install_metallb=False, install_longhorn=False)
+
+
+class OptionalMetallbLonghornTestCase(LibraryTestCase):
+    """install_metallb and install_longhorn each gate exactly their own setup call.
+
+    CreatePhaseCountTestCase pins the phase arithmetic; this class pins the
+    behaviour the arithmetic is standing in for -- that turning one flag
+    off skips only that one setup() call, that the other one still runs,
+    and that create() still reaches state 'created' either way.
+    """
+
+    def test_no_metallb_skips_only_metallb(self):
+        c = self._cluster()
+        with mock.patch.object(Cluster, 'setup_metallb') as metallb, \
+                mock.patch.object(Cluster, 'setup_longhorn') as longhorn:
+            c.create(1, 1, 1, install_metallb=False)
+        metallb.assert_not_called()
+        longhorn.assert_called_once()
+        self.assertEqual('created', c.show()['state'])
+
+    def test_no_longhorn_skips_only_longhorn(self):
+        c = self._cluster()
+        with mock.patch.object(Cluster, 'setup_metallb') as metallb, \
+                mock.patch.object(Cluster, 'setup_longhorn') as longhorn:
+            c.create(1, 1, 1, install_longhorn=False)
+        metallb.assert_called_once()
+        longhorn.assert_not_called()
+        self.assertEqual('created', c.show()['state'])
+
+    def test_neither_flag_off_runs_both(self):
+        c = self._cluster()
+        with mock.patch.object(Cluster, 'setup_metallb') as metallb, \
+                mock.patch.object(Cluster, 'setup_longhorn') as longhorn:
+            c.create(1, 1, 1)
+        metallb.assert_called_once()
+        longhorn.assert_called_once()
+
+    def test_no_metallb_leaves_no_routed_addresses(self):
+        # allocate_metallb_addresses(), which writes routed_addresses, is
+        # inside setup_metallb(). Skipping the phase header is not enough
+        # on its own -- this checks the work behind it was skipped too.
+        c = self._cluster()
+        c.create(1, 1, 3, install_metallb=False)
+        self.assertEqual([], c.show()['routed_addresses'])
+
+    def test_metal_address_count_is_ignored_without_metallb(self):
+        # Decision recorded in create()'s docstring and in --metal-address-
+        # count's --help: the combination is accepted, not an error, and
+        # the count is simply unused when metallb is not being installed.
+        c = self._cluster()
+        c.create(1, 1, 999999, install_metallb=False)
+        self.assertEqual('created', c.show()['state'])
 
 
 class ClusterAccessorTestCase(testtools.TestCase):
