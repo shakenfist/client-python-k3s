@@ -274,6 +274,78 @@ def k3s_show(ctx, name=None, namespace=None):
 k3s.add_command(k3s_show)
 
 
+@k3s.command(name='health', help='Report the health of a k3s cluster')
+@click.argument('name', type=click.STRING)
+@click.option('--namespace', type=click.STRING,
+              help=('If you are an admin, you can report on a cluster in a '
+                    'different namespace.'))
+@click.pass_context
+def k3s_health(ctx, name=None, namespace=None):
+    c = _bind_cluster_context(ctx, name, namespace)
+    _render_health(c.reporter, c.health())
+
+
+def _render_health(out, report):
+    """Render Cluster.health()'s report for a human.
+
+    This writes to the reporter rather than to print(), which the older
+    commands in this module use. Those pre-date the reporter and their
+    comments say so; there is no reason to add another bare print() now,
+    and a health check is the command most likely to be run by something
+    which is also using the process's stdout for its own output.
+
+    Nothing here decides anything: an unhealthy cluster is reported and the
+    command still exits zero, because producing the report is what was
+    asked for and it succeeded. A caller which wants to branch on the
+    answer calls Cluster.health() and reads the dict, which is the whole
+    point of decision 7 of the phase 3 plan.
+    """
+    out.write('Cluster %s in namespace %s is %s\n' % (
+        report['name'], report['namespace'],
+        'healthy' if report['healthy'] else 'NOT healthy'))
+
+    if report['interrupted']:
+        out.write("  state: %s (interrupted: this cluster never finished being "
+                  'built)\n' % report['state'])
+    else:
+        out.write('  state: %s\n' % report['state'])
+
+    out.write('  nodes:\n')
+    if not report['nodes']:
+        out.write('    this cluster has no nodes\n')
+    for node in report['nodes']:
+        # 'control_plane' is the metadata's spelling, and is what the
+        # report carries; create_and_await_instances() does the same
+        # substitution for the same reason.
+        role = node['role'].replace('_', ' ')
+        marker = 'ok' if node['healthy'] else '!!'
+        if not node['exists']:
+            out.write('    [%s] %s (%s): this instance no longer exists\n'
+                      % (marker, node['uuid'], role))
+            continue
+        out.write('    [%s] %s (%s, %s): instance %s, agent %s\n' % (
+            marker, node['name'], node['uuid'], role, node['state'],
+            node['agent_state'] or 'not yet contactable'))
+
+    api = report['api']
+    if api['answered']:
+        out.write('  k3s API: answered on %s\n' % api['instance_uuid'])
+    else:
+        out.write('  k3s API: did not answer (%s)\n' % api['error'])
+
+    # kubectl's own output, which is the most useful thing in the report
+    # when the API answered (it lists the k3s nodes and whether they are
+    # Ready) and the explanation when it did not.
+    for stream in ['stdout', 'stderr']:
+        for line in (api.get(stream) or '').rstrip().split('\n'):
+            if line:
+                out.write('    %s\n' % line)
+    out.flush()
+
+
+k3s.add_command(k3s_health)
+
+
 @k3s.command(name='delete', help='Destroy a k3s cluster')
 @click.argument('name', type=click.STRING)
 @click.option('--namespace', type=click.STRING,

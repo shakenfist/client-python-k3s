@@ -1,4 +1,5 @@
 import copy
+import io
 import tempfile
 import time
 
@@ -12,6 +13,7 @@ import testtools
 import shakenfist_client_k3s
 from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import primitives
+from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.tests import fakes
 
 
@@ -409,3 +411,180 @@ class RemoveWorkerCommandTestCase(testtools.TestCase):
         self.assertEqual([], self.client.deleted_instances)
         self.assertEqual(['inst-w1', 'inst-w2', 'inst-w3'],
                          self._md()['worker_nodes'])
+
+
+class HealthCommandTestCase(testtools.TestCase):
+    """health renders the report, and renders an unhealthy cluster without failing.
+
+    The library method is covered in test_cluster.py; what is here is the
+    rendering, which is the half of decision 7 the library tests cannot
+    see. Three things can go wrong in it and nothing else pins them: the
+    report could be rendered with a bare print() rather than through the
+    reporter, an unhealthy cluster could be turned into a non-zero exit
+    (health is a report, not a judgement, and the verb which exits 1
+    cannot be used to find out whether it should), and a node the metadata
+    names which no longer exists has no name to interpolate, so rendering
+    it is the one line most likely to raise a TypeError in front of the
+    operator who most needed the report.
+    """
+
+    def setUp(self):
+        super(HealthCommandTestCase, self).setUp()
+        self.client = fakes.HealthClient()
+
+        md = copy.deepcopy(EXISTING_MD)
+        md['worker_nodes'] = ['inst-w1', 'inst-w2']
+        self.client.metadata[cluster_module.METADATA_KEY % 'banana'] = md
+        self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        self.md = md
+
+        for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                    ('inst-w1', 'k3s-banana-node-002'),
+                                    ('inst-w2', 'k3s-banana-node-003')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.runner = CliRunner()
+
+    def _invoke(self):
+        return self.runner.invoke(
+            shakenfist_client_k3s.k3s, ['health', 'banana'],
+            obj={'VERBOSE': False, 'CLIENT': self.client})
+
+    def test_a_healthy_cluster_renders_every_node_and_the_api(self):
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn('Cluster banana in namespace testns is healthy',
+                      result.output)
+        self.assertIn('state: created', result.output)
+        self.assertIn('[ok] k3s-banana-node-001 (inst-cp1, control plane): '
+                      'instance created, agent ready', result.output)
+        self.assertIn('[ok] k3s-banana-node-002 (inst-w1, worker): '
+                      'instance created, agent ready', result.output)
+        self.assertIn('[ok] k3s-banana-node-003 (inst-w2, worker): '
+                      'instance created, agent ready', result.output)
+        self.assertIn('k3s API: answered on inst-cp1', result.output)
+
+        # kubectl's own output is the most useful thing in the report, so it
+        # is rendered rather than discarded.
+        self.assertIn('k3s-banana-node-001   Ready    control-plane',
+                      result.output)
+
+    def test_an_unhealthy_cluster_renders_and_still_exits_zero(self):
+        self.client.instances['inst-w1']['state'] = 'error'
+        self.client.instances['inst-w1']['agent_state'] = None
+        self.client.probe_return_code = 1
+        self.client.probe_stdout = ''
+        self.client.probe_stderr = (
+            'The connection to the server 127.0.0.1:6443 was refused\n')
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn('Cluster banana in namespace testns is NOT healthy',
+                      result.output)
+        self.assertIn('[!!] k3s-banana-node-002 (inst-w1, worker): '
+                      'instance error, agent not yet contactable',
+                      result.output)
+        self.assertIn('k3s API: did not answer', result.output)
+        self.assertIn('The connection to the server 127.0.0.1:6443 was refused',
+                      result.output)
+
+    def test_a_node_which_no_longer_exists_renders(self):
+        del self.client.instances['inst-w2']
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn('[!!] inst-w2 (worker): this instance no longer exists',
+                      result.output)
+
+    def test_an_interrupted_cluster_renders_its_state(self):
+        self.md['state'] = 'initial'
+        self.md['control_plane_nodes'] = []
+        self.md['worker_nodes'] = []
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn('state: initial (interrupted: this cluster never '
+                      'finished being built)', result.output)
+        self.assertIn('this cluster has no nodes', result.output)
+        self.assertIn('no control plane node', result.output)
+
+    def test_an_unknown_cluster_fails_the_command(self):
+        client = fakes.HealthClient()
+        result = self.runner.invoke(
+            shakenfist_client_k3s.k3s, ['health', 'banana'],
+            obj={'VERBOSE': False, 'CLIENT': client})
+
+        self.assertEqual(1, result.exit_code, result.output)
+        self.assertIn('does not appear to exist', result.output)
+
+
+class HealthRenderingReporterTestCase(testtools.TestCase):
+    """The health rendering writes to the reporter it is handed, not to stdout.
+
+    HealthCommandTestCase cannot see the difference: Click's CliRunner
+    replaces sys.stdout, and the default Reporter writes to sys.stdout, so
+    a bare print() in the renderer would land in result.output and pass
+    every assertion there. This drives the renderer directly with a
+    collecting reporter, which is the only arrangement in which the two
+    destinations are distinguishable -- and it is the arrangement phase 5's
+    Ansible module will be in, where stdout carries a JSON result and
+    anything else written there corrupts it.
+    """
+
+    # A minimal report, in the shape Cluster.health() returns and with one
+    # of everything the renderer has a branch for.
+    REPORT = {
+        'name': 'banana',
+        'namespace': 'testns',
+        'state': 'created',
+        'interrupted': False,
+        'nodes': [
+            {'uuid': 'inst-cp1', 'role': 'control_plane',
+             'name': 'k3s-banana-node-001', 'exists': True,
+             'state': 'created', 'agent_state': 'ready', 'healthy': True},
+            {'uuid': 'inst-w1', 'role': 'worker', 'name': None,
+             'exists': False, 'state': None, 'agent_state': None,
+             'healthy': False}
+        ],
+        'api': {
+            'probed': True, 'answered': True, 'instance_uuid': 'inst-cp1',
+            'command': 'kubectl get nodes', 'return_code': 0,
+            'stdout': 'NAME   STATUS\nk3s-banana-node-001   Ready\n',
+            'stderr': '', 'error': None
+        },
+        'healthy': False
+    }
+
+    def test_the_report_goes_to_the_reporter_and_not_to_stdout(self):
+        reporter = progress.CollectingReporter()
+        stdout = io.StringIO()
+
+        patcher = mock.patch('sys.stdout', stdout)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        shakenfist_client_k3s._render_health(reporter, self.REPORT)
+
+        self.assertIn('Cluster banana in namespace testns is NOT healthy',
+                      reporter.getvalue())
+        self.assertIn('[ok] k3s-banana-node-001 (inst-cp1, control plane)',
+                      reporter.getvalue())
+        self.assertIn('[!!] inst-w1 (worker): this instance no longer exists',
+                      reporter.getvalue())
+        self.assertIn('k3s API: answered on inst-cp1', reporter.getvalue())
+        self.assertIn('k3s-banana-node-001   Ready', reporter.getvalue())
+
+        self.assertEqual(
+            '', stdout.getvalue(),
+            'the health rendering wrote to the process stdout rather than to '
+            'the reporter it was handed. It wrote:\n%s' % stdout.getvalue())

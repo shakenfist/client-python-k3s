@@ -1,3 +1,4 @@
+import copy
 import io
 import tempfile
 
@@ -915,3 +916,264 @@ class InterruptedClusterVerbsTestCase(testtools.TestCase):
         cluster.remove_worker(['inst-w1'])
 
         self.assertEqual([], client.metadata[MD_KEY]['worker_nodes'])
+
+
+class HealthTestCase(testtools.TestCase):
+    """health() reports an unhealthy cluster rather than failing on one.
+
+    That is the whole verb: decision 7 of the phase 3 plan has it return
+    structured data and repair nothing, and phase 5's Ansible module will
+    branch on the dict rather than parse text. So the assertions here are
+    on the content of the report, and in particular on the cases where the
+    orchestration's normal behaviour is to raise -- a command which exits
+    non-zero, an agent operation in the error state, an instance the
+    metadata names which no longer exists -- each of which must arrive as a
+    finding instead.
+    """
+
+    def setUp(self):
+        super(HealthTestCase, self).setUp()
+        self.client = fakes.HealthClient()
+
+        self.md = {
+            'name': 'banana',
+            'namespace': 'testns',
+            'state': 'created',
+            'node_serial': 4,
+            'node_network': 'net-1',
+            'node_token': 'node-token',
+            'k3s_version': 'v1.33',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'],
+            'worker_nodes': ['inst-w1', 'inst-w2'],
+            'routed_addresses': []
+        }
+        self.client.metadata[MD_KEY] = self.md
+
+        for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                    ('inst-w1', 'k3s-banana-node-002'),
+                                    ('inst-w2', 'k3s-banana-node-003')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.cluster = _make_cluster(self.client)
+
+    def test_a_healthy_cluster_reports_every_node(self):
+        report = self.cluster.health()
+
+        self.assertEqual(
+            [{'uuid': 'inst-cp1', 'role': 'control_plane',
+              'name': 'k3s-banana-node-001', 'exists': True,
+              'state': 'created', 'agent_state': 'ready', 'healthy': True},
+             {'uuid': 'inst-w1', 'role': 'worker',
+              'name': 'k3s-banana-node-002', 'exists': True,
+              'state': 'created', 'agent_state': 'ready', 'healthy': True},
+             {'uuid': 'inst-w2', 'role': 'worker',
+              'name': 'k3s-banana-node-003', 'exists': True,
+              'state': 'created', 'agent_state': 'ready', 'healthy': True}],
+            report['nodes'])
+        self.assertEqual('created', report['state'])
+        self.assertFalse(report['interrupted'])
+        self.assertTrue(report['healthy'])
+        self.assertEqual('banana', report['name'])
+        self.assertEqual('testns', report['namespace'])
+
+    def test_the_api_is_probed_on_the_first_control_plane_node(self):
+        report = self.cluster.health()
+
+        self.assertEqual(
+            [('inst-cp1',
+              'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml')],
+            self.client.executed)
+        self.assertTrue(report['api']['probed'])
+        self.assertTrue(report['api']['answered'])
+        self.assertEqual('inst-cp1', report['api']['instance_uuid'])
+        self.assertEqual(0, report['api']['return_code'])
+        self.assertIn('k3s-banana-node-001   Ready', report['api']['stdout'])
+        self.assertIsNone(report['api']['error'])
+
+    def test_nothing_is_repaired(self):
+        # health() must not be the verb which quietly fixes things, so the
+        # only thing it is allowed to ask the cluster to do is the read only
+        # probe: no metadata write, no instance created or destroyed, no
+        # network touched. The write is asserted as a call rather than as a
+        # changed document because set_metadata() stores the very dictionary
+        # the cache is already holding, so a write back leaves the stored
+        # metadata comparing equal to what it was and an assertion on the
+        # content cannot see it.
+        before = copy.deepcopy(self.client.metadata)
+
+        self.cluster.health()
+
+        self.assertEqual(before, self.client.metadata)
+        self.assertEqual([], self.client.metadata_writes)
+        self.assertEqual([], self.client.metadata_deletes)
+        self.assertEqual([], self.client.deleted_instances)
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertEqual([], self.client.unrouted_addresses)
+        self.assertEqual(0, self.client.instance_serial)
+        self.assertEqual(
+            ['kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'],
+            [command for _, command in self.client.executed])
+
+    def test_an_instance_in_the_error_state_is_reported_rather_than_raised(self):
+        self.client.instances['inst-w1']['state'] = 'error'
+        self.client.instances['inst-w1']['agent_state'] = None
+
+        report = self.cluster.health()
+
+        worker = [n for n in report['nodes'] if n['uuid'] == 'inst-w1'][0]
+        self.assertEqual('error', worker['state'])
+        self.assertIsNone(worker['agent_state'])
+        self.assertFalse(worker['healthy'])
+        self.assertFalse(report['healthy'])
+
+        # And the rest of the report is still complete: a broken node must
+        # not truncate the answer.
+        self.assertEqual(3, len(report['nodes']))
+        self.assertTrue(
+            [n for n in report['nodes'] if n['uuid'] == 'inst-w2'][0]['healthy'])
+        self.assertTrue(report['api']['answered'])
+
+    def test_an_instance_whose_agent_is_not_ready_is_unhealthy(self):
+        # A booted instance whose in-guest agent has never answered is a
+        # node k3s cannot be running on, and is the state await_boot()
+        # waits out rather than the one it accepts.
+        self.client.instances['inst-w2']['agent_state'] = 'not ready'
+
+        report = self.cluster.health()
+
+        worker = [n for n in report['nodes'] if n['uuid'] == 'inst-w2'][0]
+        self.assertEqual('created', worker['state'])
+        self.assertEqual('not ready', worker['agent_state'])
+        self.assertFalse(worker['healthy'])
+        self.assertFalse(report['healthy'])
+
+    def test_an_instance_which_no_longer_exists_is_reported_rather_than_raised(self):
+        # Cluster metadata can name an instance somebody has since deleted
+        # out from under it, which is why delete() catches this per
+        # instance. health() hits the same case, and is the verb which is
+        # supposed to tell you about it.
+        del self.client.instances['inst-w1']
+
+        report = self.cluster.health()
+
+        self.assertEqual(
+            {'uuid': 'inst-w1', 'role': 'worker', 'name': None,
+             'exists': False, 'state': None, 'agent_state': None,
+             'healthy': False},
+            [n for n in report['nodes'] if n['uuid'] == 'inst-w1'][0])
+        self.assertFalse(report['healthy'])
+        self.assertEqual(3, len(report['nodes']))
+
+    def test_a_kubectl_which_exits_non_zero_is_reported_rather_than_raised(self):
+        # execute_and_await() would raise CommandFailedError here, which is
+        # exactly what the verb cannot do: an API which does not answer is
+        # the single most important thing health() has to be able to say.
+        self.client.probe_return_code = 1
+        self.client.probe_stdout = ''
+        self.client.probe_stderr = (
+            'The connection to the server 127.0.0.1:6443 was refused\n')
+
+        report = self.cluster.health()
+
+        self.assertTrue(report['api']['probed'])
+        self.assertFalse(report['api']['answered'])
+        self.assertEqual(1, report['api']['return_code'])
+        self.assertIn('connection to the server', report['api']['stderr'])
+        self.assertIn('exited 1', report['api']['error'])
+        self.assertFalse(report['healthy'])
+
+        # ...and every node is still reported, which is the other half of
+        # not raising.
+        self.assertEqual(3, len(report['nodes']))
+        self.assertTrue(all(n['healthy'] for n in report['nodes']))
+
+    def test_an_errored_agent_operation_is_reported_rather_than_raised(self):
+        # await_idle() raises AgentOperationError for this, which is why the
+        # probe does not go through execute_and_await().
+        self.client.probe_state = 'error'
+
+        report = self.cluster.health()
+
+        self.assertFalse(report['api']['answered'])
+        self.assertIn('error state', report['api']['error'])
+        self.assertIn('kubectl get nodes', report['api']['error'])
+        self.assertFalse(report['healthy'])
+        self.assertEqual(3, len(report['nodes']))
+
+    def test_an_api_refusal_to_run_the_probe_is_reported_rather_than_raised(self):
+        # The control plane instance is gone, so the command cannot even be
+        # submitted. The nodes are still reported.
+        self.client.probe_raises = fakes.not_found('inst-cp1')
+
+        report = self.cluster.health()
+
+        self.assertFalse(report['api']['probed'])
+        self.assertFalse(report['api']['answered'])
+        self.assertIn('ResourceNotFoundException', report['api']['error'])
+        self.assertIn('inst-cp1', report['api']['error'])
+        self.assertFalse(report['healthy'])
+        self.assertEqual(3, len(report['nodes']))
+
+    def test_an_interrupted_cluster_is_reported_rather_than_refused(self):
+        # The three verbs which change a built cluster call
+        # require_usable() and refuse this. health() must not: describing a
+        # cluster which never finished being built is what it is for.
+        self.md['state'] = 'initial'
+        self.md['control_plane_nodes'] = []
+        self.md['worker_nodes'] = []
+
+        report = self.cluster.health()
+
+        self.assertEqual('initial', report['state'])
+        self.assertTrue(report['interrupted'])
+        self.assertEqual([], report['nodes'])
+        self.assertFalse(report['healthy'])
+
+        # There was no node to ask, so the probe was never run rather than
+        # failing on md['control_plane_nodes'][0].
+        self.assertFalse(report['api']['probed'])
+        self.assertIsNone(report['api']['instance_uuid'])
+        self.assertIn('no control plane node', report['api']['error'])
+        self.assertEqual([], self.client.executed)
+
+    def test_metadata_with_no_state_at_all_is_interrupted(self):
+        # interrupted_state() answers 'unknown' rather than None for a
+        # document this package did not write, and the report says so.
+        del self.md['state']
+
+        report = self.cluster.health()
+
+        self.assertEqual('unknown', report['state'])
+        self.assertTrue(report['interrupted'])
+        self.assertFalse(report['healthy'])
+
+    def test_a_cluster_with_no_nodes_is_not_healthy(self):
+        # The state here is 'created' and there is nothing unhealthy in the
+        # (empty) node list, over which all() answers True. What makes this
+        # unhealthy is that there was no control plane node to ask, so the
+        # k3s API never answered -- which is why health() carries no
+        # separate "has at least one node" term. This pins that the empty
+        # cluster still comes out unhealthy, and for that reason.
+        self.md['control_plane_nodes'] = []
+        self.md['worker_nodes'] = []
+
+        report = self.cluster.health()
+
+        self.assertEqual([], report['nodes'])
+        self.assertTrue(all(node['healthy'] for node in report['nodes']))
+        self.assertFalse(report['api']['answered'])
+        self.assertFalse(report['healthy'])
+
+    def test_a_missing_cluster_raises(self):
+        client = fakes.HealthClient()
+        cluster = _make_cluster(client)
+
+        self.assertRaises(
+            exceptions.ClusterNotFoundError, cluster.health)

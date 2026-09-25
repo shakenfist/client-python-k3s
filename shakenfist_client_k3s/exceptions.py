@@ -65,19 +65,26 @@ class NetworkNotFoundError(K3sClusterException):
 class ClusterNotFoundError(K3sClusterException):
     """Raised when a named cluster (or a required part of its state) is missing.
 
-    This covers six sites across five commands, which use three distinct
-    message strings. None of the three interpolate the cluster name, so
-    ``name`` is carried only as a structured attribute, not rendered.
-    Construct via the classmethods below, one per distinct message:
+    This covers one site in each of eight commands, which use three
+    distinct message strings. None of the three interpolate the cluster
+    name, so ``name`` is carried only as a structured attribute, not
+    rendered. Construct via the classmethods below, one per distinct
+    message:
 
     - ``unknown_cluster()``: raised by ``Cluster.get_kubeconfig()`` when
       there is no cluster metadata at all.
-    - ``does_not_exist()``: raised by ``Cluster.show()`` and
-      ``Cluster.delete()``.
+    - ``does_not_exist()``: raised by ``Cluster.show()``,
+      ``Cluster.health()`` and ``Cluster.delete()``.
     - ``not_found()``: raised by ``Cluster.expand_workers()``,
-      ``Cluster.expand_addresses()`` and ``Cluster.update_os()``.
+      ``Cluster.remove_worker()``, ``Cluster.expand_addresses()`` and
+      ``Cluster.update_os()``.
 
-    The sixth original site, ``Cluster.get_kubeconfig()``'s second check
+    Which of the two "there is no such cluster" messages a verb uses is
+    historical rather than meaningful, and new verbs join the group they
+    read like: ``health()`` reports on a cluster the way ``show()`` does,
+    so it says what ``show()`` says.
+
+    One further original site, ``Cluster.get_kubeconfig()``'s second check
     -- metadata present but no kubeconfig recorded -- is not here: that
     cluster does exist, so it raises ``ClusterIncompleteError`` instead.
     """

@@ -318,10 +318,23 @@ class Cluster:
             data += chunk
         return data.decode('utf-8')
 
-    def reap_execute(self, aop):
+    def await_execute(self, aop):
+        """Wait for an execute agent operation to finish, and return it.
+
+        Split out of reap_execute() so that a caller which wants a command's
+        return code as data rather than as an exception can wait for the
+        command without also being made to raise on it. health() is that
+        caller, and the only one: a command which ran and failed is the
+        finding health() exists to report, so it needs the wait without the
+        judgement.
+        """
         while aop['state'] not in ('complete', 'error'):
             time.sleep(1)
             aop = self.client.get_agent_operation(aop['uuid'])
+        return aop
+
+    def reap_execute(self, aop):
+        aop = self.await_execute(aop)
 
         if aop['state'] == 'error':
             raise self._agent_op_error(aop)
@@ -375,6 +388,126 @@ class Cluster:
         self.await_idle(instance_uuids)
         for aop in aops:
             self.reap_execute(aop)
+
+    def _probe_k3s_api(self, instance_uuid):
+        """Ask a control plane node whether its k3s API answers, and report the answer.
+
+        This is execute_and_await()'s read only sibling, and exists because
+        that method cannot be used here. It submits every command and only
+        then reaps the results, and its reaping raises: await_idle() raises
+        AgentOperationError for an operation which entered the error state,
+        and reap_execute() raises CommandFailedError for a non-zero return
+        code. A failing kubectl is the finding health() exists to report, so
+        raising on it would defeat the verb. This therefore submits the
+        command itself, waits for that one operation with await_execute(),
+        and reads the return code as data.
+
+        await_idle() is deliberately not called either, for a second reason:
+        it waits for *every* agent operation on the instance to complete,
+        including ones another process queued, and a read only health check
+        must not block on somebody else's k3s install.
+
+        Returns the dict health() reports under ``api``; see health()'s
+        docstring for the keys. Nothing here raises for an unhealthy answer.
+        apiclient.APIException is caught, rather than only its
+        ResourceNotFoundException subclass, because every way the API can
+        refuse to run a command on this node -- the instance is gone, it is
+        in a state which cannot accept agent operations, the cluster is
+        unwell enough to return a 500 -- is a fact about this cluster's
+        health rather than a bug in this code. An authentication or
+        authorisation failure would already have stopped get_metadata()
+        before we got here.
+        """
+        # --kubeconfig explicitly, matching remove_worker(): bare kubectl
+        # works on these nodes today, and being consistent about saying so
+        # keeps the next reader from wondering which spelling matters.
+        command = 'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'
+        probe = {
+            'probed': True,
+            'answered': False,
+            'instance_uuid': instance_uuid,
+            'command': command,
+            'return_code': None,
+            'stdout': None,
+            'stderr': None,
+            'error': None
+        }
+
+        self.reporter.debug('Asking %s whether the k3s API answers' % instance_uuid)
+        try:
+            aop = self.await_execute(
+                self.client.instance_execute(instance_uuid, command))
+        except apiclient.APIException as e:
+            # apiclient's exceptions never pass their message to
+            # Exception.__init__(), so str() on one is the empty string and
+            # the only way to the explanation is the attribute.
+            detail = getattr(e, 'message', None) or str(e) or 'no detail given'
+            probe['probed'] = False
+            probe['error'] = ('the command could not be run on instance %s: %s: %s'
+                              % (instance_uuid, e.__class__.__name__, detail))
+            return probe
+
+        if aop['state'] == 'error':
+            probe['error'] = (
+                'the agent operation for %s entered the error state'
+                % (primitives._describe_agent_op(aop, max_len=None) or command))
+            return probe
+
+        # An operation which completed without recording a result for its
+        # only command should not happen, and health() is the one method
+        # which must not turn "should not happen" into a traceback.
+        result = (aop.get('results') or {}).get('0')
+        if not result:
+            probe['error'] = 'the agent operation completed but recorded no result'
+            return probe
+
+        probe['return_code'] = result.get('return-code')
+        probe['stdout'] = result.get('stdout')
+        probe['stderr'] = result.get('stderr')
+        probe['answered'] = probe['return_code'] == 0
+        if not probe['answered']:
+            probe['error'] = "'%s' exited %s" % (command, probe['return_code'])
+        return probe
+
+    def _node_health(self, instance_uuid, role):
+        """Report the Shaken Fist state of one node, whether or not it still exists.
+
+        Returns one element of health()'s ``nodes`` list; see health()'s
+        docstring for the keys. The two states compared against are the two
+        await_boot() waits for, so "healthy" here means the same thing as
+        "finished booting" there.
+
+        ResourceNotFoundException is caught for the same reason delete()
+        catches it per instance: cluster metadata can name an instance which
+        somebody has since deleted out from under it, and on a verb whose
+        job is to say what is wrong that is an answer rather than a failure.
+        Every field is read with .get() rather than subscripted, because a
+        health check which crashes on an instance representation missing a
+        field is a health check which cannot report the instance it most
+        needs to.
+        """
+        node = {
+            'uuid': instance_uuid,
+            'role': role,
+            'name': None,
+            'exists': False,
+            'state': None,
+            'agent_state': None,
+            'healthy': False
+        }
+
+        try:
+            inst = self.client.get_instance(instance_uuid)
+        except apiclient.ResourceNotFoundException:
+            return node
+
+        node['exists'] = True
+        node['name'] = inst.get('name')
+        node['state'] = inst.get('state')
+        node['agent_state'] = inst.get('agent_state')
+        node['healthy'] = (node['state'] == 'created'
+                           and node['agent_state'] == 'ready')
+        return node
 
     def instance_os_update(self, instance_uuids):
         self.execute_and_await(
@@ -913,6 +1046,133 @@ class Cluster:
                 % (self.name, interrupted, self.name))
 
         return md
+
+    def health(self):
+        """Report the state of this cluster and of every node in it, and repair nothing.
+
+        This is the body of ``sf-client k3s health``, which renders what
+        this returns. Per decision 7 of
+        ``docs/plans/library-api-and-collection-phase-03-missing-verbs.md``
+        it returns structured data rather than text, so that phase 5's
+        Ansible module can branch on it without parsing anything, and it
+        performs no repair: a verb which silently fixes things cannot be
+        used to decide whether to fix things.
+
+        Nothing about an unhealthy cluster raises. An instance in the error
+        state, an instance the metadata names which no longer exists, a
+        cluster which was interrupted mid-create, a cluster with no control
+        plane node at all, and a kubectl which exits non-zero are all
+        findings in the returned report. The only thing which raises is a
+        cluster this namespace has no metadata for, which is not an
+        unhealthy cluster but a question about a cluster that does not
+        exist.
+
+        The report is::
+
+            {
+                'name': str,                # this cluster's name
+                'namespace': str,           # the namespace it lives in
+                'state': str,               # md['state'], or 'unknown'
+                'interrupted': bool,        # state is not 'created'
+                'nodes': [
+                    {
+                        'uuid': str,            # the Shaken Fist instance uuid
+                        'role': str,            # 'control_plane' or 'worker'
+                        'name': str or None,    # the instance name, None if gone
+                        'exists': bool,         # the instance still exists
+                        'state': str or None,   # the instance state
+                        'agent_state': str or None,
+                        'healthy': bool         # created, and its agent ready
+                    },
+                    ...
+                ],
+                'api': {
+                    'probed': bool,             # the command was run at all
+                    'answered': bool,           # ...and it exited zero
+                    'instance_uuid': str or None,
+                    'command': str or None,
+                    'return_code': int or None,
+                    'stdout': str or None,      # 'kubectl get nodes' output
+                    'stderr': str or None,
+                    'error': str or None        # why it did not answer
+                },
+                'healthy': bool             # all of the above agree
+            }
+
+        ``nodes`` lists the control plane nodes first and then the workers,
+        each group in the order the metadata holds them, which is the order
+        they were created in. ``agent_state`` is the raw API value, so it is
+        None on an instance the agent has never reached; rendering that as
+        'not yet contactable' is the caller's business, as it is in
+        await_boot().
+
+        The top level ``healthy`` is the conjunction a caller would
+        otherwise have to write itself: the cluster finished being built,
+        every node in it exists and is up, and the k3s API answered. The
+        ``all()`` over an empty node list is True, and there is deliberately
+        no separate "and it has at least one node" term, because there is no
+        report in which that term could change the answer: the probe runs on
+        ``md['control_plane_nodes'][0]``, so ``api['answered']`` can only be
+        True for a cluster which has at least one control plane node, and
+        therefore at least one node. A cluster with no nodes reports
+        unhealthy because there was no k3s API to ask, which is the same
+        answer for the more informative reason.
+
+        Unlike expand_workers(), remove_worker() and expand_addresses() this
+        does not call require_usable(): reporting on a cluster which never
+        finished being built is exactly what the verb is for, so an
+        interrupted cluster is described rather than refused. It must
+        therefore not assume anything create() records, which is why
+        md['control_plane_nodes'] being empty is a finding about the API
+        probe rather than an IndexError.
+        """
+        md = self.get_metadata()
+        if not md:
+            raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+
+        nodes = []
+        for role, md_key in (('control_plane', 'control_plane_nodes'),
+                             ('worker', 'worker_nodes')):
+            for instance_uuid in md.get(md_key) or []:
+                nodes.append(self._node_health(instance_uuid, role))
+
+        # The k3s API is asked through the first control plane node, which an
+        # interrupted create may never have made. That is a finding rather
+        # than an error, so it is reported the same way a kubectl which
+        # exits non-zero is.
+        control_plane = md.get('control_plane_nodes') or []
+        if control_plane:
+            api = self._probe_k3s_api(control_plane[0])
+        else:
+            api = {
+                'probed': False,
+                'answered': False,
+                'instance_uuid': None,
+                'command': None,
+                'return_code': None,
+                'stdout': None,
+                'stderr': None,
+                'error': ('this cluster has no control plane node to ask: its '
+                          'metadata lists none, so there is no k3s API')
+            }
+
+        # interrupted_state() answers 'unknown' rather than None for
+        # metadata carrying no state at all, so interrupted is True for that
+        # case too, which is what it should be: a document this package did
+        # not write describes a cluster we cannot vouch for.
+        interrupted = self.interrupted_state(md) is not None
+
+        return {
+            'name': self.name,
+            'namespace': self.namespace,
+            'state': md.get('state', 'unknown'),
+            'interrupted': interrupted,
+            'nodes': nodes,
+            'api': api,
+            'healthy': (not interrupted
+                        and all(node['healthy'] for node in nodes)
+                        and api['answered'])
+        }
 
     def delete(self, update_kubeconfig=False):
         """Destroy this cluster and everything created alongside it.

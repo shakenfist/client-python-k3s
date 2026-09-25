@@ -27,6 +27,7 @@ SUBCOMMANDS = [
     'query-longhorn-version',
     'getconfig',
     'show',
+    'health',
     'delete',
     'expand-workers',
     'remove-worker',
