@@ -108,7 +108,7 @@ external callers. Everything else `Cluster` exposes --
 `allocate_metallb_addresses()`, `configure_metallb_addresses()`,
 `setup_metallb()`, `setup_longhorn()`,
 `create_and_await_instances()`, `get_progress()`,
-`interrupted_state()` and `require_usable()` -- is internal
+`_interrupted_state()` and `_require_usable()` -- is internal
 orchestration the methods above are built from, not a supported
 entry point, so treat it as unstable even though nothing today
 stops a caller reaching it directly.
@@ -233,7 +233,7 @@ a correct caller never needs to catch it.
 | `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable, not valid YAML, or a line colliding with the staging marker |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
-| `AgentOperationError` | a Shaken Fist agent operation enters the `error` state |
+| `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
 | `KubeconfigError` | a local `~/.kube/config` write, merge or `kubectl config unset` fails |
 
@@ -264,6 +264,24 @@ cluster's metadata document -- so an interrupted `delete()` leaves a
 document whose name is already free, and calling `delete()` again
 finishes the job. That is why #72 is a create-side gap rather than a
 gap on both sides.
+
+`AgentOperationError` carries the operation `state` which brought it
+about, and renders it only when it is not `error`. Shaken Fist gives
+every agent operation a deadline (600 seconds unless the creator asked
+for something else) and moves one that overruns it to `expired`, which
+it documents as deliberately distinct from `error`: "run it again with
+a longer deadline" and "the command is broken" are different next
+steps. Every wait in this library ends on any state the operation
+cannot leave, rather than on the two it used to name, so a state this
+library has never heard of ends a wait instead of spinning in one.
+
+`health()` is the exception to that, in the other direction: its
+`kubectl` probe carries a wall clock timeout, and it is skipped
+altogether when the node it would run on is not up. Both are reported
+as `api['probed'] is False` with an explanatory `api['error']`, and
+neither raises. `remove_worker([])` is likewise an accepted no-op, so a
+caller computing the removal list programmatically does not need to
+guard the call.
 
 `ComponentNotInstalledError` is the one exception here which depends on
 how the cluster was built rather than on what state it is in.

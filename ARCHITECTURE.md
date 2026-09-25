@@ -153,14 +153,23 @@ command is visible as a growing elapsed time, and idle waits describe
 the agent command currently executing rather than a bare operation
 count. The module is dependency free.
 
-The wait loops also detect failure: an agent operation which enters
-the `error` state aborts the command immediately with the operation
-uuid, the command it was on, and a pointer to `sf-client instance
-events` for the server side detail (operations in the error state
-never complete, so waiting on them would hang forever). Errored
-operations which predate the current wait are ignored, so a historical
-failure does not prevent later commands like `expand-workers` from
-running. If a single agent command runs for more than five minutes a
+The wait loops also detect failure. They wait while an operation can
+still progress -- `initial`, `preflight`, `queued`, `executing` -- and
+treat any other state as an ending, rather than naming the endings they
+expect. That matters because Shaken Fist gives every agent operation a
+wall clock budget and moves one that overruns it to `expired`, which is
+deliberately distinct from `error`, and because `deleted` is reachable
+from every state: a loop that waited for `complete` or `error` by name
+spun forever on either. An ending which is not `complete` aborts the
+command with the operation uuid, its state, the command it was on, and
+a pointer to `sf-client instance events` for the server side detail.
+Failed operations which predate the current wait are ignored, so a
+historical failure does not prevent later commands like
+`expand-workers` from running. The one bounded wait is `health()`'s
+read-only probe, which carries a thirty second timeout and is skipped
+entirely when the node it would run on is not up -- an operation queued
+against an unreachable agent never leaves the queue, and that is the
+cluster the verb exists to describe. If a single agent command runs for more than five minutes a
 one-off note flags that it may be stalled. Notes emitted mid-wait
 leave the wait block's per-item timers intact (and, on a TTY, redraw
 the status block below the note), so a stall note does not reset the

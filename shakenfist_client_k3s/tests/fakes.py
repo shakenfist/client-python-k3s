@@ -14,6 +14,13 @@ the health verb both drive.
 from shakenfist_client import apiclient
 
 
+def not_found(instance_uuid):
+    """Build the exception the API client raises for an instance which is gone."""
+    return apiclient.ResourceNotFoundException(
+        'instance not found', 'GET', '/instances/%s' % instance_uuid, 404,
+        'instance not found')
+
+
 # A minimal kubeconfig in the shape k3s writes, pointing at the loopback
 # address the way the real file does before create rewrites it.
 KUBECONFIG = """apiVersion: v1
@@ -100,6 +107,14 @@ class FakeClusterClient:
         return self.instances[instance_uuid]
 
     def get_instance(self, instance_ref):
+        # The API client's exception, not a KeyError. Three places in the
+        # orchestration catch ResourceNotFoundException for an instance the
+        # metadata names which somebody has deleted out from under it --
+        # delete(), _node_health() and remove_worker() -- and a fake which
+        # raises KeyError instead cannot exercise any of them, which is how
+        # a test asserting that behaviour passes for the wrong reason.
+        if instance_ref not in self.instances:
+            raise not_found(instance_ref)
         return self.instances[instance_ref]
 
     def delete_instance(self, instance_ref):
@@ -110,6 +125,13 @@ class FakeClusterClient:
 
     def get_instance_agentoperations(self, instance_ref, all=False):
         return []
+
+    def get_agent_operation(self, operation_uuid):
+        # The wait loops re-read an operation until it leaves its pending
+        # states. Everything this fake hands out is already complete, so a
+        # re-read is only reached by a test which built a pending operation
+        # itself; such a test overrides this.
+        return {'uuid': operation_uuid, 'state': 'complete', 'results': {}}
 
     def _complete_aop(self, instance_ref, commands, results):
         self.aop_serial += 1
@@ -148,22 +170,13 @@ class FakeClusterClient:
         self.unrouted_addresses.append((network_uuid, address))
 
 
-def not_found(instance_uuid):
-    """Build the exception the API client raises for an instance which is gone."""
-    return apiclient.ResourceNotFoundException(
-        'instance not found', 'GET', '/instances/%s' % instance_uuid, 404,
-        'instance not found')
-
-
 class HealthClient(FakeClusterClient):
     """A scripted client which can be made unwell in each of the ways health() reports.
 
     The stock fake cannot express any of them: every instance it knows
-    about is created with its agent ready, every agent command it is given
-    completes with a return code of zero, and get_instance() on an instance
-    it has never heard of raises KeyError rather than the API client's
-    ResourceNotFoundException. A health check whose entire purpose is
-    reporting bad news needs a client which can deliver some.
+    about is created with its agent ready and every agent command it is
+    given completes with a return code of zero. A health check whose entire
+    purpose is reporting bad news needs a client which can deliver some.
     """
 
     def __init__(self):
@@ -191,10 +204,14 @@ class HealthClient(FakeClusterClient):
         self.probe_state = 'complete'
         self.probe_raises = None
 
-    def get_instance(self, instance_ref):
-        if instance_ref not in self.instances:
-            raise not_found(instance_ref)
-        return self.instances[instance_ref]
+        # How many times the operation may be re-read before this fake
+        # decides the wait is not going to end. A wait which does not end
+        # is the bug health() had, so a test for it must fail rather than
+        # hang: a hung suite names no test, and nobody reads a run which
+        # did not finish. The correct code reads a pending operation once
+        # per second up to its timeout, which is well inside this.
+        self.agent_operation_reads = 0
+        self.max_agent_operation_reads = 60
 
     def set_namespace_metadata_item(self, namespace, key, value):
         self.metadata_writes.append(key)
@@ -209,6 +226,28 @@ class HealthClient(FakeClusterClient):
     def delete_instance(self, instance_ref):
         self.deleted_instances.append(instance_ref)
         return super(HealthClient, self).delete_instance(instance_ref)
+
+    def get_agent_operation(self, operation_uuid):
+        # A probe which is still pending stays pending: this is the node
+        # whose agent is not connected, where the operation is accepted and
+        # then never runs. A test which wants the wait to end sets
+        # probe_state to a terminal state.
+        self.agent_operation_reads += 1
+        if self.agent_operation_reads > self.max_agent_operation_reads:
+            raise AssertionError(
+                'the wait re-read the agent operation %d times without '
+                'ending. The operation is %r, which is not a state it can '
+                'leave, so whatever is waiting on it is waiting forever.'
+                % (self.agent_operation_reads, self.probe_state))
+        return {
+            'uuid': operation_uuid,
+            'instance_uuid': None,
+            'state': self.probe_state,
+            'commands': [],
+            'results': {'0': {'return-code': self.probe_return_code,
+                              'stdout': self.probe_stdout,
+                              'stderr': self.probe_stderr}}
+        }
 
     def instance_execute(self, instance_ref, commandline):
         self.executed.append((instance_ref, commandline))

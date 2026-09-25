@@ -159,17 +159,34 @@ Every UUID given is checked against the cluster's worker list before
 anything happens, so a typo in the last of three fails the whole
 command rather than removing the first two and then failing. Each
 surviving worker is then drained (`kubectl drain --ignore-daemonsets
---delete-emptydir-data`) and removed from k3s (`kubectl delete node`)
-before its instance is deleted, so that pods running on it are
-rescheduled rather than left orphaned on a node object nobody will
-ever clean up.
+--delete-emptydir-data --timeout=300s`) and removed from k3s (`kubectl
+delete node`) before its instance is deleted, so that pods running on
+it are rescheduled rather than left orphaned on a node object nobody
+will ever clean up.
 
 Removing the last worker of a cluster is allowed -- a k3s server node
-is schedulable, so a cluster with no workers still works -- but if
-workloads on that worker have nowhere else to go, the drain blocks
-until it times out, which surfaces as an agent operation error rather
-than as a quick failure. Refuses to run against a cluster that never
-finished being built; see `create`, above.
+is schedulable, so a cluster with no workers still works.
+
+A drain that cannot finish is bounded and undone. If a pod on the
+worker has nowhere else to go -- a PodDisruptionBudget refuses the
+eviction, an unmanaged pod would need `--force`, or the cluster has no
+other node with room -- `kubectl drain` gives up after its timeout and
+says which pod it could not move. Draining cordons the node as its
+first act, so the command then uncordons it before reporting the
+failure: a refused removal leaves the cluster as it found it rather
+than one node short of schedulable capacity. If the uncordon fails as
+well, the output says so and names the `kubectl uncordon` to run by
+hand; the original reason is still what the command reports, because
+that is the part you can act on.
+
+A worker whose instance has already been deleted out of band is
+removed from the cluster's records rather than refused. There is no
+node to drain and no instance to destroy, so both are skipped. This is
+the only command that can clear such an entry, which `health` reports
+as a node that no longer exists.
+
+Refuses to run against a cluster that never finished being built; see
+`create`, above.
 
 Workers are named by instance UUID rather than by node name, which is
 also what makes a mixed case cluster name work here: Shaken Fist
@@ -247,6 +264,15 @@ than refused -- reporting on a broken cluster is what this command is
 for -- so its `state` line names the state it was interrupted in
 instead of `created`, and an instance the metadata names but which no
 longer exists is reported as gone rather than failing the command.
+
+The command never hangs, which matters most on exactly the clusters
+it is for. The `kubectl get nodes` probe is only attempted when the
+control plane node it would run on looks able to answer -- the report
+has already read that node's instance and agent state -- and it is
+given a thirty second budget even then, because a command queued
+against an instance whose agent is not connected is accepted and then
+never runs. Each of those outcomes is reported on the `k3s API:` line
+with the reason, rather than waited on.
 Pass `--strict` to exit 1 when the cluster is not healthy, which is
 what makes `health` usable from a shell:
 

@@ -74,6 +74,7 @@ wait_for_nodes() {
 worker_uuids() {
     # k3s show prints: worker_nodes = ['uuid-one', 'uuid-two']. Captured
     # first for the reason count_routed_addresses() gives below.
+    local show_output
     show_output=$(sf-client k3s show "${CLUSTER}")
     echo "${show_output}" | grep 'worker_nodes' | grep -o "'[^']*'" | tr -d "'"
 }
@@ -83,6 +84,7 @@ count_routed_addresses() {
     # show output is captured first so a failure of sf-client itself
     # aborts the script rather than being masked as a zero count; the
     # || true only covers grep finding no matches.
+    local show_output
     show_output=$(sf-client k3s show "${CLUSTER}")
     echo "${show_output}" | grep 'routed_addresses' | grep -o "'[0-9.]*'" | wc -l || true
 }
@@ -129,6 +131,11 @@ MANIFEST
 sf-client k3s create "${CLUSTER}" \
     --control-plane-count 1 --worker-count 2 --metal-address-count 2 \
     --manifest "${manifest_dir}/ci-staged.yaml"
+
+# The manifest is on the cluster now, so the local copy has done its job.
+# Cleaned up here the way the kubectl download's temp directory is, rather
+# than left for the ephemeral runner to take with it.
+rm -rf "${manifest_dir}"
 
 status 'Fetch cluster credentials with getconfig'
 export KUBECONFIG=/tmp/k3s-ci-kubeconfig

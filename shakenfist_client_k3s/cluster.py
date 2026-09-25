@@ -53,6 +53,38 @@ BASE_OS_VERSION = 'debian:12'
 # notes that it might be stalled.
 STALL_WARNING_SECONDS = 300
 
+# The agent operation states an operation can still move out of, and the
+# ones which mean it finished without doing the work.
+#
+# Waiting "while the operation can still progress" rather than "until it is
+# complete or error" is the load bearing part. Shaken Fist gives every
+# agent operation a wall clock budget -- AGENT_OPERATION_DEFAULT_DEADLINE,
+# 600 seconds unless the creator asked for something else -- and an
+# operation which runs out of it moves to 'expired', which the server
+# documents as deliberately distinct from 'error'. Every wait loop here
+# used to test for 'complete' and 'error' by name, so an expired operation
+# satisfied neither and the loop spun for as long as the process was left
+# running. 'deleted' is reachable from every state and had the same effect.
+# Enumerating what is still pending instead means a state this package has
+# never heard of ends a wait rather than wedging it.
+AGENT_OP_PENDING_STATES = ('initial', 'preflight', 'queued', 'executing')
+AGENT_OP_FAILED_STATES = ('error', 'expired')
+
+# How long health()'s read only probe waits for its one command before it
+# reports a timeout as a finding. The server's own deadline would bound it
+# eventually, but ten minutes of silence is not a health check: a
+# 'kubectl get nodes' on a cluster which is answering returns in well
+# under a second, so a cluster which has not answered in thirty is the
+# answer rather than a slow one.
+HEALTH_PROBE_TIMEOUT_SECONDS = 30
+
+# The timeout passed to 'kubectl drain'. Without it a drain which cannot
+# evict a pod blocks until the agent operation's own deadline expires,
+# which reports the operation rather than the reason, and leaves the node
+# cordoned for the whole wait. With it kubectl gives up and says why, and
+# remove_worker() uncordons the node before re-raising.
+KUBECTL_DRAIN_TIMEOUT = '300s'
+
 # Where k3s looks for manifests to apply itself, and the filename suffixes
 # it will look at. Everything in this directory is applied when the server
 # starts and again whenever a file in it changes, which is what makes
@@ -245,7 +277,7 @@ class Cluster:
         del self._metadata[md_key]
         self.client.delete_namespace_metadata_item(self.namespace, md_key)
 
-    def interrupted_state(self, md):
+    def _interrupted_state(self, md):
         """Return md's cluster state if it never finished being built, else None.
 
         ``md['state']`` has been written since this package's first commit
@@ -274,7 +306,7 @@ class Cluster:
             return None
         return state
 
-    def require_usable(self, md, verb):
+    def _require_usable(self, md, verb):
         """Refuse to run verb against a cluster which never finished being built.
 
         The verbs which change a built cluster all assume the things
@@ -285,7 +317,7 @@ class Cluster:
         token ``None``. Both are worse than being told the cluster is
         rubbish and how to remove it, which is all this does.
         """
-        state = self.interrupted_state(md)
+        state = self._interrupted_state(md)
         if state:
             raise exceptions.ClusterInterruptedError.not_usable(
                 self.name, state, verb)
@@ -361,7 +393,7 @@ class Cluster:
         return inst
 
     def _agent_op_error(self, aop):
-        """Build the exception for an agent operation which entered the error state.
+        """Build the exception for an agent operation which did not do its work.
 
         This builds the exception rather than raising it so that the
         ``raise`` is visible at each of the three call sites. The previous
@@ -376,7 +408,8 @@ class Cluster:
         return exceptions.AgentOperationError(
             inst['name'], aop['instance_uuid'], aop['uuid'],
             primitives._describe_agent_op(aop, max_len=None),
-            aop.get('results', {}) or {})
+            aop.get('results', {}) or {},
+            state=aop.get('state'))
 
     def await_boot(self, instances):
         p = self.get_progress()
@@ -399,14 +432,16 @@ class Cluster:
         waiting = copy.copy(instances)
 
         # Agent operations stay associated with an instance forever, and an
-        # operation in the error state will never complete. Snapshot any which
-        # had already failed before this wait started so a historical failure
-        # can neither wedge this wait nor incorrectly abort it.
-        preexisting_errors = {}
+        # operation which failed will never complete. Snapshot any which had
+        # already failed before this wait started so a historical failure
+        # can neither wedge this wait nor incorrectly abort it. 'expired' is
+        # in that set as well as 'error': see AGENT_OP_FAILED_STATES.
+        preexisting_failures = {}
         for instance_uuid in waiting:
             aops = self.client.get_instance_agentoperations(instance_uuid, all=True)
-            preexisting_errors[instance_uuid] = {
-                aop['uuid'] for aop in aops if aop['state'] == 'error'}
+            preexisting_failures[instance_uuid] = {
+                aop['uuid'] for aop in aops
+                if aop['state'] in AGENT_OP_FAILED_STATES}
 
         running_since = {}
         stall_warned = set()
@@ -417,13 +452,18 @@ class Cluster:
                 agent_ops = self.client.get_instance_agentoperations(
                     instance_uuid, all=True)
                 agent_ops = [aop for aop in agent_ops
-                             if aop['uuid'] not in preexisting_errors[instance_uuid]]
+                             if aop['uuid'] not in preexisting_failures[instance_uuid]]
 
-                errored = [aop for aop in agent_ops if aop['state'] == 'error']
-                if errored:
-                    raise self._agent_op_error(errored[0])
+                failed = [aop for aop in agent_ops
+                          if aop['state'] in AGENT_OP_FAILED_STATES]
+                if failed:
+                    raise self._agent_op_error(failed[0])
 
-                incomplete = [aop for aop in agent_ops if aop['state'] != 'complete']
+                # Pending rather than "not complete": an operation which
+                # somebody deleted is finished, and counting it as
+                # incomplete waits for something which will never happen.
+                incomplete = [aop for aop in agent_ops
+                              if aop['state'] in AGENT_OP_PENDING_STATES]
                 if not incomplete:
                     p.update(inst['name'], 'idle')
                     waiting.remove(instance_uuid)
@@ -459,13 +499,13 @@ class Cluster:
 
     def await_fetch(self, aop):
         p = self.get_progress()
-        while aop['state'] not in ['complete', 'error']:
+        while aop['state'] in AGENT_OP_PENDING_STATES:
             p.update('fetch operation', 'state %s' % aop['state'])
             time.sleep(1)
             aop = self.client.get_agent_operation(aop['uuid'])
         p.wait_done()
 
-        if aop['state'] == 'error':
+        if aop['state'] != 'complete':
             raise self._agent_op_error(aop)
 
         blob_uuid = aop['results']['0']['content_blob']
@@ -474,7 +514,7 @@ class Cluster:
             data += chunk
         return data.decode('utf-8')
 
-    def await_execute(self, aop):
+    def await_execute(self, aop, timeout=None):
         """Wait for an execute agent operation to finish, and return it.
 
         Split out of reap_execute() so that a caller which wants a command's
@@ -483,8 +523,22 @@ class Cluster:
         caller, and the only one: a command which ran and failed is the
         finding health() exists to report, so it needs the wait without the
         judgement.
+
+        timeout is a wall clock budget in seconds, after which the operation
+        as last seen is returned with whatever state it had. It is None for
+        every caller but health()'s probe: an install which takes eleven
+        minutes is a slow install rather than a failed one, and abandoning
+        it would leave the caller believing a command it can still see
+        running did not happen. Abandoning a read only 'kubectl get nodes'
+        costs nothing, which is why that one caller can. A caller passing a
+        timeout has to be prepared for a pending state in the returned
+        operation; reap_execute() does not pass one, and so its own state
+        check is exhaustive.
         """
-        while aop['state'] not in ('complete', 'error'):
+        deadline = None if timeout is None else time.time() + timeout
+        while aop['state'] in AGENT_OP_PENDING_STATES:
+            if deadline is not None and time.time() >= deadline:
+                return aop
             time.sleep(1)
             aop = self.client.get_agent_operation(aop['uuid'])
         return aop
@@ -492,7 +546,10 @@ class Cluster:
     def reap_execute(self, aop):
         aop = self.await_execute(aop)
 
-        if aop['state'] == 'error':
+        # Not 'state == error': await_execute() was called with no timeout,
+        # so the operation is in one of its terminal states, and anything
+        # which is not 'complete' is one which did not run the command.
+        if aop['state'] != 'complete':
             raise self._agent_op_error(aop)
 
         if aop['results']['0']['return-code'] != 0:
@@ -592,7 +649,8 @@ class Cluster:
         self.reporter.debug('Asking %s whether the k3s API answers' % instance_uuid)
         try:
             aop = self.await_execute(
-                self.client.instance_execute(instance_uuid, command))
+                self.client.instance_execute(instance_uuid, command),
+                timeout=HEALTH_PROBE_TIMEOUT_SECONDS)
         except apiclient.APIException as e:
             # apiclient's exceptions never pass their message to
             # Exception.__init__(), so str() on one is the empty string and
@@ -603,10 +661,25 @@ class Cluster:
                               % (instance_uuid, e.__class__.__name__, detail))
             return probe
 
-        if aop['state'] == 'error':
+        if aop['state'] in AGENT_OP_PENDING_STATES:
+            # The wait gave up. This is the state a node whose agent is not
+            # connected leaves the operation in: the API accepted it, so
+            # nothing raised, and it then sits queued. health() skips the
+            # probe when it can already see that from the instance, so
+            # reaching here means the instance looked well and the command
+            # still did not run.
+            probe['probed'] = False
             probe['error'] = (
-                'the agent operation for %s entered the error state'
-                % (primitives._describe_agent_op(aop, max_len=None) or command))
+                "'%s' had not finished after %s seconds (the agent operation "
+                'is still %s), so the wait was abandoned'
+                % (command, HEALTH_PROBE_TIMEOUT_SECONDS, aop['state']))
+            return probe
+
+        if aop['state'] in AGENT_OP_FAILED_STATES:
+            probe['error'] = (
+                'the agent operation for %s entered the %s state'
+                % (primitives._describe_agent_op(aop, max_len=None) or command,
+                   aop['state']))
             return probe
 
         # An operation which completed without recording a result for its
@@ -624,6 +697,25 @@ class Cluster:
         if not probe['answered']:
             probe['error'] = "'%s' exited %s" % (command, probe['return_code'])
         return probe
+
+    def _unprobed(self, instance_uuid, error):
+        """Build health()'s ``api`` report for a probe which was not run.
+
+        Two callers, and the same shape for both, because a caller reading
+        the report must not have to tell "no control plane node to ask"
+        apart from "the node we would have asked is down" by which keys
+        are present. ``probed`` is False and ``error`` says which.
+        """
+        return {
+            'probed': False,
+            'answered': False,
+            'instance_uuid': instance_uuid,
+            'command': None,
+            'return_code': None,
+            'stdout': None,
+            'stderr': None,
+            'error': error
+        }
 
     def _node_health(self, instance_uuid, role):
         """Report the Shaken Fist state of one node, whether or not it still exists.
@@ -674,17 +766,31 @@ class Cluster:
             ]
         )
 
-    def install_control_plane(self, manifests=None):
+    def install_control_plane(self, manifests=None, staged=None):
         """Prepare the first control plane node, and install k3s on it.
 
         manifests is a list of local file paths, each of which is written
         into k3s's auto-apply directory on this node before k3s is
         installed, so that k3s applies it itself the first time the server
-        starts. They are read here as well as in create(), which is not a
-        redundancy: create() reads them before it builds anything so that a
-        bad path does not cost a network and a handful of instances first,
-        and this method is callable on its own, so it does not trust an
-        argument somebody else was supposed to have checked.
+        starts.
+
+        staged is the same thing already read: the list of
+        ``(basename, content)`` pairs read_manifests() returns. create()
+        passes it, and that is the point of the argument. create() reads the
+        manifests before it builds anything, so that a bad path costs an
+        error rather than a network and a handful of instances, and ten to
+        twenty minutes of network allocation, instance creation, boot and OS
+        update then pass before this method runs. Re-reading the paths here
+        would throw that guarantee away: a file edited, moved or deleted in
+        that window would raise from here, with the cluster name claimed and
+        its metadata document stuck in 'initial', which is exactly the
+        outcome the early read exists to prevent. What gets staged is
+        therefore what was validated, byte for byte.
+
+        The paths are still read here when staged is not given, because this
+        method is callable on its own and a direct caller has had nothing
+        check its arguments. Passing both is not an error and staged wins;
+        manifests is then only documentation of where it came from.
         """
         md = self.get_metadata()
 
@@ -696,7 +802,8 @@ class Cluster:
         # directly on an HA cluster is told "[2/1]".
         p = self.get_progress(
             total_phases=2 if len(md['control_plane_nodes']) > 1 else 1)
-        staged = read_manifests(manifests)
+        if staged is None:
+            staged = read_manifests(manifests)
         cmds = []
 
         p.phase('Installing k3s on the first control plane node')
@@ -1024,12 +1131,13 @@ class Cluster:
         # A bad path or a duplicate basename discovered once a network has
         # been allocated and several instances booted is a cluster the
         # caller has to delete before the name can be used again, and the
-        # only thing between a library caller and that is this line. The
-        # result is deliberately discarded: install_control_plane() reads
-        # the files again where it writes them, so that there is one reader
-        # of manifest content rather than a list threaded through the
-        # middle of this function.
-        read_manifests(manifests)
+        # only thing between a library caller and that is this line.
+        #
+        # The result is kept and handed to install_control_plane() below,
+        # rather than letting it read the paths again. There are ten to
+        # twenty minutes between here and there, and a file which changed
+        # in that window would make this check a check of something else.
+        staged_manifests = read_manifests(manifests)
 
         # Phases: create control plane nodes, create workers, install control
         # plane, install workers, fetch credentials, metallb, longhorn, and
@@ -1076,7 +1184,7 @@ class Cluster:
         # the list first would answer "that name is taken" for the one case
         # which has a more useful answer than that.
         if md:
-            interrupted = self.interrupted_state(md)
+            interrupted = self._interrupted_state(md)
             if interrupted:
                 raise exceptions.ClusterInterruptedError.mid_create(
                     self.name, interrupted)
@@ -1138,6 +1246,15 @@ class Cluster:
             # never reaches those still describes the cluster it was
             # building. Readers must treat a missing key as True, because
             # every cluster built before this key existed has both.
+            #
+            # Only metallb_installed has a reader today, in
+            # expand_addresses(). longhorn_installed is written for the
+            # same reason and read by nothing, because no verb drives
+            # Longhorn after create(); health() growing a storage check is
+            # the obvious first reader. That is the position md['state']
+            # was in for this package's whole history until phase 3 found
+            # it (survey finding 2), so it is said out loud here rather
+            # than left for somebody to rediscover.
             'metallb_installed': install_metallb,
             'longhorn_installed': install_longhorn,
         }
@@ -1181,7 +1298,8 @@ class Cluster:
         md['join_address'] = interfaces[0]['ipv4']
         self.set_metadata(md)
 
-        self.install_control_plane(manifests=manifests)
+        self.install_control_plane(manifests=manifests,
+                                   staged=staged_manifests)
         self.install_workers(md['worker_nodes'])
 
         # install_control_plane() recorded the two registration tokens.
@@ -1306,7 +1424,7 @@ class Cluster:
         if not md:
             raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
 
-        interrupted = self.interrupted_state(md)
+        interrupted = self._interrupted_state(md)
         if interrupted:
             self.reporter.write(
                 "Cluster %s is in state '%s' rather than 'created': it was "
@@ -1335,6 +1453,17 @@ class Cluster:
         cluster this namespace has no metadata for, which is not an
         unhealthy cluster but a question about a cluster that does not
         exist.
+
+        Nor does it hang. The k3s API probe is only attempted when the node
+        it would be run on looks able to answer -- the node entry this
+        method has just built says whether the instance exists, is created
+        and has a ready agent -- and it carries a wall clock timeout even
+        then. An agent operation queued against an instance whose agent is
+        not connected never leaves its queued state, so a probe which is
+        attempted anyway waits forever on exactly the cluster this verb
+        exists to describe. Every one of those outcomes is ``probed``
+        False with an ``error`` saying which, so a caller never has to
+        tell them apart by which keys are present.
 
         The report is::
 
@@ -1388,7 +1517,7 @@ class Cluster:
         answer for the more informative reason.
 
         Unlike expand_workers(), remove_worker() and expand_addresses() this
-        does not call require_usable(): reporting on a cluster which never
+        does not call _require_usable(): reporting on a cluster which never
         finished being built is exactly what the verb is for, so an
         interrupted cluster is described rather than refused. It must
         therefore not assume anything create() records, which is why
@@ -1410,26 +1539,34 @@ class Cluster:
         # than an error, so it is reported the same way a kubectl which
         # exits non-zero is.
         control_plane = md.get('control_plane_nodes') or []
-        if control_plane:
+        first = nodes[0] if control_plane else None
+        if first and first['exists'] and first['healthy']:
             api = self._probe_k3s_api(control_plane[0])
+        elif not control_plane:
+            api = self._unprobed(
+                None,
+                'this cluster has no control plane node to ask: its metadata '
+                'lists none, so there is no k3s API')
         else:
-            api = {
-                'probed': False,
-                'answered': False,
-                'instance_uuid': None,
-                'command': None,
-                'return_code': None,
-                'stdout': None,
-                'stderr': None,
-                'error': ('this cluster has no control plane node to ask: its '
-                          'metadata lists none, so there is no k3s API')
-            }
+            # The probe is skipped rather than attempted, because the
+            # attempt is what used to hang: an agent operation queued
+            # against an instance whose agent is not connected never
+            # leaves its queued state, and the node entry above has
+            # already read the state and agent_state which say so. There
+            # is nothing to learn from asking, and this is the cluster the
+            # verb most needs to answer about.
+            api = self._unprobed(
+                control_plane[0],
+                'the first control plane node is not in a state which can '
+                'answer: instance %s, agent %s'
+                % (first['state'] or 'gone',
+                   first['agent_state'] or 'not contactable'))
 
-        # interrupted_state() answers 'unknown' rather than None for
+        # _interrupted_state() answers 'unknown' rather than None for
         # metadata carrying no state at all, so interrupted is True for that
         # case too, which is what it should be: a document this package did
         # not write describes a cluster we cannot vouch for.
-        interrupted = self.interrupted_state(md) is not None
+        interrupted = self._interrupted_state(md) is not None
 
         return {
             'name': self.name,
@@ -1480,7 +1617,7 @@ class Cluster:
         # supported recovery, and an operator running it wants to be told
         # that this is the cluster they think it is before their instances
         # go away. A cluster which reached 'created' says nothing new.
-        interrupted = self.interrupted_state(md)
+        interrupted = self._interrupted_state(md)
         if interrupted:
             self.reporter.write(
                 "Cluster %s is in state '%s' rather than 'created': it never "
@@ -1638,7 +1775,7 @@ class Cluster:
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
-        self.require_usable(md, 'expand-workers')
+        self._require_usable(md, 'expand-workers')
 
         p = progress.Progress(
             total_phases=2, verbose=self.reporter.verbose, stream=self.reporter)
@@ -1673,11 +1810,33 @@ class Cluster:
         Removing the last worker is allowed, and is the caller's business:
         a k3s server node is schedulable, so a cluster with no workers is a
         working cluster, and conductor's workers are ephemeral CI runners
-        which legitimately go to zero. Note though that ``kubectl drain``
-        blocks while a pod has nowhere else to go, so draining the last
-        worker of a cluster with workloads pinned to it will wait until the
-        agent operation times out. That surfaces as an
-        ``AgentOperationError``, which is the right failure.
+        which legitimately go to zero.
+
+        A drain which cannot finish is bounded and undone. ``kubectl
+        drain`` blocks while a pod has nowhere else to go -- a
+        PodDisruptionBudget which refuses the eviction, an unmanaged pod
+        which needs ``--force``, the last worker of a cluster with
+        workloads pinned to it -- so it is given ``--timeout``
+        (KUBECTL_DRAIN_TIMEOUT), and it then exits non-zero and says why
+        rather than sitting there until Shaken Fist takes the agent
+        operation's deadline away. Either way the node is left cordoned,
+        because cordoning is the drain's first act, so this uncordons it
+        before re-raising: a refused removal has to leave the cluster as it
+        found it, not one node short of schedulable capacity with nothing
+        in this package which would put it back.
+
+        An instance in ``md['worker_nodes']`` which no longer exists is
+        removed from the metadata rather than refused. There is no node to
+        drain and no instance to destroy, so both are skipped and the entry
+        goes; this is the same state health() reports as a finding and
+        delete() tolerates per instance, and remove-worker is the only verb
+        which can clear it.
+
+        An empty list is an accepted no-op, so a caller computing the list
+        programmatically -- phase 5's Ansible module, a conductor reconcile
+        loop -- does not have to guard the call. It returns before building
+        a Progress, because a Progress with no phases prints a completion
+        line for work nobody asked for.
 
         This does not wait for the instances to reach the deleted state.
         The drain is what makes the removal safe for the cluster, and it
@@ -1686,7 +1845,7 @@ class Cluster:
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
-        self.require_usable(md, 'remove-worker')
+        self._require_usable(md, 'remove-worker')
 
         # Repeating --worker with the same uuid would otherwise drain a node
         # which has already been removed, and then fail on the second
@@ -1703,6 +1862,9 @@ class Cluster:
                    if instance_uuid not in md['worker_nodes']]
         if unknown:
             raise exceptions.WorkerNotFoundError(self.name, unknown)
+
+        if not wanted:
+            return
 
         p = progress.Progress(
             total_phases=len(wanted), verbose=self.reporter.verbose,
@@ -1734,8 +1896,29 @@ class Cluster:
             # capital letter in it: the drain fails to find the node and
             # raises CommandFailedError, which at least fails before
             # anything is destroyed.
-            inst = self.client.get_instance(instance_uuid)
-            node_name = inst['name'].lower()
+            #
+            # ResourceNotFoundException is caught for the reason delete()
+            # catches it per instance: cluster metadata can name an
+            # instance somebody has since deleted out from under it.
+            # health() reports that as a finding and delete() tolerates
+            # it, and this is the only verb which can take the entry out
+            # of the metadata, so refusing it would make a stale entry
+            # unfixable short of deleting the whole cluster.
+            try:
+                inst = self.client.get_instance(instance_uuid)
+                node_name = inst['name'].lower()
+            except apiclient.ResourceNotFoundException:
+                node_name = None
+
+            if node_name is None:
+                p.phase('Removing worker %s, whose instance is already gone'
+                        % instance_uuid)
+                md['worker_nodes'].remove(instance_uuid)
+                self.set_metadata(md)
+                p.note('instance %s no longer exists, so there was nothing to '
+                       'drain or delete; removed it from the cluster metadata'
+                       % instance_uuid)
+                continue
 
             p.phase('Removing worker %s (uuid %s)' % (node_name, instance_uuid))
 
@@ -1763,10 +1946,25 @@ class Cluster:
             # trust boundary, and delete() quotes the same string for the
             # same reason.
             quoted = shlex.quote(node_name)
-            self.execute_and_await(
-                [md['control_plane_nodes'][0]],
-                ['kubectl drain %s --ignore-daemonsets --delete-emptydir-data '
-                 '--kubeconfig /etc/rancher/k3s/k3s.yaml' % quoted])
+            try:
+                self.execute_and_await(
+                    [md['control_plane_nodes'][0]],
+                    ['kubectl drain %s --ignore-daemonsets '
+                     '--delete-emptydir-data --timeout=%s '
+                     '--kubeconfig /etc/rancher/k3s/k3s.yaml'
+                     % (quoted, KUBECTL_DRAIN_TIMEOUT)])
+            except (exceptions.K3sClusterException,
+                    apiclient.APIException):
+                # Both hierarchies, because the question is whether the
+                # drain might have cordoned the node rather than which
+                # kind of failure stopped it. An APIException from the
+                # submission means it never ran and there is nothing to
+                # undo, and an uncordon of a node which was never
+                # cordoned is a no-op, so covering both costs one
+                # harmless command in the case which does not need it.
+                self._uncordon(md['control_plane_nodes'][0], node_name, quoted)
+                raise
+
             self.execute_and_await(
                 [md['control_plane_nodes'][0]],
                 ['kubectl delete node %s --kubeconfig /etc/rancher/k3s/k3s.yaml'
@@ -1784,6 +1982,38 @@ class Cluster:
 
         p.finish('Removed %s from cluster %s' % (
             progress.count_str(len(wanted), 'worker'), self.name))
+
+    def _uncordon(self, control_plane_uuid, node_name, quoted_node_name):
+        """Put a node back in service after a drain which did not finish.
+
+        ``kubectl drain`` cordons before it evicts, so every way the drain
+        can fail leaves the node unschedulable. Nothing else in this
+        package would put it back, which would make a refused
+        remove-worker worse for the cluster than not running it.
+
+        The original failure is the one the caller needs, so this never
+        raises: an uncordon which itself fails is reported and swallowed,
+        because replacing "the drain was refused because of a disruption
+        budget" with "the uncordon failed" loses the reason. The node is
+        named in that report so an operator can run the one command. Both
+        exception hierarchies are caught for that reason and not because
+        either is expected -- apiclient's exceptions do not descend from
+        K3sClusterException, so catching only ours would let an
+        unreachable API mask the drain's explanation.
+        """
+        self.reporter.write(
+            'The drain of %s did not finish, so it is still cordoned. '
+            'Uncordoning it.\n' % node_name)
+        try:
+            self.execute_and_await(
+                [control_plane_uuid],
+                ['kubectl uncordon %s --kubeconfig /etc/rancher/k3s/k3s.yaml'
+                 % quoted_node_name])
+        except (exceptions.K3sClusterException, apiclient.APIException) as e:
+            self.reporter.write(
+                'Uncordoning %s failed as well, so it is still unschedulable. '
+                "Run 'kubectl uncordon %s' against the cluster to put it back. "
+                'The uncordon said:\n%s\n' % (node_name, node_name, e))
 
     def expand_addresses(self, address_count):
         """Route more floating addresses into this cluster for metallb to hand out.
@@ -1809,7 +2039,7 @@ class Cluster:
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
-        self.require_usable(md, 'expand-addresses')
+        self._require_usable(md, 'expand-addresses')
 
         # Absent means True: clusters built before create() recorded this
         # all have metallb.

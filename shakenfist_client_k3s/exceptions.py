@@ -472,7 +472,7 @@ class ReleaseLookupError(K3sClusterException):
 
 
 class AgentOperationError(K3sClusterException):
-    """Raised when a Shaken Fist agent operation enters the error state.
+    """Raised when a Shaken Fist agent operation finished without doing its work.
 
     Built by ``Cluster._agent_op_error()`` and raised by its three
     callers: ``Cluster.await_idle()``, ``Cluster.await_fetch()`` and
@@ -482,15 +482,24 @@ class AgentOperationError(K3sClusterException):
     is the agent operation's results dict; when it is empty (or falsy) a
     fixed "no results were recorded" line is rendered instead of a JSON
     dump.
+
+    ``state`` is the operation state which brought us here, and is
+    rendered only when it is not ``error``. That keeps the message
+    byte for byte what it was for the case which has always raised this,
+    while saying which ending it was for the one which did not:
+    ``expired`` means Shaken Fist took the operation's wall clock budget
+    away rather than the command failing, and "run it again with a longer
+    deadline" and "the command is broken" are different next steps.
     """
 
     def __init__(self, instance_name, instance_uuid, operation_uuid,
-                 command_description, results):
+                 command_description, results, state='error'):
         self.instance_name = instance_name
         self.instance_uuid = instance_uuid
         self.operation_uuid = operation_uuid
         self.command_description = command_description
         self.results = results
+        self.state = state
         super(AgentOperationError, self).__init__(instance_name)
 
     def __str__(self):
@@ -499,6 +508,8 @@ class AgentOperationError(K3sClusterException):
             '  instance: %s (uuid %s)' % (self.instance_name, self.instance_uuid),
             '  operation: %s' % self.operation_uuid,
         ]
+        if self.state and self.state != 'error':
+            lines.append('  state: %s' % self.state)
         if self.command_description:
             lines.append('  command: %s' % self.command_description)
         if self.results:

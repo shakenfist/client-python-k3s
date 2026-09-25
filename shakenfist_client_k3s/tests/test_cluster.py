@@ -7,6 +7,7 @@ import tempfile
 # The PyPI mock backport is used for consistency with the other tests in
 # this package, which support Python >= 3.7.
 import mock
+from shakenfist_client import apiclient
 import testtools
 import yaml
 
@@ -382,7 +383,7 @@ class CreateInstallsWorkersTestCase(testtools.TestCase):
         self._assert_installed_on(workers, agent_calls)
 
 
-class RecordingClient(fakes.FakeClusterClient):
+class ActionLogClient(fakes.FakeClusterClient):
     """A scripted client which records executes and deletes in one ordered log.
 
     The assertion this class exists for -- that a worker is drained and
@@ -390,20 +391,25 @@ class RecordingClient(fakes.FakeClusterClient):
     from two separate call lists, because neither of them knows where in
     the other its own calls fell. One log, in the order the client was
     asked, is the only shape which can answer "before".
+
+    Named for what it does rather than "RecordingClient", which
+    test_library_api.py already uses for a differently shaped fake in the
+    same test package: two classes sharing a name is one grep away from
+    being read as one class.
     """
 
     def __init__(self):
-        super(RecordingClient, self).__init__()
+        super(ActionLogClient, self).__init__()
         self.actions = []
 
     def instance_execute(self, instance_ref, commandline):
         self.actions.append(('execute', instance_ref, commandline))
-        return super(RecordingClient, self).instance_execute(
+        return super(ActionLogClient, self).instance_execute(
             instance_ref, commandline)
 
     def delete_instance(self, instance_ref):
         self.actions.append(('delete_instance', instance_ref, None))
-        return super(RecordingClient, self).delete_instance(instance_ref)
+        return super(ActionLogClient, self).delete_instance(instance_ref)
 
 
 class RemoveWorkerTestCase(testtools.TestCase):
@@ -419,7 +425,7 @@ class RemoveWorkerTestCase(testtools.TestCase):
 
     def setUp(self):
         super(RemoveWorkerTestCase, self).setUp()
-        self.client = RecordingClient()
+        self.client = ActionLogClient()
 
         self.md = {
             'name': 'banana',
@@ -495,7 +501,8 @@ class RemoveWorkerTestCase(testtools.TestCase):
         self.assertEqual(
             [('execute', 'inst-cp1',
               'kubectl drain k3s-banana-node-003 --ignore-daemonsets '
-              '--delete-emptydir-data --kubeconfig /etc/rancher/k3s/k3s.yaml'),
+              '--delete-emptydir-data --timeout=300s '
+              '--kubeconfig /etc/rancher/k3s/k3s.yaml'),
              ('execute', 'inst-cp1',
               'kubectl delete node k3s-banana-node-003 '
               '--kubeconfig /etc/rancher/k3s/k3s.yaml'),
@@ -572,7 +579,7 @@ class RemoveWorkerTestCase(testtools.TestCase):
         self.assertEqual([], self.client.metadata[MD_KEY]['worker_nodes'])
 
     def test_an_unknown_cluster_raises(self):
-        client = RecordingClient()
+        client = ActionLogClient()
         cluster = _make_cluster(client)
 
         self.assertRaises(
@@ -620,7 +627,7 @@ class InterruptedStateTestCase(testtools.TestCase):
     """
 
     def _state_of(self, md):
-        return _make_cluster(mock.MagicMock()).interrupted_state(md)
+        return _make_cluster(mock.MagicMock())._interrupted_state(md)
 
     def test_a_finished_cluster_is_not_interrupted(self):
         self.assertIsNone(self._state_of(_interrupted_md(state='created')))
@@ -735,7 +742,7 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
 
     def setUp(self):
         super(DeleteInterruptedClusterTestCase, self).setUp()
-        self.client = RecordingClient()
+        self.client = ActionLogClient()
         self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
 
         patcher = mock.patch('time.sleep', lambda seconds: None)
@@ -867,7 +874,7 @@ class InterruptedClusterVerbsTestCase(testtools.TestCase):
     """
 
     def _cluster(self, md):
-        client = RecordingClient()
+        client = ActionLogClient()
         client.metadata[primitives.CLUSTER_LIST] = ['banana']
         client.metadata[MD_KEY] = md
         client.instances['inst-w1'] = {
@@ -1145,7 +1152,7 @@ class HealthTestCase(testtools.TestCase):
 
     def test_an_interrupted_cluster_is_reported_rather_than_refused(self):
         # The three verbs which change a built cluster call
-        # require_usable() and refuse this. health() must not: describing a
+        # _require_usable() and refuse this. health() must not: describing a
         # cluster which never finished being built is what it is for.
         self.md['state'] = 'initial'
         self.md['control_plane_nodes'] = []
@@ -1166,7 +1173,7 @@ class HealthTestCase(testtools.TestCase):
         self.assertEqual([], self.client.executed)
 
     def test_metadata_with_no_state_at_all_is_interrupted(self):
-        # interrupted_state() answers 'unknown' rather than None for a
+        # _interrupted_state() answers 'unknown' rather than None for a
         # document this package did not write, and the report says so.
         del self.md['state']
 
@@ -1537,7 +1544,7 @@ class RemoveWorkerNodeNameTestCase(testtools.TestCase):
 
     def setUp(self):
         super(RemoveWorkerNodeNameTestCase, self).setUp()
-        self.client = RecordingClient()
+        self.client = ActionLogClient()
 
         # 'MixedCase' is the cluster name a user typed. create() builds
         # instance names from it verbatim -- create_instance() does
@@ -1577,7 +1584,8 @@ class RemoveWorkerNodeNameTestCase(testtools.TestCase):
         self.assertEqual(
             [('execute', 'inst-cp1',
               'kubectl drain k3s-mixedcase-node-002 --ignore-daemonsets '
-              '--delete-emptydir-data --kubeconfig /etc/rancher/k3s/k3s.yaml'),
+              '--delete-emptydir-data --timeout=300s '
+              '--kubeconfig /etc/rancher/k3s/k3s.yaml'),
              ('execute', 'inst-cp1',
               'kubectl delete node k3s-mixedcase-node-002 '
               '--kubeconfig /etc/rancher/k3s/k3s.yaml'),
@@ -1645,7 +1653,7 @@ class ShellQuotingTestCase(testtools.TestCase):
         # package's trust boundary, and without the quoting this command
         # line carries a second command to run as root on the control
         # plane node.
-        client = RecordingClient()
+        client = ActionLogClient()
         client.metadata[MD_KEY] = {
             'name': 'banana', 'namespace': 'testns', 'state': 'created',
             'node_serial': 2, 'node_network': 'net-1', 'node_token': 'tok',
@@ -1966,3 +1974,598 @@ class InstallControlPlanePhaseCountTestCase(testtools.TestCase):
             ['[1/2] Installing k3s on the first control plane node',
              '[2/2] Installing k3s on the additional control plane nodes'],
             self._headers(['inst-cp1', 'inst-cp2', 'inst-cp3']))
+
+
+def _pending_aop(state='queued'):
+    return {'uuid': 'aop-001', 'instance_uuid': 'inst-001', 'state': state,
+            'commands': [], 'results': {}}
+
+
+class AgentOperationEndingsTestCase(testtools.TestCase):
+    """A wait ends when the operation can no longer progress, not only on two states.
+
+    Shaken Fist gives every agent operation a wall clock budget and moves
+    one which overruns it to 'expired', which the server documents as
+    deliberately distinct from 'error'. 'deleted' is reachable from every
+    state. Each wait loop here used to test for 'complete' and 'error' by
+    name, so either of those left it spinning for as long as the process
+    was running.
+
+    The client answers a bounded number of times and then runs out, which
+    is what turns that spinning into a failure rather than a hang. A
+    regression here would otherwise wedge the test run, and a wedged run
+    says nothing: nobody reads a suite which did not finish, and CI would
+    report a timeout with no failing test named. The correct code reads the
+    operation once, so the budget is generous.
+    """
+
+    ANSWERS = 20
+
+    def _cluster(self, aop_state):
+        client = mock.MagicMock()
+        client.get_agent_operation.side_effect = [
+            _pending_aop(aop_state) for _ in range(self.ANSWERS)]
+        client.get_instance.return_value = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001'}
+        return client, Cluster(client, 'banana', 'testns',
+                               reporter=progress.CollectingReporter())
+
+    def test_await_execute_returns_an_expired_operation(self):
+        client, cluster = self._cluster('expired')
+        with mock.patch('time.sleep', lambda seconds: None):
+            aop = cluster.await_execute(_pending_aop())
+        self.assertEqual('expired', aop['state'])
+
+    def test_reap_execute_raises_for_an_expired_operation(self):
+        client, cluster = self._cluster('expired')
+        with mock.patch('time.sleep', lambda seconds: None):
+            e = self.assertRaises(exceptions.AgentOperationError,
+                                  cluster.reap_execute, _pending_aop())
+        self.assertEqual('expired', e.state)
+        self.assertIn('state: expired', str(e))
+
+    def test_await_fetch_raises_for_an_expired_operation(self):
+        client, cluster = self._cluster('expired')
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(exceptions.AgentOperationError,
+                              cluster.await_fetch, _pending_aop())
+
+    def test_await_fetch_raises_for_a_deleted_operation(self):
+        client, cluster = self._cluster('deleted')
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(exceptions.AgentOperationError,
+                              cluster.await_fetch, _pending_aop())
+
+    def test_an_error_still_renders_exactly_the_text_it_did(self):
+        # The state line is only added when the state is not 'error', so
+        # the message for the ending which has always raised this is
+        # unchanged.
+        client, cluster = self._cluster('error')
+        with mock.patch('time.sleep', lambda seconds: None):
+            e = self.assertRaises(exceptions.AgentOperationError,
+                                  cluster.reap_execute, _pending_aop())
+        self.assertNotIn('state:', str(e))
+
+    def _await_idle(self, aop_states):
+        client = mock.MagicMock()
+        client.get_instance.return_value = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        aops = [{'uuid': 'aop-%03d' % (i + 1), 'instance_uuid': 'inst-001',
+                 'state': state, 'commands': [], 'results': {}}
+                for i, state in enumerate(aop_states)]
+
+        # An empty first answer, so nothing is snapshotted as a
+        # pre-existing failure and the states below are the ones the wait
+        # actually sees.
+        client.get_instance_agentoperations.side_effect = [[]] + [aops] * 50
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        with mock.patch('time.sleep', lambda seconds: None):
+            return cluster.await_idle(['inst-001'])
+
+    def test_await_idle_raises_for_an_expired_operation(self):
+        self.assertRaises(exceptions.AgentOperationError,
+                          self._await_idle, ['expired'])
+
+    def test_await_idle_does_not_wait_for_a_deleted_operation(self):
+        # A deleted operation is finished. Counting it as incomplete waits
+        # for a transition which cannot happen.
+        self._await_idle(['deleted'])
+
+    def test_await_idle_still_waits_for_a_running_operation(self):
+        client = mock.MagicMock()
+        client.get_instance.return_value = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        running = [{'uuid': 'aop-001', 'instance_uuid': 'inst-001',
+                    'state': 'executing', 'commands': [], 'results': {}}]
+        done = [{'uuid': 'aop-001', 'instance_uuid': 'inst-001',
+                 'state': 'complete', 'commands': [], 'results': {}}]
+        client.get_instance_agentoperations.side_effect = [[], running, done]
+
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        with mock.patch('time.sleep', lambda seconds: None):
+            cluster.await_idle(['inst-001'])
+
+        self.assertEqual(3, client.get_instance_agentoperations.call_count)
+
+    def test_a_preexisting_expired_operation_does_not_wedge_the_wait(self):
+        # The snapshot at the top of await_idle() exists so a historical
+        # failure neither wedges the wait nor aborts it. It covered
+        # 'error' only, so a historical expired operation did both.
+        client = mock.MagicMock()
+        client.get_instance.return_value = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        old = [{'uuid': 'aop-old', 'instance_uuid': 'inst-001',
+                'state': 'expired', 'commands': [], 'results': {}}]
+        # Bounded, for the reason the class docstring gives.
+        client.get_instance_agentoperations.side_effect = [old] * 20
+
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        with mock.patch('time.sleep', lambda seconds: None):
+            cluster.await_idle(['inst-001'])
+
+
+class AwaitExecuteTimeoutTestCase(testtools.TestCase):
+    """await_execute's timeout, which is health()'s probe and nothing else.
+
+    A fake clock, because the point is how long it waits: real time would
+    make the assertion either slow or untrue.
+    """
+
+    def _cluster(self, states):
+        client = mock.MagicMock()
+        client.get_agent_operation.side_effect = [
+            _pending_aop(state) for state in states]
+        return client, Cluster(client, 'banana', 'testns',
+                               reporter=progress.CollectingReporter())
+
+    def _with_clock(self, fn):
+        clock = [1000.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch('time.time', lambda: clock[0]), \
+                mock.patch('time.sleep', sleep):
+            return fn(), clock[0] - 1000.0
+
+    def test_a_pending_operation_is_abandoned_at_the_deadline(self):
+        client, cluster = self._cluster(['queued'] * 100)
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=5))
+
+        self.assertEqual('queued', aop['state'])
+        self.assertEqual(5, elapsed)
+
+    def test_an_operation_which_finishes_first_is_returned(self):
+        client, cluster = self._cluster(['queued', 'executing', 'complete'])
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=30))
+
+        self.assertEqual('complete', aop['state'])
+        self.assertEqual(3, elapsed)
+
+    def test_no_timeout_keeps_waiting(self):
+        # Which is every caller but the probe. An install which takes
+        # eleven minutes is a slow install, and abandoning it would leave
+        # the caller believing a command it can still see running did not
+        # happen.
+        client, cluster = self._cluster(['queued'] * 600 + ['complete'])
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop()))
+
+        self.assertEqual('complete', aop['state'])
+        self.assertEqual(601, elapsed)
+
+
+class HealthProbeIsSkippedTestCase(testtools.TestCase):
+    """health() does not ask a node which it can already see cannot answer.
+
+    This is the bug the verb existed to avoid and had: an agent operation
+    queued against an instance whose agent is not connected is accepted by
+    the API and then never runs, so the probe waited on exactly the cluster
+    health() is for. The node entry has already read the state and
+    agent_state which say so, a few lines earlier in the same method.
+    """
+
+    def setUp(self):
+        super(HealthProbeIsSkippedTestCase, self).setUp()
+        self.client = fakes.HealthClient()
+        self.client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 2, 'node_network': 'net-1', 'node_token': 'tok',
+            'k3s_version': 'v1.33',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1'],
+            'routed_addresses': []
+        }
+        for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                    ('inst-w1', 'k3s-banana-node-002')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+        self.cluster = _make_cluster(self.client)
+
+    def test_an_agentless_control_plane_node_is_not_asked(self):
+        self.client.instances['inst-cp1']['agent_state'] = None
+
+        report = self.cluster.health()
+
+        self.assertEqual([], self.client.executed)
+        self.assertFalse(report['api']['probed'])
+        self.assertFalse(report['api']['answered'])
+        self.assertFalse(report['healthy'])
+        self.assertIn('not in a state which can answer', report['api']['error'])
+        self.assertIn('agent not contactable', report['api']['error'])
+
+    def test_an_errored_control_plane_node_is_not_asked(self):
+        self.client.instances['inst-cp1']['state'] = 'error'
+
+        report = self.cluster.health()
+
+        self.assertEqual([], self.client.executed)
+        self.assertIn('instance error', report['api']['error'])
+
+    def test_a_vanished_control_plane_node_is_not_asked(self):
+        del self.client.instances['inst-cp1']
+
+        report = self.cluster.health()
+
+        self.assertEqual([], self.client.executed)
+        self.assertFalse(report['api']['probed'])
+        self.assertEqual('inst-cp1', report['api']['instance_uuid'])
+        self.assertIn('instance gone', report['api']['error'])
+
+    def test_an_unhealthy_worker_does_not_stop_the_probe(self):
+        # Only the node the probe runs on decides whether to run it. A
+        # worker in the error state is a finding about that worker, and the
+        # k3s API still has something to say about it.
+        self.client.instances['inst-w1']['state'] = 'error'
+
+        report = self.cluster.health()
+
+        self.assertEqual(1, len(self.client.executed))
+        self.assertTrue(report['api']['probed'])
+        self.assertTrue(report['api']['answered'])
+        self.assertFalse(report['healthy'])
+
+    def test_a_cluster_with_no_control_plane_reports_the_same_shape(self):
+        # Both unprobed answers carry the same keys, so a caller never has
+        # to tell them apart by which are present.
+        self.client.metadata[MD_KEY]['control_plane_nodes'] = []
+        self.cluster = _make_cluster(self.client)
+
+        absent = self.cluster.health()['api']
+
+        self.client.metadata[MD_KEY]['control_plane_nodes'] = ['inst-cp1']
+        self.client.instances['inst-cp1']['agent_state'] = None
+        down = _make_cluster(self.client).health()['api']
+
+        self.assertEqual(sorted(absent), sorted(down))
+        self.assertFalse(absent['probed'])
+        self.assertFalse(down['probed'])
+
+    def test_a_probe_which_never_finishes_is_abandoned(self):
+        # The node looks well and the command still does not run. Bounded,
+        # and reported as a finding rather than waited on.
+        self.client.probe_state = 'queued'
+
+        with mock.patch.object(cluster_module, 'HEALTH_PROBE_TIMEOUT_SECONDS', 0):
+            report = self.cluster.health()
+
+        self.assertEqual(1, len(self.client.executed))
+        self.assertFalse(report['api']['probed'])
+        self.assertIn('had not finished after 0 seconds',
+                      report['api']['error'])
+        self.assertIn('still queued', report['api']['error'])
+
+    def test_an_expired_probe_is_a_finding_and_names_the_state(self):
+        self.client.probe_state = 'expired'
+
+        report = self.cluster.health()
+
+        self.assertTrue(report['api']['probed'])
+        self.assertFalse(report['api']['answered'])
+        self.assertIn('expired state', report['api']['error'])
+
+
+class ActionLogFailingDrainClient(ActionLogClient):
+    """An action log client whose kubectl drain (and optionally uncordon) fails."""
+
+    def __init__(self, uncordon_fails=False):
+        super(ActionLogFailingDrainClient, self).__init__()
+        self.uncordon_fails = uncordon_fails
+
+    def instance_execute(self, instance_ref, commandline):
+        self.actions.append(('execute', instance_ref, commandline))
+        failing = (commandline.startswith('kubectl drain')
+                   or (self.uncordon_fails
+                       and commandline.startswith('kubectl uncordon')))
+        self.aop_serial += 1
+        return {
+            'uuid': 'aop-%03d' % self.aop_serial,
+            'instance_uuid': instance_ref,
+            'state': 'complete',
+            'commands': [{'command': 'execute', 'commandline': commandline}],
+            'results': {'0': {
+                'return-code': 1 if failing else 0,
+                'stdout': '',
+                'stderr': ('error when evicting pod "web-1": Cannot evict pod '
+                           'as it would violate the disruption budget\n')
+                          if failing else ''}}
+        }
+
+
+class DrainFailureTestCase(testtools.TestCase):
+    """A refused drain leaves the cluster as it found it.
+
+    kubectl drain cordons the node as its first act, so every way the
+    eviction can fail -- a PodDisruptionBudget, an unmanaged pod, a pod with
+    nowhere to go -- leaves the node unschedulable. Nothing else in this
+    package would put it back, so a remove-worker which refuses has to.
+    """
+
+    def _cluster(self, uncordon_fails=False):
+        client = ActionLogFailingDrainClient(uncordon_fails=uncordon_fails)
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 3, 'node_network': 'net-1', 'node_token': 'tok',
+            'k3s_version': 'v1.33', 'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'],
+            'worker_nodes': ['inst-w1', 'inst-w2'], 'routed_addresses': []
+        }
+        for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                    ('inst-w1', 'k3s-banana-node-002'),
+                                    ('inst-w2', 'k3s-banana-node-003')]:
+            client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+        reporter = progress.CollectingReporter()
+        return client, reporter, Cluster(client, 'banana', 'testns',
+                                         reporter=reporter)
+
+    def test_the_drain_carries_a_timeout(self):
+        client, _, cluster = self._cluster()
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(exceptions.CommandFailedError,
+                              cluster.remove_worker, ['inst-w1'])
+
+        drain = [a[2] for a in client.actions
+                 if a[2] and a[2].startswith('kubectl drain')][0]
+        self.assertIn('--timeout=%s' % cluster_module.KUBECTL_DRAIN_TIMEOUT,
+                      drain)
+
+    def test_the_node_is_uncordoned_before_the_failure_is_raised(self):
+        client, _, cluster = self._cluster()
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(exceptions.CommandFailedError,
+                              cluster.remove_worker, ['inst-w1'])
+
+        self.assertEqual(
+            ['kubectl drain', 'kubectl uncordon'],
+            [' '.join(a[2].split()[:2]) for a in client.actions if a[2]])
+
+    def test_nothing_is_destroyed_by_a_refused_drain(self):
+        client, _, cluster = self._cluster()
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(exceptions.CommandFailedError,
+                              cluster.remove_worker, ['inst-w1'])
+
+        self.assertEqual([], [a for a in client.actions
+                              if a[0] == 'delete_instance'])
+        self.assertEqual(['inst-w1', 'inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_an_api_failure_during_the_drain_also_uncordons(self):
+        # apiclient's exceptions do not descend from K3sClusterException,
+        # and the question the handler is answering is whether the drain
+        # might have cordoned the node, not which hierarchy the failure
+        # came from.
+        client, _, cluster = self._cluster()
+        boom = apiclient.APIException(
+            'nope', 'POST', '/instances/inst-cp1/agent/execute', 500, 'nope')
+        calls = []
+
+        real = client.instance_execute
+
+        def execute(instance_ref, commandline):
+            calls.append(commandline)
+            if commandline.startswith('kubectl drain'):
+                raise boom
+            return real(instance_ref, commandline)
+
+        client.instance_execute = execute
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(apiclient.APIException,
+                              cluster.remove_worker, ['inst-w1'])
+
+        self.assertEqual(['kubectl drain', 'kubectl uncordon'],
+                         [' '.join(c.split()[:2]) for c in calls])
+
+    def test_a_failed_uncordon_does_not_replace_the_reason(self):
+        # Reporting "the uncordon failed" instead of "the disruption budget
+        # refused the eviction" loses the only thing the operator can act
+        # on, so the original failure is still what is raised.
+        client, reporter, cluster = self._cluster(uncordon_fails=True)
+        with mock.patch('time.sleep', lambda seconds: None):
+            e = self.assertRaises(exceptions.CommandFailedError,
+                                  cluster.remove_worker, ['inst-w1'])
+
+        self.assertIn('disruption budget', str(e))
+        written = '\n'.join(reporter.lines)
+        self.assertIn('still unschedulable', written)
+        self.assertIn("kubectl uncordon k3s-banana-node-002", written)
+
+
+class RemoveWorkerEdgeCaseTestCase(testtools.TestCase):
+    """The two shapes a programmatic caller reaches and the command line cannot."""
+
+    def _cluster(self):
+        client = ActionLogClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 3, 'node_network': 'net-1', 'node_token': 'tok',
+            'k3s_version': 'v1.33', 'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'],
+            'worker_nodes': ['inst-w1', 'inst-w2'], 'routed_addresses': []
+        }
+        for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                    ('inst-w1', 'k3s-banana-node-002'),
+                                    ('inst-w2', 'k3s-banana-node-003')]:
+            client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+        reporter = progress.CollectingReporter()
+        return client, reporter, Cluster(client, 'banana', 'testns',
+                                         reporter=reporter)
+
+    def test_an_empty_list_does_nothing_and_says_nothing(self):
+        client, reporter, cluster = self._cluster()
+
+        cluster.remove_worker([])
+
+        self.assertEqual([], client.actions)
+        self.assertEqual([], reporter.lines)
+        self.assertEqual(['inst-w1', 'inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_an_instance_which_no_longer_exists_is_still_removed(self):
+        # The state health() reports as a finding and delete() tolerates.
+        # remove-worker is the only verb which can clear the metadata entry,
+        # so refusing it would make a stale entry unfixable short of
+        # deleting the cluster.
+        client, reporter, cluster = self._cluster()
+        del client.instances['inst-w1']
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            cluster.remove_worker(['inst-w1'])
+
+        self.assertEqual([], client.actions)
+        self.assertEqual(['inst-w2'], client.metadata[MD_KEY]['worker_nodes'])
+        self.assertIn('no longer exists', '\n'.join(reporter.lines))
+
+    def test_a_gone_instance_alongside_a_live_one(self):
+        client, reporter, cluster = self._cluster()
+        del client.instances['inst-w1']
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            cluster.remove_worker(['inst-w1', 'inst-w2'])
+
+        self.assertEqual([], client.metadata[MD_KEY]['worker_nodes'])
+        drains = [a for a in client.actions
+                  if a[2] and a[2].startswith('kubectl drain')]
+        self.assertEqual(1, len(drains), client.actions)
+        self.assertIn('k3s-banana-node-003', drains[0][2])
+
+
+class StagedManifestsAreWhatWasValidatedTestCase(testtools.TestCase):
+    """create() stages the manifests it read, not the files as they are later.
+
+    The read at the top of create() exists so that a bad manifest costs an
+    error rather than a half built cluster. Ten to twenty minutes of network
+    allocation, instance creation, boot and OS update sit between that read
+    and the write, so re-reading the paths there would make the early check
+    a check of something else -- and a file which changed in the window
+    would raise from inside install_control_plane(), with the name claimed
+    and the metadata document stuck in 'initial'.
+    """
+
+    def setUp(self):
+        super(StagedManifestsAreWhatWasValidatedTestCase, self).setUp()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.tempdir = tempdir.name
+        self.path = os.path.join(self.tempdir, 'staged.yaml')
+        with open(self.path, 'w') as f:
+            f.write('kind: Original\n')
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.client = fakes.FakeClusterClient()
+
+    def _writes(self):
+        return [commandline for _, commandline in self.client.executed
+                if commandline.startswith(
+                    'cat - > %s/staged.yaml ' % cluster_module.K3S_MANIFEST_DIR)]
+
+    def test_the_content_read_up_front_is_what_is_staged(self):
+        original = 'kind: Original\n'
+
+        def rewrite(*args, **kwargs):
+            # Stand in for the twenty minutes: the file changes after
+            # create() has validated it and before the write happens.
+            with open(self.path, 'w') as f:
+                f.write('kind: Replaced\n')
+            return fakes.FakeClusterClient.get_instance_interfaces(
+                self.client, *args, **kwargs)
+
+        with mock.patch.object(self.client, 'get_instance_interfaces',
+                               side_effect=rewrite):
+            _make_cluster(self.client).create(1, 1, 1, manifests=[self.path])
+
+        writes = self._writes()
+        self.assertEqual(1, len(writes), self.client.executed)
+        self.assertIn(original, writes[0])
+        self.assertNotIn('kind: Replaced', writes[0])
+
+    def test_a_manifest_deleted_after_validation_still_reaches_the_node(self):
+        def remove(*args, **kwargs):
+            os.unlink(self.path)
+            return fakes.FakeClusterClient.get_instance_interfaces(
+                self.client, *args, **kwargs)
+
+        with mock.patch.object(self.client, 'get_instance_interfaces',
+                               side_effect=remove):
+            _make_cluster(self.client).create(1, 1, 1, manifests=[self.path])
+
+        self.assertEqual(1, len(self._writes()))
+        self.assertEqual('created',
+                         self.client.metadata[MD_KEY]['state'])
+
+    def test_install_control_plane_still_reads_paths_for_a_direct_caller(self):
+        # staged is create()'s optimisation, not a new requirement: a
+        # library caller invoking install_control_plane() on its own has had
+        # nothing check its arguments, so the paths are still read there.
+        self.client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 1, 'node_network': 'net-1', 'k3s_version': 'v1.33',
+            'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': []
+        }
+        self.client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        _make_cluster(self.client).install_control_plane(manifests=[self.path])
+
+        writes = self._writes()
+        self.assertEqual(1, len(writes), self.client.executed)
+        self.assertIn('kind: Original\n', writes[0])
+
+    def test_a_direct_caller_with_no_manifests_stages_nothing(self):
+        self.client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 1, 'node_network': 'net-1', 'k3s_version': 'v1.33',
+            'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': []
+        }
+        self.client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        _make_cluster(self.client).install_control_plane()
+
+        self.assertEqual([], self._writes())
