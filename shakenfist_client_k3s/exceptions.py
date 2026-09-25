@@ -246,6 +246,36 @@ class WorkerNotFoundError(K3sClusterException):
                 % (self.name, ', '.join(self.instance_uuids)))
 
 
+class ComponentNotInstalledError(K3sClusterException):
+    """Raised when a verb needs an optional component this cluster was built without.
+
+    ``create()`` takes ``install_metallb`` and ``install_longhorn``, and
+    records which way each of them went in the cluster metadata. The verbs
+    which drive one of those components ask that metadata before they do
+    anything, because the alternative is not a clean failure: MetalLB's
+    absence is discovered by ``kubectl wait`` timing out after five
+    minutes on a namespace which does not exist, by which point
+    ``expand_addresses()`` has already routed and charged for addresses
+    nothing can hand out.
+
+    ``component`` is the component's own name as an operator would type
+    it, and ``verb`` is the command line spelling of what was refused,
+    matching ``ClusterInterruptedError.not_usable()``.
+    """
+
+    def __init__(self, name, component, verb):
+        self.name = name
+        self.component = component
+        self.verb = verb
+        super(ComponentNotInstalledError, self).__init__(name)
+
+    def __str__(self):
+        return (
+            'Cluster %s was created without %s, so %s has nothing to\n'
+            'configure. Install %s on the cluster yourself if you want it.'
+            % (self.name, self.component, self.verb, self.component))
+
+
 class ManifestError(K3sClusterException):
     """Raised when a manifest handed to ``Cluster.create()`` cannot be staged.
 
@@ -254,7 +284,7 @@ class ManifestError(K3sClusterException):
     control plane node before k3s is installed there, so that k3s applies
     them itself when the server first starts. Decision 8 of the phase 3
     plan says nothing about them is templated, so this is not a validation
-    of what a manifest declares. It is a refusal of the five ways a file
+    of what a manifest declares. It is a refusal of the six ways a file
     cannot be staged at all, each of which would otherwise either corrupt
     the payload or drop it silently:
 
@@ -262,6 +292,13 @@ class ManifestError(K3sClusterException):
       ``.yaml``, ``.yml`` or ``.json``. k3s's deploy controller only looks
       at those three, so such a file would be copied onto the node and then
       ignored without comment.
+    - ``unsafe_basename(path, basename)``: the basename is not a plain
+      filename. The basename is interpolated into the shell command line
+      which writes the file on the control plane node, so this is the
+      check which makes ``/tmp/a;touch /pwned.yaml`` a refusal rather
+      than a command run as root. The write site quotes the name as well
+      -- see rule 1 at the top of ``cluster.py`` -- so neither of these
+      is the only thing standing between a caller and that.
     - ``duplicate_basename(basename, first_path, second_path)``: two paths
       share a basename, and the basename is the destination filename, so
       the second write would silently replace the first.
@@ -309,6 +346,16 @@ class ManifestError(K3sClusterException):
         ) % (path, ', '.join(suffixes))
         return cls('not_a_manifest', message, path=path,
                    suffixes=tuple(suffixes))
+
+    @classmethod
+    def unsafe_basename(cls, path, basename):
+        message = (
+            'Manifest %s cannot be staged: the name it would be written under\n'
+            'on the cluster, %r, is not a plain filename. Manifest names may\n'
+            'contain letters, digits, dots, underscores and hyphens, and must\n'
+            'start with a letter or a digit.'
+        ) % (path, basename)
+        return cls('unsafe_basename', message, path=path, basename=basename)
 
     @classmethod
     def duplicate_basename(cls, basename, first_path, second_path):

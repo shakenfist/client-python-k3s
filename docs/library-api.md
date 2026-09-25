@@ -230,7 +230,8 @@ a correct caller never needs to catch it.
 | `ClusterNotFoundError` | the named cluster does not exist -- see method docstrings for which |
 | `ClusterIncompleteError` | `get_kubeconfig()` is called on a cluster that exists but has not finished `create()` |
 | `WorkerNotFoundError` | `remove_worker()` is given a uuid that is not one of the cluster's workers |
-| `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a duplicate basename, unreadable, not valid YAML, or a line colliding with the staging marker |
+| `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable, not valid YAML, or a line colliding with the staging marker |
+| `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation enters the `error` state |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
@@ -256,6 +257,20 @@ way to free it from this library --
 `health()` deliberately does not raise `ClusterInterruptedError`:
 reporting on an interrupted cluster, rather than refusing to look at
 it, is what that verb is for.
+
+`delete()` has the same two writes as `create()` in the other order --
+it releases the name from the cluster list before it removes the
+cluster's metadata document -- so an interrupted `delete()` leaves a
+document whose name is already free, and calling `delete()` again
+finishes the job. That is why #72 is a create-side gap rather than a
+gap on both sides.
+
+`ComponentNotInstalledError` is the one exception here which depends on
+how the cluster was built rather than on what state it is in.
+`create()` records `metallb_installed` and `longhorn_installed` in the
+cluster metadata, and a verb that drives one of those components reads
+it before it does anything. Metadata written before those keys existed
+is read as having both components, which every such cluster does.
 
 ## Worked example
 

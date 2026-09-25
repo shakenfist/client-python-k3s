@@ -73,6 +73,13 @@ applies it itself the first time the server starts:
 - A file that cannot be read, is not valid YAML, or contains a line
   that collides with the internal transfer marker is refused the same
   way.
+- The filename must be a plain one: letters, digits, dots, underscores
+  and hyphens, starting with a letter or a digit. The filename is
+  interpolated into the command that writes the file on the control
+  plane node, so this is about the name rather than the content. The
+  directory the file came from is not carried along -- the destination
+  is the basename -- so `--manifest ~/work/net/policy.yaml` lands as
+  `policy.yaml`.
 - k3s ships its own manifests in the same directory --
   `traefik.yaml`, `coredns.yaml`, `local-storage.yaml` and `ccm.yaml`
   as of the k3s versions current when this was written -- and
@@ -102,6 +109,14 @@ cluster does not exist, because there is no metadata document for it to
 read. There is currently no supported way to free such a name from
 this plugin; see
 [shakenfist/client-python-k3s#72](https://github.com/shakenfist/client-python-k3s/issues/72).
+
+`delete` has the same two writes in the other order, and deliberately
+so: it releases the name from the cluster list first and removes the
+metadata document second, so a `delete` killed between them leaves a
+metadata document whose name is already free. Running `delete NAME`
+again finishes the job -- the instances and the network it had already
+removed stay removed -- which is why the window is recoverable on this
+side and not on the create side.
 
 ### `delete NAME`
 
@@ -156,12 +171,27 @@ until it times out, which surfaces as an agent operation error rather
 than as a quick failure. Refuses to run against a cluster that never
 finished being built; see `create`, above.
 
+Workers are named by instance UUID rather than by node name, which is
+also what makes a mixed case cluster name work here: Shaken Fist
+accepts a capital letter in an instance name and Kubernetes does not
+accept one in a node name, so on a cluster called `MyCluster` the
+instance `k3s-MyCluster-node-002` is the k3s node
+`k3s-mycluster-node-002`. The drain uses the name k3s registered.
+
 ### `expand-addresses NAME [--address-count N]`
 
 Routes `N` more floating addresses (default 2) into the cluster
 network and reconfigures MetalLB's pool to include them. Refuses to
 run against a cluster that never finished being built; see `create`,
 above.
+
+Also refuses a cluster created with `--no-metallb`, before it routes
+anything. There is nothing to reconfigure on such a cluster, and the
+refusal is checked up front because the alternative is the worst shape
+of failure: the addresses get routed and charged for, and the command
+then waits five minutes for a MetalLB pod in a namespace that does not
+exist before failing. Clusters created before this was recorded are
+treated as having MetalLB, which they do.
 
 ### `update-os NAME`
 
@@ -196,8 +226,8 @@ control plane node and worker, whether the Shaken Fist instance still
 exists and its instance and agent state; and whether the k3s API
 answers, by running `kubectl get nodes` through the first control
 plane node. It repairs nothing -- this is a report, not a fix -- and
-always exits 0, because producing the report is what was asked for and
-it succeeded regardless of what it found:
+by default exits 0 whatever it found, because producing the report is
+what was asked for and it succeeded:
 
 ```
 $ sf-client k3s health mycluster
@@ -217,8 +247,24 @@ than refused -- reporting on a broken cluster is what this command is
 for -- so its `state` line names the state it was interrupted in
 instead of `created`, and an instance the metadata names but which no
 longer exists is reported as gone rather than failing the command.
-`create -> health -> delete` is a reasonable way to check a cluster
-came up correctly before handing it to something else.
+Pass `--strict` to exit 1 when the cluster is not healthy, which is
+what makes `health` usable from a shell:
+
+```
+sf-client k3s health mycluster --strict && ./deploy-my-workload.sh
+```
+
+The report is printed identically either way -- only the exit code
+changes -- so one run gives both the text and the branch, and nothing
+has to parse the output. `create -> health --strict -> delete` is a
+reasonable CI gate for checking a cluster came up correctly before
+handing it to something else.
+
+The default stays at "always 0" because "the cluster is unwell" and
+"the health check could not run" are different answers, and a command
+whose exit code conflates them is worse than one that reports neither.
+A library caller reads `Cluster.health()`'s dictionary and does not
+need either.
 
 ### `getconfig NAME`
 

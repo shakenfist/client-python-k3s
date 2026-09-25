@@ -407,12 +407,17 @@ class HealthCommandTestCase(testtools.TestCase):
     rendering, which is the half of decision 7 the library tests cannot
     see. Three things can go wrong in it and nothing else pins them: the
     report could be rendered with a bare print() rather than through the
-    reporter, an unhealthy cluster could be turned into a non-zero exit
-    (health is a report, not a judgement, and the verb which exits 1
-    cannot be used to find out whether it should), and a node the metadata
-    names which no longer exists has no name to interpolate, so rendering
-    it is the one line most likely to raise a TypeError in front of the
-    operator who most needed the report.
+    reporter, an unhealthy cluster could be turned into a non-zero exit by
+    default (health is a report, not a judgement, and the verb which exits
+    1 cannot be used to find out whether it should), and a node the
+    metadata names which no longer exists has no name to interpolate, so
+    rendering it is the one line most likely to raise a TypeError in front
+    of the operator who most needed the report.
+
+    --strict is the supported way to get the judgement, and it changes the
+    exit code and nothing else: the report is rendered identically either
+    way, so a caller which wants both the text and the branch gets them
+    from one run.
     """
 
     def setUp(self):
@@ -438,10 +443,18 @@ class HealthCommandTestCase(testtools.TestCase):
 
         self.runner = CliRunner()
 
-    def _invoke(self):
+    def _invoke(self, *args):
         return self.runner.invoke(
-            shakenfist_client_k3s.k3s, ['health', 'banana'],
+            shakenfist_client_k3s.k3s, ['health', 'banana'] + list(args),
             obj={'VERBOSE': False, 'CLIENT': self.client})
+
+    def _make_unhealthy(self):
+        self.client.instances['inst-w1']['state'] = 'error'
+        self.client.instances['inst-w1']['agent_state'] = None
+        self.client.probe_return_code = 1
+        self.client.probe_stdout = ''
+        self.client.probe_stderr = (
+            'The connection to the server 127.0.0.1:6443 was refused\n')
 
     def test_a_healthy_cluster_renders_every_node_and_the_api(self):
         result = self._invoke()
@@ -464,12 +477,7 @@ class HealthCommandTestCase(testtools.TestCase):
                       result.output)
 
     def test_an_unhealthy_cluster_renders_and_still_exits_zero(self):
-        self.client.instances['inst-w1']['state'] = 'error'
-        self.client.instances['inst-w1']['agent_state'] = None
-        self.client.probe_return_code = 1
-        self.client.probe_stdout = ''
-        self.client.probe_stderr = (
-            'The connection to the server 127.0.0.1:6443 was refused\n')
+        self._make_unhealthy()
 
         result = self._invoke()
 
@@ -504,6 +512,42 @@ class HealthCommandTestCase(testtools.TestCase):
                       'finished being built)', result.output)
         self.assertIn('this cluster has no nodes', result.output)
         self.assertIn('no control plane node', result.output)
+
+    def test_strict_exits_one_for_an_unhealthy_cluster(self):
+        self._make_unhealthy()
+
+        result = self._invoke('--strict')
+
+        self.assertEqual(1, result.exit_code, result.output)
+
+    def test_strict_renders_the_same_report_it_would_have_anyway(self):
+        # The exit code is the only difference. A --strict which printed
+        # something extra, or which exited before rendering, would make
+        # "run it once and both read and branch on the answer" impossible,
+        # which is the entire reason for the flag.
+        self._make_unhealthy()
+
+        plain = self._invoke()
+        strict = self._invoke('--strict')
+
+        self.assertEqual(0, plain.exit_code)
+        self.assertEqual(1, strict.exit_code)
+        self.assertEqual(plain.output, strict.output)
+
+    def test_strict_exits_zero_for_a_healthy_cluster(self):
+        result = self._invoke('--strict')
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn('Cluster banana in namespace testns is healthy',
+                      result.output)
+
+    def test_no_strict_is_the_default(self):
+        self._make_unhealthy()
+
+        result = self._invoke('--no-strict')
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(self._invoke().output, result.output)
 
     def test_an_unknown_cluster_fails_the_command(self):
         client = fakes.HealthClient()

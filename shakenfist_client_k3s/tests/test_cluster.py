@@ -1206,12 +1206,15 @@ class ReadManifestsTestCase(testtools.TestCase):
 
     Everything it refuses, it refuses before create() has built anything,
     which is the whole reason it is a separate function called at the top of
-    create() rather than a loop inside install_control_plane(). The five
-    refusals are each a way a manifest would otherwise be lost silently --
-    overwritten by another manifest, copied to a filename k3s never looks
-    at, truncated by its own content, rejected on the node by a parser
-    nobody is watching -- or, in the case of an unreadable file, the check
-    which stands in for click.Path(exists=True) for a caller with no click.
+    create() rather than a loop inside install_control_plane(). Five of the
+    six refusals are each a way a manifest would otherwise be lost silently
+    -- overwritten by another manifest, copied to a filename k3s never
+    looks at, truncated by its own content, rejected on the node by a
+    parser nobody is watching -- or, in the case of an unreadable file, the
+    check which stands in for click.Path(exists=True) for a caller with no
+    click. The sixth is about the name rather than the content: the
+    basename is interpolated into a shell command line which runs as root
+    on the control plane node.
     """
 
     def setUp(self):
@@ -1260,6 +1263,49 @@ class ReadManifestsTestCase(testtools.TestCase):
         path = self._write('SHOUTY.YAML', 'kind: Loud\n')
         self.assertEqual([('SHOUTY.YAML', 'kind: Loud\n')],
                          cluster_module.read_manifests([path]))
+
+    def test_a_basename_with_shell_metacharacters_is_refused(self):
+        # os.path.basename('/tmp/a;touch pwned.yaml') is
+        # 'a;touch pwned.yaml', which as the destination of the staging
+        # write would run 'touch pwned' as root on the control plane node.
+        # click.Path(exists=True) does not help here: the file exists.
+        path = self._write('a;touch pwned.yaml', 'kind: One\n')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [path])
+
+        self.assertEqual('unsafe_basename', e.reason)
+        self.assertEqual('a;touch pwned.yaml', e.basename)
+        self.assertEqual(path, e.path)
+
+    def test_a_basename_with_a_newline_is_refused(self):
+        # Quoting makes this safe rather than dangerous, but a heredoc
+        # whose destination filename spans two lines is unreadable in the
+        # agent operation log and is not a name anybody meant to use.
+        path = self._write('two\nlines.yaml', 'kind: One\n')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [path])
+
+        self.assertEqual('unsafe_basename', e.reason)
+
+    def test_a_basename_starting_with_a_dot_or_a_hyphen_is_refused(self):
+        for name in ['.hidden.yaml', '-dash.yaml']:
+            path = self._write(name, 'kind: One\n')
+            e = self.assertRaises(
+                exceptions.ManifestError, cluster_module.read_manifests,
+                [path])
+            self.assertEqual('unsafe_basename', e.reason, name)
+
+    def test_the_ordinary_filename_shapes_are_still_accepted(self):
+        # The charset is only worth having if it does not refuse the names
+        # a real manifest has. Underscores, hyphens, dots and digits are
+        # all ordinary in a Kubernetes manifest filename.
+        for name in ['plain.yaml', 'with-hyphens.yaml', 'with_underscores.yml',
+                     '00-ordered.yaml', 'dotted.name.json', 'CamelCase.yaml']:
+            path = self._write(name, 'kind: One\n')
+            self.assertEqual([(name, 'kind: One\n')],
+                             cluster_module.read_manifests([path]))
 
     def test_a_duplicate_basename_raises_and_names_both_paths(self):
         first = self._write('same.yaml', 'kind: One\n', subdir='one')
@@ -1477,3 +1523,446 @@ class ManifestHeredocTestCase(testtools.TestCase):
 
     def test_a_manifest_which_already_ends_in_a_newline_gains_nothing(self):
         self.assertEqual('kind: One\n', self._stage('tidy.yaml', 'kind: One\n'))
+
+
+class RemoveWorkerNodeNameTestCase(testtools.TestCase):
+    """The name remove-worker drains is the name k3s knows, not the instance's.
+
+    Shaken Fist accepts a capital letter in an instance name and Kubernetes
+    does not accept one in a node name, so on a cluster whose name has one
+    the two spellings differ. Everything else in this package addresses
+    nodes by instance uuid; remove-worker is the only verb which addresses
+    one by name, so it is the only verb the difference reaches.
+    """
+
+    def setUp(self):
+        super(RemoveWorkerNodeNameTestCase, self).setUp()
+        self.client = RecordingClient()
+
+        # 'MixedCase' is the cluster name a user typed. create() builds
+        # instance names from it verbatim -- create_instance() does
+        # 'k3s-%s-node-%03d' % (md['name'], md['node_serial']) -- and the
+        # Shaken Fist API accepts that, because its instance name guard
+        # permits A-Z.
+        key = cluster_module.METADATA_KEY % 'MixedCase'
+        self.client.metadata[key] = {
+            'name': 'MixedCase',
+            'namespace': 'testns',
+            'state': 'created',
+            'node_serial': 3,
+            'node_network': 'net-1',
+            'node_token': 'node-token',
+            'k3s_version': 'v1.33',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'],
+            'worker_nodes': ['inst-w1'],
+            'routed_addresses': []
+        }
+        for instance_uuid, name in [('inst-cp1', 'k3s-MixedCase-node-001'),
+                                    ('inst-w1', 'k3s-MixedCase-node-002')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.cluster = Cluster(self.client, 'MixedCase', 'testns',
+                               reporter=progress.CollectingReporter())
+
+    def test_the_node_name_is_lowercased(self):
+        self.cluster.remove_worker(['inst-w1'])
+
+        self.assertEqual(
+            [('execute', 'inst-cp1',
+              'kubectl drain k3s-mixedcase-node-002 --ignore-daemonsets '
+              '--delete-emptydir-data --kubeconfig /etc/rancher/k3s/k3s.yaml'),
+             ('execute', 'inst-cp1',
+              'kubectl delete node k3s-mixedcase-node-002 '
+              '--kubeconfig /etc/rancher/k3s/k3s.yaml'),
+             ('delete_instance', 'inst-w1', None)],
+            self.client.actions)
+
+    def test_the_instance_name_is_never_sent_as_typed(self):
+        # The failure this pins is not "the name is wrong" but "the drain
+        # is aimed at a node which does not exist", which kubectl answers
+        # with a non-zero exit and remove_worker turns into a
+        # CommandFailedError. Asserting the absence separately means a
+        # future rewrite which sends both spellings still fails here.
+        self.cluster.remove_worker(['inst-w1'])
+
+        for _, _, commandline in self.client.actions:
+            if commandline:
+                self.assertNotIn('k3s-MixedCase-node-002', commandline)
+
+
+class ShellQuotingTestCase(testtools.TestCase):
+    """Values interpolated into a command line cannot become a command.
+
+    Rule 1 at the top of cluster.py: anything interpolated into a shell
+    command line this module builds goes through shlex.quote() unless it
+    is one of this module's own literals. These commands run as root on a
+    cluster node, so a value which the remote shell reads as a command
+    separator is a root shell on that node.
+
+    The values here are hostile in a way the real ones cannot be today --
+    the Shaken Fist API refuses an instance name containing a semicolon,
+    and a k3s channel comes from a release lookup -- which is the point:
+    this pins the quoting rather than the current reachability of a value
+    which bypasses it.
+    """
+
+    HOSTILE = 'v1.33; touch /pwned #'
+
+    def _install_commands(self, md):
+        # mock.patch of execute_and_await rather than a scripted client,
+        # matching InstallK3sComponentTestCase above: the question here is
+        # what command line was built, and nothing after that matters.
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {MD_KEY: md}
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        with mock.patch.object(Cluster, 'execute_and_await') as ea:
+            cluster.install_k3s_component(['inst-w1'], 'token', 'agent')
+            return list(ea.call_args[0][1])
+
+    def test_the_k3s_channel_is_quoted(self):
+        commands = self._install_commands({
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'k3s_version': self.HOSTILE, 'join_address': '10.0.0.4',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1']})
+
+        installs = [c for c in commands if 'INSTALL_K3S_CHANNEL' in c]
+        self.assertEqual(1, len(installs), commands)
+        self.assertIn("INSTALL_K3S_CHANNEL='%s'" % self.HOSTILE, installs[0])
+
+    def test_the_drained_node_name_is_quoted(self):
+        # The Shaken Fist API would not return an instance named this --
+        # its name guard allows only letters, digits and hyphens -- which
+        # is the point: a remote API's input validation is not this
+        # package's trust boundary, and without the quoting this command
+        # line carries a second command to run as root on the control
+        # plane node.
+        client = RecordingClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 2, 'node_network': 'net-1', 'node_token': 'tok',
+            'k3s_version': 'v1.33', 'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1'],
+            'routed_addresses': []
+        }
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        client.instances['inst-w1'] = {
+            'uuid': 'inst-w1', 'name': 'node;touch /pwned',
+            'state': 'created', 'agent_state': 'ready'}
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            _make_cluster(client).remove_worker(['inst-w1'])
+
+        drains = [a[2] for a in client.actions
+                  if a[0] == 'execute' and a[2].startswith('kubectl drain')]
+        self.assertEqual(1, len(drains), client.actions)
+        self.assertIn("kubectl drain 'node;touch /pwned' ", drains[0])
+
+        # And through a shell, which is what actually decides how many
+        # commands that line is.
+        with tempfile.TemporaryDirectory() as tempdir:
+            probe = drains[0].replace('kubectl', 'true', 1)
+            probe = probe.replace('/pwned', 'pwned')
+            subprocess.run(probe, shell=True, cwd=tempdir, capture_output=True)
+            self.assertEqual([], os.listdir(tempdir),
+                             'the shell read the node name as a second '
+                             'command: %s' % probe)
+
+    def test_the_longhorn_version_is_quoted(self):
+        # This one comes from a GitHub release lookup rather than from
+        # anything this module wrote, which is the same trust position as
+        # the k3s channel above.
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {MD_KEY: {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': []}}
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+
+        with mock.patch.object(cluster_module.primitives,
+                               'get_longhorn_release',
+                               return_value='v1.9.0; touch /pwned'), \
+                mock.patch.object(Cluster, 'execute_and_await') as ea:
+            cluster.setup_longhorn()
+
+        installs = [c for c in ea.call_args[0][1] if 'longhorn/longhorn' in c]
+        self.assertEqual(1, len(installs), ea.call_args[0][1])
+        self.assertIn("--version 'v1.9.0; touch /pwned'", installs[0])
+
+    def test_the_quoted_install_runs_no_second_command(self):
+        # Asserting the quoting through a shell rather than against a
+        # string, the way ManifestHeredocTestCase does: the question is
+        # what /bin/sh does with this line, and only /bin/sh answers it.
+        commands = self._install_commands({
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'k3s_version': 'v1.33; touch pwned #', 'join_address': '10.0.0.4',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1']})
+        install = [c for c in commands if 'INSTALL_K3S_CHANNEL' in c][0]
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            # curl is not going to be reached; the point is what the shell
+            # decides the line is made of before anything runs. 'env' as a
+            # harmless stand-in for the pipeline keeps this off the
+            # network while leaving the word splitting intact.
+            probe = install.replace('curl -sfL https://get.k3s.io | ', 'env ')
+            probe = probe.replace(' sh -s - agent', ' true')
+            subprocess.run(probe, shell=True, cwd=tempdir, capture_output=True)
+            self.assertEqual([], os.listdir(tempdir),
+                             'the shell ran something the quoting should '
+                             'have made into a word: %s' % probe)
+
+
+class HeredocDelimiterTestCase(testtools.TestCase):
+    """Every heredoc this module generates has a quoted delimiter.
+
+    Rule 2 at the top of cluster.py. An unquoted delimiter lets the remote
+    shell expand $, backticks and $( ) inside the body, and every heredoc
+    here carries a value Python already substituted, so there is nothing
+    for the shell to be expanding. This asserts the rule over the
+    generated commands rather than per site, because the failure mode is a
+    new heredoc written the old way rather than one of these two changing
+    back.
+    """
+
+    def _commands(self):
+        client = fakes.FakeClusterClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 1, 'node_network': 'net-1', 'node_token': None,
+            'server_token': None, 'k3s_version': 'v1.33',
+            'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': ['192.168.10.101', '192.168.10.102']
+        }
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            manifest = os.path.join(tempdir, 'staged.yaml')
+            with open(manifest, 'w') as f:
+                f.write('kind: One\n')
+
+            cluster = _make_cluster(client)
+            cluster.install_control_plane(manifests=[manifest])
+            _make_cluster(client).configure_metallb_addresses()
+
+        return [commandline for _, commandline in client.executed]
+
+    def test_no_generated_heredoc_is_unquoted(self):
+        heredocs = []
+        for commandline in self._commands():
+            for line in commandline.split('\n'):
+                if '<<' in line:
+                    heredocs.append(line)
+
+        self.assertNotEqual([], heredocs, 'no heredoc was generated at all')
+        for line in heredocs:
+            introducer = line.split('<<', 1)[1].strip()
+            self.assertTrue(
+                introducer.startswith("'") and introducer.endswith("'"),
+                'this heredoc delimiter is not quoted, so the remote shell '
+                'expands the body: %s' % line)
+
+
+class DeleteReleasesTheNameBeforeTheMetadataTestCase(testtools.TestCase):
+    """delete() unlists the cluster name before it deletes the document.
+
+    The two writes are not atomic, and which order they happen in decides
+    what an interrupted delete leaves behind. Unlisting first leaves a
+    metadata document in state 'deleted' whose name is free of the cluster
+    list, which delete() itself runs to completion over, so the recovery
+    is to run the delete again. The other order leaves the name listed
+    with no document behind it: delete() raises ClusterNotFoundError
+    because there is no metadata and create() raises ClusterExistsError
+    because the name is listed, so the name is unusable forever.
+    """
+
+    def setUp(self):
+        super(DeleteReleasesTheNameBeforeTheMetadataTestCase, self).setUp()
+        self.client = fakes.FakeClusterClient()
+        self.client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 1, 'node_network': None, 'node_token': None,
+            'k3s_version': 'v1.33', 'control_plane_nodes': [],
+            'worker_nodes': [], 'routed_addresses': []
+        }
+        self.client.metadata[primitives.CLUSTER_LIST] = ['banana', 'other']
+
+        self.writes = []
+        original_set = self.client.set_namespace_metadata_item
+        original_delete = self.client.delete_namespace_metadata_item
+
+        def record_set(namespace, key, value):
+            self.writes.append(('set', key, copy.deepcopy(value)))
+            return original_set(namespace, key, value)
+
+        def record_delete(namespace, key):
+            self.writes.append(('delete', key, None))
+            return original_delete(namespace, key)
+
+        self.client.set_namespace_metadata_item = record_set
+        self.client.delete_namespace_metadata_item = record_delete
+
+    def test_the_name_is_unlisted_before_the_document_is_removed(self):
+        _make_cluster(self.client).delete()
+
+        unlist = [i for i, w in enumerate(self.writes)
+                  if w[0] == 'set' and w[1] == primitives.CLUSTER_LIST]
+        document = [i for i, w in enumerate(self.writes)
+                    if w[0] == 'delete' and w[1] == MD_KEY]
+        self.assertEqual(1, len(unlist), self.writes)
+        self.assertEqual(1, len(document), self.writes)
+        self.assertTrue(
+            unlist[0] < document[0],
+            'the metadata document was removed while the name was still '
+            'listed, which strands the name forever. The writes were:\n    %s'
+            % '\n    '.join(repr(w) for w in self.writes))
+
+    def test_the_survivors_keep_their_place_in_the_list(self):
+        _make_cluster(self.client).delete()
+        self.assertEqual(['other'],
+                         self.client.metadata[primitives.CLUSTER_LIST])
+
+    def test_a_name_already_absent_from_the_list_is_not_an_error(self):
+        # Which is the state a delete interrupted between the two writes
+        # above leaves, and the state two concurrent deletes reach.
+        # list.remove() raises a bare ValueError, which is not a
+        # K3sClusterException, so GroupCatchClusterExceptions does not
+        # catch it and the operator sees a traceback instead of a cluster
+        # which finished being deleted.
+        self.client.metadata[primitives.CLUSTER_LIST] = ['other']
+
+        _make_cluster(self.client).delete()
+
+        self.assertEqual(['other'],
+                         self.client.metadata[primitives.CLUSTER_LIST])
+        self.assertNotIn(MD_KEY, self.client.metadata)
+
+    def test_the_list_is_removed_when_this_was_the_last_cluster(self):
+        self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
+
+        _make_cluster(self.client).delete()
+
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+
+class ExpandAddressesWithoutMetallbTestCase(testtools.TestCase):
+    """expand-addresses refuses a cluster which was built without metallb.
+
+    Without this the verb routes the addresses, commits them to the
+    metadata, and then waits five minutes for a metallb pod in a namespace
+    which does not exist before failing -- leaving the caller with routed
+    addresses nothing can hand out. The refusal has to come before the
+    allocation, which is what these assert.
+    """
+
+    def _cluster(self, md_extra):
+        client = fakes.FakeClusterClient()
+        md = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 1, 'node_network': 'net-1', 'node_token': 'tok',
+            'k3s_version': 'v1.33', 'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': []
+        }
+        md.update(md_extra)
+        client.metadata[MD_KEY] = md
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        return client, _make_cluster(client)
+
+    def test_a_cluster_built_without_metallb_is_refused(self):
+        client, cluster = self._cluster({'metallb_installed': False})
+
+        e = self.assertRaises(exceptions.ComponentNotInstalledError,
+                              cluster.expand_addresses, 2)
+        self.assertEqual('metallb', e.component)
+        self.assertEqual('expand-addresses', e.verb)
+        self.assertIn('metallb', str(e))
+
+    def test_no_address_is_routed_by_the_refusal(self):
+        client, cluster = self._cluster({'metallb_installed': False})
+
+        self.assertRaises(exceptions.ComponentNotInstalledError,
+                          cluster.expand_addresses, 2)
+
+        self.assertEqual([], client.metadata[MD_KEY]['routed_addresses'])
+        self.assertEqual([], client.executed)
+
+    def test_a_cluster_with_metallb_is_expanded(self):
+        client, cluster = self._cluster({'metallb_installed': True})
+
+        cluster.expand_addresses(2)
+
+        self.assertEqual(
+            2, len(client.metadata[MD_KEY]['routed_addresses']))
+
+    def test_metadata_written_before_the_key_existed_is_expanded(self):
+        # Every cluster built before create() recorded this has both
+        # components, so an absent key must read as True rather than as
+        # False or as an error.
+        client, cluster = self._cluster({})
+        self.assertNotIn('metallb_installed', client.metadata[MD_KEY])
+
+        cluster.expand_addresses(1)
+
+        self.assertEqual(
+            1, len(client.metadata[MD_KEY]['routed_addresses']))
+
+
+class InstallControlPlanePhaseCountTestCase(testtools.TestCase):
+    """install_control_plane() counts the phases it is actually going to open.
+
+    It opens one for the first control plane node, and a second through
+    install_extra_control_plane() when there is more than one. A library
+    caller who invokes it directly on an HA cluster got "[2/1]" for the
+    second of those, which is worse than the un-numbered header the
+    lazy default replaced.
+    """
+
+    def _headers(self, control_plane_nodes):
+        client = fakes.FakeClusterClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': len(control_plane_nodes), 'node_network': 'net-1',
+            'node_token': None, 'server_token': None, 'k3s_version': 'v1.33',
+            'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': list(control_plane_nodes),
+            'worker_nodes': [], 'routed_addresses': []
+        }
+        for i, instance_uuid in enumerate(control_plane_nodes):
+            client.instances[instance_uuid] = {
+                'uuid': instance_uuid,
+                'name': 'k3s-banana-node-%03d' % (i + 1),
+                'state': 'created', 'agent_state': 'ready'}
+
+        reporter = progress.CollectingReporter()
+        cluster = Cluster(client, 'banana', 'testns', reporter=reporter)
+        cluster.install_control_plane()
+        return [line for line in reporter.lines if line.startswith('[')]
+
+    def test_a_single_control_plane_node_opens_one_phase(self):
+        self.assertEqual(
+            ['[1/1] Installing k3s on the first control plane node'],
+            self._headers(['inst-cp1']))
+
+    def test_extra_control_plane_nodes_open_a_second_phase(self):
+        self.assertEqual(
+            ['[1/2] Installing k3s on the first control plane node',
+             '[2/2] Installing k3s on the additional control plane nodes'],
+            self._headers(['inst-cp1', 'inst-cp2', 'inst-cp3']))

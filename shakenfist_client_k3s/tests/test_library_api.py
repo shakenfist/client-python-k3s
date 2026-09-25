@@ -380,6 +380,44 @@ class OptionalMetallbLonghornTestCase(LibraryTestCase):
         c.create(1, 1, 3, install_metallb=False)
         self.assertEqual([], c.show()['routed_addresses'])
 
+    def test_what_was_installed_is_recorded_in_the_metadata(self):
+        # The flags outlive the call which set them: expand_addresses()
+        # reads metallb_installed to refuse a cluster which has no metallb
+        # before it routes any address, and nothing else in the cluster
+        # state says whether the component is there.
+        c = self._cluster()
+        with mock.patch.object(Cluster, 'setup_metallb'), \
+                mock.patch.object(Cluster, 'setup_longhorn'):
+            c.create(1, 1, 1, install_metallb=False, install_longhorn=True)
+
+        md = c.show()
+        self.assertEqual(False, md['metallb_installed'])
+        self.assertEqual(True, md['longhorn_installed'])
+
+    def test_a_default_create_records_both_components(self):
+        c = self._cluster()
+        with mock.patch.object(Cluster, 'setup_metallb'), \
+                mock.patch.object(Cluster, 'setup_longhorn'):
+            c.create(1, 1, 1)
+
+        md = c.show()
+        self.assertEqual(True, md['metallb_installed'])
+        self.assertEqual(True, md['longhorn_installed'])
+
+    def test_the_flags_are_recorded_before_anything_is_built(self):
+        # A create which fails part way through still has to describe what
+        # it was building, because delete() is the only way out of one and
+        # the health report reads the same document.
+        c = self._cluster()
+        with mock.patch.object(Cluster, 'install_control_plane',
+                               side_effect=RuntimeError('boom')):
+            self.assertRaises(RuntimeError, c.create, 1, 1, 1,
+                              install_longhorn=False)
+
+        md = c.show()
+        self.assertEqual(True, md['metallb_installed'])
+        self.assertEqual(False, md['longhorn_installed'])
+
     def test_metal_address_count_is_ignored_without_metallb(self):
         # Decision recorded in create()'s docstring and in --metal-address-
         # count's --help: the combination is accepted, not an error, and
@@ -779,9 +817,16 @@ class ManifestStagingTestCase(LibraryTestCase):
 
     def _server_install_index(self):
         # The worker install uses the same installer with 'agent', so the
-        # role is what identifies the control plane node's install.
+        # role is what identifies the control plane node's install. The
+        # installer itself is recognised by the environment variable it
+        # is driven with rather than by the URL it is fetched from:
+        # CodeQL reads a hostname substring test as an incomplete URL
+        # sanitization (py/incomplete-url-substring-sanitization) and
+        # fails the Analyze job over it, which is a fair complaint about
+        # the shape even though nothing here is sanitizing anything.
         return self._index_of(
-            lambda c: 'get.k3s.io' in c and c.endswith('sh -s - server'),
+            lambda c: ('INSTALL_K3S_CHANNEL=' in c
+                       and c.endswith('sh -s - server')),
             'the k3s server install')
 
     def test_two_manifests_are_written_before_k3s_is_installed(self):

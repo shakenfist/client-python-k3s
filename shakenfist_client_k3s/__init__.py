@@ -304,10 +304,27 @@ k3s.add_command(k3s_show)
 @click.option('--namespace', type=click.STRING,
               help=('If you are an admin, you can report on a cluster in a '
                     'different namespace.'))
+@click.option('--strict/--no-strict', default=False,
+              help=('Exit 1 when the cluster is not healthy, so that a shell '
+                    'can branch on the result. The report is printed either '
+                    'way; only the exit code changes.'))
 @click.pass_context
-def k3s_health(ctx, name=None, namespace=None):
+def k3s_health(ctx, name=None, namespace=None, strict=False):
     c = _bind_cluster_context(ctx, name, namespace)
-    _render_health(c.reporter, c.health())
+    report = c.health()
+    _render_health(c.reporter, report)
+
+    # Nothing is printed here. The report above has already said what is
+    # wrong, in more detail than an exit code can, and a second line
+    # saying the same thing would be one more thing for a caller parsing
+    # this output to trip over. sys.exit() rather than a
+    # K3sClusterException, because nothing failed: the command did what
+    # it was asked and is reporting the answer in the one channel a shell
+    # can read without parsing. That also keeps it out of
+    # GroupCatchClusterExceptions, which prints str(e) for everything it
+    # catches.
+    if strict and not report['healthy']:
+        sys.exit(1)
 
 
 def _render_health(out, report):
@@ -319,11 +336,16 @@ def _render_health(out, report):
     and a health check is the command most likely to be run by something
     which is also using the process's stdout for its own output.
 
-    Nothing here decides anything: an unhealthy cluster is reported and the
-    command still exits zero, because producing the report is what was
-    asked for and it succeeded. A caller which wants to branch on the
-    answer calls Cluster.health() and reads the dict, which is the whole
-    point of decision 7 of the phase 3 plan.
+    Nothing here decides anything, and by default neither does its
+    caller: an unhealthy cluster is reported and the command still exits
+    zero, because producing the report is what was asked for and it
+    succeeded. A library caller which wants to branch on the answer calls
+    Cluster.health() and reads the dict, which is the whole point of
+    decision 7 of the phase 3 plan; a shell caller which wants the same
+    thing passes --strict, which changes the exit code and nothing else.
+    The default stays as it is because "the cluster is unwell" and "the
+    health check could not run" are different answers and an exit code
+    which conflates them is worse than one which reports neither.
     """
     out.write('Cluster %s in namespace %s is %s\n' % (
         report['name'], report['namespace'],

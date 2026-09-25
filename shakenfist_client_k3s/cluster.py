@@ -24,7 +24,9 @@ standard library from Python 3.8, and this package supports 3.7).
 
 import copy
 import os
+import re
 from shakenfist_client import apiclient
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -65,17 +67,45 @@ STALL_WARNING_SECONDS = 300
 K3S_MANIFEST_DIR = '/var/lib/rancher/k3s/server/manifests'
 K3S_MANIFEST_SUFFIXES = ('.yaml', '.yml', '.json')
 
-# The heredoc delimiter manifest content is handed to a node with. The
-# config file write in install_control_plane() uses an unquoted EOF, which
-# is safe for content this module generates itself, but manifest content
-# belongs to the caller and routinely contains $ and backticks -- a
-# container command, a shell script in a ConfigMap -- which the shell would
-# expand inside an unquoted heredoc. Quoting the delimiter turns all of
-# that off. A line of the manifest which is exactly the delimiter would
-# still end the heredoc early, so read_manifests() refuses one; base64
-# would avoid that question entirely, at the cost of making every staged
-# manifest unreadable in the agent operation log.
+# Destination filenames are checked against this before they are used.
+# The suffix check above asks whether k3s will read the file; this asks
+# whether the shell will read the name. read_manifests() takes local paths
+# from a library caller, and os.path.basename('/tmp/a;touch /pwned.yaml')
+# is 'a;touch /pwned.yaml', which as a redirection target on the control
+# plane node runs as root. shlex.quote() at the write site makes that
+# harmless on its own, and the write site quotes; this refuses it as well,
+# because a filename containing a newline, a quote or a semicolon is
+# unreadable in the agent operation log and is not a filename anybody
+# meant to use. The leading character is restricted separately so that a
+# name cannot begin with a dot or a hyphen.
+K3S_MANIFEST_BASENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+
+# The heredoc delimiter manifest content is handed to a node with.
+# Manifest content belongs to the caller and routinely contains $ and
+# backticks -- a container command, a shell script in a ConfigMap -- which
+# the shell would expand inside an unquoted heredoc. Quoting the delimiter
+# turns all of that off. A line of the manifest which is exactly the
+# delimiter would still end the heredoc early, so read_manifests() refuses
+# one; base64 would avoid that question entirely, at the cost of making
+# every staged manifest unreadable in the agent operation log.
 K3S_MANIFEST_DELIMITER = 'SFK3SMANIFEST'
+
+# Every command this module builds is a shell command line, run as root on
+# a cluster node by the in-guest agent. Two rules keep that safe, and they
+# are rules rather than case by case judgements because the next reader
+# cannot be expected to re-derive which values are attacker reachable:
+#
+# 1. Any value interpolated into a command line is passed through
+#    shlex.quote(), unless it is a literal defined in this module. That
+#    includes values which arrive from the Shaken Fist API, which validates
+#    instance names but is not this package's trust boundary.
+# 2. Any heredoc carrying interpolated content uses a quoted delimiter, so
+#    the remote shell expands nothing inside the body. Python has already
+#    substituted the values by the time the shell sees them, so a quoted
+#    delimiter costs nothing and removes the whole question.
+#
+# Cluster.delete()'s kubectl invocation is the third form of the same rule:
+# where a real argument list is available, it is used instead.
 
 
 def read_manifests(paths):
@@ -96,7 +126,7 @@ def read_manifests(paths):
     hands over paths which nothing has looked at, and would otherwise reach
     a bare IOError from outside this package's exception hierarchy.
 
-    Raises exceptions.ManifestError, whose docstring enumerates the five
+    Raises exceptions.ManifestError, whose docstring enumerates the six
     ways a file is refused and why each of them is a refusal rather than
     something to discover on the cluster afterwards.
     """
@@ -109,6 +139,13 @@ def read_manifests(paths):
         if not basename.lower().endswith(K3S_MANIFEST_SUFFIXES):
             raise exceptions.ManifestError.not_a_manifest(
                 path, K3S_MANIFEST_SUFFIXES)
+
+        # After the suffix check rather than before it, because a caller
+        # who pointed at the wrong file is better served by being told
+        # what k3s applies than by a message about the character set.
+        if not K3S_MANIFEST_BASENAME_RE.match(basename):
+            raise exceptions.ManifestError.unsafe_basename(
+                path, basename)
 
         if basename in by_basename:
             raise exceptions.ManifestError.duplicate_basename(
@@ -253,7 +290,7 @@ class Cluster:
             raise exceptions.ClusterInterruptedError.not_usable(
                 self.name, state, verb)
 
-    def get_progress(self):
+    def get_progress(self, total_phases=1):
         """Return the Progress reporter for this operation, making a default if needed.
 
         Commands which know how many phases they have build their own and
@@ -261,17 +298,24 @@ class Cluster:
         directly by a library caller still reports progress somewhere
         sensible.
 
-        The lazy default is built with total_phases=1. Every method which
-        calls get_progress() itself -- rather than inheriting a Progress an
-        entry point like create() or expand_workers() already built -- goes
-        on to call p.phase() exactly once: create_and_await_instances(),
-        install_control_plane(), install_extra_control_plane(),
-        install_workers(), setup_metallb() and setup_longhorn() each open
-        one phase and do their work inside it. 1 is therefore not a
-        placeholder guess but the true count for exactly the callers this
-        default serves, giving a library caller who invokes one of them
-        directly an honest "[1/1]" instead of the un-numbered "[n]" this
-        used to print.
+        total_phases is the count the lazy default is built with, and is
+        ignored when there is already a Progress to return -- it says how
+        many phases *this* method is about to open, not how many the
+        operation has. It defaults to 1 because all but one of the methods
+        which call get_progress() themselves -- rather than inheriting a
+        Progress an entry point like create() or expand_workers() already
+        built -- open exactly one phase and do their work inside it:
+        create_and_await_instances(), install_extra_control_plane(),
+        install_workers(), setup_metallb() and setup_longhorn(). 1 is
+        therefore not a placeholder guess but the true count for those
+        callers, giving a library caller who invokes one of them directly
+        an honest "[1/1]" instead of the un-numbered "[n]" this used to
+        print.
+
+        The exception is install_control_plane(), which opens a second
+        phase through install_extra_control_plane() when the cluster has
+        more than one control plane node, and so passes the count it works
+        out from the metadata rather than taking the default.
 
         This is one Progress per Cluster instance, cached for its life
         (see __init__), so it is only accurate for a single such call. A
@@ -284,7 +328,8 @@ class Cluster:
         """
         if not self.progress:
             self.progress = progress.Progress(
-                total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)
+                total_phases=total_phases, verbose=self.reporter.verbose,
+                stream=self.reporter)
         return self.progress
 
     def create_instance(self):
@@ -641,8 +686,16 @@ class Cluster:
         and this method is callable on its own, so it does not trust an
         argument somebody else was supposed to have checked.
         """
-        p = self.get_progress()
         md = self.get_metadata()
+
+        # The metadata is read before the Progress rather than after it
+        # because it is what says how many phases this method has: the
+        # extra control plane nodes below are a second phase, opened on
+        # this same Progress by install_extra_control_plane(). Without
+        # this a library caller who invokes install_control_plane()
+        # directly on an HA cluster is told "[2/1]".
+        p = self.get_progress(
+            total_phases=2 if len(md['control_plane_nodes']) > 1 else 1)
         staged = read_manifests(manifests)
         cmds = []
 
@@ -651,9 +704,14 @@ class Cluster:
         # Write a configuration file with the external address to the first control
         # plane node. This is needed so that the SSL certificate includes this
         # external name.
+        #
+        # The heredoc delimiter is quoted, per rule 2 at the top of this
+        # module: Python has already substituted the address by the time
+        # the remote shell sees this, so there is nothing here the shell
+        # should be expanding.
         cmds.append('mkdir -p /etc/rancher/k3s/')
         cmds.append(
-            'cat - > /etc/rancher/k3s/config.yaml << EOF\n'
+            "cat - > /etc/rancher/k3s/config.yaml << 'EOF'\n"
             'write-kubeconfig-mode: "0644"\n'
             'tls-san:\n'
             '  - "%s"\n'
@@ -689,15 +747,25 @@ class Cluster:
                 # its delimiter on a line of its own and a file which
                 # already ends in a newline must not gain a blank line.
                 body = content if content.endswith('\n') else content + '\n'
+                # Quoted per rule 1 at the top of this module. The
+                # basename is the caller's, by way of os.path.basename()
+                # of a path nothing else has looked at;
+                # read_manifests() refuses the shapes which would be
+                # unreadable in the operation log, and this makes the
+                # ones it allows unable to mean anything to the shell.
+                # A basename of plain filename characters quotes to
+                # itself, so the common case is byte for byte what it
+                # was.
                 cmds.append(
-                    "cat - > %s/%s << '%s'\n%s%s\n"
-                    % (K3S_MANIFEST_DIR, basename, K3S_MANIFEST_DELIMITER,
-                       body, K3S_MANIFEST_DELIMITER))
+                    "cat - > %s << '%s'\n%s%s\n"
+                    % (shlex.quote('%s/%s' % (K3S_MANIFEST_DIR, basename)),
+                       K3S_MANIFEST_DELIMITER, body,
+                       K3S_MANIFEST_DELIMITER))
 
         # Instruct the first control plane node to install k3s and helm
         cmds.append('curl -sfL https://get.k3s.io | '
                     'INSTALL_K3S_CHANNEL=%s sh -s - server'
-                    % md['k3s_version'])
+                    % shlex.quote(md['k3s_version']))
         cmds.append('sudo apt-get install -y extrepo')
         cmds.append('sudo extrepo enable helm')
         cmds.append('sudo apt-get update')
@@ -739,9 +807,12 @@ class Cluster:
                 'sudo apt-get install -y',
                 (
                     'curl -sfL https://get.k3s.io | '
-                    f'INSTALL_K3S_CHANNEL={md["k3s_version"]} '
-                    f'K3S_URL=https://{join_address}:6443 '
-                    f'K3S_TOKEN={token} sh -s - {node_role}'
+                    'INSTALL_K3S_CHANNEL=%s '
+                    'K3S_URL=https://%s:6443 '
+                    'K3S_TOKEN=%s sh -s - %s'
+                    % (shlex.quote(md['k3s_version']),
+                       shlex.quote(join_address), shlex.quote(token),
+                       shlex.quote(node_role))
                 )
             ]
         )
@@ -797,7 +868,9 @@ class Cluster:
 
         # Setup metallb for traffic ingress, guided by
         # https://itnext.io/kubernetes-loadbalancer-service-for-on-premises-6b7f75187be8
-        metal_lb_config = ('cat - > /etc/sf/metallb-range-allocation.yaml << EOF\n'
+        #
+        # Quoted delimiter per rule 2 at the top of this module.
+        metal_lb_config = ("cat - > /etc/sf/metallb-range-allocation.yaml << 'EOF'\n"
                            'apiVersion: metallb.io/v1beta1\n'
                            'kind: IPAddressPool\n'
                            'metadata:\n'
@@ -873,7 +946,7 @@ class Cluster:
                     'helm --kubeconfig /etc/rancher/k3s/k3s.yaml '
                     'install longhorn longhorn/longhorn '
                     '--namespace longhorn-system '
-                    f'--version {version}'
+                    '--version %s' % shlex.quote(version)
                 ),
                 (
                     'kubectl patch storageclass local-path -p '
@@ -924,7 +997,11 @@ class Cluster:
         the credentials without the side effect asks for them there.
 
         install_metallb and install_longhorn default to True, matching the
-        behaviour before this parameter existed. metal_address_count is
+        behaviour before this parameter existed. Which way they went is
+        recorded in the metadata as ``metallb_installed`` and
+        ``longhorn_installed``, so that a later verb can refuse to drive a
+        component this cluster does not have rather than discovering it as
+        a timeout: see ``expand_addresses()``. metal_address_count is
         still a required positional argument even when install_metallb is
         False, in which case it is accepted and ignored -- see
         k3s_create()'s --metal-address-count help in __init__.py for why
@@ -1051,7 +1128,18 @@ class Cluster:
             'control_plane_nodes': [],
             'worker_nodes': [],
             'routed_addresses': [],
-            'ssh_key': ssh_key_content
+            'ssh_key': ssh_key_content,
+
+            # What this cluster has, not what this call was asked for:
+            # every verb which drives one of these components has to know
+            # whether it is there, and the metadata is the only thing
+            # which outlives the call. They are recorded here rather than
+            # next to the setup_*() calls below so that a create which
+            # never reaches those still describes the cluster it was
+            # building. Readers must treat a missing key as True, because
+            # every cluster built before this key existed has both.
+            'metallb_installed': install_metallb,
+            'longhorn_installed': install_longhorn,
         }
         self.set_metadata(md)
 
@@ -1462,17 +1550,41 @@ class Cluster:
         md['state'] = 'deleted'
         self.set_metadata(md)
 
-        # Then remove the metadata
-        self.delete_metadata()
+        # Then release the name, and only then remove the metadata
+        # document. These two writes are not atomic and this is the order
+        # which makes an interruption between them recoverable.
+        #
+        # The other order -- which this did until now -- leaves the name
+        # in the cluster list with no metadata document behind it, and
+        # that combination is unusable forever: delete() raises
+        # ClusterNotFoundError because there is no metadata, and create()
+        # raises ClusterExistsError because the name is in the list. This
+        # order leaves a metadata document in state 'deleted' whose name
+        # is no longer listed, which delete() runs to completion over --
+        # the instances and the network are already gone, and the steps
+        # above tolerate that -- so the recovery is to run the delete
+        # again. That is the same recovery an interrupted create has, and
+        # the same one docs/usage.md documents for
+        # shakenfist/client-python-k3s#72.
         namespace_md = self.client.get_namespace_metadata(self.namespace)
         all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
-        all_clusters.remove(self.name)
+
+        # Tested for rather than removed unconditionally: list.remove()
+        # raises a bare ValueError, which is not a K3sClusterException, so
+        # the group handler does not catch it and the user sees a
+        # traceback. A second delete of a cluster this one has already
+        # unlisted is exactly the recovery described above, and two
+        # concurrent deletes reach it as well.
+        if self.name in all_clusters:
+            all_clusters.remove(self.name)
         if not all_clusters:
             self.client.delete_namespace_metadata_item(
                 self.namespace, primitives.CLUSTER_LIST)
         else:
             self.client.set_namespace_metadata_item(
                 self.namespace, primitives.CLUSTER_LIST, all_clusters)
+
+        self.delete_metadata()
 
         # And remove the local config, if the caller wants the local side
         # effect. Everything above this point is the cluster; this is the
@@ -1608,8 +1720,22 @@ class Cluster:
             # and it is read from the instance rather than rebuilt from
             # md['node_serial'] so that a node this plugin did not name is
             # still drained by the name k3s knows it by.
+            #
+            # Lowercased, because a Kubernetes node name is a DNS
+            # subdomain name and those are lowercase: kubelet lowercases
+            # the hostname before it registers, and the API server would
+            # refuse an uppercase name if it did not. Shaken Fist does
+            # not lowercase -- its instance name guard permits "a-z, A-Z,
+            # 0-9, or hyphen (-)", in the POST handler in
+            # shakenfist/external_api/instance.py -- so
+            # "k3s-MyCluster-node-002" is a real instance name whose node
+            # k3s knows as "k3s-mycluster-node-002". Without this,
+            # remove-worker is unusable on any cluster whose name has a
+            # capital letter in it: the drain fails to find the node and
+            # raises CommandFailedError, which at least fails before
+            # anything is destroyed.
             inst = self.client.get_instance(instance_uuid)
-            node_name = inst['name']
+            node_name = inst['name'].lower()
 
             p.phase('Removing worker %s (uuid %s)' % (node_name, instance_uuid))
 
@@ -1628,14 +1754,23 @@ class Cluster:
             # spelling is load-bearing. Being explicit keeps this working
             # if these are ever run as a user whose default kubeconfig is
             # not k3s's.
+            #
+            # The node name is quoted per rule 1 at the top of this
+            # module. It cannot contain a shell metacharacter today --
+            # the instance it names was accepted by the Shaken Fist API,
+            # whose name check allows only letters, digits and hyphens --
+            # but a remote API's input validation is not this package's
+            # trust boundary, and delete() quotes the same string for the
+            # same reason.
+            quoted = shlex.quote(node_name)
             self.execute_and_await(
                 [md['control_plane_nodes'][0]],
                 ['kubectl drain %s --ignore-daemonsets --delete-emptydir-data '
-                 '--kubeconfig /etc/rancher/k3s/k3s.yaml' % node_name])
+                 '--kubeconfig /etc/rancher/k3s/k3s.yaml' % quoted])
             self.execute_and_await(
                 [md['control_plane_nodes'][0]],
                 ['kubectl delete node %s --kubeconfig /etc/rancher/k3s/k3s.yaml'
-                 % node_name])
+                 % quoted])
 
             p.note('drained %s and removed it from k3s' % node_name)
             self.client.delete_instance(instance_uuid)
@@ -1658,11 +1793,29 @@ class Cluster:
         metallb's configuration through the first control plane node, which
         an interrupted create may not have made, let alone installed
         metallb on.
+
+        It must also be a cluster which has metallb, which is checked
+        before an address is routed rather than after. The two halves of
+        this are allocate_metallb_addresses(), which routes floating
+        addresses and commits them to the metadata, and
+        configure_metallb_addresses(), whose first command waits five
+        minutes for a metallb pod. On a cluster created with
+        install_metallb=False that is five minutes of waiting for a
+        namespace which does not exist, ending in a CommandFailedError,
+        with the addresses already routed and charged for and nothing able
+        to hand them out. Refusing up front costs the caller an error
+        instead.
         """
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
         self.require_usable(md, 'expand-addresses')
+
+        # Absent means True: clusters built before create() recorded this
+        # all have metallb.
+        if not md.get('metallb_installed', True):
+            raise exceptions.ComponentNotInstalledError(
+                self.name, 'metallb', 'expand-addresses')
 
         p = progress.Progress(
             total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)

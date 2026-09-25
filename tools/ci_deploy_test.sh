@@ -11,7 +11,13 @@
 set -e
 set -o pipefail
 
-CLUSTER=ci
+# Deliberately mixed case. Shaken Fist accepts a capital letter in an
+# instance name and Kubernetes does not accept one in a node name, so on a
+# cluster named this way the k3s node name and the instance name differ.
+# remove-worker is the only verb which addresses a node by name, and this
+# is the only tier which can tell whether the name it computes is the one
+# k3s actually registered.
+CLUSTER=ciMixed
 # This tracks the cluster's k3s channel only loosely, which is fine for
 # the simple kubectl operations used here.
 # renovate: datasource=github-releases depName=kubernetes/kubernetes
@@ -65,6 +71,13 @@ wait_for_nodes() {
     fi
 }
 
+worker_uuids() {
+    # k3s show prints: worker_nodes = ['uuid-one', 'uuid-two']. Captured
+    # first for the reason count_routed_addresses() gives below.
+    show_output=$(sf-client k3s show "${CLUSTER}")
+    echo "${show_output}" | grep 'worker_nodes' | grep -o "'[^']*'" | tr -d "'"
+}
+
 count_routed_addresses() {
     # k3s show prints: routed_addresses = ['a.b.c.d', 'e.f.g.h']. The
     # show output is captured first so a failure of sf-client itself
@@ -95,8 +108,27 @@ sudo install -m 0755 "${tmpdir}/kubectl" /usr/local/bin/kubectl
 rm -rf "${tmpdir}"
 
 status 'Create the cluster'
+# A manifest staged at create time, which k3s applies itself the first
+# time the server starts. This is the only tier which can answer whether
+# the quoted heredoc survives the agent's command transport to land a
+# file k3s will parse -- the unit tests run the same command through
+# /bin/sh, which pins the quoting but not the transport.
+manifest_dir=$(mktemp -d)
+cat - > "${manifest_dir}/ci-staged.yaml" <<'MANIFEST'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ci-staged
+  namespace: default
+data:
+  # Metacharacters on purpose: these are what an unquoted heredoc would
+  # have expanded on the node before the file was written.
+  hazards: "$HOME `id` $(whoami) \"double\""
+MANIFEST
+
 sf-client k3s create "${CLUSTER}" \
-    --control-plane-count 1 --worker-count 2 --metal-address-count 2
+    --control-plane-count 1 --worker-count 2 --metal-address-count 2 \
+    --manifest "${manifest_dir}/ci-staged.yaml"
 
 status 'Fetch cluster credentials with getconfig'
 export KUBECONFIG=/tmp/k3s-ci-kubeconfig
@@ -104,6 +136,27 @@ sf-client k3s getconfig "${CLUSTER}" > "${KUBECONFIG}"
 
 status 'Verify all nodes become ready'
 wait_for_nodes 3
+
+status 'Verify the staged manifest was applied, byte for byte'
+staged=$(kubectl get configmap ci-staged -o jsonpath='{.data.hazards}')
+# Single quoted, so this side of the comparison is the literal text as
+# well: the value above is a YAML double quoted scalar, so the only
+# escape in it is the \" pair, and everything else is what k3s parsed.
+# shellcheck disable=SC2016
+# Nothing here is meant to expand: this is the literal text the manifest
+# carried, and the whole point is that nothing on the node expanded it
+# either.
+expected='$HOME `id` $(whoami) "double"'
+if [ "${staged}" != "${expected}" ]; then
+    echo "The staged ConfigMap says ${staged}"
+    echo "It should say ${expected}"
+    exit 1
+fi
+
+status 'Verify health reports a healthy cluster'
+# --strict is what makes this an assertion rather than a print: without
+# it health exits 0 whatever it found.
+sf-client k3s health "${CLUSTER}" --strict
 
 status 'Verify a LoadBalancer service gets an address and answers'
 # registry.k8s.io rather than Docker Hub: the under-cloud's shared
@@ -134,8 +187,28 @@ curl -sf --retry 10 --retry-delay 10 --retry-all-errors --max-time 10 \
     "http://${lb_address}/" > /dev/null
 
 status 'Expand the cluster with an extra worker'
+before_workers=$(worker_uuids | sort)
 sf-client k3s expand-workers "${CLUSTER}" --worker-count 1
 wait_for_nodes 4
+after_workers=$(worker_uuids | sort)
+
+status 'Remove the worker which was just added'
+new_worker=$(comm -13 <(echo "${before_workers}") <(echo "${after_workers}"))
+if [ "$(echo "${new_worker}" | wc -l)" -ne 1 ] || [ -z "${new_worker}" ]; then
+    echo "Expected exactly one new worker, found: ${new_worker}"
+    exit 1
+fi
+echo "Removing worker ${new_worker}"
+sf-client k3s remove-worker "${CLUSTER}" --worker "${new_worker}"
+
+# The node object has to be gone, not merely NotReady: remove-worker
+# drains and then deletes it, and a NotReady node left behind is the
+# failure the drain-first ordering exists to prevent.
+wait_for_nodes 3
+if sf-client k3s show "${CLUSTER}" | grep -q "${new_worker}"; then
+    echo "Worker ${new_worker} is still in the cluster metadata"
+    exit 1
+fi
 
 status 'Expand the MetalLB address pool'
 before=$(count_routed_addresses)

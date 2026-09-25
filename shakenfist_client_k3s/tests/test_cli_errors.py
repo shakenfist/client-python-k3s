@@ -12,16 +12,17 @@ below assert the first by invoking the subcommand object directly (which
 bypasses the group, so the exception escapes to the test) and the second
 by invoking through the group, where the handler catches it.
 
-Click 8.2 removed CliRunner's mix_stderr argument and made it always keep
-stdout and stderr separate, which is what these tests rely on: result.stdout
-and result.stderr are independently readable without any special
-construction. pyproject.toml floors click at >= 8.0.0 with no ceiling, and
-the tox environment this suite actually runs under installs 8.5.0, so this
-file is written against that separated-streams behaviour rather than against
-click 8.0/8.1's merged-by-default one.
+These tests read result.stdout and result.stderr independently, which no
+single CliRunner construction gives across the range of click this package
+declares: click 8.2 removed CliRunner's mix_stderr argument and made the
+streams always separate, while 8.0 and 8.1 merge them unless asked not to.
+separated_runner() below is what reconciles that; every runner in this file
+comes from it, and nothing here reads result.output, whose meaning differs
+between those versions even when the streams are separate.
 """
 
 import copy
+import inspect
 import time
 
 import click
@@ -70,6 +71,28 @@ def _response(payload, status_code=200, text='the server said no'):
     return resp
 
 
+def separated_runner(**kwargs):
+    """Build a CliRunner which keeps stdout and stderr apart, on any click.
+
+    pyproject.toml floors click at >= 8.0.0 and cannot reasonably raise
+    that to 8.2: click 8.2 requires Python >= 3.10 and this package
+    supports >= 3.7, so raising the floor would drop Python versions to
+    satisfy a test. An install which resolves 8.0 or 8.1 -- entirely
+    valid per the declared dependency, and not what the tox environment
+    happens to build -- gets a runner which merges the streams, where
+    result.stderr raises ValueError('stderr not separately captured') and
+    result.stdout returns the merged text, so every assertion in this
+    file would fail.
+
+    The signature is inspected rather than the call being wrapped in
+    try/except TypeError, so that a TypeError raised from inside
+    CliRunner for some other reason is not read as "this is click 8.2".
+    """
+    if 'mix_stderr' in inspect.signature(CliRunner).parameters:
+        return CliRunner(mix_stderr=False, **kwargs)
+    return CliRunner(**kwargs)
+
+
 class ClientTestCase(testtools.TestCase):
     """Shared plumbing: a mocked API client and a Click runner."""
 
@@ -77,7 +100,7 @@ class ClientTestCase(testtools.TestCase):
         super(ClientTestCase, self).setUp()
         self.client = mock.MagicMock()
         self.client.namespace = 'clientns'
-        self.runner = CliRunner()
+        self.runner = separated_runner()
 
     def _invoke(self, target, args, namespace_metadata=None):
         if namespace_metadata is not None:
@@ -100,7 +123,13 @@ class CommandExceptionTestCase(ClientTestCase):
                        namespace_metadata=None):
         result = self._invoke(target, args, namespace_metadata)
         self.assertIsInstance(result.exception, expected_class)
-        self.assertEqual('', result.output)
+
+        # Both streams, rather than result.output: result.output is
+        # stdout alone on click 8.0/8.1 with the streams separated, and
+        # an interleaved capture of both on 8.2+, so asserting on it
+        # means two different things depending on which click resolved.
+        self.assertEqual('', result.stdout)
+        self.assertEqual('', result.stderr)
         return result.exception
 
     def test_create_name_in_cluster_list(self):
@@ -340,7 +369,7 @@ class GroupHandlerScopeTestCase(testtools.TestCase):
     def test_cluster_exception_becomes_text_and_exit_one(self):
         group = self._group(exceptions.ClusterNotFoundError.not_found('banana'))
 
-        result = CliRunner().invoke(group, ['boom'], terminal_width=80)
+        result = separated_runner().invoke(group, ['boom'], terminal_width=80)
 
         self.assertEqual(1, result.exit_code)
         self.assertEqual('', result.stdout)
@@ -358,7 +387,7 @@ class GroupHandlerScopeTestCase(testtools.TestCase):
             'still waiting', 'timed out on pod one\ntimed out on pod two')
         group = self._group(error)
 
-        result = CliRunner().invoke(group, ['boom'], terminal_width=80)
+        result = separated_runner().invoke(group, ['boom'], terminal_width=80)
 
         self.assertEqual(1, result.exit_code)
         self.assertEqual('', result.stdout)
@@ -381,7 +410,8 @@ class GroupHandlerScopeTestCase(testtools.TestCase):
             'nope', 'GET', 'http://sf/instances', 401, 'not for you')
         group = self._group(error)
 
-        result = CliRunner().invoke(group, ['boom'], terminal_width=80)
+        result = separated_runner().invoke(group, ['boom'], terminal_width=80)
 
         self.assertIs(error, result.exception)
-        self.assertEqual('', result.output)
+        self.assertEqual('', result.stdout)
+        self.assertEqual('', result.stderr)
