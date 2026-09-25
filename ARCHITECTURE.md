@@ -39,20 +39,22 @@ that; this section is only the shape.
   control plane nodes, workers, MetalLB address allocation, and
   Longhorn storage; `k3s getconfig` fetches a kubeconfig;
   `k3s expand-workers` / `expand-addresses` grow a cluster;
-  `k3s update-os` updates every node's OS packages;
+  `k3s remove-worker` shrinks one; `k3s update-os` updates every
+  node's OS packages; `k3s health` reports a cluster's health;
   `k3s query-k3s-version` / `query-longhorn-version` inspect the
   release version caches. `GroupCatchClusterExceptions`, a
   `click.Group` subclass, is the single place that catches a
-  `K3sClusterException`, prints it and exits 1 -- every command
-  raises rather than exiting directly.
+  `K3sClusterException`, prints it to stderr and exits 1 -- every
+  command raises rather than exiting directly.
 - **`Cluster` (`cluster.py`)** -- everything scoped to one named
   cluster: its namespace metadata cache (`get_metadata()` /
   `set_metadata()` / `delete_metadata()`), the instance orchestration,
-  and the seven methods each command body above moved onto
+  and the nine methods each command body above moved onto
   (`create()`, `get_kubeconfig()`, `show()`, `delete()`,
-  `expand_workers()`, `expand_addresses()`, `update_os()`). Methods
-  return values instead of printing them, and raise
-  `exceptions.K3sClusterException` subclasses instead of exiting.
+  `expand_workers()`, `remove_worker()`, `expand_addresses()`,
+  `update_os()`, `health()`). Methods return values instead of
+  printing them, and raise `exceptions.K3sClusterException`
+  subclasses instead of exiting.
 - **Namespace scoped lookups and stateless helpers (`primitives.py`)**
   -- work with no cluster identity: the two release lookups, whose
   caches live in *namespace* metadata rather than any one cluster's,
@@ -83,11 +85,12 @@ that; this section is only the shape.
   channel
 - **Cluster assembly**: the first control plane node is installed
   with `k3s server`, additional control plane nodes and workers join
-  using the node token, MetalLB is installed (from the official
-  metallb helm chart -- the Bitnami chart references versioned
-  docker.io/bitnami images which stopped being published in 2025)
-  and configured with floating addresses routed to the node network,
-  and Longhorn is installed for persistent volumes
+  using the node token, and, unless a caller opts out, MetalLB is
+  installed (from the official metallb helm chart -- the Bitnami
+  chart references versioned docker.io/bitnami images which stopped
+  being published in 2025) and configured with floating addresses
+  routed to the node network, and Longhorn is installed for
+  persistent volumes
 - **Join address**: nodes register through the cluster's
   `join_address` (namespace metadata), initially the first control
   plane node's in-network address. It is mutable cluster state, not
