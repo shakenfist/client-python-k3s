@@ -9,8 +9,11 @@ prints today, so the Click layer can catch the common base once and print
 ``str(e)`` with no per-command formatting.
 
 ``GroupCatchClusterExceptions`` in ``__init__.py`` is that catch: it
-overrides ``click.Group.invoke()``, prints ``str(e)`` to stdout and exits
-1, and is the one place in this package which exits the process. Because
+overrides ``click.Group.invoke()``, prints ``str(e)`` to stderr and exits
+1, and is the one place in this package which exits the process. stderr
+rather than stdout because ``get-kubeconfig`` and the ``--json`` outputs
+put machine readable text on stdout, and an error printed there is text a
+pipeline would parse. Because
 ``shakenfist_client_k3s`` is imported unconditionally by the ``sf-client``
 plugin loader, this module must import nothing beyond the standard
 library.
@@ -32,11 +35,16 @@ class K3sClusterException(Exception):
 class ClusterExistsError(K3sClusterException):
     """Raised when a cluster create is attempted with a name already in use.
 
-    Raised by ``Cluster.create()``, from either of its two identical
-    checks: the name is already present in the namespace's cluster list,
-    or namespace metadata already exists for it.
-    Both render the same text, so this class does not need to distinguish
-    which check failed.
+    Raised by ``Cluster.create()``, from either of two checks: the name is
+    already present in the namespace's cluster list, or namespace metadata
+    already exists for it and records a cluster which finished being built.
+    The second check no longer always reaches here -- metadata whose
+    ``state`` is anything but ``created`` raises
+    ``ClusterInterruptedError.mid_create()`` instead, because a cluster
+    which never finished is a different problem with a different answer
+    (tear it down) from a name which is genuinely in use. Both paths which
+    do reach here render the same text, so this class does not need to
+    distinguish which check failed.
     """
 
     def __init__(self, name):
@@ -246,6 +254,39 @@ class WorkerNotFoundError(K3sClusterException):
                 % (self.name, ', '.join(self.instance_uuids)))
 
 
+class WorkerUnnamedError(K3sClusterException):
+    """Raised when a worker's instance has no name to drain its node by.
+
+    Raised by ``Cluster.remove_worker()``, which resolves every worker's
+    node name from its instance before it drains anything. k3s knows a node
+    by the hostname of the machine it runs on, and Shaken Fist derives that
+    from the instance's name, so an instance representation with no usable
+    ``name`` is one whose node cannot be identified. Draining the wrong node
+    would evict somebody else's pods, and skipping the drain would delete a
+    node object with workloads still on it, so this refuses instead --
+    before the first worker is touched, so nothing has been destroyed when
+    it fires.
+
+    Not reachable from the Shaken Fist API as it stands: every instance
+    representation it returns carries a name. It exists because
+    ``remove_worker()`` is the destructive verb and ``_node_health()``
+    already reads the same field defensively, and because a caller which
+    catches ``K3sClusterException`` should not be handed an
+    ``AttributeError`` from the middle of a multi-worker removal.
+    """
+
+    def __init__(self, name, instance_uuid):
+        self.name = name
+        self.instance_uuid = instance_uuid
+        super(WorkerUnnamedError, self).__init__(name)
+
+    def __str__(self):
+        return ('Cluster %s has a worker, instance %s, whose instance record\n'
+                'has no name, so the k3s node it became cannot be identified\n'
+                'and it cannot be drained.'
+                % (self.name, self.instance_uuid))
+
+
 class ComponentNotInstalledError(K3sClusterException):
     """Raised when a verb needs an optional component this cluster was built without.
 
@@ -284,8 +325,8 @@ class ManifestError(K3sClusterException):
     control plane node before k3s is installed there, so that k3s applies
     them itself when the server first starts. Decision 8 of the phase 3
     plan says nothing about them is templated, so this is not a validation
-    of what a manifest declares. It is a refusal of the six ways a file
-    cannot be staged at all, each of which would otherwise either corrupt
+    of what a manifest declares. It is a refusal of the seven ways a
+    file cannot be staged at all, each of which would otherwise either corrupt
     the payload or drop it silently:
 
     - ``not_a_manifest(path, suffixes)``: the basename does not end in
@@ -302,14 +343,24 @@ class ManifestError(K3sClusterException):
     - ``duplicate_basename(basename, first_path, second_path)``: two paths
       share a basename, and the basename is the destination filename, so
       the second write would silently replace the first.
-    - ``unreadable(path, detail)``: the local file could not be opened or
-      read. This is the check which stands in for
+    - ``unreadable(path, detail)``: the local file could not be opened,
+      read, or decoded as UTF-8. This is the check which stands in for
       ``click.Path(exists=True)`` for a library caller, which has no click
-      to check its paths for it.
-    - ``invalid_yaml(path, detail)``: the file is not parsable YAML (JSON
-      being a subset of it). k3s logs a failure to apply it and carries on,
-      so without this the cluster comes up looking healthy with the payload
-      missing.
+      to check its paths for it, and the reason the read names its
+      encoding and catches ``UnicodeDecodeError`` as well as ``OSError``:
+      a decode error is a ``ValueError``, and letting one out would put a
+      caller which catches ``K3sClusterException`` back to catching
+      builtins.
+    - ``invalid_yaml(path, detail)``: the file is not parsable YAML. k3s
+      logs a failure to apply it and carries on, so without this the
+      cluster comes up looking healthy with the payload missing.
+    - ``invalid_json(path, detail)``: the same refusal for a file whose
+      content marks it as JSON. Which of the two applies is decided by the
+      content and not by the suffix, because that is how k3s decides: see
+      the comment on the parse in ``read_manifests()``. One class rather
+      than two because the caller's problem is the same either way, and
+      separate ``reason`` values because the format named in the message
+      has to be the one the file is written in.
     - ``delimiter_collision(path, delimiter)``: a line of the file is
       exactly the heredoc delimiter the staging write uses, which would end
       the heredoc early and truncate the manifest.
@@ -380,6 +431,14 @@ class ManifestError(K3sClusterException):
         return cls('invalid_yaml', message, path=path, detail=detail)
 
     @classmethod
+    def invalid_json(cls, path, detail):
+        message = (
+            'Manifest %s is not valid JSON, so k3s would refuse to apply it:\n'
+            '%s'
+        ) % (path, detail)
+        return cls('invalid_json', message, path=path, detail=detail)
+
+    @classmethod
     def delimiter_collision(cls, path, delimiter):
         message = (
             'Manifest %s contains a line which is exactly %s, which is the\n'
@@ -388,6 +447,37 @@ class ManifestError(K3sClusterException):
         ) % (path, delimiter)
         return cls('delimiter_collision', message, path=path,
                    delimiter=delimiter)
+
+
+class SshKeyError(K3sClusterException):
+    """Raised when the ssh key handed to ``Cluster.create()`` cannot be read.
+
+    ``--sshkey`` (and the ``sshkey`` argument behind it) names a local
+    public key file whose content is put in the cloud-init user data of
+    every node, so it is read before the first instance is created. This is
+    the same refusal ``ManifestError.unreadable()`` is, for the same reason
+    and at the same point: the CLI has ``click.Path(exists=True)`` to catch
+    a path which is not there, a library caller has nothing, and an
+    ``OSError`` or ``UnicodeDecodeError`` out of ``create()`` is outside the
+    hierarchy phase 5's Ansible module catches.
+
+    A separate class rather than another ``ManifestError`` reason, because
+    the two are handed in by different arguments and a caller which wants
+    to tell "your manifest is unusable" from "your ssh key is unusable"
+    should be able to do it on the type.
+    """
+
+    def __init__(self, path, detail):
+        self.path = path
+        self.detail = detail
+        super(SshKeyError, self).__init__(path)
+
+    @classmethod
+    def unreadable(cls, path, detail):
+        return cls(path, detail)
+
+    def __str__(self):
+        return 'Could not read ssh key %s: %s' % (self.path, self.detail)
 
 
 class ReleaseLookupError(K3sClusterException):

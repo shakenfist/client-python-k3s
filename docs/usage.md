@@ -70,9 +70,19 @@ applies it itself the first time the server starts:
   built (instances included), because the destination filename is the
   source basename and the second write would silently replace the
   first on the node.
-- A file that cannot be read, is not valid YAML, or contains a line
-  that collides with the internal transfer marker is refused the same
-  way.
+- A file that cannot be read, cannot be decoded as UTF-8, does not
+  parse, or contains a line that collides with the internal transfer
+  marker is refused the same way. Manifests are read as UTF-8
+  regardless of the locale the command runs under, which is what YAML
+  and JSON both specify; a file in some other encoding is refused
+  rather than mis-decoded into something the cluster would then apply.
+- Whether a file is checked as JSON or as YAML is decided by its
+  content, not its name, because that is how k3s decides: leading
+  whitespace aside, a file starting with `{` goes to k3s's JSON
+  decoder untouched and anything else through its YAML parser. So a
+  tab indented `.json` manifest is accepted -- YAML forbids tabs for
+  indentation and JSON does not -- and a `.yaml` file that is really
+  JSON is accepted as JSON.
 - The filename must be a plain one: letters, digits, dots, underscores
   and hyphens, starting with a letter or a digit. The filename is
   interpolated into the command that writes the file on the control
@@ -157,12 +167,17 @@ sf-client k3s remove-worker mycluster \
 
 Every UUID given is checked against the cluster's worker list before
 anything happens, so a typo in the last of three fails the whole
-command rather than removing the first two and then failing. Each
-surviving worker is then drained (`kubectl drain --ignore-daemonsets
---delete-emptydir-data --timeout=300s`) and removed from k3s (`kubectl
-delete node`) before its instance is deleted, so that pods running on
-it are rescheduled rather than left orphaned on a node object nobody
-will ever clean up.
+command rather than removing the first two and then failing. The same
+is true of the node names: every one is resolved from its instance up
+front, so a worker whose instance record cannot supply one is refused
+before any other worker has been touched.
+
+Each worker being removed is then drained (`kubectl drain
+--ignore-daemonsets --delete-emptydir-data --timeout=300s`) and
+removed from k3s (`kubectl delete node`) before its instance is
+deleted, so that pods running on it are rescheduled rather than left
+orphaned on a node object nobody will ever clean up. The workers not
+named are left alone entirely.
 
 Removing the last worker of a cluster is allowed -- a k3s server node
 is schedulable, so a cluster with no workers still works.
@@ -174,10 +189,21 @@ other node with room -- `kubectl drain` gives up after its timeout and
 says which pod it could not move. Draining cordons the node as its
 first act, so the command then uncordons it before reporting the
 failure: a refused removal leaves the cluster as it found it rather
-than one node short of schedulable capacity. If the uncordon fails as
-well, the output says so and names the `kubectl uncordon` to run by
-hand; the original reason is still what the command reports, because
-that is the part you can act on.
+than one node short of schedulable capacity. The same applies to the
+`kubectl delete node` that follows a drain that did succeed -- by then
+the node is not only cordoned but empty, so a failure there is the one
+that most needs putting back. If the uncordon fails as well, the
+output says so and names the `kubectl uncordon` to run by hand; the
+original reason is still what the command reports, because that is the
+part you can act on.
+
+One failure is not undone, because by then there is nothing left to
+undo: an instance delete that fails after the node object is already
+gone from k3s. The worker stays in the cluster's records, so `delete`
+still destroys the instance and `health` still reports it, and the
+output names the instance to delete by hand before running
+`remove-worker` for it again. Dropping the record instead would leave
+an instance running that no command here could see.
 
 A worker whose instance has already been deleted out of band is
 removed from the cluster's records rather than refused. There is no
@@ -273,6 +299,15 @@ given a thirty second budget even then, because a command queued
 against an instance whose agent is not connected is accepted and then
 never runs. Each of those outcomes is reported on the `k3s API:` line
 with the reason, rather than waited on.
+
+An abandoned probe leaves its `kubectl get nodes` queued against the
+control plane node, and the reason on the `k3s API:` line names the
+agent operation so it can be recognised later: until Shaken Fist's own
+deadline ends it, a subsequent `expand-workers` or `update-os` waits
+for it along with everything else. That is a delay in a later command,
+not a hang, and it is worth knowing about if you poll `health` in a
+loop against a cluster whose agent is intermittently slow.
+
 Pass `--strict` to exit 1 when the cluster is not healthy, which is
 what makes `health` usable from a shell:
 

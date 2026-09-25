@@ -153,27 +153,42 @@ command is visible as a growing elapsed time, and idle waits describe
 the agent command currently executing rather than a bare operation
 count. The module is dependency free.
 
-The wait loops also detect failure. They wait while an operation can
-still progress -- `initial`, `preflight`, `queued`, `executing` -- and
-treat any other state as an ending, rather than naming the endings they
-expect. That matters because Shaken Fist gives every agent operation a
-wall clock budget and moves one that overruns it to `expired`, which is
+The wait loops also detect failure. They enumerate the agent operation
+states rather than naming the endings they expect: `initial`,
+`preflight`, `queued` and `executing` are still in progress, `error`
+and `expired` are failures, and `complete` and `deleted` are over. That
+matters because Shaken Fist gives every agent operation a wall clock
+budget and moves one that overruns it to `expired`, which is
 deliberately distinct from `error`, and because `deleted` is reachable
 from every state: a loop that waited for `complete` or `error` by name
 spun forever on either. An ending which is not `complete` aborts the
 command with the operation uuid, its state, the command it was on, and
 a pointer to `sf-client instance events` for the server side detail.
+
+A state none of those name is one Shaken Fist added later, and the two
+kinds of wait answer that differently on purpose. Waiting for an
+instance to go idle waits for it, because an unrecognised state is more
+likely a new way of being in flight than a new ending, and running the
+next install step over a command still executing corrupts the node; it
+says so once, naming the state. Waiting for a command's output raises,
+because that output only exists for `complete`. Neither can wedge the
+way `expired` did, because the server moves every operation out of
+whatever state it is in within its deadline.
+
 Failed operations which predate the current wait are ignored, so a
 historical failure does not prevent later commands like
 `expand-workers` from running. The one bounded wait is `health()`'s
 read-only probe, which carries a thirty second timeout and is skipped
 entirely when the node it would run on is not up -- an operation queued
 against an unreachable agent never leaves the queue, and that is the
-cluster the verb exists to describe. If a single agent command runs for more than five minutes a
-one-off note flags that it may be stalled. Notes emitted mid-wait
-leave the wait block's per-item timers intact (and, on a TTY, redraw
-the status block below the note), so a stall note does not reset the
-very elapsed counter it is drawing attention to.
+cluster the verb exists to describe. If a single agent command runs for
+more than five minutes a one-off note flags that it may be stalled.
+Every elapsed time here is measured on the monotonic clock, so a wall
+clock step mid-install cannot move a timeout or fire a stall note.
+Notes emitted mid-wait leave the wait block's per-item timers intact
+(and, on a TTY, redraw the status block below the note), so a stall
+note does not reset the very elapsed counter it is drawing attention
+to.
 
 ## Python Version Compatibility
 

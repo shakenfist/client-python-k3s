@@ -128,7 +128,14 @@ class Progress:
         self.stream = stream if stream is not None else sys.stdout
         self.total_phases = total_phases
         self.interactive = not verbose and self.stream.isatty()
-        self.started = time.time()
+
+        # time.monotonic() throughout this module rather than time.time().
+        # Every reading taken here is subtracted from another one to produce
+        # an elapsed time, and none of them is ever recorded or compared
+        # across processes, so a wall clock buys nothing and can step: an
+        # ntp correction during a long install would otherwise make a phase
+        # appear to take a negative amount of time, or an hour.
+        self.started = time.monotonic()
         self.phase_index = 0
 
         # Per wait block state: item key -> (status, time the status first
@@ -175,7 +182,7 @@ class Progress:
         had its current status, so a stalled command is visible as a
         growing elapsed time.
         """
-        now = time.time()
+        now = time.monotonic()
         prev = self._statuses.get(key)
         since = prev[1] if prev and prev[0] == status else now
 
@@ -191,7 +198,7 @@ class Progress:
 
     def _render_block(self):
         columns = shutil.get_terminal_size().columns
-        now = time.time()
+        now = time.monotonic()
         lines = []
         for key, (status, since, _) in self._statuses.items():
             line = '  %s: %s (%s)' % (key, status, format_elapsed(now - since))
@@ -218,4 +225,4 @@ class Progress:
     def finish(self, msg):
         """Print a completion line with the total elapsed time."""
         self.wait_done()
-        self._println('%s (%s total)' % (msg, format_elapsed(time.time() - self.started)))
+        self._println('%s (%s total)' % (msg, format_elapsed(time.monotonic() - self.started)))

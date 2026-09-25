@@ -22,7 +22,16 @@ from shakenfist_client_k3s.tests import fakes
 
 
 class FakeClock:
-    """A controllable stand-in for time.time()."""
+    """A controllable stand-in for time.monotonic().
+
+    monotonic() and not time(), because every elapsed time this package
+    measures is measured on the monotonic clock: a wall clock can step and an
+    elapsed time cannot. Patching progress.time.monotonic patches the name on
+    the time module itself, so this also stands in for cluster.py's readings
+    -- which is what WaitLoopTestCase relies on -- while leaving the release
+    cache timestamps in primitives.py, which are wall clock on purpose,
+    alone.
+    """
 
     def __init__(self, start=1000.0):
         self.now = start
@@ -130,7 +139,7 @@ class ProgressThroughCollectorTestCase(testtools.TestCase):
     def setUp(self):
         super().setUp()
         self.clock = FakeClock()
-        patcher = mock.patch('shakenfist_client_k3s.progress.time.time', self.clock)
+        patcher = mock.patch('shakenfist_client_k3s.progress.time.monotonic', self.clock)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -168,7 +177,7 @@ class ProgressLineModeTestCase(testtools.TestCase):
     def setUp(self):
         super().setUp()
         self.clock = FakeClock()
-        patcher = mock.patch('shakenfist_client_k3s.progress.time.time', self.clock)
+        patcher = mock.patch('shakenfist_client_k3s.progress.time.monotonic', self.clock)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -290,7 +299,7 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
         super().setUp()
         self.clock = FakeClock()
         for target, replacement in [
-                ('shakenfist_client_k3s.progress.time.time', self.clock),
+                ('shakenfist_client_k3s.progress.time.monotonic', self.clock),
                 ('shakenfist_client_k3s.progress.shutil.get_terminal_size',
                  lambda: os.terminal_size((80, 24)))]:
             patcher = mock.patch(target, replacement)
@@ -411,7 +420,7 @@ class WaitLoopTestCase(testtools.TestCase):
         super().setUp()
         self.clock = FakeClock()
         for target, replacement in [
-                ('shakenfist_client_k3s.progress.time.time', self.clock),
+                ('shakenfist_client_k3s.progress.time.monotonic', self.clock),
                 ('shakenfist_client_k3s.cluster.time.sleep',
                  lambda seconds: self.clock.advance(seconds))]:
             patcher = mock.patch(target, replacement)

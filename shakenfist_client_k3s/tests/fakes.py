@@ -56,6 +56,7 @@ class FakeClusterClient:
         self.metadata = {}
         self.instances = {}
         self.instance_serial = 0
+        self.instance_sshkeys = []
         self.aop_serial = 0
         self.routed_serial = 0
 
@@ -99,6 +100,11 @@ class FakeClusterClient:
 
     def create_instance(self, name, cpus, memory, networks, disks, sshkey,
                         userdata, side_channels=None, namespace=None):
+        # Recorded beside the instance rather than in it, because the real
+        # API does not return the key in an instance representation and a
+        # fake which did would let a test assert on a field that does not
+        # exist.
+        self.instance_sshkeys.append(sshkey)
         self.instance_serial += 1
         instance_uuid = 'inst-%03d' % self.instance_serial
         self.instances[instance_uuid] = {

@@ -113,6 +113,16 @@ orchestration the methods above are built from, not a supported
 entry point, so treat it as unstable even though nothing today
 stops a caller reaching it directly.
 
+One module level name in `cluster.py` is on the stable side of that
+line: `read_manifests(paths)`, which takes a list of local paths and
+returns a list of `(basename, content)` pairs, raising `ManifestError`
+for the first path it cannot stage. `create()` calls it before it
+allocates anything, and it is public deliberately so that a caller
+which wants to validate paths without building a cluster -- an Ansible
+module in check mode, a form which wants to reject a file before the
+operator waits twenty minutes -- can do the same check the real call
+will do. It touches no cluster and no API client.
+
 Phase 3 reshaped two of these rather than leaving them for later, and
 the reshaping is worth naming because it corrects what this page used
 to say about them. `install_workers()` now takes the instance uuids to
@@ -230,7 +240,9 @@ a correct caller never needs to catch it.
 | `ClusterNotFoundError` | the named cluster does not exist -- see method docstrings for which |
 | `ClusterIncompleteError` | `get_kubeconfig()` is called on a cluster that exists but has not finished `create()` |
 | `WorkerNotFoundError` | `remove_worker()` is given a uuid that is not one of the cluster's workers |
-| `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable, not valid YAML, or a line colliding with the staging marker |
+| `WorkerUnnamedError` | `remove_worker()` finds a worker whose instance record has no name, so the k3s node it became cannot be identified |
+| `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable or not decodable as UTF-8, not valid YAML or JSON, or a line colliding with the staging marker |
+| `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
@@ -271,17 +283,36 @@ every agent operation a deadline (600 seconds unless the creator asked
 for something else) and moves one that overruns it to `expired`, which
 it documents as deliberately distinct from `error`: "run it again with
 a longer deadline" and "the command is broken" are different next
-steps. Every wait in this library ends on any state the operation
-cannot leave, rather than on the two it used to name, so a state this
-library has never heard of ends a wait instead of spinning in one.
+steps. Every wait in this library enumerates the states an operation
+can be in, rather than naming the two endings it used to expect, so
+`expired` and `deleted` end a wait instead of spinning in one.
 
-`health()` is the exception to that, in the other direction: its
-`kubectl` probe carries a wall clock timeout, and it is skipped
-altogether when the node it would run on is not up. Both are reported
-as `api['probed'] is False` with an explanatory `api['error']`, and
-neither raises. `remove_worker([])` is likewise an accepted no-op, so a
-caller computing the removal list programmatically does not need to
-guard the call.
+A state this library has never heard of is handled differently by the
+two kinds of wait, which is worth knowing if you are reading the
+source. A wait for an instance to become idle keeps waiting and says
+so, because an unrecognised state is more likely a new way of being in
+flight than a new ending, and starting the next command over one that
+is still running would corrupt the node. A wait for a command's output
+raises, because that output exists only for `complete`. Neither can
+wedge: the server moves every operation out of whatever state it is in
+within its deadline.
+
+`health()` is the exception to all of that, in the other direction: its
+`kubectl` probe carries a timeout, and it is skipped altogether when
+the node it would run on is not up. Both are reported as
+`api['probed'] is False` with an explanatory `api['error']`, and
+neither raises. An abandoned probe does leave its operation queued
+against the control plane node until the server's deadline ends it, and
+`api['error']` names that operation: a caller polling `health()` in a
+loop should know that a later `expand_workers()` or `update_os()` waits
+for those alongside its own commands. `remove_worker([])` is likewise
+an accepted no-op, so a caller computing the removal list
+programmatically does not need to guard the call.
+
+Every elapsed time this library measures -- the probe's timeout, the
+stall notes, the progress reporting -- is taken from `time.monotonic()`,
+so a wall clock adjustment during a long create cannot shorten a
+timeout or invent a stall.
 
 `ComponentNotInstalledError` is the one exception here which depends on
 how the cluster was built rather than on what state it is in.

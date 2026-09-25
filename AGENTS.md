@@ -59,6 +59,14 @@ Both tiers skip a change touching only `docs/`. See
   used wherever one is available. The rule and its reasoning are at
   the top of `cluster.py`; `ShellQuotingTestCase` and
   `HeredocDelimiterTestCase` enforce it
+- Every `open()` states `encoding='utf-8'`, and a read of a
+  caller-supplied path catches `UnicodeDecodeError` as well as
+  `OSError`, so a decode failure stays inside `K3sClusterException`.
+  `FileEncodingIsStatedTestCase` enforces the first half
+- Elapsed time is measured with `time.monotonic()`, never
+  `time.time()`. The exception is the release caches in
+  `primitives.py`, which record when something happened and have to
+  survive a restart
 
 ## Planning and Pre-push Review
 

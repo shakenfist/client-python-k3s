@@ -1,7 +1,10 @@
+import ast
 import copy
 import io
+import json
 import os
 import subprocess
+import sys
 import tempfile
 
 # The PyPI mock backport is used for consistency with the other tests in
@@ -1213,15 +1216,19 @@ class ReadManifestsTestCase(testtools.TestCase):
 
     Everything it refuses, it refuses before create() has built anything,
     which is the whole reason it is a separate function called at the top of
-    create() rather than a loop inside install_control_plane(). Five of the
-    six refusals are each a way a manifest would otherwise be lost silently
-    -- overwritten by another manifest, copied to a filename k3s never
-    looks at, truncated by its own content, rejected on the node by a
+    create() rather than a loop inside install_control_plane(). Six of the
+    seven refusals are each a way a manifest would otherwise be lost
+    silently -- overwritten by another manifest, copied to a filename k3s
+    never looks at, truncated by its own content, rejected on the node by a
     parser nobody is watching -- or, in the case of an unreadable file, the
     check which stands in for click.Path(exists=True) for a caller with no
-    click. The sixth is about the name rather than the content: the
+    click. The seventh is about the name rather than the content: the
     basename is interpolated into a shell command line which runs as root
     on the control plane node.
+
+    Which parser the content is checked with is decided the way k3s decides
+    it, on the content and not the suffix, so the tests below check a JSON
+    manifest as JSON wherever k3s would.
     """
 
     def setUp(self):
@@ -1236,7 +1243,13 @@ class ReadManifestsTestCase(testtools.TestCase):
             directory = os.path.join(self.tempdir, subdir)
             os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, name)
-        with open(path, 'w') as f:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return path
+
+    def _write_bytes(self, name, content):
+        path = os.path.join(self.tempdir, name)
+        with open(path, 'wb') as f:
             f.write(content)
         return path
 
@@ -1364,6 +1377,105 @@ class ReadManifestsTestCase(testtools.TestCase):
         self.assertEqual('invalid_yaml', e.reason)
         self.assertEqual(path, e.path)
         self.assertIn(path, str(e))
+
+    def test_a_file_which_is_not_text_at_all_is_unreadable(self):
+        # UnicodeDecodeError is a ValueError, not an OSError, so a read which
+        # catches only OSError lets it out of the K3sClusterException
+        # hierarchy entirely -- which is the one thing unreadable() exists to
+        # stop for a library caller.
+        path = self._write_bytes('binary.yaml', b'kind: One\n# \xff\xfe\n')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [path])
+
+        self.assertEqual('unreadable', e.reason)
+        self.assertEqual(path, e.path)
+
+    def test_a_utf_8_manifest_reads_the_same_under_an_ascii_locale(self):
+        # The read states its encoding rather than inheriting the locale's.
+        # Without that, the same manifest is a different string depending on
+        # where this runs: a UnicodeDecodeError under LC_ALL=C, or worse, a
+        # successful mis-decode under a latin-1 locale which stages bytes the
+        # caller never supplied. A subprocess because tox sets LC_ALL to a
+        # UTF-8 locale for the suite, so this is the only way to vary it.
+        path = self._write('accented.yaml', 'kind: One\nname: caf\u00e9\n')
+        package_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(cluster_module.__file__)))
+        script = (
+            'import locale, sys\n'
+            'if "utf" in locale.getpreferredencoding(False).lower():\n'
+            '    print("SKIP"); sys.exit(0)\n'
+            'from shakenfist_client_k3s import cluster\n'
+            'print(cluster.read_manifests([%r])[0][1].encode("unicode_escape")'
+            '.decode())\n' % path)
+        env = {'PATH': os.environ.get('PATH', ''), 'LC_ALL': 'C',
+               'LANG': 'C', 'PYTHONCOERCECLOCALE': '0', 'PYTHONUTF8': '0',
+               'PYTHONPATH': package_root}
+
+        proc = subprocess.run([sys.executable, '-c', script], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        out = proc.stdout.decode('utf-8').strip()
+        if out == 'SKIP':
+            self.skipTest('this interpreter will not leave UTF-8 mode')
+        self.assertEqual('kind: One\\nname: caf\\xe9\\n', out)
+
+    def test_a_tab_indented_json_manifest_is_accepted(self):
+        # PyYAML implements YAML 1.1, which forbids tabs where JSON permits
+        # them, so a YAML-only gate refuses this. k3s does not: its deploy
+        # controller hands the document to apimachinery's ToJSON(), which
+        # returns a '{'-prefixed buffer untouched.
+        content = json.dumps({'kind': 'ConfigMap', 'metadata': {'name': 'x'}},
+                             indent='\t') + '\n'
+        self.assertIn('\n\t', content)
+        path = self._write('tabbed.json', content)
+
+        self.assertEqual([('tabbed.json', content)],
+                         cluster_module.read_manifests([path]))
+
+    def test_a_json_manifest_which_does_not_parse_is_refused_as_json(self):
+        path = self._write('broken.json', '{"kind": "ConfigMap",\n')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [path])
+
+        self.assertEqual('invalid_json', e.reason)
+        self.assertEqual(path, e.path)
+        self.assertIn('not valid JSON', str(e))
+
+    def test_json_content_in_a_yaml_file_is_checked_as_json(self):
+        # The suffix is not the deciding fact, because it is not the fact k3s
+        # decides on: IsJSONBuffer() looks at the content, so a .yaml file
+        # full of tab indented JSON is applied as JSON and must be accepted
+        # here as JSON too.
+        content = json.dumps({'kind': 'ConfigMap'}, indent='\t') + '\n'
+        path = self._write('really-json.yaml', content)
+
+        self.assertEqual([('really-json.yaml', content)],
+                         cluster_module.read_manifests([path]))
+
+    def test_a_json_file_which_is_not_object_shaped_is_checked_as_yaml(self):
+        # IsJSONBuffer() tests for '{' and nothing else, so a document
+        # starting with '[' goes through k3s's YAML path however it is named,
+        # and a tab in it is refused there rather than here.
+        path = self._write('list.json', '[{"kind": "ConfigMap"}]\n')
+        self.assertEqual([('list.json', '[{"kind": "ConfigMap"}]\n')],
+                         cluster_module.read_manifests([path]))
+
+        tabbed = self._write('tabbed-list.json', '[\n\t{"kind": "ConfigMap"}\n]\n')
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [tabbed])
+        self.assertEqual('invalid_yaml', e.reason)
+
+    def test_leading_whitespace_does_not_hide_the_json(self):
+        # apimachinery trims leading whitespace before it looks for the
+        # brace, so this is JSON to k3s and has to be JSON here.
+        content = '\n  ' + json.dumps({'kind': 'ConfigMap'}, indent='\t') + '\n'
+        path = self._write('indented.json', content)
+
+        self.assertEqual([('indented.json', content)],
+                         cluster_module.read_manifests([path]))
 
     def test_several_documents_in_one_file_are_still_yaml(self):
         # A manifest is routinely a multi document stream, which
@@ -2091,6 +2203,45 @@ class AgentOperationEndingsTestCase(testtools.TestCase):
 
         self.assertEqual(3, client.get_instance_agentoperations.call_count)
 
+    def test_await_idle_waits_for_a_state_it_does_not_recognise(self):
+        # The asymmetry this covers: await_fetch() raises for anything but
+        # 'complete', which is fail-safe, while await_idle() used to treat
+        # anything not in AGENT_OP_PENDING_STATES as finished, which is
+        # fail-open. A state Shaken Fist adds later is far more likely to be
+        # a new way of being in flight than a new ending, and declaring the
+        # instance idle would run the next install step over a command still
+        # executing on the node.
+        client = mock.MagicMock()
+        client.get_instance.return_value = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        def aops(state):
+            return [{'uuid': 'aop-001', 'instance_uuid': 'inst-001',
+                     'state': state, 'commands': [], 'results': {}}]
+
+        # Bounded, for the reason the class docstring gives: a regression
+        # which waits forever must fail rather than hang.
+        client.get_instance_agentoperations.side_effect = (
+            [[]] + [aops('reticulating')] * 3 + [aops('complete')])
+
+        reporter = progress.CollectingReporter()
+        cluster = Cluster(client, 'banana', 'testns', reporter=reporter)
+        with mock.patch('time.sleep', lambda seconds: None):
+            cluster.await_idle(['inst-001'])
+
+        # It kept waiting rather than declaring the instance idle at the
+        # first sight of the state.
+        self.assertEqual(5, client.get_instance_agentoperations.call_count)
+
+        # And said so, once, naming the state: a wait which silently treats
+        # a new state as "still running" is indistinguishable from a hang.
+        written = '\n'.join(reporter.lines)
+        self.assertIn('reticulating', written)
+        self.assertIn('not one this version of the k3s plugin knows about',
+                      written)
+        self.assertEqual(1, written.count('reticulating is not one'))
+
     def test_a_preexisting_expired_operation_does_not_wedge_the_wait(self):
         # The snapshot at the top of await_idle() exists so a historical
         # failure neither wedges the wait nor aborts it. It covered
@@ -2130,7 +2281,7 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
         def sleep(seconds):
             clock[0] += seconds
 
-        with mock.patch('time.time', lambda: clock[0]), \
+        with mock.patch('time.monotonic', lambda: clock[0]), \
                 mock.patch('time.sleep', sleep):
             return fn(), clock[0] - 1000.0
 
@@ -2151,6 +2302,21 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
 
         self.assertEqual('complete', aop['state'])
         self.assertEqual(3, elapsed)
+
+    def test_a_wall_clock_step_does_not_move_the_deadline(self):
+        # time.time() is not the clock for measuring how long something has
+        # been going: an ntp correction or somebody setting the date mid-wait
+        # would otherwise cut the probe short or extend it well past its
+        # bound. Here the wall clock is stuck at the epoch, which would make
+        # every deadline computed from it already past.
+        client, cluster = self._cluster(['queued'] * 100)
+
+        with mock.patch('time.time', lambda: 0.0):
+            aop, elapsed = self._with_clock(
+                lambda: cluster.await_execute(_pending_aop(), timeout=5))
+
+        self.assertEqual('queued', aop['state'])
+        self.assertEqual(5, elapsed)
 
     def test_no_timeout_keeps_waiting(self):
         # Which is every caller but the probe. An install which takes
@@ -2266,6 +2432,14 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
                       report['api']['error'])
         self.assertIn('still queued', report['api']['error'])
 
+        # The uuid of the operation left queued against the node, because
+        # this is the one outcome which leaves something behind: an
+        # await_idle() in a later verb waits for it until the server's
+        # deadline ends it, and a polling caller can only account for that
+        # if it is told which operation.
+        self.assertIn('agent operation aop-001 is still queued',
+                      report['api']['error'])
+
     def test_an_expired_probe_is_a_finding_and_names_the_state(self):
         self.client.probe_state = 'expired'
 
@@ -2277,15 +2451,22 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
 
 
 class ActionLogFailingDrainClient(ActionLogClient):
-    """An action log client whose kubectl drain (and optionally uncordon) fails."""
+    """An action log client where one nominated kubectl exits non-zero.
 
-    def __init__(self, uncordon_fails=False):
+    Parameterised by which command fails rather than hard wired to the
+    drain, because the property under test is that every command which can
+    leave the node cordoned routes through the uncordon, and 'kubectl
+    delete node' is the second of those.
+    """
+
+    def __init__(self, uncordon_fails=False, failing_prefix='kubectl drain'):
         super(ActionLogFailingDrainClient, self).__init__()
         self.uncordon_fails = uncordon_fails
+        self.failing_prefix = failing_prefix
 
     def instance_execute(self, instance_ref, commandline):
         self.actions.append(('execute', instance_ref, commandline))
-        failing = (commandline.startswith('kubectl drain')
+        failing = (commandline.startswith(self.failing_prefix)
                    or (self.uncordon_fails
                        and commandline.startswith('kubectl uncordon')))
         self.aop_serial += 1
@@ -2312,8 +2493,10 @@ class DrainFailureTestCase(testtools.TestCase):
     package would put it back, so a remove-worker which refuses has to.
     """
 
-    def _cluster(self, uncordon_fails=False):
-        client = ActionLogFailingDrainClient(uncordon_fails=uncordon_fails)
+    def _cluster(self, uncordon_fails=False,
+                 failing_prefix='kubectl drain'):
+        client = ActionLogFailingDrainClient(uncordon_fails=uncordon_fails,
+                                             failing_prefix=failing_prefix)
         client.metadata[MD_KEY] = {
             'name': 'banana', 'namespace': 'testns', 'state': 'created',
             'node_serial': 3, 'node_network': 'net-1', 'node_token': 'tok',
@@ -2389,6 +2572,52 @@ class DrainFailureTestCase(testtools.TestCase):
         self.assertEqual(['kubectl drain', 'kubectl uncordon'],
                          [' '.join(c.split()[:2]) for c in calls])
 
+    def test_a_failing_delete_node_also_uncordons(self):
+        # The drain succeeded, so the node is not merely cordoned but empty.
+        # Leaving it there costs the cluster a node's worth of schedulable
+        # capacity, which is exactly what remove_worker() promises a refused
+        # removal will not do.
+        client, _, cluster = self._cluster(
+            failing_prefix='kubectl delete node')
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(exceptions.CommandFailedError,
+                              cluster.remove_worker, ['inst-w1'])
+
+        self.assertEqual(
+            ['kubectl drain', 'kubectl delete', 'kubectl uncordon'],
+            [' '.join(a[2].split()[:2]) for a in client.actions if a[2]])
+        self.assertEqual([], [a for a in client.actions
+                              if a[0] == 'delete_instance'])
+        self.assertEqual(['inst-w1', 'inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_a_failing_instance_delete_keeps_the_worker_in_the_metadata(self):
+        # Past the point an uncordon helps: the node object is gone. The
+        # metadata entry stays so that 'k3s delete' still destroys the
+        # instance and health() still reports it -- dropping it would trade
+        # a visible stale entry for an instance nothing here can see -- and
+        # the recovery is said rather than attempted.
+        client, reporter, cluster = self._cluster(failing_prefix='never')
+        boom = apiclient.APIException(
+            'nope', 'DELETE', '/instances/inst-w1', 500, 'nope')
+
+        def delete_instance(instance_ref):
+            raise boom
+
+        client.delete_instance = delete_instance
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(apiclient.APIException,
+                              cluster.remove_worker, ['inst-w1'])
+
+        self.assertEqual(['inst-w1', 'inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+        written = '\n'.join(reporter.lines)
+        self.assertIn('still lists it as a worker', written)
+        self.assertIn('inst-w1', written)
+        # No uncordon: there is no node object left to put back in service.
+        self.assertNotIn('kubectl uncordon',
+                         ' '.join(a[2] or '' for a in client.actions))
+
     def test_a_failed_uncordon_does_not_replace_the_reason(self):
         # Reporting "the uncordon failed" instead of "the disruption budget
         # refused the eviction" loses the only thing the operator can act
@@ -2450,6 +2679,52 @@ class RemoveWorkerEdgeCaseTestCase(testtools.TestCase):
         self.assertEqual([], client.actions)
         self.assertEqual(['inst-w2'], client.metadata[MD_KEY]['worker_nodes'])
         self.assertIn('no longer exists', '\n'.join(reporter.lines))
+
+    def test_an_instance_with_no_name_is_refused(self):
+        # k3s knows a node by the hostname Shaken Fist built from the
+        # instance's name, so an instance with no name is one whose node
+        # cannot be identified. Draining a guess would evict somebody
+        # else's pods; skipping the drain would delete a node object with
+        # workloads still on it.
+        client, _, cluster = self._cluster()
+        del client.instances['inst-w1']['name']
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            e = self.assertRaises(exceptions.WorkerUnnamedError,
+                                  cluster.remove_worker, ['inst-w1'])
+
+        self.assertIn('inst-w1', str(e))
+        self.assertEqual([], client.actions)
+        self.assertEqual(['inst-w1', 'inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_a_null_name_is_refused_the_same_way(self):
+        client, _, cluster = self._cluster()
+        client.instances['inst-w1']['name'] = None
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(exceptions.WorkerUnnamedError,
+                              cluster.remove_worker, ['inst-w1'])
+
+        self.assertEqual([], client.actions)
+
+    def test_an_unnamed_worker_is_caught_before_the_first_one_is_drained(self):
+        # The same property the uuid check has: a run which discovers a
+        # problem on its second worker has already destroyed the first, so
+        # every name is resolved before anything is touched.
+        client, _, cluster = self._cluster()
+        del client.instances['inst-w2']['name']
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(exceptions.WorkerUnnamedError,
+                              cluster.remove_worker, ['inst-w1', 'inst-w2'])
+
+        self.assertEqual([], [a for a in client.actions
+                              if a[2] and a[2].startswith('kubectl')])
+        self.assertEqual([], [a for a in client.actions
+                              if a[0] == 'delete_instance'])
+        self.assertEqual(['inst-w1', 'inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
 
     def test_a_gone_instance_alongside_a_live_one(self):
         client, reporter, cluster = self._cluster()
@@ -2569,3 +2844,108 @@ class StagedManifestsAreWhatWasValidatedTestCase(testtools.TestCase):
         _make_cluster(self.client).install_control_plane()
 
         self.assertEqual([], self._writes())
+
+
+class SshKeyIsReadThroughTheHierarchyTestCase(testtools.TestCase):
+    """The other local path a caller hands create() is refused the same way.
+
+    The CLI has click.Path(exists=True) on --sshkey; a library caller has
+    nothing, and phase 5's Ansible module catches K3sClusterException. An
+    OSError out of create() is therefore a traceback in somebody's playbook
+    rather than an error message, which is the same defect ManifestError's
+    unreadable() exists to prevent for manifests.
+    """
+
+    def setUp(self):
+        super(SshKeyIsReadThroughTheHierarchyTestCase, self).setUp()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.tempdir = tempdir.name
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.client = fakes.FakeClusterClient()
+
+    def test_a_key_which_is_not_there_is_refused_in_the_hierarchy(self):
+        missing = os.path.join(self.tempdir, 'no-such-key.pub')
+
+        e = self.assertRaises(
+            exceptions.SshKeyError,
+            _make_cluster(self.client).create, 1, 1, 1, sshkey=missing)
+
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual(missing, e.path)
+        self.assertIn(missing, str(e))
+
+    def test_a_key_which_cannot_be_decoded_is_refused_the_same_way(self):
+        path = os.path.join(self.tempdir, 'binary.pub')
+        with open(path, 'wb') as f:
+            f.write(b'ssh-rsa AAAA\xff\xfe comment\n')
+
+        self.assertRaises(
+            exceptions.SshKeyError,
+            _make_cluster(self.client).create, 1, 1, 1, sshkey=path)
+
+    def test_a_key_with_a_non_ascii_comment_is_read_and_passed_on(self):
+        path = os.path.join(self.tempdir, 'accented.pub')
+        content = 'ssh-rsa AAAAB3Nz josé@example.com\n'
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+        _make_cluster(self.client).create(1, 1, 1, sshkey=path)
+
+        self.assertEqual([content], sorted(set(self.client.instance_sshkeys)))
+
+
+class FileEncodingIsStatedTestCase(testtools.TestCase):
+    """Every text file this package opens names the encoding it is in.
+
+    A general check rather than one assertion per call site, for the reason
+    HeredocDelimiterTestCase is general: the defect the review found was one
+    of five open() calls, and the useful property is that there is no sixth.
+    Without an encoding, open() uses locale.getpreferredencoding(), so the
+    same manifest, ssh key or kubeconfig is a different sequence of bytes
+    depending on where the plugin runs -- and that is the quiet failure, not
+    the UnicodeDecodeError.
+
+    Checked against the parsed source, because the alternative is exercising
+    every path under every locale. A new open() without an encoding fails
+    here and names its own line number.
+    """
+
+    def test_no_open_call_leaves_the_encoding_to_the_locale(self):
+        package_dir = os.path.dirname(cluster_module.__file__)
+        offenders = []
+
+        for name in sorted(os.listdir(package_dir)):
+            if not name.endswith('.py'):
+                continue
+            path = os.path.join(package_dir, name)
+            with open(path, encoding='utf-8') as f:
+                tree = ast.parse(f.read(), filename=path)
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                # Both spellings: a bare open() and an io.open()/builtins.open()
+                # have the same defect, and a check which only knew the first
+                # would report no offenders for a module using the second.
+                if isinstance(node.func, ast.Name):
+                    if node.func.id != 'open':
+                        continue
+                elif isinstance(node.func, ast.Attribute):
+                    if node.func.attr != 'open':
+                        continue
+                else:
+                    continue
+                # A binary mode open has no encoding to state.
+                modes = [a.value for a in node.args[1:2]
+                         if isinstance(a, ast.Constant)]
+                if modes and 'b' in modes[0]:
+                    continue
+                if not any(kw.arg == 'encoding' for kw in node.keywords):
+                    offenders.append('%s:%s' % (name, node.lineno))
+
+        self.assertEqual([], offenders)

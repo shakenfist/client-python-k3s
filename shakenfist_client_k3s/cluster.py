@@ -23,6 +23,7 @@ standard library from Python 3.8, and this package supports 3.7).
 """
 
 import copy
+import json
 import os
 import re
 from shakenfist_client import apiclient
@@ -53,8 +54,9 @@ BASE_OS_VERSION = 'debian:12'
 # notes that it might be stalled.
 STALL_WARNING_SECONDS = 300
 
-# The agent operation states an operation can still move out of, and the
-# ones which mean it finished without doing the work.
+# The agent operation states an operation can still move out of, the ones
+# which mean it finished without doing the work, and the ones which mean it
+# is over and nothing is owed.
 #
 # Waiting "while the operation can still progress" rather than "until it is
 # complete or error" is the load bearing part. Shaken Fist gives every
@@ -65,10 +67,27 @@ STALL_WARNING_SECONDS = 300
 # used to test for 'complete' and 'error' by name, so an expired operation
 # satisfied neither and the loop spun for as long as the process was left
 # running. 'deleted' is reachable from every state and had the same effect.
-# Enumerating what is still pending instead means a state this package has
-# never heard of ends a wait rather than wedging it.
+# Enumerating the states instead means the server can be the authority on
+# what an operation is doing.
+#
+# A state none of these three name is one Shaken Fist added after this
+# release, and the two kinds of wait here answer that differently on
+# purpose. await_idle() asks "may this instance be given another command",
+# and waits, because an unrecognised state is far more likely to be a new
+# way of being in flight than a new ending, and running the next install
+# step over a command which is still executing corrupts the node. It cannot
+# wedge the way 'expired' and 'deleted' did, because the server moves every
+# operation out of whatever state it is in within its deadline. await_fetch()
+# and reap_execute() ask "did this command run", and raise, because the
+# answer they need is only available from 'complete' and anything else is a
+# command whose output does not exist. Waiting is the safe default for the
+# first question and refusing is the safe default for the second, which is
+# why the asymmetry is deliberate rather than an oversight.
 AGENT_OP_PENDING_STATES = ('initial', 'preflight', 'queued', 'executing')
 AGENT_OP_FAILED_STATES = ('error', 'expired')
+AGENT_OP_FINISHED_STATES = ('complete', 'deleted')
+AGENT_OP_KNOWN_STATES = (AGENT_OP_PENDING_STATES + AGENT_OP_FAILED_STATES
+                         + AGENT_OP_FINISHED_STATES)
 
 # How long health()'s read only probe waits for its one command before it
 # reports a timeout as a finding. The server's own deadline would bound it
@@ -183,10 +202,22 @@ def read_manifests(paths):
             raise exceptions.ManifestError.duplicate_basename(
                 basename, by_basename[basename], path)
 
+        # encoding is stated rather than inherited from the locale.
+        # Without it the file is decoded with locale.getpreferredencoding(),
+        # so the same manifest is a different string on a UTF-8 host and an
+        # ASCII or latin-1 one -- either a UnicodeDecodeError, or worse, a
+        # successful mis-decode which stages bytes the caller did not
+        # supply. YAML is UTF-8 by specification and so is JSON, so there is
+        # one right answer and it does not depend on where this runs.
+        #
+        # UnicodeDecodeError is a ValueError, not an OSError, so it is named
+        # here explicitly: without it a manifest which cannot be decoded
+        # escapes the K3sClusterException hierarchy entirely, which is the
+        # one thing unreadable() exists to prevent for a library caller.
         try:
-            with open(path) as f:
+            with open(path, encoding='utf-8') as f:
                 content = f.read()
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             raise exceptions.ManifestError.unreadable(path, str(e))
 
         # Parsed and thrown away: this asks whether k3s will be able to
@@ -194,12 +225,29 @@ def read_manifests(paths):
         # does not parse is applied by nobody and reported to nobody --
         # k3s logs it on the node and carries on -- so the cluster comes
         # up healthy with the payload missing unless we refuse it here.
-        # safe_load_all because a manifest is routinely several documents,
-        # and JSON is a subset of YAML so the same parse covers it.
-        try:
-            list(yaml.safe_load_all(content))
-        except yaml.YAMLError as e:
-            raise exceptions.ManifestError.invalid_yaml(path, str(e))
+        #
+        # Which parser to use is decided by the content and not by the
+        # suffix, because that is how k3s decides. Its deploy controller
+        # (pkg/deploy/controller.go) hands each document to ToJSON() in
+        # k8s.io/apimachinery/pkg/util/yaml, which returns the bytes
+        # untouched when IsJSONBuffer() says that, with leading whitespace
+        # trimmed, they start with '{', and only otherwise runs them
+        # through a YAML parser. Branching on the suffix instead would
+        # refuse a tab indented .json file that k3s applies happily:
+        # PyYAML implements YAML 1.1, which forbids tabs where JSON
+        # permits them, and json.dump(indent='\t') writes exactly that.
+        # safe_load_all for the YAML case because a manifest is routinely
+        # several documents.
+        if content.lstrip().startswith('{'):
+            try:
+                json.loads(content)
+            except ValueError as e:
+                raise exceptions.ManifestError.invalid_json(path, str(e))
+        else:
+            try:
+                list(yaml.safe_load_all(content))
+            except yaml.YAMLError as e:
+                raise exceptions.ManifestError.invalid_yaml(path, str(e))
 
         if K3S_MANIFEST_DELIMITER in content.split('\n'):
             raise exceptions.ManifestError.delimiter_collision(
@@ -445,6 +493,7 @@ class Cluster:
 
         running_since = {}
         stall_warned = set()
+        state_warned = set()
 
         while waiting:
             for instance_uuid in copy.copy(waiting):
@@ -459,11 +508,28 @@ class Cluster:
                 if failed:
                     raise self._agent_op_error(failed[0])
 
-                # Pending rather than "not complete": an operation which
-                # somebody deleted is finished, and counting it as
-                # incomplete waits for something which will never happen.
+                # "Not finished" rather than "pending": an operation which
+                # somebody deleted is finished and must not be waited for,
+                # but an operation in a state this version has never heard
+                # of must be, because declaring the instance idle would run
+                # the next install step over a command which may still be
+                # executing. See AGENT_OP_KNOWN_STATES for why this loop
+                # waits where await_fetch() raises.
                 incomplete = [aop for aop in agent_ops
-                              if aop['state'] in AGENT_OP_PENDING_STATES]
+                              if aop['state'] not in AGENT_OP_FINISHED_STATES]
+
+                # Said once per unrecognised state rather than per poll, and
+                # said at all because a wait which silently treats a new
+                # state as "still running" is indistinguishable from a hang
+                # until it ends.
+                for state in sorted({aop['state'] for aop in agent_ops
+                                     if aop['state'] not in AGENT_OP_KNOWN_STATES}):
+                    if state not in state_warned:
+                        state_warned.add(state)
+                        p.note('agent operation state %s is not one this version of '
+                               'the k3s plugin knows about; waiting for it as though '
+                               'the command were still running' % state)
+
                 if not incomplete:
                     p.update(inst['name'], 'idle')
                     waiting.remove(instance_uuid)
@@ -480,7 +546,20 @@ class Cluster:
                     # long. The progress elapsed times show the same thing, but
                     # this note includes the operation uuid and where to look
                     # for more detail, and persists in scrollback.
-                    now = time.time()
+                    #
+                    # time.monotonic() rather than time.time() here and in
+                    # await_execute(), because both are measuring how long
+                    # something has been going rather than what the time is.
+                    # A wall clock can step -- ntp correcting a drifted
+                    # clock, or somebody setting the date -- and a step
+                    # backwards through a comparison against time.time()
+                    # silently extends a bound, while a step forwards fires
+                    # a stall warning for a command which has been running
+                    # for seconds. The release caches in primitives.py do
+                    # use time.time(), correctly: they record when something
+                    # happened, which has to survive a restart, and a
+                    # monotonic clock is meaningless across processes.
+                    now = time.monotonic()
                     command_key = (aop['uuid'], len(aop.get('results', {}) or {}))
                     running_since.setdefault(command_key, now)
                     if (now - running_since[command_key] >= STALL_WARNING_SECONDS
@@ -524,7 +603,8 @@ class Cluster:
         finding health() exists to report, so it needs the wait without the
         judgement.
 
-        timeout is a wall clock budget in seconds, after which the operation
+        timeout is a budget in seconds measured on the monotonic clock,
+        after which the operation
         as last seen is returned with whatever state it had. It is None for
         every caller but health()'s probe: an install which takes eleven
         minutes is a slow install rather than a failed one, and abandoning
@@ -535,9 +615,9 @@ class Cluster:
         operation; reap_execute() does not pass one, and so its own state
         check is exhaustive.
         """
-        deadline = None if timeout is None else time.time() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         while aop['state'] in AGENT_OP_PENDING_STATES:
-            if deadline is not None and time.time() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 return aop
             time.sleep(1)
             aop = self.client.get_agent_operation(aop['uuid'])
@@ -668,11 +748,17 @@ class Cluster:
             # probe when it can already see that from the instance, so
             # reaching here means the instance looked well and the command
             # still did not run.
+            # The operation uuid is in the message because this is the one
+            # outcome which leaves something behind on the cluster: the
+            # command is still queued against the instance, and this is
+            # where an operator or a polling caller finds out which one to
+            # look at. See health()'s docstring for what that costs.
             probe['probed'] = False
             probe['error'] = (
-                "'%s' had not finished after %s seconds (the agent operation "
+                "'%s' had not finished after %s seconds (agent operation %s "
                 'is still %s), so the wait was abandoned'
-                % (command, HEALTH_PROBE_TIMEOUT_SECONDS, aop['state']))
+                % (command, HEALTH_PROBE_TIMEOUT_SECONDS, aop['uuid'],
+                   aop['state']))
             return probe
 
         if aop['state'] in AGENT_OP_FAILED_STATES:
@@ -1214,11 +1300,20 @@ class Cluster:
                 time.sleep(1)
             p.wait_done()
 
-        # Read the ssh key if any
+        # Read the ssh key if any. Guarded and with the encoding stated for
+        # the same two reasons read_manifests() is: this is the other local
+        # path a caller hands in, an OpenSSH public key's comment field can
+        # hold any bytes the user put in it, and a library caller which
+        # catches K3sClusterException should not have to catch OSError as
+        # well to survive a path which does not exist. The CLI's own
+        # click.Path(exists=True) covers only the CLI.
         ssh_key_content = None
         if sshkey:
-            with open(sshkey) as f:
-                ssh_key_content = f.read()
+            try:
+                with open(sshkey, encoding='utf-8') as f:
+                    ssh_key_content = f.read()
+            except (OSError, UnicodeDecodeError) as e:
+                raise exceptions.SshKeyError.unreadable(sshkey, str(e))
 
         # Initialise the metadata
         self.reporter.debug('Initialize cluster metadata')
@@ -1344,7 +1439,7 @@ class Cluster:
             if not os.path.exists(main_config_path):
                 # There is no existing configuration to preserve, so no merge is
                 # required and we don't need a local kubectl.
-                with open(main_config_path, 'w') as f:
+                with open(main_config_path, 'w', encoding='utf-8') as f:
                     f.write(yaml.dump(kc))
             else:
                 if not shutil.which('kubectl'):
@@ -1353,7 +1448,7 @@ class Cluster:
 
                 with tempfile.TemporaryDirectory() as tempdir:
                     new_config_path = os.path.join(tempdir, 'config')
-                    with open(new_config_path, 'w') as f:
+                    with open(new_config_path, 'w', encoding='utf-8') as f:
                         f.write(yaml.dump(kc))
                     merged = subprocess.run(
                         'kubectl config view --flatten', shell=True, capture_output=True,
@@ -1375,7 +1470,7 @@ class Cluster:
                     # the no-merge path above.
                     merged_kc = yaml.safe_load(merged.stdout)
                     merged_kc['current-context'] = fqcn
-                    with open(main_config_path, 'w') as f:
+                    with open(main_config_path, 'w', encoding='utf-8') as f:
                         f.write(yaml.dump(merged_kc))
 
         # setup_metallb() recorded the routed addresses it allocated, and
@@ -1523,6 +1618,18 @@ class Cluster:
         therefore not assume anything create() records, which is why
         md['control_plane_nodes'] being empty is a finding about the API
         probe rather than an IndexError.
+
+        One thing this leaves behind, which matters to a caller polling it in
+        a loop: the probe submits an agent operation, and when it gives up
+        waiting the operation is still queued against the control plane node.
+        Nothing here reaps it, because there is nothing to reap it with -- the
+        command may yet run -- so the server's own deadline ends it, and until
+        then an await_idle() in a later expand-workers or update-os waits for
+        it along with everything else. The uuid of an abandoned operation is in
+        ``api['error']`` so that wait can be accounted for rather than
+        guessed at. This is bounded rather than free: a reconcile loop
+        polling health() against a node whose agent is intermittently slow
+        pays for it in a delayed later verb, not in a hang.
         """
         md = self.get_metadata()
         if not md:
@@ -1800,12 +1907,13 @@ class Cluster:
         fail on ``md['control_plane_nodes'][0]``, or on a drain aimed at a
         node where k3s was never installed.
 
-        Every uuid is checked against this cluster's worker list before
-        anything is drained or deleted, so a typo in the third of three
-        arguments fails the call rather than destroying the first two.
-        Workers are then removed one at a time, each committed to metadata
-        before the next is started, so an interrupted run leaves the
-        metadata describing the cluster which actually exists.
+        Every uuid is checked against this cluster's worker list, and every
+        node name resolved from its instance, before anything is drained or
+        deleted, so a typo in the third of three arguments fails the call
+        rather than destroying the first two. Workers are then removed one
+        at a time, each committed to metadata before the next is started, so
+        an interrupted run leaves the metadata describing the cluster which
+        actually exists.
 
         Removing the last worker is allowed, and is the caller's business:
         a k3s server node is schedulable, so a cluster with no workers is a
@@ -1823,7 +1931,16 @@ class Cluster:
         because cordoning is the drain's first act, so this uncordons it
         before re-raising: a refused removal has to leave the cluster as it
         found it, not one node short of schedulable capacity with nothing
-        in this package which would put it back.
+        in this package which would put it back. The ``kubectl delete
+        node`` which follows a successful drain is inside the same guard,
+        because by then the node is not only cordoned but empty, so a
+        failure there is the case which most needs the uncordon.
+
+        Only one failure is not undone, and it is the one where there is
+        nothing left to undo: a ``delete_instance`` which fails after the
+        node object is gone. The worker stays in this cluster's metadata so
+        that ``delete`` still destroys the instance and health() still
+        reports it, and the message says which instance to delete by hand.
 
         An instance in ``md['worker_nodes']`` which no longer exists is
         removed from the metadata rather than refused. There is no node to
@@ -1871,45 +1988,62 @@ class Cluster:
             stream=self.reporter)
         self.progress = p
 
+        # Every node name is resolved before anything is drained or deleted,
+        # for the reason the uuid check above runs first: this loop destroys
+        # things, and a run which discovers a problem on its third worker
+        # has already destroyed the first two. Reading three instances costs
+        # three API calls and turns "half the workers are gone and the
+        # command failed" into a refusal.
+        #
+        # k3s names a node after the hostname of the machine it runs on, and
+        # Shaken Fist derives the guest's hostname from the instance's name:
+        # the config drive it builds sets meta_data.json's "hostname" to
+        # "<instance name>.local" (see shakenfist/instance.py), which
+        # cloud-init applies as the short hostname. There is no separate
+        # hostname field in the instance API representation to read instead,
+        # so 'name' is the field, and it is read from the instance rather
+        # than rebuilt from md['node_serial'] so that a node this plugin did
+        # not name is still drained by the name k3s knows it by.
+        #
+        # Lowercased, because a Kubernetes node name is a DNS subdomain name
+        # and those are lowercase: kubelet lowercases the hostname before it
+        # registers, and the API server would refuse an uppercase name if it
+        # did not. Shaken Fist does not lowercase -- its instance name guard
+        # permits "a-z, A-Z, 0-9, or hyphen (-)", in the POST handler in
+        # shakenfist/external_api/instance.py -- so "k3s-MyCluster-node-002"
+        # is a real instance name whose node k3s knows as
+        # "k3s-mycluster-node-002". Without this, remove-worker is unusable
+        # on any cluster whose name has a capital letter in it: the drain
+        # fails to find the node and raises CommandFailedError, which at
+        # least fails before anything is destroyed.
+        #
+        # ResourceNotFoundException is caught for the reason delete()
+        # catches it per instance: cluster metadata can name an instance
+        # somebody has since deleted out from under it. health() reports
+        # that as a finding and delete() tolerates it, and this is the only
+        # verb which can take the entry out of the metadata, so refusing it
+        # would make a stale entry unfixable short of deleting the whole
+        # cluster. A None name below means that case and only that case.
+        #
+        # .get() rather than a subscript, matching _node_health(), and then
+        # refused rather than worked around: an instance representation with
+        # no name is not one this verb can drain, and guessing would drain
+        # the wrong node. It is not reachable from the API as it stands,
+        # which is why it is a check and not a code path with a story.
+        resolved = []
         for instance_uuid in wanted:
-            # k3s names a node after the hostname of the machine it runs on,
-            # and Shaken Fist derives the guest's hostname from the
-            # instance's name: the config drive it builds sets
-            # meta_data.json's "hostname" to "<instance name>.local" (see
-            # shakenfist/instance.py), which cloud-init applies as the short
-            # hostname. There is no separate hostname field in the instance
-            # API representation to read instead, so 'name' is the field,
-            # and it is read from the instance rather than rebuilt from
-            # md['node_serial'] so that a node this plugin did not name is
-            # still drained by the name k3s knows it by.
-            #
-            # Lowercased, because a Kubernetes node name is a DNS
-            # subdomain name and those are lowercase: kubelet lowercases
-            # the hostname before it registers, and the API server would
-            # refuse an uppercase name if it did not. Shaken Fist does
-            # not lowercase -- its instance name guard permits "a-z, A-Z,
-            # 0-9, or hyphen (-)", in the POST handler in
-            # shakenfist/external_api/instance.py -- so
-            # "k3s-MyCluster-node-002" is a real instance name whose node
-            # k3s knows as "k3s-mycluster-node-002". Without this,
-            # remove-worker is unusable on any cluster whose name has a
-            # capital letter in it: the drain fails to find the node and
-            # raises CommandFailedError, which at least fails before
-            # anything is destroyed.
-            #
-            # ResourceNotFoundException is caught for the reason delete()
-            # catches it per instance: cluster metadata can name an
-            # instance somebody has since deleted out from under it.
-            # health() reports that as a finding and delete() tolerates
-            # it, and this is the only verb which can take the entry out
-            # of the metadata, so refusing it would make a stale entry
-            # unfixable short of deleting the whole cluster.
             try:
                 inst = self.client.get_instance(instance_uuid)
-                node_name = inst['name'].lower()
             except apiclient.ResourceNotFoundException:
-                node_name = None
+                resolved.append((instance_uuid, None))
+                continue
 
+            node_name = inst.get('name')
+            if not node_name:
+                raise exceptions.WorkerUnnamedError(self.name, instance_uuid)
+            resolved.append((instance_uuid, node_name.lower()))
+
+        for instance_uuid, node_name in resolved:
             if node_name is None:
                 p.phase('Removing worker %s, whose instance is already gone'
                         % instance_uuid)
@@ -1953,25 +2087,56 @@ class Cluster:
                      '--delete-emptydir-data --timeout=%s '
                      '--kubeconfig /etc/rancher/k3s/k3s.yaml'
                      % (quoted, KUBECTL_DRAIN_TIMEOUT)])
+                self.execute_and_await(
+                    [md['control_plane_nodes'][0]],
+                    ['kubectl delete node %s --kubeconfig /etc/rancher/k3s/k3s.yaml'
+                     % quoted])
             except (exceptions.K3sClusterException,
                     apiclient.APIException):
                 # Both hierarchies, because the question is whether the
-                # drain might have cordoned the node rather than which
-                # kind of failure stopped it. An APIException from the
+                # node might now be cordoned rather than which kind of
+                # failure stopped the command. An APIException from the
                 # submission means it never ran and there is nothing to
                 # undo, and an uncordon of a node which was never
                 # cordoned is a no-op, so covering both costs one
                 # harmless command in the case which does not need it.
+                #
+                # Both commands are inside the guard, because a drain
+                # which succeeded has already cordoned the node and
+                # evicted every pod on it. A 'kubectl delete node' which
+                # then fails would otherwise leave the cluster one
+                # schedulable node short with nothing in this package
+                # willing to put it back -- the outcome this method's
+                # docstring promises not to produce. The delete is still
+                # a separate submission from the drain rather than a
+                # second command in the same one, because
+                # execute_and_await() submits everything it is given and
+                # only then reads the return codes, which would delete a
+                # node still running the pods the drain could not move.
                 self._uncordon(md['control_plane_nodes'][0], node_name, quoted)
                 raise
 
-            self.execute_and_await(
-                [md['control_plane_nodes'][0]],
-                ['kubectl delete node %s --kubeconfig /etc/rancher/k3s/k3s.yaml'
-                 % quoted])
-
             p.note('drained %s and removed it from k3s' % node_name)
-            self.client.delete_instance(instance_uuid)
+
+            # Past the point an uncordon could help: the node object is gone
+            # from k3s, so there is nothing left to put back into service,
+            # and the entry in md['worker_nodes'] is deliberately left alone
+            # rather than removed before the instance is. Keeping it means
+            # 'k3s delete' still destroys this instance and health() still
+            # reports it; dropping it first would trade a visible stale
+            # entry for an instance nothing in this package can see, which
+            # is the worse of the two. So the recovery is stated rather than
+            # attempted, and the original failure is the one raised.
+            try:
+                self.client.delete_instance(instance_uuid)
+            except apiclient.APIException:
+                self.reporter.write(
+                    'Node %s has been removed from k3s but its instance could '
+                    'not be deleted, so cluster %s still lists it as a worker. '
+                    'Delete instance %s and run remove-worker for it again to '
+                    'take it out of the cluster metadata.\n'
+                    % (node_name, self.name, instance_uuid))
+                raise
 
             # list.remove() rather than a rebuilt list: the survivors keep
             # the order they were created in, which is the order every other
@@ -1984,12 +2149,14 @@ class Cluster:
             progress.count_str(len(wanted), 'worker'), self.name))
 
     def _uncordon(self, control_plane_uuid, node_name, quoted_node_name):
-        """Put a node back in service after a drain which did not finish.
+        """Put a node back in service after a removal which did not finish.
 
         ``kubectl drain`` cordons before it evicts, so every way the drain
-        can fail leaves the node unschedulable. Nothing else in this
-        package would put it back, which would make a refused
-        remove-worker worse for the cluster than not running it.
+        can fail leaves the node unschedulable -- and so does a successful
+        drain whose ``kubectl delete node`` then fails, which is the worse
+        of the two because the node is empty as well. Nothing else in this
+        package would put it back, which would make a refused remove-worker
+        worse for the cluster than not running it.
 
         The original failure is the one the caller needs, so this never
         raises: an uncordon which itself fails is reported and swallowed,
@@ -1999,10 +2166,10 @@ class Cluster:
         exception hierarchies are caught for that reason and not because
         either is expected -- apiclient's exceptions do not descend from
         K3sClusterException, so catching only ours would let an
-        unreachable API mask the drain's explanation.
+        unreachable API mask the original explanation.
         """
         self.reporter.write(
-            'The drain of %s did not finish, so it is still cordoned. '
+            'The removal of %s did not finish, so it may still be cordoned. '
             'Uncordoning it.\n' % node_name)
         try:
             self.execute_and_await(

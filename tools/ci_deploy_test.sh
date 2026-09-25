@@ -18,6 +18,13 @@ set -o pipefail
 # is the only tier which can tell whether the name it computes is the one
 # k3s actually registered.
 CLUSTER=ciMixed
+# The second, deliberately minimal cluster: one control plane node and
+# none of the optional components. It exists because --no-metallb,
+# --no-longhorn and --no-kubeconfig change what create() does on a real
+# cluster and nowhere else can tell whether skipping those steps leaves a
+# working cluster behind. It is cheaper than the cluster above rather
+# than more expensive: no worker nodes, and neither component install.
+MINIMAL_CLUSTER=ciMinimal
 # This tracks the cluster's k3s channel only loosely, which is fine for
 # the simple kubectl operations used here.
 # renovate: datasource=github-releases depName=kubernetes/kubernetes
@@ -238,6 +245,55 @@ fi
 remaining=$(sf-client instance list --all | grep "k3s-${CLUSTER}-node" | grep -cv 'deleted' || true)
 if [ "${remaining}" -ne 0 ]; then
     echo "Found ${remaining} instances still present after deletion"
+    exit 1
+fi
+
+status 'Create a cluster with none of the optional components'
+# HOME is left alone on purpose: --no-kubeconfig has to be the thing that
+# leaves ~/.kube/config alone, not the absence of a home directory.
+sf-client k3s create "${MINIMAL_CLUSTER}" \
+    --control-plane-count 1 --worker-count 0 --metal-address-count 0 \
+    --no-metallb --no-longhorn --no-kubeconfig
+
+status 'Verify --no-kubeconfig wrote no local kubeconfig'
+# The main cluster above used getconfig and an explicit KUBECONFIG, so
+# nothing in this script has written the default path. If it exists, the
+# create did it.
+if [ -e "${HOME}/.kube/config" ]; then
+    echo "create --no-kubeconfig wrote ${HOME}/.kube/config anyway"
+    exit 1
+fi
+
+status 'Verify the minimal cluster is healthy and answers kubectl'
+# The credentials are in the cluster metadata either way, which is the
+# point of the flag: --no-kubeconfig declines to touch the local file, it
+# does not decline to build a usable cluster.
+sf-client k3s health "${MINIMAL_CLUSTER}" --strict
+KUBECONFIG=/tmp/k3s-ci-kubeconfig-minimal
+sf-client k3s getconfig "${MINIMAL_CLUSTER}" > "${KUBECONFIG}"
+export KUBECONFIG
+wait_for_nodes 1
+
+status 'Verify expand-addresses refuses a cluster built without metallb'
+# Routing more addresses into a cluster with nothing to hand them out is
+# the refusal ComponentNotInstalledError exists for, and this is the only
+# tier where the cluster really was built without metallb.
+if sf-client k3s expand-addresses "${MINIMAL_CLUSTER}" --address-count 1 \
+        > /tmp/k3s-ci-expand-refusal 2>&1; then
+    echo 'expand-addresses succeeded on a cluster built without metallb'
+    cat /tmp/k3s-ci-expand-refusal
+    exit 1
+fi
+if ! grep -qi 'metallb' /tmp/k3s-ci-expand-refusal; then
+    echo 'expand-addresses refused without saying metallb is the reason'
+    cat /tmp/k3s-ci-expand-refusal
+    exit 1
+fi
+
+status 'Delete the minimal cluster'
+sf-client k3s delete "${MINIMAL_CLUSTER}" --no-kubeconfig
+if sf-client k3s list | grep -q "^${MINIMAL_CLUSTER}$"; then
+    echo 'The minimal cluster is still listed after deletion'
     exit 1
 fi
 
