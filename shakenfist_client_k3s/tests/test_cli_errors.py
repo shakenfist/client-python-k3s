@@ -5,10 +5,20 @@ things to hold still. The first is that each site raises the right
 exception, carrying the right structured fields, and prints nothing on the
 way -- that is what makes the library usable from an Ansible module, which
 owns stdout for its own JSON result. The second is that the command line
-behaves exactly as it did before: the same text, on stdout, with exit code
-1. The tests below assert the first by invoking the subcommand object
-directly (which bypasses the group, so the exception escapes to the test)
-and the second by invoking through the group, where the handler catches it.
+behaves exactly as it did before, with one deliberate change: the same
+text and exit code 1, now on stderr rather than stdout (see decision 9 of
+the phase 3 plan and GroupCatchClusterExceptions's docstring). The tests
+below assert the first by invoking the subcommand object directly (which
+bypasses the group, so the exception escapes to the test) and the second
+by invoking through the group, where the handler catches it.
+
+Click 8.2 removed CliRunner's mix_stderr argument and made it always keep
+stdout and stderr separate, which is what these tests rely on: result.stdout
+and result.stderr are independently readable without any special
+construction. pyproject.toml floors click at >= 8.0.0 with no ceiling, and
+the tox environment this suite actually runs under installs 8.5.0, so this
+file is written against that separated-streams behaviour rather than against
+click 8.0/8.1's merged-by-default one.
 """
 
 import copy
@@ -219,16 +229,20 @@ class GroupHandlerTestCase(ClientTestCase):
     """The group handler reproduces the pre-refactor CLI failure behaviour.
 
     Every one of these printed its message and called sys.exit(1) before
-    this change, and the text and exit code are the contract. The output
-    asserted here is the whole of result.output, so an extra blank line or
-    a message which moved to stderr fails the test.
+    this package's exceptions existed, and the text and exit code are still
+    the contract -- except the stream, which decision 9 of the phase 3 plan
+    deliberately moves from stdout to stderr. The text asserted here is the
+    whole of result.stderr, so an extra blank line, or a message which
+    leaks onto stdout instead, fails the test; result.stdout is asserted
+    empty for the same reason.
     """
 
     def _assert_cli_failure(self, args, expected_output, namespace_metadata=None):
         result = self._invoke(
             shakenfist_client_k3s.k3s, args, namespace_metadata)
-        self.assertEqual(1, result.exit_code, result.output)
-        self.assertEqual(expected_output, result.output)
+        self.assertEqual(1, result.exit_code, result.stderr)
+        self.assertEqual('', result.stdout)
+        self.assertEqual(expected_output, result.stderr)
 
     def test_getconfig_unknown_cluster(self):
         self._assert_cli_failure(
@@ -329,7 +343,8 @@ class GroupHandlerScopeTestCase(testtools.TestCase):
         result = CliRunner().invoke(group, ['boom'], terminal_width=80)
 
         self.assertEqual(1, result.exit_code)
-        self.assertEqual('Cluster not found!\n', result.output)
+        self.assertEqual('', result.stdout)
+        self.assertEqual('Cluster not found!\n', result.stderr)
         self.assertIsInstance(result.exception, SystemExit)
 
     def test_multiline_message_is_printed_verbatim(self):
@@ -337,7 +352,7 @@ class GroupHandlerScopeTestCase(testtools.TestCase):
         # longest text, and they are the ones the pre-refactor code printed
         # a line at a time. The handler prints str(e) once, so the whole
         # block has to arrive unwrapped and unindented, with exactly one
-        # trailing newline, on stdout.
+        # trailing newline, on stderr.
         error = exceptions.CommandFailedError(
             'node-001', 'uuid-001', 'kubectl wait pods', 1,
             'still waiting', 'timed out on pod one\ntimed out on pod two')
@@ -346,6 +361,7 @@ class GroupHandlerScopeTestCase(testtools.TestCase):
         result = CliRunner().invoke(group, ['boom'], terminal_width=80)
 
         self.assertEqual(1, result.exit_code)
+        self.assertEqual('', result.stdout)
         self.assertEqual(
             'Command failed!\n'
             '  instance: node-001 (UUID uuid-001)\n'
@@ -354,7 +370,7 @@ class GroupHandlerScopeTestCase(testtools.TestCase):
             '   stdout: still waiting\n'
             '   stderr: timed out on pod one\n'
             '   stderr: timed out on pod two\n',
-            result.output)
+            result.stderr)
 
     def test_apiclient_exceptions_are_left_alone(self):
         # The parent CLI's GroupCatchExceptions maps every apiclient

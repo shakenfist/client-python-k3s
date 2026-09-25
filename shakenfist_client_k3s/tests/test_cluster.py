@@ -129,6 +129,25 @@ class ClusterProgressTestCase(testtools.TestCase):
         cluster.progress = p
         self.assertIs(p, cluster.get_progress())
 
+    def test_lazy_default_carries_a_real_total_phases(self):
+        # A library caller invoking a mid-level method directly (rather
+        # than going through an entry point like create() or
+        # expand_workers(), which build their own Progress with the real
+        # count) gets this lazy default. 1 is the honest count for it: see
+        # get_progress()'s docstring for which callers this serves and why
+        # each of them opens exactly one phase.
+        reporter = progress.CollectingReporter()
+        cluster = Cluster(mock.MagicMock(), 'banana', 'testns', reporter=reporter)
+
+        p = cluster.get_progress()
+        self.assertEqual(1, p.total_phases)
+
+        # The number is not just stored but used: the phase header it
+        # produces is numbered "[1/1]", not the un-numbered "[1]" a caller
+        # got before total_phases existed here.
+        p.phase('Doing a thing')
+        self.assertEqual(['[1/1] Doing a thing'], reporter.lines)
+
     def test_reporter_verbosity_selects_the_output_mode(self):
         # A verbose reporter's debug lines would interleave badly with in
         # place cursor updates, which is why Progress refuses interactive

@@ -260,10 +260,31 @@ class Cluster:
         assign it; everything else gets one lazily, so a method called
         directly by a library caller still reports progress somewhere
         sensible.
+
+        The lazy default is built with total_phases=1. Every method which
+        calls get_progress() itself -- rather than inheriting a Progress an
+        entry point like create() or expand_workers() already built -- goes
+        on to call p.phase() exactly once: create_and_await_instances(),
+        install_control_plane(), install_extra_control_plane(),
+        install_workers(), setup_metallb() and setup_longhorn() each open
+        one phase and do their work inside it. 1 is therefore not a
+        placeholder guess but the true count for exactly the callers this
+        default serves, giving a library caller who invokes one of them
+        directly an honest "[1/1]" instead of the un-numbered "[n]" this
+        used to print.
+
+        This is one Progress per Cluster instance, cached for its life
+        (see __init__), so it is only accurate for a single such call. A
+        library caller who invokes two of these methods in sequence on the
+        same Cluster shares the one lazily built Progress between them --
+        the second call's phase header becomes "[2/1]", which is worse
+        than un-numbered. A caller doing that should build its own
+        progress.Progress with the real total and assign it to
+        self.progress first, the way create() and expand_workers() do.
         """
         if not self.progress:
             self.progress = progress.Progress(
-                verbose=self.reporter.verbose, stream=self.reporter)
+                total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)
         return self.progress
 
     def create_instance(self):

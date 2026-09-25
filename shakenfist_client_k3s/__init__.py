@@ -90,11 +90,23 @@ class GroupCatchClusterExceptions(click.Group):
     exiting the process, so that an in process caller -- the Ansible
     module this plan exists for -- can fail structurally and keep stdout
     for its own JSON result. The command line still has to behave exactly
-    as it did, so this is where the two meet: one handler which prints the
-    message the failing command used to print, on stdout where it has
-    always gone, and exits 1. Click's Group.invoke() is what resolves and
-    invokes the subcommand, so catching here covers every command,
-    including any added later.
+    as it did, exit code and message included, so this is where the two
+    meet: one handler which prints the message the failing command used to
+    print and exits 1. Click's Group.invoke() is what resolves and invokes
+    the subcommand, so catching here covers every command, including any
+    added later.
+
+    The message goes to stderr, not the stdout it used to reach before
+    this class existed. That earlier behaviour was never examined on its
+    own merits: phase 1 introduced this handler to reproduce it exactly,
+    deliberately deferring the fix so that phase's diff stayed about
+    exceptions rather than output streams. An error belongs on stderr on
+    ordinary Unix principle, and this package now has an extra reason --
+    it is a plugin loaded into a larger CLI whose own error handler
+    (GroupCatchExceptions in shakenfist_client.main, which logs through
+    LOG.error() and so also lands on stderr) already does the same, so
+    this handler matching it makes `sf-client`'s failures consistent
+    regardless of which layer caught them.
 
     Nothing from shakenfist_client.apiclient is caught here. The parent
     CLI's GroupCatchExceptions already maps every API exception to its own
@@ -108,8 +120,8 @@ class GroupCatchClusterExceptions(click.Group):
             # Terminal output, deliberately not routed through a reporter:
             # this is the Click layer converting a raised exception back
             # into the error line and exit code the command used to
-            # produce directly, on the process's own stdout.
-            print(str(e))
+            # produce directly, on the process's own stderr.
+            print(str(e), file=sys.stderr)
             sys.exit(1)
 
 
