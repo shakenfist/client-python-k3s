@@ -115,11 +115,15 @@ them directly.
 `create()`'s remaining keyword arguments (`refresh_version_cache`,
 `release_channel`, `sshkey`) mirror the command's options of the same
 name; see its docstring in `cluster.py` for the full signature.
-`create()` and `delete()` still write and merge `~/.kube/config`, and
-shell out to `kubectl config unset`, unconditionally -- that is
-unchanged CLI behaviour, not new library behaviour, and making it
-optional is future work. See `docs/usage.md` for what each command
-does; this page does not restate it.
+`create(write_kubeconfig=...)` and `delete(update_kubeconfig=...)`
+govern the only two things either call does to the machine it runs on
+rather than to the cluster: writing and merging `~/.kube/config`, and
+shelling out to `kubectl config unset`. Both default to `False` here
+and are passed `True` by the command line, so `sf-client k3s` behaves
+as it always has while a library caller's `~/.kube/config` is left
+alone unless it asks. The cluster's kubeconfig is recorded either way
+and `get_kubeconfig()` serves it. See `docs/usage.md` for what each
+command does; this page does not restate it.
 
 `k3s list`, `query-k3s-version` and `query-longhorn-version` name no
 cluster, so they stay module level functions rather than `Cluster`
@@ -211,36 +215,37 @@ cluster.create(control_plane_count=1, worker_count=1, metal_address_count=1)
 kubeconfig = cluster.get_kubeconfig()
 cluster.delete()
 
-# create() and get_kubeconfig() wrote nothing to sys.stdout;
-# delete() is the one exception below. Everything else is here.
+# Nothing above wrote to sys.stdout, or to the process's stdout
+# behind its back. Everything either of them said is here.
 print(reporter.getvalue())
 ```
 
-`create()` and `get_kubeconfig()` write nothing to `sys.stdout` at
-all; a caller that owns stdout for its own output (an Ansible
-module's JSON result, in particular) can run either and keep it
-that way. The same is true of `show()`, `expand_workers()`,
-`expand_addresses()` and `update_os()`. `delete()`, the third call
-in this example, is the one exception: its three `kubectl config
-unset` calls run with no captured output, so the child process
-inherits file descriptor 1 and kubectl's `Property "..." unset.`
-lines reach the real stdout directly, bypassing both `sys.stdout`
-and the reporter. This is a known, tracked gap, not an oversight --
-see `KubectlUnsetLeakTestCase` in
-`shakenfist_client_k3s/tests/test_library_api.py` and the phase 3
-row of `docs/plans/library-api-and-collection.md` -- and it is fixed
-by phase 3's kubeconfig side effects opt-out, not by this phase.
+No call here writes anything to `sys.stdout`; a caller that owns
+stdout for its own output (an Ansible module's JSON result, in
+particular) can run any of them and keep it that way. That includes
+`delete()`, which used to be an exception: its three `kubectl config
+unset` calls ran with no captured output, so the child process
+inherited file descriptor 1 and kubectl's `Property "..." unset.`
+lines reached the real stdout directly, bypassing both `sys.stdout`
+and the reporter. They now capture their output, and what kubectl
+says arrives through the reporter (at debug level) or, on a failure,
+on the `KubeconfigError` it raises.
+
 `reporter.getvalue()` holds the same numbered-phase, per-node
-progress text `sf-client k3s create` and `delete` print, for
-example:
+progress text `sf-client k3s create` prints, for example:
 
 ```
-[1/9] Creating node network
+[1/8] Creating node network
   created k3s-mycluster-node (uuid ...)
 ...
-[9/9] Updating local kubeconfig
+[8/8] Setting up longhorn version 1.6.0
 Cluster mycluster is ready (... total)
 ```
+
+The total follows what the call actually does, so the command line's
+nine-phase create becomes eight here: the example above did not ask
+for `write_kubeconfig`, so there is no `Updating local kubeconfig`
+phase to count.
 
 This exact call sequence -- `Cluster(...)`, `create()`,
 `get_kubeconfig()`, `delete()`, with a `CollectingReporter` -- is

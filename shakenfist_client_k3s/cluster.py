@@ -610,7 +610,7 @@ class Cluster:
     def create(self, control_plane_count, worker_count, metal_address_count,
                network=None, refresh_version_cache=False,
                release_channel='stable', sshkey=None, install_metallb=True,
-               install_longhorn=True):
+               install_longhorn=True, write_kubeconfig=False):
         """Build this cluster, from nothing to a working k3s.
 
         The namespace must already exist. The command line creates it when
@@ -618,12 +618,20 @@ class Cluster:
         knows whether the option was passed at all; see
         _bind_new_cluster_context() in this package's __init__.
 
-        Writing ~/.kube/config, and shelling out to kubectl to merge into
-        an existing one, are unconditional here because they are
-        unconditional in the command this replaces. Making them optional is
-        phase 3: doing it here would put a behaviour change inside a
-        refactor whose entire safety argument is that behaviour is
-        unchanged.
+        write_kubeconfig is the one parameter here whose default is not the
+        command line's behaviour. Writing ~/.kube/config, and shelling out
+        to kubectl to merge into an existing one, are side effects on the
+        calling machine rather than on the cluster, and a library whose
+        default is to rewrite the caller's ~/.kube/config is surprising.
+        ``k3s create`` passes True unless --no-kubeconfig was given, so the
+        command line is unchanged. Decision 6 of the phase 3 plan records
+        why the asymmetry is worth it, and why nothing breaks: this package
+        has never been released, so the CLI is the only caller there is.
+
+        The cluster's kubeconfig is fetched and recorded in the metadata
+        either way. write_kubeconfig only governs the local file:
+        get_kubeconfig() serves what was fetched, and a caller which wants
+        the credentials without the side effect asks for them there.
 
         install_metallb and install_longhorn default to True, matching the
         behaviour before this parameter existed. metal_address_count is
@@ -635,9 +643,12 @@ class Cluster:
         # Phases: create control plane nodes, create workers, install control
         # plane, install workers, fetch credentials, metallb, longhorn, and
         # update the local kubeconfig. Creating a node network and installing
-        # additional control plane nodes only sometimes happen, and metallb
-        # and longhorn are each skipped -- and their phase uncounted -- when
-        # the corresponding install_* flag is False.
+        # additional control plane nodes only sometimes happen; metallb and
+        # longhorn are each skipped -- and their phase uncounted -- when the
+        # corresponding install_* flag is False; and the local kubeconfig
+        # update goes the same way when write_kubeconfig is False. Note that
+        # this last one is subtracted by default, because that flag defaults
+        # to False rather than to True.
         total_phases = 8
         if not network:
             total_phases += 1
@@ -646,6 +657,8 @@ class Cluster:
         if not install_metallb:
             total_phases -= 1
         if not install_longhorn:
+            total_phases -= 1
+        if not write_kubeconfig:
             total_phases -= 1
         p = progress.Progress(
             total_phases=total_phases, verbose=self.reporter.verbose,
@@ -797,48 +810,53 @@ class Cluster:
         if install_longhorn:
             self.setup_longhorn()
 
-        # Install the kubeconfig we fetched earlier
-        p.phase('Updating local kubeconfig')
-        kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
-        main_config_path = os.path.join(kube_dir, 'config')
-        os.makedirs(kube_dir, exist_ok=True)
+        # Install the kubeconfig we fetched earlier, if the caller wants the
+        # local side effect. The fetch above is unconditional -- the cluster
+        # credentials are in the metadata either way -- and only the write to
+        # ~/.kube/config and the kubectl merge into an existing one are gated
+        # here. See create()'s docstring, and decision 6 of the phase 3 plan.
+        if write_kubeconfig:
+            p.phase('Updating local kubeconfig')
+            kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
+            main_config_path = os.path.join(kube_dir, 'config')
+            os.makedirs(kube_dir, exist_ok=True)
 
-        if not os.path.exists(main_config_path):
-            # There is no existing configuration to preserve, so no merge is
-            # required and we don't need a local kubectl.
-            with open(main_config_path, 'w') as f:
-                f.write(yaml.dump(kc))
-        else:
-            if not shutil.which('kubectl'):
-                raise exceptions.KubeconfigError.missing_kubectl(
-                    main_config_path, self.name)
-
-            with tempfile.TemporaryDirectory() as tempdir:
-                new_config_path = os.path.join(tempdir, 'config')
-                with open(new_config_path, 'w') as f:
-                    f.write(yaml.dump(kc))
-                merged = subprocess.run(
-                    'kubectl config view --flatten', shell=True, capture_output=True,
-                    env={**os.environ,
-                         'KUBECONFIG': '%s:%s' % (main_config_path, new_config_path)})
-                if merged.returncode != 0:
-                    # kubectl's stderr arrives as bytes, and was decoded at the
-                    # point it was printed; decode it here so the exception
-                    # renders exactly the same text.
-                    stderr = None
-                    if merged.stderr:
-                        stderr = merged.stderr.decode('utf-8', errors='replace')
-                    raise exceptions.KubeconfigError.merge_failed(
-                        main_config_path, merged.returncode, stderr)
-
-                # kubectl's merge keeps the pre-existing file's current-context,
-                # which would leave kubectl pointed at whatever cluster was
-                # active before this create. Select the new cluster, matching
-                # the no-merge path above.
-                merged_kc = yaml.safe_load(merged.stdout)
-                merged_kc['current-context'] = fqcn
+            if not os.path.exists(main_config_path):
+                # There is no existing configuration to preserve, so no merge is
+                # required and we don't need a local kubectl.
                 with open(main_config_path, 'w') as f:
-                    f.write(yaml.dump(merged_kc))
+                    f.write(yaml.dump(kc))
+            else:
+                if not shutil.which('kubectl'):
+                    raise exceptions.KubeconfigError.missing_kubectl(
+                        main_config_path, self.name)
+
+                with tempfile.TemporaryDirectory() as tempdir:
+                    new_config_path = os.path.join(tempdir, 'config')
+                    with open(new_config_path, 'w') as f:
+                        f.write(yaml.dump(kc))
+                    merged = subprocess.run(
+                        'kubectl config view --flatten', shell=True, capture_output=True,
+                        env={**os.environ,
+                             'KUBECONFIG': '%s:%s' % (main_config_path, new_config_path)})
+                    if merged.returncode != 0:
+                        # kubectl's stderr arrives as bytes, and was decoded at the
+                        # point it was printed; decode it here so the exception
+                        # renders exactly the same text.
+                        stderr = None
+                        if merged.stderr:
+                            stderr = merged.stderr.decode('utf-8', errors='replace')
+                        raise exceptions.KubeconfigError.merge_failed(
+                            main_config_path, merged.returncode, stderr)
+
+                    # kubectl's merge keeps the pre-existing file's current-context,
+                    # which would leave kubectl pointed at whatever cluster was
+                    # active before this create. Select the new cluster, matching
+                    # the no-merge path above.
+                    merged_kc = yaml.safe_load(merged.stdout)
+                    merged_kc['current-context'] = fqcn
+                    with open(main_config_path, 'w') as f:
+                        f.write(yaml.dump(merged_kc))
 
         # setup_metallb() recorded the routed addresses it allocated, and
         # this is the write which would otherwise put a stale local
@@ -896,13 +914,24 @@ class Cluster:
 
         return md
 
-    def delete(self):
+    def delete(self, update_kubeconfig=False):
         """Destroy this cluster and everything created alongside it.
 
-        This is the body of ``sf-client k3s delete``. Removing this
-        cluster's entries from the local ~/.kube/config with kubectl is
-        unconditional here because it is unconditional in the command this
-        replaces; step 3e of the phase 3 plan makes it optional.
+        This is the body of ``sf-client k3s delete``.
+
+        update_kubeconfig governs one thing: whether this cluster's entries
+        are removed from the local ~/.kube/config. It is the counterpart of
+        ``create()``'s write_kubeconfig and it defaults off for the same
+        reason -- the calling machine's kubectl configuration is not part of
+        the cluster, and a library should not edit it unasked. ``k3s
+        delete`` passes True unless --no-kubeconfig was given, so the
+        command line is unchanged. Decision 6 of the phase 3 plan has the
+        argument.
+
+        Leaving it off strands whatever ``create(write_kubeconfig=True)``
+        wrote, which is why the two are symmetrical rather than
+        independently defaulted: a caller which asked for the write asks for
+        the cleanup too.
 
         This works on a cluster which never reached ``created``, and that
         is the only way out of an interrupted create: decision 5 of the
@@ -1004,23 +1033,45 @@ class Cluster:
             self.client.set_namespace_metadata_item(
                 self.namespace, primitives.CLUSTER_LIST, all_clusters)
 
-        # And remove the local config
-        fqcn = '%s.%s' % (self.name, self.namespace)
-        for config_elem in ['users.%s' % fqcn,
-                            'contexts.%s' % fqcn,
-                            'clusters.%s' % fqcn]:
-            # An argument list, not a shell string: config_elem interpolates
-            # the cluster name, which arrives from a click.STRING argument,
-            # an Ansible playbook variable or an API request with no
-            # validation anywhere on the path, so a name containing shell
-            # metacharacters would otherwise run as a command. This is
-            # output neutral -- the child still inherits file descriptor 1,
-            # so kubectl's three 'Property "..." unset.' lines are printed
-            # exactly as before. See KubectlUnsetLeakTestCase, which pins
-            # that leak until phase 3 closes it.
-            p = subprocess.run(['kubectl', 'config', 'unset', config_elem])
-            if p.returncode != 0:
-                raise exceptions.KubeconfigError.unset_failed(config_elem)
+        # And remove the local config, if the caller wants the local side
+        # effect. Everything above this point is the cluster; this is the
+        # calling machine's kubectl configuration.
+        if update_kubeconfig:
+            fqcn = '%s.%s' % (self.name, self.namespace)
+            for config_elem in ['users.%s' % fqcn,
+                                'contexts.%s' % fqcn,
+                                'clusters.%s' % fqcn]:
+                # An argument list, not a shell string: config_elem
+                # interpolates the cluster name, which arrives from a
+                # click.STRING argument, an Ansible playbook variable or an
+                # API request with no validation anywhere on the path, so a
+                # name containing shell metacharacters would otherwise run
+                # as a command.
+                unset = subprocess.run(
+                    ['kubectl', 'config', 'unset', config_elem],
+                    capture_output=True)
+
+                # capture_output is what stops kubectl's three 'Property
+                # "..." unset.' lines going to the process's file descriptor
+                # 1, which the reporter does not own and a caller emitting
+                # JSON there cannot afford. They are not thrown away: the
+                # reporter gets them, at debug level, because they only
+                # confirm something the caller asked for.
+                if unset.stdout:
+                    self.reporter.debug(
+                        unset.stdout.decode('utf-8', errors='replace').rstrip())
+
+                if unset.returncode != 0:
+                    # And this is the other half of capturing the output:
+                    # kubectl's explanation of the failure used to reach the
+                    # terminal on its own, so it now has to be carried by
+                    # the exception. Decoded at the raise, matching
+                    # merge_failed() on the create side.
+                    stderr = None
+                    if unset.stderr:
+                        stderr = unset.stderr.decode('utf-8', errors='replace')
+                    raise exceptions.KubeconfigError.unset_failed(
+                        config_elem, stderr)
 
     def expand_workers(self, worker_count):
         """Add worker nodes to this cluster.

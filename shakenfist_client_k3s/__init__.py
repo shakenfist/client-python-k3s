@@ -168,16 +168,24 @@ k3s.add_command(k3s_list)
                     'is ignored when this is off.'))
 @click.option('--longhorn/--no-longhorn', default=True,
               help='Install longhorn for persistent storage.')
+@click.option('--kubeconfig/--no-kubeconfig', default=True,
+              help=('Add the new cluster to your local ~/.kube/config, merging it '
+                    'into any existing configuration. Cluster credentials remain '
+                    "available from 'sf-client k3s getconfig' either way."))
 @click.pass_context
 def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                metal_address_count=None,  namespace=None, network=None,
                refresh_version_cache=False, release_channel=None,
-               sshkey=None, metallb=True, longhorn=True):
+               sshkey=None, metallb=True, longhorn=True, kubeconfig=True):
     c = _bind_new_cluster_context(ctx, name, namespace)
+    # write_kubeconfig defaults to False in the library and True here: the
+    # command line's behaviour is unchanged, and a library caller does not
+    # have its ~/.kube/config edited unasked. Decision 6 of the phase 3 plan.
     c.create(control_plane_count, worker_count, metal_address_count,
              network=network, refresh_version_cache=refresh_version_cache,
              release_channel=release_channel, sshkey=sshkey,
-             install_metallb=metallb, install_longhorn=longhorn)
+             install_metallb=metallb, install_longhorn=longhorn,
+             write_kubeconfig=kubeconfig)
 
 
 k3s.add_command(k3s_create)
@@ -271,9 +279,15 @@ k3s.add_command(k3s_show)
 @click.option('--namespace', type=click.STRING,
               help=('If you are an admin, you can alter clusters in a '
                     'different namespace.'))
+@click.option('--kubeconfig/--no-kubeconfig', default=True,
+              help=('Remove the deleted cluster from your local ~/.kube/config. '
+                    'This is the counterpart of the same flag on create.'))
 @click.pass_context
-def k3s_delete(ctx, name=None, namespace=None):
-    _bind_cluster_context(ctx, name, namespace).delete()
+def k3s_delete(ctx, name=None, namespace=None, kubeconfig=True):
+    # As with create's --kubeconfig, the library default is off and the
+    # command line passes True, so this command behaves as it always has.
+    _bind_cluster_context(ctx, name, namespace).delete(
+        update_kubeconfig=kubeconfig)
 
 
 k3s.add_command(k3s_delete)

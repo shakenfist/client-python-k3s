@@ -24,4 +24,9 @@ Options:
                                   --metal-address-count is ignored when this is
                                   off.
   --longhorn / --no-longhorn      Install longhorn for persistent storage.
+  --kubeconfig / --no-kubeconfig  Add the new cluster to your local
+                                  ~/.kube/config, merging it into any existing
+                                  configuration. Cluster credentials remain
+                                  available from 'sf-client k3s getconfig'
+                                  either way.
   --help                          Show this message and exit.

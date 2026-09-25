@@ -164,8 +164,13 @@ class CommandExceptionTestCase(ClientTestCase):
         self.assertEqual('not_found', e.reason)
 
     def test_delete_kubectl_unset_failure(self):
+        # stdout and stderr are bytes because the loop captures them, which
+        # is also why the exception has to carry the explanation: nothing
+        # else would ever show the operator kubectl's own account of this.
         completed = mock.MagicMock()
         completed.returncode = 1
+        completed.stdout = b''
+        completed.stderr = b'error: unable to parse /home/u/.kube/config\n'
         with mock.patch('subprocess.run',
                         return_value=completed):
             e = self._assert_raises(
@@ -175,6 +180,8 @@ class CommandExceptionTestCase(ClientTestCase):
 
         self.assertEqual('unset_failed', e.reason)
         self.assertEqual('users.banana.clientns', e.config_elem)
+        self.assertEqual('error: unable to parse /home/u/.kube/config\n',
+                         e.stderr)
 
     def test_query_k3s_version_http_error(self):
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
@@ -271,11 +278,17 @@ class GroupHandlerTestCase(ClientTestCase):
     def test_delete_kubectl_unset_failure(self):
         completed = mock.MagicMock()
         completed.returncode = 1
+        completed.stdout = b''
+        completed.stderr = b'error: unable to parse /home/u/.kube/config\n'
         with mock.patch('subprocess.run',
                         return_value=completed):
             self._assert_cli_failure(
                 ['delete', 'banana'],
-                'Could not unset kubectl config element users.banana.clientns\n',
+                # kubectl's stderr keeps its own trailing newline, exactly
+                # as the create side's merge_failed renders it, so the
+                # handler's newline lands after it as a blank line.
+                'Could not unset kubectl config element users.banana.clientns\n'
+                'error: unable to parse /home/u/.kube/config\n\n',
                 {CLUSTER_LIST: ['banana'], MD_KEY: copy.deepcopy(DELETABLE_MD)})
 
     def test_query_k3s_version_http_error(self):

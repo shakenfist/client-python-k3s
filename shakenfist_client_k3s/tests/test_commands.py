@@ -183,7 +183,7 @@ EXISTING_MD = {
 
 
 class CommandWiringTestCase(testtools.TestCase):
-    """The three one-line command bodies forward the right argument.
+    """The one-line command bodies forward the right argument.
 
     expand-workers, expand-addresses and update-os stopped being command
     bodies in this phase and became argument parsing plus a single Cluster
@@ -192,6 +192,11 @@ class CommandWiringTestCase(testtools.TestCase):
     expand-addresses called expand_addresses(worker_count) or if a count
     were dropped on the floor. So each of these drives the real method
     against a scripted client and counts what it did.
+
+    delete is here for the same reason and one more: its
+    update_kubeconfig defaults to False in the library and the command line
+    passes True, so the forwarding is the only thing standing between
+    ``k3s delete`` and a silent change to what the command does.
     """
 
     def setUp(self):
@@ -274,6 +279,31 @@ class CommandWiringTestCase(testtools.TestCase):
         self.assertEqual(0, self.client.instance_serial)
         self.assertIn('Added 3 metallb addresses to cluster banana',
                       result.output)
+
+    def test_delete_updates_the_local_kubeconfig(self):
+        result = self.runner.invoke(
+            shakenfist_client_k3s.k3s, ['delete', 'banana'],
+            obj={'VERBOSE': False, 'CLIENT': self.client})
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(
+            [['kubectl', 'config', 'unset', 'users.banana.testns'],
+             ['kubectl', 'config', 'unset', 'contexts.banana.testns'],
+             ['kubectl', 'config', 'unset', 'clusters.banana.testns']],
+            [call[0][0] for call in self.subprocess_run.call_args_list])
+
+    def test_delete_with_no_kubeconfig_leaves_it_alone(self):
+        result = self.runner.invoke(
+            shakenfist_client_k3s.k3s, ['delete', 'banana', '--no-kubeconfig'],
+            obj={'VERBOSE': False, 'CLIENT': self.client})
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual([], self.subprocess_run.call_args_list)
+
+        # The cluster still went away: --no-kubeconfig declines one local
+        # side effect, not the delete.
+        self.assertNotIn(cluster_module.METADATA_KEY % 'banana',
+                         self.client.metadata)
 
     def test_update_os_updates_every_node(self):
         result = self.runner.invoke(

@@ -688,7 +688,10 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
         self.assertIn('Cluster banana is ready', output)
 
         # With no pre-existing local configuration the kubeconfig is
-        # written directly, pointing at the cluster's floating address.
+        # written directly, pointing at the cluster's floating address. This
+        # is also what pins the command line's --kubeconfig default: the
+        # library's write_kubeconfig defaults to False, so a k3s create
+        # which stopped passing True would leave no file here at all.
         with open(os.path.join(self.home, '.kube', 'config')) as f:
             kubeconfig = f.read()
         self.assertIn('192.168.10.100', kubeconfig)
@@ -771,6 +774,16 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
         self.assertNotIn('Setting up metallb', output)
         self.assertNotIn('Setting up longhorn', output)
         self.assertIn('Cluster banana is ready', output)
+
+    def test_create_with_no_kubeconfig(self):
+        output = self._create(['banana', '--no-kubeconfig'])
+        self._assert_phases_consistent(output)
+        self.assertNotIn('Updating local kubeconfig', output)
+        self.assertIn('Cluster banana is ready', output)
+
+        # And no file, which is the side effect the phase header stands for.
+        self.assertFalse(
+            os.path.exists(os.path.join(self.home, '.kube', 'config')))
 
     def test_create_with_no_metallb_ignores_metal_address_count(self):
         # --metal-address-count is meaningless without metallb; the CLI

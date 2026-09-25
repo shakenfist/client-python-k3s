@@ -408,12 +408,15 @@ class KubeconfigError(K3sClusterException):
       ``subprocess`` returns at the raise, and the second line is only
       rendered when it is non-empty, matching the original's conditional
       ``print()``.
-    - ``unset_failed(config_elem)``: raised by ``Cluster.delete()`` when
-      its ``kubectl config unset`` loop exits non-zero for one config
-      element. This is a separate rendering from the two above -- it
-      names a config element, not a config file path -- but it is still
-      local-kubectl-state, so it lives on this class rather than on
-      ``ClusterNotFoundError``.
+    - ``unset_failed(config_elem, stderr)``: raised by
+      ``Cluster.delete()`` when its ``kubectl config unset`` loop exits
+      non-zero for one config element. This is a separate rendering from
+      the two above -- it names a config element, not a config file path
+      -- but it is still local-kubectl-state, so it lives on this class
+      rather than on ``ClusterNotFoundError``. ``stderr`` is carried for
+      the same reason as ``merge_failed()``'s: the loop captures the
+      child's output, so kubectl's own account of why it failed reaches
+      nobody unless the exception renders it.
 
     As with ``ReleaseLookupError``, the union of the fields the
     classmethods set is declared explicitly, so which attributes an
@@ -456,6 +459,9 @@ class KubeconfigError(K3sClusterException):
                    returncode=returncode, stderr=stderr)
 
     @classmethod
-    def unset_failed(cls, config_elem):
-        message = 'Could not unset kubectl config element %s' % config_elem
-        return cls('unset_failed', message, config_elem=config_elem)
+    def unset_failed(cls, config_elem, stderr=None):
+        lines = ['Could not unset kubectl config element %s' % config_elem]
+        if stderr:
+            lines.append(stderr)
+        message = '\n'.join(lines)
+        return cls('unset_failed', message, config_elem=config_elem, stderr=stderr)

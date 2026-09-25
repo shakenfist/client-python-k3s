@@ -287,8 +287,9 @@ class CreateInstallsWorkersTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # create() writes ~/.kube/config unconditionally, and must not be
-        # allowed to write the operator's own.
+        # create() only writes ~/.kube/config when asked, which these tests
+        # do not do, but a test which grew that side effect back must not
+        # write the operator's own.
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         patcher = mock.patch.dict('os.environ', {'HOME': home.name})
@@ -718,8 +719,10 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # Unmocked, delete's three 'kubectl config unset' calls would edit
-        # the operator's own ~/.kube/config.
+        # delete() only runs its three 'kubectl config unset' calls when
+        # asked, which these tests do not do; the mock stays so that a
+        # regression there fails rather than edits the operator's own
+        # ~/.kube/config.
         self.subprocess_run = mock.MagicMock()
         self.subprocess_run.return_value.returncode = 0
         patcher = mock.patch('subprocess.run', self.subprocess_run)
