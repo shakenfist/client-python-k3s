@@ -152,19 +152,6 @@ class ListOutputTestCase(testtools.TestCase):
         self.assertEqual('', result.output)
 
 
-class RecordingClient(fakes.FakeClusterClient):
-    """A scripted client which also records the commands it was asked to run."""
-
-    def __init__(self):
-        super(RecordingClient, self).__init__()
-        self.executed = []
-
-    def instance_execute(self, instance_ref, commandline):
-        self.executed.append((instance_ref, commandline))
-        return super(RecordingClient, self).instance_execute(
-            instance_ref, commandline)
-
-
 # A cluster which has finished being created, in the shape the three
 # expansion commands read it in: one control plane node, one worker, one
 # routed address, and the tokens and versions install_k3s_component wants.
@@ -203,7 +190,7 @@ class CommandWiringTestCase(testtools.TestCase):
 
     def setUp(self):
         super(CommandWiringTestCase, self).setUp()
-        self.client = RecordingClient()
+        self.client = fakes.FakeClusterClient()
         # Deep, not shallow: expand-workers appends to worker_nodes and
         # expand-addresses to routed_addresses, so a shallow copy would
         # leave those lists shared with the module level constant and let
@@ -323,7 +310,7 @@ class CommandWiringTestCase(testtools.TestCase):
                       result.output)
 
 
-class DeleteRecordingClient(RecordingClient):
+class DeleteRecordingClient(fakes.FakeClusterClient):
     """A scripted client which also records the instances it was asked to delete."""
 
     def __init__(self):

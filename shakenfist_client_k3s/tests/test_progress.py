@@ -793,3 +793,51 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
             ['banana', '--no-metallb', '--metal-address-count', '99'])
         self._assert_phases_consistent(output)
         self.assertNotIn('Setting up metallb', output)
+
+    def test_create_with_manifests(self):
+        # --manifest is repeatable, and each file named is staged on the
+        # first control plane node. Staging is not a phase of its own -- the
+        # writes are extra commands inside the phase which installs k3s
+        # there -- so the headers have to stay consistent with the total
+        # create() advertised.
+        paths = []
+        for name, content in [('first.yaml', 'kind: One\n'),
+                              ('second.yaml', 'kind: Two\n')]:
+            path = os.path.join(self.home, name)
+            with open(path, 'w') as f:
+                f.write(content)
+            paths.append(path)
+
+        output = self._create(
+            ['banana', '--manifest', paths[0], '--manifest', paths[1]])
+
+        self._assert_phases_consistent(output)
+        self.assertIn('staging 2 manifests', output)
+        self.assertEqual(
+            ['cat - > %s/first.yaml' % cluster_module.K3S_MANIFEST_DIR,
+             'cat - > %s/second.yaml' % cluster_module.K3S_MANIFEST_DIR],
+            [' '.join(commandline.split(' ')[:4])
+             for _, commandline in self.client.executed
+             if commandline.startswith(
+                 'cat - > %s/' % cluster_module.K3S_MANIFEST_DIR)])
+
+    def test_create_without_manifests_stages_nothing(self):
+        output = self._create(['banana'])
+        self.assertNotIn('staging', output)
+        self.assertEqual(
+            [], [commandline for _, commandline in self.client.executed
+                 if cluster_module.K3S_MANIFEST_DIR in commandline])
+
+    def test_create_refuses_a_manifest_which_is_not_there(self):
+        # click.Path(exists=True) is the command line's half of the check,
+        # and it fires before create() is called at all, which is why this
+        # exits 2 rather than 1. read_manifests() is the other half, for a
+        # library caller whose paths click never saw.
+        result = CliRunner().invoke(
+            shakenfist_client_k3s.k3s,
+            ['create', 'banana', '--manifest',
+             os.path.join(self.home, 'absent.yaml')],
+            obj={'VERBOSE': False, 'CLIENT': self.client})
+
+        self.assertEqual(2, result.exit_code, result.output)
+        self.assertEqual({}, self.client.instances)

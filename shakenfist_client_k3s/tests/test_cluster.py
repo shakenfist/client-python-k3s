@@ -1,11 +1,14 @@
 import copy
 import io
+import os
+import subprocess
 import tempfile
 
 # The PyPI mock backport is used for consistency with the other tests in
 # this package, which support Python >= 3.7.
 import mock
 import testtools
+import yaml
 
 from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import exceptions
@@ -1177,3 +1180,281 @@ class HealthTestCase(testtools.TestCase):
 
         self.assertRaises(
             exceptions.ClusterNotFoundError, cluster.health)
+
+
+class ReadManifestsTestCase(testtools.TestCase):
+    """read_manifests() reads what it can stage, and refuses what it cannot.
+
+    Everything it refuses, it refuses before create() has built anything,
+    which is the whole reason it is a separate function called at the top of
+    create() rather than a loop inside install_control_plane(). The five
+    refusals are each a way a manifest would otherwise be lost silently --
+    overwritten by another manifest, copied to a filename k3s never looks
+    at, truncated by its own content, rejected on the node by a parser
+    nobody is watching -- or, in the case of an unreadable file, the check
+    which stands in for click.Path(exists=True) for a caller with no click.
+    """
+
+    def setUp(self):
+        super(ReadManifestsTestCase, self).setUp()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.tempdir = tempdir.name
+
+    def _write(self, name, content, subdir=None):
+        directory = self.tempdir
+        if subdir:
+            directory = os.path.join(self.tempdir, subdir)
+            os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, name)
+        with open(path, 'w') as f:
+            f.write(content)
+        return path
+
+    def test_nothing_to_read(self):
+        # None and an empty list are both "no manifests", which is what
+        # every existing caller of install_control_plane() passes.
+        self.assertEqual([], cluster_module.read_manifests(None))
+        self.assertEqual([], cluster_module.read_manifests([]))
+
+    def test_the_basename_and_the_content_are_returned_in_order(self):
+        first = self._write('first.yaml', 'kind: One\n')
+        second = self._write('second.yml', 'kind: Two\n')
+        third = self._write('third.json', '{"kind": "Three"}\n')
+
+        self.assertEqual(
+            [('first.yaml', 'kind: One\n'),
+             ('second.yml', 'kind: Two\n'),
+             ('third.json', '{"kind": "Three"}\n')],
+            cluster_module.read_manifests([first, second, third]))
+
+    def test_the_directory_the_file_came_from_is_not_carried_along(self):
+        # The destination is the basename, so a manifest read from a deep
+        # local path lands in the manifests directory itself.
+        path = self._write('deep.yaml', 'kind: Deep\n', subdir='a/b/c')
+        self.assertEqual([('deep.yaml', 'kind: Deep\n')],
+                         cluster_module.read_manifests([path]))
+
+    def test_an_upper_case_extension_is_still_a_manifest(self):
+        # k3s matches its three suffixes case insensitively, so this file
+        # will be applied and must not be refused.
+        path = self._write('SHOUTY.YAML', 'kind: Loud\n')
+        self.assertEqual([('SHOUTY.YAML', 'kind: Loud\n')],
+                         cluster_module.read_manifests([path]))
+
+    def test_a_duplicate_basename_raises_and_names_both_paths(self):
+        first = self._write('same.yaml', 'kind: One\n', subdir='one')
+        second = self._write('same.yaml', 'kind: Two\n', subdir='two')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests,
+            [first, second])
+
+        self.assertEqual('duplicate_basename', e.reason)
+        self.assertEqual('same.yaml', e.basename)
+        self.assertIn(first, str(e))
+        self.assertIn(second, str(e))
+
+    def test_a_file_which_is_not_there_raises_a_manifest_error(self):
+        # The library boundary: --manifest is a click.Path(exists=True), so
+        # the command line never gets here, but a library caller passes
+        # paths nothing has checked. It must get this hierarchy's exception
+        # rather than a bare FileNotFoundError, because the Ansible module
+        # phase 5 builds catches K3sClusterException.
+        path = os.path.join(self.tempdir, 'absent.yaml')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [path])
+
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('unreadable', e.reason)
+        self.assertEqual(path, e.path)
+        self.assertIn(path, str(e))
+
+    def test_a_file_which_cannot_be_read_raises_a_manifest_error(self):
+        # Existing but unopenable, which click.Path(exists=True) does not
+        # catch either: it is a directory, so open() raises IsADirectoryError.
+        path = os.path.join(self.tempdir, 'directory.yaml')
+        os.makedirs(path)
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [path])
+
+        self.assertEqual('unreadable', e.reason)
+        self.assertIn(path, str(e))
+
+    def test_a_file_which_is_not_yaml_raises(self):
+        path = self._write('broken.yaml', 'kind: [unclosed\n')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [path])
+
+        self.assertEqual('invalid_yaml', e.reason)
+        self.assertEqual(path, e.path)
+        self.assertIn(path, str(e))
+
+    def test_several_documents_in_one_file_are_still_yaml(self):
+        # A manifest is routinely a multi document stream, which
+        # safe_load() alone would refuse.
+        content = 'kind: One\n---\nkind: Two\n'
+        path = self._write('two-documents.yaml', content)
+        self.assertEqual([('two-documents.yaml', content)],
+                         cluster_module.read_manifests([path]))
+
+    def test_an_extension_k3s_ignores_raises(self):
+        path = self._write('payload.txt', 'kind: Ignored\n')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [path])
+
+        self.assertEqual('not_a_manifest', e.reason)
+        for suffix in cluster_module.K3S_MANIFEST_SUFFIXES:
+            self.assertIn(suffix, str(e))
+
+    def test_content_which_would_end_the_heredoc_early_raises(self):
+        # Valid YAML -- the second document is a plain scalar -- so what is
+        # refused here is the transport rather than the payload.
+        path = self._write(
+            'collides.yaml',
+            'kind: One\n---\n%s\n' % cluster_module.K3S_MANIFEST_DELIMITER)
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests, [path])
+
+        self.assertEqual('delimiter_collision', e.reason)
+        self.assertEqual(cluster_module.K3S_MANIFEST_DELIMITER, e.delimiter)
+
+    def test_the_delimiter_inside_a_line_is_not_a_collision(self):
+        # Only a line which is exactly the delimiter ends the heredoc, so
+        # refusing one which merely mentions it would be a false refusal.
+        content = 'kind: One\nvalue: not-%s-really\n' % (
+            cluster_module.K3S_MANIFEST_DELIMITER)
+        path = self._write('mentions.yaml', content)
+        self.assertEqual([('mentions.yaml', content)],
+                         cluster_module.read_manifests([path]))
+
+    def test_the_first_bad_manifest_is_the_one_reported(self):
+        # Unlike WorkerNotFoundError this does not aggregate, because
+        # nothing has been changed when it raises. What matters is that the
+        # good manifest which follows does not paper over the bad one.
+        bad = self._write('bad.txt', 'kind: Ignored\n')
+        good = self._write('good.yaml', 'kind: Fine\n')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, cluster_module.read_manifests,
+            [bad, good])
+
+        self.assertEqual(bad, e.path)
+
+
+class ManifestHeredocTestCase(testtools.TestCase):
+    """The command a manifest is staged with, run through a real shell.
+
+    Asserting on the text of the command (test_library_api.py's
+    ManifestStagingTestCase does) pins what this package generates. It
+    cannot tell whether what it generates means what we think it does: the
+    write is a shell heredoc, so a manifest arriving intact is a fact about
+    shell quoting rather than about Python string formatting. This runs the
+    command and compares the file which lands with the file which went in.
+
+    Only the write is run, with its destination rewritten into a temporary
+    directory. The mkdir alongside it names absolute paths under
+    /var/lib/rancher and is asserted on rather than executed, because a test
+    which creates those on the developer's own machine is a test which has
+    misunderstood its job.
+    """
+
+    # A manifest carrying every hazard the transport has to survive: a
+    # variable, both kinds of command substitution, both kinds of quote,
+    # trailing whitespace, and a second document which is nothing but the
+    # delimiter the config file write above it uses -- a line which would
+    # have truncated the manifest had this reused that delimiter.
+    HAZARDS = (
+        'apiVersion: v1\n'
+        'kind: ConfigMap\n'
+        'metadata:\n'
+        '  name: shell-hazards\n'
+        'data:\n'
+        '  entrypoint.sh: |\n'
+        '    echo "$HOME is $(hostname) or `hostname`"\n'
+        "    echo '${NOT_EXPANDED}' | tee /tmp/x\n"
+        '    printf "%s\\n" "trailing   "\n'
+        '---\n'
+        'EOF\n'
+    )
+
+    def setUp(self):
+        super(ManifestHeredocTestCase, self).setUp()
+        if not os.path.exists('/bin/sh'):
+            self.skipTest('this test runs the staging command through /bin/sh')
+
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.tempdir = tempdir.name
+
+        self.client = fakes.FakeClusterClient()
+        self.client.metadata[MD_KEY] = {
+            'name': 'banana',
+            'namespace': 'testns',
+            'state': 'initial',
+            'node_serial': 2,
+            'node_network': 'net-1',
+            'k3s_version': 'v1.33',
+            'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'],
+            'worker_nodes': []
+        }
+        self.client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _stage(self, name, content):
+        path = os.path.join(self.tempdir, name)
+        with open(path, 'w') as f:
+            f.write(content)
+
+        _make_cluster(self.client).install_control_plane(manifests=[path])
+
+        writes = [commandline for _, commandline in self.client.executed
+                  if commandline.startswith(
+                      'cat - > %s/%s ' % (cluster_module.K3S_MANIFEST_DIR, name))]
+        self.assertEqual(1, len(writes), self.client.executed)
+
+        # Run the write where it can do no harm. Only the destination
+        # directory moves; the rest of the command, quoting included, is
+        # what would have run on the node.
+        destination = os.path.join(self.tempdir, 'manifests')
+        os.makedirs(destination, exist_ok=True)
+        command = writes[0].replace(cluster_module.K3S_MANIFEST_DIR, destination)
+        run = subprocess.run(command, shell=True, cwd=self.tempdir,
+                             capture_output=True)
+        self.assertEqual(
+            0, run.returncode,
+            'the staging command failed: %s' % run.stderr.decode(
+                'utf-8', errors='replace'))
+
+        with open(os.path.join(destination, name)) as f:
+            return f.read()
+
+    def test_a_hazardous_manifest_arrives_unchanged(self):
+        self.assertEqual(self.HAZARDS, self._stage('hazards.yaml', self.HAZARDS))
+
+    def test_the_manifest_which_arrives_is_still_the_yaml_which_went_in(self):
+        # The point of the previous test, expressed as the thing k3s will
+        # do with the file: an expansion which ate a $ or a backtick could
+        # leave a file which still parses but says something else.
+        arrived = self._stage('hazards.yaml', self.HAZARDS)
+        self.assertEqual(
+            list(yaml.safe_load_all(self.HAZARDS)),
+            list(yaml.safe_load_all(arrived)))
+
+    def test_a_manifest_with_no_trailing_newline_arrives_with_one(self):
+        self.assertEqual('kind: One\n', self._stage('terse.yaml', 'kind: One'))
+
+    def test_a_manifest_which_already_ends_in_a_newline_gains_nothing(self):
+        self.assertEqual('kind: One\n', self._stage('tidy.yaml', 'kind: One\n'))

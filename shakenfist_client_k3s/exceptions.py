@@ -246,6 +246,103 @@ class WorkerNotFoundError(K3sClusterException):
                 % (self.name, ', '.join(self.instance_uuids)))
 
 
+class ManifestError(K3sClusterException):
+    """Raised when a manifest handed to ``Cluster.create()`` cannot be staged.
+
+    ``--manifest`` (and the ``manifests`` argument behind it) names local
+    files which are written into k3s's auto-apply directory on the first
+    control plane node before k3s is installed there, so that k3s applies
+    them itself when the server first starts. Decision 8 of the phase 3
+    plan says nothing about them is templated, so this is not a validation
+    of what a manifest declares. It is a refusal of the five ways a file
+    cannot be staged at all, each of which would otherwise either corrupt
+    the payload or drop it silently:
+
+    - ``not_a_manifest(path, suffixes)``: the basename does not end in
+      ``.yaml``, ``.yml`` or ``.json``. k3s's deploy controller only looks
+      at those three, so such a file would be copied onto the node and then
+      ignored without comment.
+    - ``duplicate_basename(basename, first_path, second_path)``: two paths
+      share a basename, and the basename is the destination filename, so
+      the second write would silently replace the first.
+    - ``unreadable(path, detail)``: the local file could not be opened or
+      read. This is the check which stands in for
+      ``click.Path(exists=True)`` for a library caller, which has no click
+      to check its paths for it.
+    - ``invalid_yaml(path, detail)``: the file is not parsable YAML (JSON
+      being a subset of it). k3s logs a failure to apply it and carries on,
+      so without this the cluster comes up looking healthy with the payload
+      missing.
+    - ``delimiter_collision(path, delimiter)``: a line of the file is
+      exactly the heredoc delimiter the staging write uses, which would end
+      the heredoc early and truncate the manifest.
+
+    Unlike ``WorkerNotFoundError``, which collects every uuid which did not
+    match, this raises at the first unusable manifest. That class
+    aggregates because it is about to destroy instances and a second run is
+    not free; every check here is local, nothing has been changed when it
+    fires, and re-running after a fix costs nothing.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    FIELDS = ('path', 'other_path', 'basename', 'suffixes', 'delimiter',
+              'detail')
+
+    def __init__(self, reason, message, **fields):
+        self.reason = reason
+        self.message = message
+        for key in self.FIELDS:
+            setattr(self, key, None)
+        for key, value in fields.items():
+            setattr(self, key, value)
+        super(ManifestError, self).__init__(message)
+
+    def __str__(self):
+        return self.message
+
+    @classmethod
+    def not_a_manifest(cls, path, suffixes):
+        message = (
+            'Manifest %s will never be applied: k3s only applies files in its\n'
+            'manifests directory whose names end in %s.'
+        ) % (path, ', '.join(suffixes))
+        return cls('not_a_manifest', message, path=path,
+                   suffixes=tuple(suffixes))
+
+    @classmethod
+    def duplicate_basename(cls, basename, first_path, second_path):
+        message = (
+            'Manifests %s and %s would both be written to %s on the cluster,\n'
+            'so one of them would replace the other. Rename one of them.'
+        ) % (first_path, second_path, basename)
+        return cls('duplicate_basename', message, path=second_path,
+                   other_path=first_path, basename=basename)
+
+    @classmethod
+    def unreadable(cls, path, detail):
+        message = 'Could not read manifest %s: %s' % (path, detail)
+        return cls('unreadable', message, path=path, detail=detail)
+
+    @classmethod
+    def invalid_yaml(cls, path, detail):
+        message = (
+            'Manifest %s is not valid YAML, so k3s would refuse to apply it:\n'
+            '%s'
+        ) % (path, detail)
+        return cls('invalid_yaml', message, path=path, detail=detail)
+
+    @classmethod
+    def delimiter_collision(cls, path, delimiter):
+        message = (
+            'Manifest %s contains a line which is exactly %s, which is the\n'
+            'marker used to write it to the cluster, so it cannot be written\n'
+            'without being truncated there.'
+        ) % (path, delimiter)
+        return cls('delimiter_collision', message, path=path,
+                   delimiter=delimiter)
+
+
 class ReleaseLookupError(K3sClusterException):
     """Raised when looking up a k3s or Longhorn release fails.
 

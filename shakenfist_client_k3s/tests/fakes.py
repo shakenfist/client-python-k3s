@@ -52,6 +52,14 @@ class FakeClusterClient:
         self.aop_serial = 0
         self.routed_serial = 0
 
+        # Every command the client was asked to run, in the order it was
+        # asked, so a test can assert both what ran and what ran before
+        # what. Ordering claims -- a file written before the installer
+        # which reads it, a node drained before its instance is destroyed
+        # -- cannot be made from separate per-call lists, because neither
+        # knows where in the other its own calls fell.
+        self.executed = []
+
         # What the caller asked us to destroy, so a test can assert on the
         # teardown as well as the build.
         self.deleted_networks = []
@@ -114,6 +122,7 @@ class FakeClusterClient:
         }
 
     def instance_execute(self, instance_ref, commandline):
+        self.executed.append((instance_ref, commandline))
         return self._complete_aop(
             instance_ref,
             [{'command': 'execute', 'commandline': commandline}],
@@ -159,10 +168,6 @@ class HealthClient(FakeClusterClient):
 
     def __init__(self):
         super(HealthClient, self).__init__()
-
-        # Every command the probe was asked to run, so a test can assert
-        # what it asked and where.
-        self.executed = []
 
         # Every mutation the client was asked to make. health() must make
         # none of them, and the calls have to be recorded rather than their

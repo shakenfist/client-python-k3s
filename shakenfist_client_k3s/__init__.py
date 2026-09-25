@@ -172,20 +172,33 @@ k3s.add_command(k3s_list)
               help=('Add the new cluster to your local ~/.kube/config, merging it '
                     'into any existing configuration. Cluster credentials remain '
                     "available from 'sf-client k3s getconfig' either way."))
+@click.option('--manifest', 'manifests', type=click.Path(exists=True),
+              multiple=True,
+              help=('A local .yaml, .yml or .json manifest to place in the new '
+                    "cluster's k3s auto-apply directory, so that k3s applies it "
+                    'when the cluster first starts. May be repeated. The file is '
+                    'copied verbatim under its own name: nothing is templated, '
+                    "and the order manifests are applied in is k3s's business "
+                    "rather than this command's."))
 @click.pass_context
 def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                metal_address_count=None,  namespace=None, network=None,
                refresh_version_cache=False, release_channel=None,
-               sshkey=None, metallb=True, longhorn=True, kubeconfig=True):
+               sshkey=None, metallb=True, longhorn=True, kubeconfig=True,
+               manifests=None):
     c = _bind_new_cluster_context(ctx, name, namespace)
     # write_kubeconfig defaults to False in the library and True here: the
     # command line's behaviour is unchanged, and a library caller does not
     # have its ~/.kube/config edited unasked. Decision 6 of the phase 3 plan.
+    # click hands multiple=True options over as a tuple, and the library
+    # takes a list: the parameter is documented as a list of paths, and a
+    # library caller has no reason to be handed one shape by the CLI and
+    # asked for another.
     c.create(control_plane_count, worker_count, metal_address_count,
              network=network, refresh_version_cache=refresh_version_cache,
              release_channel=release_channel, sshkey=sshkey,
              install_metallb=metallb, install_longhorn=longhorn,
-             write_kubeconfig=kubeconfig)
+             write_kubeconfig=kubeconfig, manifests=list(manifests or []))
 
 
 k3s.add_command(k3s_create)

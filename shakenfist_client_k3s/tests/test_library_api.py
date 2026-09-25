@@ -326,6 +326,16 @@ class CreatePhaseCountTestCase(LibraryTestCase):
             8, 2, 1, 1, network='net-1', install_longhorn=False,
             write_kubeconfig=True)
 
+    def test_manifests_do_not_add_a_phase(self):
+        # Staging a manifest is extra commands inside the phase which
+        # installs k3s on the first control plane node rather than a phase
+        # of its own, so the total does not move with this argument. The
+        # write itself is covered by ManifestStagingTestCase below.
+        path = os.path.join(self.home, 'payload.yaml')
+        with open(path, 'w') as f:
+            f.write('kind: One\n')
+        self._assert_phases(8, 1, 1, 1, manifests=[path])
+
 
 class OptionalMetallbLonghornTestCase(LibraryTestCase):
     """install_metallb and install_longhorn each gate exactly their own setup call.
@@ -713,3 +723,217 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         self.assertEqual(
             'Could not unset kubectl config element users.banana.testns\n'
             'error: unable to parse /home/u/.kube/config\n', str(e))
+
+
+class ManifestStagingTestCase(LibraryTestCase):
+    """create(manifests=...) stages files on the node before k3s is installed.
+
+    The ordering is the whole mechanism rather than a detail: k3s applies
+    everything in its manifests directory when the server first starts, so
+    a manifest written after the installer has run is a manifest which is
+    applied on the next restart, whenever that turns out to be. That is
+    also the kind of claim a test can agree with while checking nothing, so
+    the assertions here are on positions in one ordered log of what the
+    client was asked to run, not on the presence of two commands somewhere.
+
+    Nothing is templated (decision 8 of the phase 3 plan), which makes
+    "written verbatim" a testable property and one worth testing: the
+    content goes to the node inside a shell heredoc, and an unquoted
+    delimiter would have the node's shell expand the $ and the backticks a
+    real manifest is full of.
+    """
+
+    def setUp(self):
+        super(ManifestStagingTestCase, self).setUp()
+        manifests = tempfile.TemporaryDirectory()
+        self.addCleanup(manifests.cleanup)
+        self.manifest_dir = manifests.name
+
+    def _manifest(self, name, content, subdir=None):
+        directory = self.manifest_dir
+        if subdir:
+            directory = os.path.join(self.manifest_dir, subdir)
+            os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, name)
+        with open(path, 'w') as f:
+            f.write(content)
+        return path
+
+    def _commands(self):
+        return [commandline for _, commandline in self.client.executed]
+
+    def _index_of(self, predicate, description):
+        for i, commandline in enumerate(self._commands()):
+            if predicate(commandline):
+                return i
+        self.fail('%s never ran. The node was asked to run:\n    %s'
+                  % (description,
+                     '\n    '.join(repr(c) for c in self._commands())
+                     or '(nothing at all)'))
+
+    def _write_index(self, basename):
+        return self._index_of(
+            lambda c: c.startswith(
+                'cat - > %s/%s ' % (cluster_module.K3S_MANIFEST_DIR, basename)),
+            'the write of %s' % basename)
+
+    def _server_install_index(self):
+        # The worker install uses the same installer with 'agent', so the
+        # role is what identifies the control plane node's install.
+        return self._index_of(
+            lambda c: 'get.k3s.io' in c and c.endswith('sh -s - server'),
+            'the k3s server install')
+
+    def test_two_manifests_are_written_before_k3s_is_installed(self):
+        first = self._manifest('first.yaml', 'kind: One\n')
+        second = self._manifest('second.yaml', 'kind: Two\n')
+
+        self._cluster().create(1, 1, 1, manifests=[first, second])
+
+        install = self._server_install_index()
+        for basename in ['first.yaml', 'second.yaml']:
+            write = self._write_index(basename)
+            self.assertTrue(
+                write < install,
+                '%s was written at position %d, after the k3s install at '
+                'position %d. k3s applies its manifests directory when the '
+                'server starts, so this manifest would not be applied until '
+                'something restarted it. The node was asked to run:\n    %s'
+                % (basename, write, install,
+                   '\n    '.join(repr(c) for c in self._commands())))
+
+    def test_the_manifests_are_written_on_the_first_control_plane_node(self):
+        path = self._manifest('only.yaml', 'kind: One\n')
+
+        cluster = self._cluster()
+        cluster.create(1, 1, 1, manifests=[path])
+
+        md = cluster.show()
+        wrote_on = [instance_uuid for instance_uuid, commandline
+                    in self.client.executed
+                    if cluster_module.K3S_MANIFEST_DIR in commandline]
+        self.assertNotEqual([], wrote_on)
+        self.assertEqual([md['control_plane_nodes'][0]], list(set(wrote_on)))
+
+    def test_the_directory_is_created_before_the_manifests_are_written(self):
+        # k3s creates this directory when the server starts, which has not
+        # happened yet, so the write would fail without this.
+        path = self._manifest('only.yaml', 'kind: One\n')
+
+        self._cluster().create(1, 1, 1, manifests=[path])
+
+        mkdir = self._index_of(
+            lambda c: c.startswith('mkdir -p') and c.endswith(
+                cluster_module.K3S_MANIFEST_DIR),
+            'the creation of %s' % cluster_module.K3S_MANIFEST_DIR)
+        self.assertTrue(mkdir < self._write_index('only.yaml'))
+
+        # And it is created with the mode k3s would have used. Go's
+        # MkdirAll does not tighten a directory which already exists, so a
+        # directory left at mkdir's default here would permanently loosen
+        # the directory k3s is about to put the cluster's tokens and TLS
+        # keys in. -m applies only to the directories named as operands,
+        # which is why the parents are named.
+        command = self._commands()[mkdir]
+        self.assertIn('-m 0700', command)
+        for directory in ['/var/lib/rancher', '/var/lib/rancher/k3s',
+                          '/var/lib/rancher/k3s/server']:
+            self.assertIn(directory + ' ', command)
+
+    def test_the_content_is_written_verbatim(self):
+        # A manifest full of the things a shell would otherwise eat: $, a
+        # command substitution, and both kinds of quote. The heredoc
+        # delimiter is quoted, which is what turns all of that off, and
+        # this asserts on the whole command so that a change to the
+        # quoting cannot pass.
+        content = (
+            'apiVersion: v1\n'
+            'kind: ConfigMap\n'
+            'metadata:\n'
+            '  name: shell-hazards\n'
+            'data:\n'
+            '  entrypoint.sh: |\n'
+            '    echo "$HOME is $(hostname) or `hostname`"\n'
+            "    echo '${NOT_EXPANDED}' > /tmp/manifest-test\n"
+        )
+        path = self._manifest('hazards.yaml', content)
+
+        self._cluster().create(1, 1, 1, manifests=[path])
+
+        self.assertEqual(
+            "cat - > %s/hazards.yaml << '%s'\n%s%s\n"
+            % (cluster_module.K3S_MANIFEST_DIR,
+               cluster_module.K3S_MANIFEST_DELIMITER, content,
+               cluster_module.K3S_MANIFEST_DELIMITER),
+            self._commands()[self._write_index('hazards.yaml')])
+
+    def test_a_manifest_with_no_trailing_newline_gains_one(self):
+        # The heredoc's closing delimiter has to be on a line of its own,
+        # so a file which does not end in a newline needs one added. YAML
+        # does not care, and the alternative is a command which never
+        # terminates its heredoc.
+        path = self._manifest('terse.yaml', 'kind: One')
+
+        self._cluster().create(1, 1, 1, manifests=[path])
+
+        self.assertEqual(
+            "cat - > %s/terse.yaml << '%s'\nkind: One\n%s\n"
+            % (cluster_module.K3S_MANIFEST_DIR,
+               cluster_module.K3S_MANIFEST_DELIMITER,
+               cluster_module.K3S_MANIFEST_DELIMITER),
+            self._commands()[self._write_index('terse.yaml')])
+
+    def test_no_manifests_means_no_write_at_all(self):
+        # The default, and every caller which existed before this argument
+        # did: the manifests directory is never mentioned, so neither the
+        # mkdir nor a write happens.
+        self._cluster().create(1, 1, 1)
+
+        self.assertEqual(
+            [], [c for c in self._commands()
+                 if cluster_module.K3S_MANIFEST_DIR in c])
+
+    def test_a_duplicate_basename_raises_before_anything_is_built(self):
+        # The basename is the destination filename, so the second of these
+        # would silently replace the first on the node.
+        first = self._manifest('same.yaml', 'kind: One\n', subdir='one')
+        second = self._manifest('same.yaml', 'kind: Two\n', subdir='two')
+
+        e = self.assertRaises(
+            exceptions.ManifestError, self._cluster().create,
+            1, 1, 1, manifests=[first, second])
+        self.assertEqual('duplicate_basename', e.reason)
+
+        self._assert_nothing_was_built()
+
+    def test_an_absent_manifest_raises_before_anything_is_built(self):
+        # The library boundary: --manifest is a click.Path(exists=True), so
+        # the command line refuses this before create() is called at all,
+        # but a library caller's paths have been checked by nobody. Failing
+        # at the point of use instead would leave a cluster of instances
+        # which have to be deleted before the name can be used again.
+        e = self.assertRaises(
+            exceptions.ManifestError, self._cluster().create,
+            1, 1, 1, manifests=[os.path.join(self.manifest_dir, 'absent.yaml')])
+        self.assertEqual('unreadable', e.reason)
+
+        self._assert_nothing_was_built()
+
+    def _assert_nothing_was_built(self):
+        self.assertEqual(
+            [], self.client.calls,
+            'the cluster was registered or an instance created before the '
+            'manifests were read')
+        self.assertEqual({}, self.client.instances)
+        self.assertEqual({}, self.client.metadata)
+        self.assertEqual([], self.client.executed)
+
+    def test_the_staging_is_reported(self):
+        first = self._manifest('first.yaml', 'kind: One\n')
+        second = self._manifest('second.yaml', 'kind: Two\n')
+
+        self._cluster().create(1, 1, 1, manifests=[first, second])
+
+        output = self.reporter.getvalue()
+        self.assertIn('staging 2 manifests', output)
+        self.assertIn('first.yaml, second.yaml', output)

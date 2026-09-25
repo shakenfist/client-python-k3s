@@ -51,6 +51,96 @@ BASE_OS_VERSION = 'debian:12'
 # notes that it might be stalled.
 STALL_WARNING_SECONDS = 300
 
+# Where k3s looks for manifests to apply itself, and the filename suffixes
+# it will look at. Everything in this directory is applied when the server
+# starts and again whenever a file in it changes, which is what makes
+# staging a manifest before k3s is installed work at all. The directory
+# does not exist at that point -- k3s creates it when the server starts --
+# so install_control_plane() creates it, and k3s finds our files already
+# there the first time it runs. Only .yaml, .yml and .json are looked at
+# (k3s pkg/deploy/controller.go matches those three suffixes, case
+# insensitively), and anything else in the directory is ignored without
+# comment, which is why read_manifests() refuses such a file rather than
+# let a payload go quietly missing.
+K3S_MANIFEST_DIR = '/var/lib/rancher/k3s/server/manifests'
+K3S_MANIFEST_SUFFIXES = ('.yaml', '.yml', '.json')
+
+# The heredoc delimiter manifest content is handed to a node with. The
+# config file write in install_control_plane() uses an unquoted EOF, which
+# is safe for content this module generates itself, but manifest content
+# belongs to the caller and routinely contains $ and backticks -- a
+# container command, a shell script in a ConfigMap -- which the shell would
+# expand inside an unquoted heredoc. Quoting the delimiter turns all of
+# that off. A line of the manifest which is exactly the delimiter would
+# still end the heredoc early, so read_manifests() refuses one; base64
+# would avoid that question entirely, at the cost of making every staged
+# manifest unreadable in the agent operation log.
+K3S_MANIFEST_DELIMITER = 'SFK3SMANIFEST'
+
+
+def read_manifests(paths):
+    """Read the manifest files named by paths, and return them ready to stage.
+
+    Returns a list of (basename, content) pairs in the order the paths were
+    given. The destination filename on the node is the source basename, and
+    nothing is templated, reordered or otherwise interpreted (decision 8 of
+    the phase 3 plan), so all this does is read the files and refuse the
+    ones which cannot be staged.
+
+    Every path is checked before any of them is used, which is the pattern
+    step 3b established for remove_worker(): create() calls this before it
+    allocates a network or boots an instance, so an unusable manifest costs
+    the caller an error instead of a half built cluster to tear down. It is
+    also why the existence check lives here and not only in the click
+    layer: ``--manifest`` is a click.Path(exists=True), but a library caller
+    hands over paths which nothing has looked at, and would otherwise reach
+    a bare IOError from outside this package's exception hierarchy.
+
+    Raises exceptions.ManifestError, whose docstring enumerates the five
+    ways a file is refused and why each of them is a refusal rather than
+    something to discover on the cluster afterwards.
+    """
+    manifests = []
+    by_basename = {}
+
+    for path in paths or []:
+        basename = os.path.basename(path)
+
+        if not basename.lower().endswith(K3S_MANIFEST_SUFFIXES):
+            raise exceptions.ManifestError.not_a_manifest(
+                path, K3S_MANIFEST_SUFFIXES)
+
+        if basename in by_basename:
+            raise exceptions.ManifestError.duplicate_basename(
+                basename, by_basename[basename], path)
+
+        try:
+            with open(path) as f:
+                content = f.read()
+        except OSError as e:
+            raise exceptions.ManifestError.unreadable(path, str(e))
+
+        # Parsed and thrown away: this asks whether k3s will be able to
+        # read the file at all, not what it declares. A manifest which
+        # does not parse is applied by nobody and reported to nobody --
+        # k3s logs it on the node and carries on -- so the cluster comes
+        # up healthy with the payload missing unless we refuse it here.
+        # safe_load_all because a manifest is routinely several documents,
+        # and JSON is a subset of YAML so the same parse covers it.
+        try:
+            list(yaml.safe_load_all(content))
+        except yaml.YAMLError as e:
+            raise exceptions.ManifestError.invalid_yaml(path, str(e))
+
+        if K3S_MANIFEST_DELIMITER in content.split('\n'):
+            raise exceptions.ManifestError.delimiter_collision(
+                path, K3S_MANIFEST_DELIMITER)
+
+        by_basename[basename] = path
+        manifests.append((basename, content))
+
+    return manifests
+
 
 class Cluster:
     """One k3s cluster, and everything the orchestration needs to reach it.
@@ -518,9 +608,21 @@ class Cluster:
             ]
         )
 
-    def install_control_plane(self):
+    def install_control_plane(self, manifests=None):
+        """Prepare the first control plane node, and install k3s on it.
+
+        manifests is a list of local file paths, each of which is written
+        into k3s's auto-apply directory on this node before k3s is
+        installed, so that k3s applies it itself the first time the server
+        starts. They are read here as well as in create(), which is not a
+        redundancy: create() reads them before it builds anything so that a
+        bad path does not cost a network and a handful of instances first,
+        and this method is callable on its own, so it does not trust an
+        argument somebody else was supposed to have checked.
+        """
         p = self.get_progress()
         md = self.get_metadata()
+        staged = read_manifests(manifests)
         cmds = []
 
         p.phase('Installing k3s on the first control plane node')
@@ -537,6 +639,39 @@ class Cluster:
             'cluster-init: true\n'
             'EOF\n'
             % md['api_address_floating'])
+
+        # Stage the caller's manifests, before the install below rather
+        # than after it: k3s applies this directory when the server first
+        # starts, so a manifest which arrives afterwards is one which is
+        # applied on the next restart instead of on this one.
+        #
+        # The directory is ours to create, because k3s has not run yet, and
+        # it is created with the mode k3s would have used rather than
+        # mkdir's default. k3s creates its data directory with
+        # os.MkdirAll(dataDir, 0700) and Go's MkdirAll does not tighten a
+        # directory it finds already there, so leaving these at 0755 would
+        # permanently loosen /var/lib/rancher/k3s/server, which is about to
+        # hold this cluster's registration tokens and TLS keys. -m applies
+        # to each directory named as an operand and not to parents -p
+        # invents, which is why the parents are named too. An existing
+        # directory keeps whatever mode it already has, here as in k3s.
+        if staged:
+            p.note('staging %s into %s: %s'
+                   % (progress.count_str(len(staged), 'manifest'),
+                      K3S_MANIFEST_DIR,
+                      ', '.join(basename for basename, _ in staged)))
+            cmds.append(
+                'mkdir -p -m 0700 /var/lib/rancher /var/lib/rancher/k3s '
+                '/var/lib/rancher/k3s/server %s' % K3S_MANIFEST_DIR)
+            for basename, content in staged:
+                # Exactly one trailing newline, because the heredoc needs
+                # its delimiter on a line of its own and a file which
+                # already ends in a newline must not gain a blank line.
+                body = content if content.endswith('\n') else content + '\n'
+                cmds.append(
+                    "cat - > %s/%s << '%s'\n%s%s\n"
+                    % (K3S_MANIFEST_DIR, basename, K3S_MANIFEST_DELIMITER,
+                       body, K3S_MANIFEST_DELIMITER))
 
         # Instruct the first control plane node to install k3s and helm
         cmds.append('curl -sfL https://get.k3s.io | '
@@ -743,7 +878,8 @@ class Cluster:
     def create(self, control_plane_count, worker_count, metal_address_count,
                network=None, refresh_version_cache=False,
                release_channel='stable', sshkey=None, install_metallb=True,
-               install_longhorn=True, write_kubeconfig=False):
+               install_longhorn=True, write_kubeconfig=False,
+               manifests=None):
         """Build this cluster, from nothing to a working k3s.
 
         The namespace must already exist. The command line creates it when
@@ -772,7 +908,31 @@ class Cluster:
         False, in which case it is accepted and ignored -- see
         k3s_create()'s --metal-address-count help in __init__.py for why
         that combination is not an error.
+
+        manifests is a list of local file paths, written verbatim into
+        k3s's auto-apply directory on the first control plane node before
+        k3s is installed there, so that k3s applies them when the server
+        first starts. Nothing about them is templated, and their order is
+        k3s's business rather than this method's; a payload which needs
+        either belongs in a chart the caller installs afterwards (decision
+        8 of the phase 3 plan). Staging them is not a phase of its own --
+        the writes are extra commands inside the phase which installs k3s
+        on that node, so total_phases below does not move with this
+        argument.
         """
+        # Read the manifests before anything else happens, which is
+        # earlier than this function checks any of its other arguments --
+        # sshkey is read after the name and the network have been settled.
+        # A bad path or a duplicate basename discovered once a network has
+        # been allocated and several instances booted is a cluster the
+        # caller has to delete before the name can be used again, and the
+        # only thing between a library caller and that is this line. The
+        # result is deliberately discarded: install_control_plane() reads
+        # the files again where it writes them, so that there is one reader
+        # of manifest content rather than a list threaded through the
+        # middle of this function.
+        read_manifests(manifests)
+
         # Phases: create control plane nodes, create workers, install control
         # plane, install workers, fetch credentials, metallb, longhorn, and
         # update the local kubeconfig. Creating a node network and installing
@@ -912,7 +1072,7 @@ class Cluster:
         md['join_address'] = interfaces[0]['ipv4']
         self.set_metadata(md)
 
-        self.install_control_plane()
+        self.install_control_plane(manifests=manifests)
         self.install_workers(md['worker_nodes'])
 
         # install_control_plane() recorded the two registration tokens.
