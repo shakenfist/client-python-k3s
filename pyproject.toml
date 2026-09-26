@@ -14,14 +14,14 @@ dynamic = ["version"]
 
 description = "A sf-client plugin which orchestrates k3s clusters on Shaken Fist"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     {name = "Michael Still", email = "mikal@stillhq.com"},
 ]
 classifiers = [
     "Intended Audience :: Information Technology",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
@@ -46,13 +46,21 @@ dependencies = [
 [project.entry-points."shakenfist_client.plugin"]
 k3s = "shakenfist_client_k3s:load"
 
+# include_package_data defaults to true under pyproject.toml, and
+# setuptools_scm installs a file finder that offers every git-tracked
+# file as package data. That re-adds the whole tests/ tree the
+# packages.find exclude below correctly drops as a *package* -- the
+# exclude is not the bug, this is. Nothing in this package reads a
+# data file at runtime, so there is nothing legitimate to lose.
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 include = ["shakenfist_client_k3s*"]
 exclude = ["shakenfist_client_k3s.tests*"]
 
 [tool.setuptools_scm]
 git_describe_command = "git describe --dirty --tags --match v* --first-parent"
-write_to = "shakenfist_client_k3s/_version.py"
 
 [project.optional-dependencies]
 test = [

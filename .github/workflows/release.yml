@@ -49,6 +49,10 @@ jobs:
         run: |
           release-venv/bin/twine check dist/*
 
+      - name: Check wheel does not ship the test suite
+        run: |
+          tools/check-dist.sh dist/*.whl
+
       - name: Upload distribution artifacts
         uses: actions/upload-artifact@v7
         with:
