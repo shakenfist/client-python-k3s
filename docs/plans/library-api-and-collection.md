@@ -231,20 +231,22 @@ Constraints:
    understand best. Awaiting an answer; it only affects ordering.
 
 2. **What does `remove-worker` do about the k8s Node object?**
-   Deleting the VM without deleting the Node leaves NotReady
-   tombstones (`PLAN-k3s-ci-runners.md` decision 2 names this). Doing
-   it from the plugin means the plugin needs cluster credentials and a
-   kubectl-equivalent, which cuts against making kubeconfig side
-   effects opt-out. Recommendation: the plugin cordons and deletes the
-   Node using the kubeconfig already in namespace metadata, via the
-   API rather than a `kubectl` subprocess.
+   *Settled by phase 3, and not as recommended here.* This entry
+   recommended acting on the Node through the Kubernetes API using the
+   kubeconfig in namespace metadata, to avoid a `kubectl` subprocess.
+   Phase 3 instead runs `kubectl drain --ignore-daemonsets` and
+   `kubectl delete node` on the first control plane node through the
+   agent (`cluster.py` `remove_worker()`), which needs no cluster
+   credentials on the caller's machine at all and so does not cut
+   against the kubeconfig opt-out. The concern behind the
+   recommendation was the local `kubectl` dependency, and running it
+   in-cluster answers it better than an API client would.
 
 3. **Does `create` grow a `--no-metallb` as well as `--no-longhorn`?**
-   The CI cluster needs MetalLB for the federation float
-   (`PLAN-k3s-ci-runners.md` decision 4), so nothing needs it off
-   today. Recommendation: implement both flags anyway, since the code
-   paths are adjacent, but do not spend design effort on the MetalLB
-   case.
+   *Settled by phase 3, as recommended:* both flags shipped, and
+   `expand-addresses` refuses a cluster built with `--no-metallb`
+   before it routes an address, because routing first and failing
+   afterwards charges the caller for addresses nothing can hand out.
 
 ## Execution
 
@@ -252,7 +254,7 @@ Constraints:
 |-------|------|--------|--------|
 | 1. Library API | [library-api-and-collection-phase-01-library-api.md](library-api-and-collection-phase-01-library-api.md) -- extract orchestration from the Click command bodies into a callable `Cluster` layer; replace `sys.exit(1)` with an exception hierarchy; route `print()` through a reporter; make the Click commands thin wrappers | Complete | `7fb29e5` (#55) |
 | 2. Client construction | [library-api-and-collection-phase-02-client-construction.md](library-api-and-collection-phase-02-client-construction.md) -- take the client from `ctx.obj['CLIENT']` so the root `--apiurl`/`--key`/`--namespace` are honoured, and add the `api_url`/`namespace`/`key` plus `suppress_configuration_lookup=True` factory that `sf_namespace._make_client()` uses. Phase 1 collapsed the two overwrite sites this row used to cite into one, `_bind_namespace_context()` at `__init__.py:24`; the root builds its client at `client-python/shakenfist_client/main.py:229-237` and stores it at `:236`. The root's `--async` default is `pause` (`main.py:199`) and this code needs `ASYNC_CONTINUE`, which is why the root client cannot simply be used as it stands | Complete | `1c32d12` (#63, plan only), `4e76704` (#65, decision 2 settled), `871f6ee` (#68, steps 2a-2d), `539b50d` (#69, review follow-up) |
-| 3. Missing verbs | [library-api-and-collection-phase-03-missing-verbs.md](library-api-and-collection-phase-03-missing-verbs.md) -- `remove-worker`; install k3s only on the workers being added; read the cluster state we already write; a health verb; `--no-longhorn`/`--no-metallb`; kubeconfig side effects opt-out (including the `kubectl config unset` calls in `Cluster.delete()`, which run without `capture_output` and so write to the process's real stdout, bypassing the reporter -- found during phase 1 and pinned by `KubectlUnsetLeakTestCase`); route `GroupCatchClusterExceptions`'s `print(str(e))` to `sys.stderr` instead of `sys.stdout` (found during phase 1 -- pre-existing CLI behaviour, deferred because phase 1 changes no user-visible output); give `Cluster.get_progress()`'s lazy default a real `total_phases` so a library caller invoking a mid-level method directly gets `[n/total]` headers instead of un-numbered `[n]` ones (found during phase 1; no CLI path hits this today); manifest payload hook. Phase 3's survey corrected two claims this row used to make. Making `install_workers()` incremental is a defect rather than a feature: `expand_workers()` (`cluster.py:875-889`) installs over all of `md['worker_nodes']`, so adding one worker re-runs the k3s agent installer on every existing one. And there is no `state: initial` reconcile to finish -- `md['state']` is written at `:633`, `:735` and `:842` and read nowhere, so phase 3 starts reading it; resume is deferred to Future work by that phase's decision 5 | In progress | |
+| 3. Missing verbs | [library-api-and-collection-phase-03-missing-verbs.md](library-api-and-collection-phase-03-missing-verbs.md) -- `remove-worker`; install k3s only on the workers being added; read the cluster state we already write; a health verb; `--no-longhorn`/`--no-metallb`; kubeconfig side effects opt-out (including the `kubectl config unset` calls in `Cluster.delete()`, which run without `capture_output` and so write to the process's real stdout, bypassing the reporter -- found during phase 1 and pinned by `KubectlUnsetLeakTestCase`); route `GroupCatchClusterExceptions`'s `print(str(e))` to `sys.stderr` instead of `sys.stdout` (found during phase 1 -- pre-existing CLI behaviour, deferred because phase 1 changes no user-visible output); give `Cluster.get_progress()`'s lazy default a real `total_phases` so a library caller invoking a mid-level method directly gets `[n/total]` headers instead of un-numbered `[n]` ones (found during phase 1; no CLI path hits this today); manifest payload hook. Phase 3's survey corrected two claims this row used to make. Making `install_workers()` incremental is a defect rather than a feature: `expand_workers()` (`cluster.py:875-889`) installs over all of `md['worker_nodes']`, so adding one worker re-runs the k3s agent installer on every existing one. And there is no `state: initial` reconcile to finish -- `md['state']` is written at `:633`, `:735` and `:842` and read nowhere, so phase 3 starts reading it; resume is deferred to Future work by that phase's decision 5 | Complete | `d51cf59` (#75) |
 | 4. First release | Cut `v0.1.0` so `shakenfist-client-k3s` exists on PyPI and `setuptools_scm` has a real version to stamp | Not started | |
 | 5. The collection | `shakenfist.k3s` with `sf_k3s_cluster`; `tools/build-collection.py`; `build-collection` and `publish-collection` jobs in `release.yml`; ansible-lint in pre-commit and CI; docs | Not started | |
 | 6. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-5 against `develop` | Not started | |
@@ -611,7 +613,24 @@ file, with a one line summary in the index's `Intent` column.
 
 <!-- Record bugs found and fixed while executing this plan. -->
 
-Nothing yet. Note that
+Phase 3 fixed four, none of which had an issue of its own:
+
+- `expand-workers` re-ran the k3s agent installer on every existing
+  worker, not just the new ones (`install_workers()` read
+  `md['worker_nodes']` rather than the instances it was given).
+- `Cluster.delete()`'s `kubectl config unset` loop ran without
+  `capture_output`, so three `Property "..." unset.` lines went
+  straight to file descriptor 1, bypassing the reporter. This was
+  pinned by `KubectlUnsetLeakTestCase`, now deleted.
+- `GroupCatchClusterExceptions` printed error messages to stdout.
+- `configure_metallb_addresses()` waited on a snapshot of pods
+  matching a label selector, so a DaemonSet pod orphaned by
+  `remove-worker` deleting its node spent the whole five minute
+  budget and the failure then named the healthy pods the wait had
+  never reached. Found by the merge queue, fixed in `3eddbaf` before
+  #75 landed.
+
+Note that
 [#41](https://github.com/shakenfist/client-python-k3s/issues/41) --
 `k3s delete` destroying a pre-existing network passed to
 `create --network` -- is adjacent to phase 3 but is tracked as its own
