@@ -28,6 +28,15 @@ if [ -z "${WHEEL}" ]; then
     exit 1
 fi
 
+# Print each line of the argument indented by two spaces. A read loop
+# rather than sed so a path containing a space stays one line, and to
+# avoid the SC2001 style warning a sed substitution earns here.
+indent() {
+    while IFS= read -r line; do
+        echo "  ${line}"
+    done <<< "$1"
+}
+
 if [ ! -f "${WHEEL}" ]; then
     echo "No such file: ${WHEEL}"
     exit 1
@@ -38,7 +47,7 @@ entries=$(python3 -m zipfile -l "${WHEEL}" | tail -n +2 | awk '{print $1}')
 test_entries=$(echo "${entries}" | grep '/tests/' || true)
 if [ -n "${test_entries}" ]; then
     echo "check-dist: ${WHEEL} contains test paths that must not ship:"
-    echo "${test_entries}" | sed 's/^/  /'
+    indent "${test_entries}"
     echo "check-dist: check [tool.setuptools] include-package-data in" \
         "pyproject.toml -- it should be false"
     exit 1
@@ -48,7 +57,7 @@ count=$(echo "${entries}" | grep -c .)
 if [ "${count}" -gt "${MAX_ENTRIES}" ]; then
     echo "check-dist: ${WHEEL} has ${count} entries, expected at most" \
         "${MAX_ENTRIES}:"
-    echo "${entries}" | sed 's/^/  /'
+    indent "${entries}"
     echo "check-dist: check whether the new entries belong in the" \
         "published package before raising MAX_ENTRIES"
     exit 1
