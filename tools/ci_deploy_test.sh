@@ -28,7 +28,7 @@ MINIMAL_CLUSTER=ciMinimal
 # This tracks the cluster's k3s channel only loosely, which is fine for
 # the simple kubectl operations used here.
 # renovate: datasource=github-releases depName=kubernetes/kubernetes
-KUBECTL_VERSION=v1.37.0
+KUBECTL_VERSION=v1.37.1
 VENV=/tmp/venv-k3s-ci
 
 status() {
