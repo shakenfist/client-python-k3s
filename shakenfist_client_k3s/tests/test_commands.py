@@ -596,6 +596,24 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
         'healthy': False
     }
 
+    def test_an_existing_instance_with_no_name_is_not_rendered_as_None(self):
+        # _node_health() reads every field with .get(), so an instance which
+        # exists and has no name is a shape the report can carry. The
+        # existing-but-unnamed case has its own line here because the
+        # renderer only special-cases the instance which is gone, and the
+        # literal string None in a health report is worse than useless --
+        # remove_worker() refuses the same shape outright.
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][1].update({'name': None, 'exists': True,
+                                   'state': 'created', 'agent_state': 'ready'})
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn('[!!] (unnamed) (inst-w1, worker): instance created',
+                      reporter.getvalue())
+        self.assertNotIn('None', reporter.getvalue())
+
     def test_the_report_goes_to_the_reporter_and_not_to_stdout(self):
         reporter = progress.CollectingReporter()
         stdout = io.StringIO()

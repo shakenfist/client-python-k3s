@@ -295,7 +295,9 @@ flight than a new ending, and starting the next command over one that
 is still running would corrupt the node. A wait for a command's output
 raises, because that output exists only for `complete`. Neither can
 wedge: the server moves every operation out of whatever state it is in
-within its deadline.
+within its deadline. `health()`'s probe names the state too, rather
+than reporting an ending it does not recognise as a completion with no
+result.
 
 `health()` is the exception to all of that, in the other direction: its
 `kubectl` probe carries a timeout, and it is skipped altogether when
@@ -305,9 +307,22 @@ neither raises. An abandoned probe does leave its operation queued
 against the control plane node until the server's deadline ends it, and
 `api['error']` names that operation: a caller polling `health()` in a
 loop should know that a later `expand_workers()` or `update_os()` waits
-for those alongside its own commands. `remove_worker([])` is likewise
-an accepted no-op, so a caller computing the removal list
-programmatically does not need to guard the call.
+for those alongside its own commands.
+
+That wait is a delay and not a failure, and the mechanism is worth
+stating because the obvious implementation gets it wrong.
+`await_idle()` waits for *every* agent operation on an instance,
+because the next command must not race one still executing on the node,
+but it judges only the operations it was handed --
+`execute_and_await()` passes the ones it just submitted. An operation
+nobody named is waited for while it can still progress and ignored once
+it ends, whatever it ends as. Without that split, an abandoned probe
+which the server later expires would abort an unrelated
+`expand_workers()` with an `AgentOperationError` naming a `kubectl get
+nodes` the caller never ran.
+
+`remove_worker([])` is likewise an accepted no-op, so a caller computing
+the removal list programmatically does not need to guard the call.
 
 Every elapsed time this library measures -- the probe's timeout, the
 stall notes, the progress reporting -- is taken from `time.monotonic()`,

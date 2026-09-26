@@ -305,21 +305,35 @@ control plane node, and the reason on the `k3s API:` line names the
 agent operation so it can be recognised later: until Shaken Fist's own
 deadline ends it, a subsequent `expand-workers` or `update-os` waits
 for it along with everything else. That is a delay in a later command,
-not a hang, and it is worth knowing about if you poll `health` in a
-loop against a cluster whose agent is intermittently slow.
+not a failure of it -- those commands wait for every agent operation on
+a node, because the next command must not race one still running, but
+they only fail on the ones they submitted themselves. It is still worth
+knowing about if you poll `health` in a loop against a cluster whose
+agent is intermittently slow.
 
 Pass `--strict` to exit 1 when the cluster is not healthy, which is
 what makes `health` usable from a shell:
 
 ```
-sf-client k3s health mycluster --strict && ./deploy-my-workload.sh
+sf-client k3s health mycluster --strict || exit 1
 ```
 
 The report is printed identically either way -- only the exit code
 changes -- so one run gives both the text and the branch, and nothing
-has to parse the output. `create -> health --strict -> delete` is a
-reasonable CI gate for checking a cluster came up correctly before
-handing it to something else.
+has to parse the output.
+
+Be precise about what "healthy" means here, because it is narrower than
+it sounds: the cluster finished being built, every instance the metadata
+names exists and has a ready agent, and `kubectl get nodes` on the first
+control plane node exited zero. The node terms are Shaken Fist's view of
+the machines, not Kubernetes' view of the kubelets, so a cluster whose
+nodes are all `NotReady` still reports healthy -- the k3s API answered,
+which is all the last term asks. `--strict` is therefore a good gate for
+"did this cluster come up and is its control plane reachable" and not a
+substitute for waiting on workload readiness; this repo's own functional
+test uses both, `health --strict` and a separate `kubectl wait`. Folding
+Kubernetes node readiness into the report is
+[shakenfist/client-python-k3s#76](https://github.com/shakenfist/client-python-k3s/issues/76).
 
 The default stays at "always 0" because "the cluster is unwell" and
 "the health check could not run" are different answers, and a command

@@ -450,8 +450,10 @@ class WaitLoopTestCase(testtools.TestCase):
     def test_await_idle_describes_running_command(self):
         client = mock.MagicMock()
         client.get_instance.return_value = {'name': 'node-001'}
+        # No leading empty answer: await_idle() no longer snapshots the
+        # operations which had already failed, because it judges the ones it
+        # was handed instead.
         client.get_instance_agentoperations.side_effect = [
-            [],
             [{
                 'uuid': 'aop-001',
                 'state': 'executing',
@@ -463,7 +465,7 @@ class WaitLoopTestCase(testtools.TestCase):
         stream = io.StringIO()
         cluster = self._make_cluster(client, stream)
 
-        cluster.await_idle(['uuid-001'])
+        cluster.await_idle(['uuid-001'], ['aop-001'])
 
         self.assertEqual(
             "  node-001: running 'apt-get update' (1 operation remaining) (0s)\n"
@@ -474,7 +476,6 @@ class WaitLoopTestCase(testtools.TestCase):
         client = mock.MagicMock()
         client.get_instance.return_value = {'name': 'node-001'}
         client.get_instance_agentoperations.side_effect = [
-            [],
             [{
                 'uuid': 'aop-002',
                 'instance_uuid': 'uuid-001',
@@ -490,7 +491,8 @@ class WaitLoopTestCase(testtools.TestCase):
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
             e = self.assertRaises(
-                exceptions.AgentOperationError, cluster.await_idle, ['uuid-001'])
+                exceptions.AgentOperationError, cluster.await_idle,
+                ['uuid-001'], ['aop-002'])
 
         self.assertEqual('', captured.getvalue())
         self.assertEqual('aop-002', e.operation_uuid)
@@ -513,9 +515,12 @@ class WaitLoopTestCase(testtools.TestCase):
         stream = io.StringIO()
         cluster = self._make_cluster(client, stream)
 
-        # An operation which had already failed before the wait started must
-        # neither wedge the wait nor abort it.
-        cluster.await_idle(['uuid-001'])
+        # An operation this wait did not submit must neither wedge it nor
+        # abort it, whatever state it is in. This used to be a snapshot of
+        # what had already failed; it is now simply that the operation is
+        # not one of ours, which also covers the operation which fails
+        # while the wait is running.
+        cluster.await_idle(['uuid-001'], ['aop-ours'])
         self.assertIn('node-001: idle', stream.getvalue())
 
     def test_await_idle_notes_stalled_command(self):
@@ -533,11 +538,11 @@ class WaitLoopTestCase(testtools.TestCase):
         # the stall warning threshold with some slack to show the warning is
         # only emitted once.
         polls = cluster_module.STALL_WARNING_SECONDS // 5 + 10
-        client.get_instance_agentoperations.side_effect = [[]] + [[running]] * polls + [[]]
+        client.get_instance_agentoperations.side_effect = [[running]] * polls + [[]]
         stream = io.StringIO()
         cluster = self._make_cluster(client, stream)
 
-        cluster.await_idle(['uuid-001'])
+        cluster.await_idle(['uuid-001'], ['aop-001'])
 
         self.assertIn('may be stalled', stream.getvalue())
         self.assertIn('aop-001', stream.getvalue())

@@ -370,9 +370,13 @@ def _render_health(out, report):
             out.write('    [%s] %s (%s): this instance no longer exists\n'
                       % (marker, node['uuid'], role))
             continue
+        # 'or' on the name for the same reason as on the agent state:
+        # _node_health() reads every field with .get() so that a health
+        # check cannot crash on the instance it most needs to report, and
+        # the literal string None is not a name.
         out.write('    [%s] %s (%s, %s): instance %s, agent %s\n' % (
-            marker, node['name'], node['uuid'], role, node['state'],
-            node['agent_state'] or 'not yet contactable'))
+            marker, node['name'] or '(unnamed)', node['uuid'], role,
+            node['state'], node['agent_state'] or 'not yet contactable'))
 
     api = report['api']
     if api['answered']:

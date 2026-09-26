@@ -177,9 +177,10 @@ def read_manifests(paths):
     hands over paths which nothing has looked at, and would otherwise reach
     a bare IOError from outside this package's exception hierarchy.
 
-    Raises exceptions.ManifestError, whose docstring enumerates the six
-    ways a file is refused and why each of them is a refusal rather than
-    something to discover on the cluster afterwards.
+    Raises exceptions.ManifestError, whose docstring enumerates every way
+    a file is refused and why each of them is a refusal rather than
+    something to discover on the cluster afterwards. Deliberately no count
+    here: there were two and they disagreed as soon as one was added.
     """
     manifests = []
     by_basename = {}
@@ -475,21 +476,40 @@ class Cluster:
             time.sleep(5)
         p.wait_done()
 
-    def await_idle(self, instances):
+    def await_idle(self, instances, own_operations):
+        """Wait until these instances are running no agent commands.
+
+        Waits for *every* agent operation on each instance, including ones
+        another process submitted: the next command must not race one which
+        is still executing on the node, and there is no way to ask the node
+        to serialise on our behalf.
+
+        Judges only the operations named in own_operations. Agent operations
+        stay associated with an instance forever, so an instance carries
+        every command anybody ever ran on it, and a failure among those is
+        not this call's business: raising for one would abort a command over
+        somebody else's, naming an operation the caller never submitted.
+        health()'s abandoned probe is the concrete case -- it leaves a
+        'kubectl get nodes' queued, which the server later moves to
+        'expired' -- and before own_operations existed, a snapshot of the
+        operations which had *already* failed was the defence. That snapshot
+        could not see an operation which was still queued when the wait
+        started and failed while it ran, which is exactly the shape the
+        probe creates.
+
+        own_operations has no default, deliberately. A caller which wants
+        only "is this instance busy" passes an empty list and says so, where
+        a default would let a caller which meant to be judged silently not
+        be -- and a wait which quietly stops failing on a failed install is
+        the kind of bug this argument exists to prevent, not to introduce.
+        execute_and_await() passes the operations it just submitted, and
+        reap_execute() is still what turns each of those into an exception
+        with its command and output; the raise here is to fail on the first
+        failure rather than after waiting out the rest.
+        """
         p = self.get_progress()
         waiting = copy.copy(instances)
-
-        # Agent operations stay associated with an instance forever, and an
-        # operation which failed will never complete. Snapshot any which had
-        # already failed before this wait started so a historical failure
-        # can neither wedge this wait nor incorrectly abort it. 'expired' is
-        # in that set as well as 'error': see AGENT_OP_FAILED_STATES.
-        preexisting_failures = {}
-        for instance_uuid in waiting:
-            aops = self.client.get_instance_agentoperations(instance_uuid, all=True)
-            preexisting_failures[instance_uuid] = {
-                aop['uuid'] for aop in aops
-                if aop['state'] in AGENT_OP_FAILED_STATES}
+        own = set(own_operations)
 
         running_since = {}
         stall_warned = set()
@@ -500,23 +520,27 @@ class Cluster:
                 inst = self.client.get_instance(instance_uuid)
                 agent_ops = self.client.get_instance_agentoperations(
                     instance_uuid, all=True)
-                agent_ops = [aop for aop in agent_ops
-                             if aop['uuid'] not in preexisting_failures[instance_uuid]]
 
                 failed = [aop for aop in agent_ops
-                          if aop['state'] in AGENT_OP_FAILED_STATES]
+                          if aop['state'] in AGENT_OP_FAILED_STATES
+                          and aop['uuid'] in own]
                 if failed:
                     raise self._agent_op_error(failed[0])
 
-                # "Not finished" rather than "pending": an operation which
-                # somebody deleted is finished and must not be waited for,
-                # but an operation in a state this version has never heard
-                # of must be, because declaring the instance idle would run
-                # the next install step over a command which may still be
-                # executing. See AGENT_OP_KNOWN_STATES for why this loop
-                # waits where await_fetch() raises.
+                # Still in flight is "in neither the finished nor the failed
+                # set", which is not the same as "pending": an operation
+                # somebody deleted, or which the server expired, is over and
+                # must not be waited for, while one in a state this version
+                # has never heard of must be, because declaring the instance
+                # idle would run the next install step over a command which
+                # may still be executing. Someone else's failed operation
+                # ends this wait without raising, which is the whole point
+                # of separating the two questions -- and it is why 'expired'
+                # has to be excluded here as well as checked above, or an
+                # abandoned probe would wedge the wait it used to abort.
                 incomplete = [aop for aop in agent_ops
-                              if aop['state'] not in AGENT_OP_FINISHED_STATES]
+                              if aop['state'] not in AGENT_OP_FINISHED_STATES
+                              and aop['state'] not in AGENT_OP_FAILED_STATES]
 
                 # Said once per unrecognised state rather than per poll, and
                 # said at all because a wait which silently treats a new
@@ -677,8 +701,11 @@ class Cluster:
                 aops.append(self.client.instance_execute(
                     instance_uuid, cmd))
 
-        # Wait for instances to be idle and check results
-        self.await_idle(instance_uuids)
+        # Wait for instances to be idle and check results. The operations
+        # this call submitted are named, so a failure among them aborts here
+        # and a failure among anybody else's does not.
+        self.await_idle(instance_uuids,
+                        own_operations=[aop['uuid'] for aop in aops])
         for aop in aops:
             self.reap_execute(aop)
 
@@ -766,6 +793,22 @@ class Cluster:
                 'the agent operation for %s entered the %s state'
                 % (primitives._describe_agent_op(aop, max_len=None) or command,
                    aop['state']))
+            return probe
+
+        # Anything left is an ending this version does not know about:
+        # await_execute() returns as soon as the state leaves the pending
+        # set, and the two branches above cover every state
+        # AGENT_OP_KNOWN_STATES names except 'complete'. Without this the
+        # fall-through reported "completed but recorded no result", which is
+        # the one thing in the report that would definitely not be what
+        # happened -- on the verb whose job is describing unusual states
+        # accurately. The rest of this module was changed to expect a state
+        # Shaken Fist adds later; this is the place that still assumed the
+        # list was closed.
+        if aop['state'] != 'complete':
+            probe['error'] = (
+                'the agent operation is in state %s, which this version of '
+                'the k3s plugin does not recognise' % aop['state'])
             return probe
 
         # An operation which completed without recording a result for its
@@ -927,6 +970,15 @@ class Cluster:
         # to each directory named as an operand and not to parents -p
         # invents, which is why the parents are named too. An existing
         # directory keeps whatever mode it already has, here as in k3s.
+        #
+        # /var/lib/rancher is named too, and at 0700, because that is what
+        # k3s leaves it at: os.MkdirAll's documented behaviour is that "the
+        # permission bits perm (before umask) are used for all directories
+        # that MkdirAll creates", so k3s creating /var/lib/rancher/k3s on a
+        # fresh node creates its parent at 0700 as well. Staging manifests
+        # therefore does not leave a cluster with different modes from one
+        # created without them, which is worth saying because the shape of
+        # this command invites the opposite conclusion.
         if staged:
             p.note('staging %s into %s: %s'
                    % (progress.count_str(len(staged), 'manifest'),

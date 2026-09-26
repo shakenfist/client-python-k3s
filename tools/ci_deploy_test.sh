@@ -144,6 +144,16 @@ sf-client k3s create "${CLUSTER}" \
 # than left for the ephemeral runner to take with it.
 rm -rf "${manifest_dir}"
 
+status 'Verify the kubeconfig default wrote the local kubeconfig'
+# The positive half of the --no-kubeconfig assertion further down. create
+# defaults the flag on from the CLI, so this file has to exist and has to
+# name the cluster; without this half, a create which quietly stopped
+# writing it would make the negative assertion pass for the wrong reason.
+if ! grep -q "${CLUSTER}" "${HOME}/.kube/config"; then
+    echo "create did not write ${CLUSTER} into ${HOME}/.kube/config"
+    exit 1
+fi
+
 status 'Fetch cluster credentials with getconfig'
 export KUBECONFIG=/tmp/k3s-ci-kubeconfig
 sf-client k3s getconfig "${CLUSTER}" > "${KUBECONFIG}"
@@ -251,16 +261,28 @@ fi
 status 'Create a cluster with none of the optional components'
 # HOME is left alone on purpose: --no-kubeconfig has to be the thing that
 # leaves ~/.kube/config alone, not the absence of a home directory.
+#
+# Compared rather than asserted absent: the first create wrote
+# ~/.kube/config (asserted above) and the delete which followed rewrote it
+# with kubectl config unset rather than removing it, so the file exists
+# whatever this create does. What --no-kubeconfig promises is that this
+# create does not touch it, and only a before-and-after comparison says
+# that. An earlier version of this script asserted the file did not exist,
+# which could never pass.
+kubeconfig_before=$(sha256sum "${HOME}/.kube/config")
+
 sf-client k3s create "${MINIMAL_CLUSTER}" \
     --control-plane-count 1 --worker-count 0 --metal-address-count 0 \
     --no-metallb --no-longhorn --no-kubeconfig
 
-status 'Verify --no-kubeconfig wrote no local kubeconfig'
-# The main cluster above used getconfig and an explicit KUBECONFIG, so
-# nothing in this script has written the default path. If it exists, the
-# create did it.
-if [ -e "${HOME}/.kube/config" ]; then
-    echo "create --no-kubeconfig wrote ${HOME}/.kube/config anyway"
+status 'Verify --no-kubeconfig left the local kubeconfig alone'
+kubeconfig_after=$(sha256sum "${HOME}/.kube/config")
+if [ "${kubeconfig_before}" != "${kubeconfig_after}" ]; then
+    echo "create --no-kubeconfig changed ${HOME}/.kube/config anyway"
+    exit 1
+fi
+if grep -q "${MINIMAL_CLUSTER}" "${HOME}/.kube/config"; then
+    echo "create --no-kubeconfig wrote ${MINIMAL_CLUSTER} into ${HOME}/.kube/config"
     exit 1
 fi
 
@@ -291,9 +313,19 @@ if ! grep -qi 'metallb' /tmp/k3s-ci-expand-refusal; then
 fi
 
 status 'Delete the minimal cluster'
+kubeconfig_before=$(sha256sum "${HOME}/.kube/config")
 sf-client k3s delete "${MINIMAL_CLUSTER}" --no-kubeconfig
 if sf-client k3s list | grep -q "^${MINIMAL_CLUSTER}$"; then
     echo 'The minimal cluster is still listed after deletion'
+    exit 1
+fi
+# delete --no-kubeconfig skips the kubectl config unset loop, which is the
+# half of the flag create cannot exercise: there was nothing of this
+# cluster's in the file to unset, so a delete which ran the loop anyway
+# would still rewrite the file.
+kubeconfig_after=$(sha256sum "${HOME}/.kube/config")
+if [ "${kubeconfig_before}" != "${kubeconfig_after}" ]; then
+    echo "delete --no-kubeconfig changed ${HOME}/.kube/config anyway"
     exit 1
 fi
 

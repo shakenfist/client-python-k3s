@@ -175,10 +175,16 @@ because that output only exists for `complete`. Neither can wedge the
 way `expired` did, because the server moves every operation out of
 whatever state it is in within its deadline.
 
-Failed operations which predate the current wait are ignored, so a
-historical failure does not prevent later commands like
-`expand-workers` from running. The one bounded wait is `health()`'s
-read-only probe, which carries a thirty second timeout and is skipped
+A wait for an instance to be idle waits for every agent operation on it,
+because the next command must not race one that is still executing, but
+it only fails on the operations it was handed -- `execute_and_await()`
+passes the ones it just submitted. Anyone else's operation is waited for
+while it can still progress and then ignored, whatever it ended as, so
+neither a historical failure nor a `health()` probe the server later
+expires can abort an unrelated `expand-workers`.
+
+The one bounded wait is `health()`'s read-only probe, which carries a
+thirty second timeout and is skipped
 entirely when the node it would run on is not up -- an operation queued
 against an unreachable agent never leaves the queue, and that is the
 cluster the verb exists to describe. If a single agent command runs for

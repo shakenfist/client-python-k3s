@@ -2158,7 +2158,7 @@ class AgentOperationEndingsTestCase(testtools.TestCase):
                                   cluster.reap_execute, _pending_aop())
         self.assertNotIn('state:', str(e))
 
-    def _await_idle(self, aop_states):
+    def _await_idle(self, aop_states, own=True):
         client = mock.MagicMock()
         client.get_instance.return_value = {
             'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
@@ -2167,14 +2167,12 @@ class AgentOperationEndingsTestCase(testtools.TestCase):
                  'state': state, 'commands': [], 'results': {}}
                 for i, state in enumerate(aop_states)]
 
-        # An empty first answer, so nothing is snapshotted as a
-        # pre-existing failure and the states below are the ones the wait
-        # actually sees.
-        client.get_instance_agentoperations.side_effect = [[]] + [aops] * 50
+        client.get_instance_agentoperations.side_effect = [aops] * 50
         cluster = Cluster(client, 'banana', 'testns',
                           reporter=progress.CollectingReporter())
+        own_operations = [aop['uuid'] for aop in aops] if own else ['aop-ours']
         with mock.patch('time.sleep', lambda seconds: None):
-            return cluster.await_idle(['inst-001'])
+            return cluster.await_idle(['inst-001'], own_operations)
 
     def test_await_idle_raises_for_an_expired_operation(self):
         self.assertRaises(exceptions.AgentOperationError,
@@ -2194,14 +2192,100 @@ class AgentOperationEndingsTestCase(testtools.TestCase):
                     'state': 'executing', 'commands': [], 'results': {}}]
         done = [{'uuid': 'aop-001', 'instance_uuid': 'inst-001',
                  'state': 'complete', 'commands': [], 'results': {}}]
-        client.get_instance_agentoperations.side_effect = [[], running, done]
+        client.get_instance_agentoperations.side_effect = [running, done]
 
         cluster = Cluster(client, 'banana', 'testns',
                           reporter=progress.CollectingReporter())
         with mock.patch('time.sleep', lambda seconds: None):
-            cluster.await_idle(['inst-001'])
+            cluster.await_idle(['inst-001'], ['aop-001'])
 
-        self.assertEqual(3, client.get_instance_agentoperations.call_count)
+        self.assertEqual(2, client.get_instance_agentoperations.call_count)
+
+    def _queued_then_expired(self, own_operations):
+        client = mock.MagicMock()
+        client.get_instance.return_value = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        def aops(state):
+            return [{'uuid': 'aop-orphan', 'instance_uuid': 'inst-001',
+                     'state': state,
+                     'commands': [{'command': 'execute',
+                                   'commandline': 'kubectl get nodes'}],
+                     'results': {}}]
+
+        # Queued when the wait starts, expired while it runs. Bounded, for
+        # the reason the class docstring gives.
+        client.get_instance_agentoperations.side_effect = (
+            [aops('queued')] * 3 + [aops('expired')] * 20)
+
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+
+        # The patch has to be inside the callable, not around the return:
+        # the wait happens when the caller runs it, and a returned lambda
+        # would do its sleeping for real.
+        def run():
+            with mock.patch('time.sleep', lambda seconds: None):
+                return cluster.await_idle(['inst-001'], own_operations)
+
+        return cluster, run
+
+    def test_an_orphan_which_expires_mid_wait_does_not_abort_the_command(self):
+        # The shape health()'s abandoned probe creates, and the one the
+        # snapshot of already-failed operations could not cover: the
+        # 'kubectl get nodes' it left queued is still queued when a later
+        # expand-workers starts, and the server's deadline moves it to
+        # 'expired' while that wait is running. Aborting an unrelated
+        # command over it, naming a command the operator never ran, is what
+        # this asserts does not happen.
+        _, run = self._queued_then_expired(['aop-ours'])
+
+        run()
+
+    def test_our_own_operation_expiring_mid_wait_still_aborts(self):
+        # The other half of the same distinction: an operation this wait
+        # submitted, which the server then took the deadline away from, is
+        # a failure of the command in hand.
+        _, run = self._queued_then_expired(['aop-orphan'])
+
+        e = self.assertRaises(exceptions.AgentOperationError, run)
+
+        self.assertEqual('expired', e.state)
+        self.assertEqual('aop-orphan', e.operation_uuid)
+
+    def test_execute_and_await_names_the_operations_it_submitted(self):
+        # The thread between the two: execute_and_await() submits the
+        # commands and hands their uuids to await_idle(), which is the only
+        # reason await_idle() can tell its own failures from a bystander's.
+        # A version which passed nothing would wait out the whole install
+        # and then report the failure from reap_execute() instead, and one
+        # which passed the wrong thing would not report it at all.
+        client = mock.MagicMock()
+        client.get_instance.return_value = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        submitted = {'uuid': 'aop-mine', 'instance_uuid': 'inst-001',
+                     'state': 'queued',
+                     'commands': [{'command': 'execute',
+                                   'commandline': 'apt-get update'}],
+                     'results': {}}
+        client.instance_execute.return_value = submitted
+
+        def errored(state):
+            return [dict(submitted, state=state)]
+
+        client.get_instance_agentoperations.side_effect = (
+            [errored('queued')] + [errored('error')] * 20)
+
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        with mock.patch('time.sleep', lambda seconds: None):
+            e = self.assertRaises(
+                exceptions.AgentOperationError,
+                cluster.execute_and_await, ['inst-001'], ['apt-get update'])
+
+        self.assertEqual('aop-mine', e.operation_uuid)
 
     def test_await_idle_waits_for_a_state_it_does_not_recognise(self):
         # The asymmetry this covers: await_fetch() raises for anything but
@@ -2223,16 +2307,16 @@ class AgentOperationEndingsTestCase(testtools.TestCase):
         # Bounded, for the reason the class docstring gives: a regression
         # which waits forever must fail rather than hang.
         client.get_instance_agentoperations.side_effect = (
-            [[]] + [aops('reticulating')] * 3 + [aops('complete')])
+            [aops('reticulating')] * 3 + [aops('complete')])
 
         reporter = progress.CollectingReporter()
         cluster = Cluster(client, 'banana', 'testns', reporter=reporter)
         with mock.patch('time.sleep', lambda seconds: None):
-            cluster.await_idle(['inst-001'])
+            cluster.await_idle(['inst-001'], ['aop-001'])
 
         # It kept waiting rather than declaring the instance idle at the
         # first sight of the state.
-        self.assertEqual(5, client.get_instance_agentoperations.call_count)
+        self.assertEqual(4, client.get_instance_agentoperations.call_count)
 
         # And said so, once, naming the state: a wait which silently treats
         # a new state as "still running" is indistinguishable from a hang.
@@ -2243,9 +2327,12 @@ class AgentOperationEndingsTestCase(testtools.TestCase):
         self.assertEqual(1, written.count('reticulating is not one'))
 
     def test_a_preexisting_expired_operation_does_not_wedge_the_wait(self):
-        # The snapshot at the top of await_idle() exists so a historical
-        # failure neither wedges the wait nor aborts it. It covered
-        # 'error' only, so a historical expired operation did both.
+        # Someone else's expired operation must neither wedge this wait nor
+        # abort it. It used to wedge it, because the snapshot which exempted
+        # historical failures covered 'error' only; then it aborted the
+        # command instead, because the snapshot could not see an operation
+        # which was still queued when the wait began. Now it is simply not
+        # one of ours.
         client = mock.MagicMock()
         client.get_instance.return_value = {
             'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
@@ -2258,7 +2345,7 @@ class AgentOperationEndingsTestCase(testtools.TestCase):
         cluster = Cluster(client, 'banana', 'testns',
                           reporter=progress.CollectingReporter())
         with mock.patch('time.sleep', lambda seconds: None):
-            cluster.await_idle(['inst-001'])
+            cluster.await_idle(['inst-001'], ['aop-ours'])
 
 
 class AwaitExecuteTimeoutTestCase(testtools.TestCase):
@@ -2439,6 +2526,22 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
         # if it is told which operation.
         self.assertIn('agent operation aop-001 is still queued',
                       report['api']['error'])
+
+    def test_an_unrecognised_ending_is_named_rather_than_mislabelled(self):
+        # await_execute() returns as soon as the state leaves the pending
+        # set, so a terminal state this version has never heard of reaches
+        # _probe_k3s_api(). It used to fall through to the result lookup and
+        # be reported as "completed but recorded no result", which is the one
+        # message in the report that could not be true -- on the verb whose
+        # job is describing unusual states accurately.
+        self.client.probe_state = 'reticulated'
+
+        report = self.cluster.health()
+
+        self.assertFalse(report['api']['answered'])
+        self.assertIn('reticulated', report['api']['error'])
+        self.assertIn('does not recognise', report['api']['error'])
+        self.assertNotIn('recorded no result', report['api']['error'])
 
     def test_an_expired_probe_is_a_finding_and_names_the_state(self):
         self.client.probe_state = 'expired'
