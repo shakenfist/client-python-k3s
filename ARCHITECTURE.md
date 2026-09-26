@@ -39,20 +39,22 @@ that; this section is only the shape.
   control plane nodes, workers, MetalLB address allocation, and
   Longhorn storage; `k3s getconfig` fetches a kubeconfig;
   `k3s expand-workers` / `expand-addresses` grow a cluster;
-  `k3s update-os` updates every node's OS packages;
+  `k3s remove-worker` shrinks one; `k3s update-os` updates every
+  node's OS packages; `k3s health` reports a cluster's health;
   `k3s query-k3s-version` / `query-longhorn-version` inspect the
   release version caches. `GroupCatchClusterExceptions`, a
   `click.Group` subclass, is the single place that catches a
-  `K3sClusterException`, prints it and exits 1 -- every command
-  raises rather than exiting directly.
+  `K3sClusterException`, prints it to stderr and exits 1 -- every
+  command raises rather than exiting directly.
 - **`Cluster` (`cluster.py`)** -- everything scoped to one named
   cluster: its namespace metadata cache (`get_metadata()` /
   `set_metadata()` / `delete_metadata()`), the instance orchestration,
-  and the seven methods each command body above moved onto
+  and the nine methods each command body above moved onto
   (`create()`, `get_kubeconfig()`, `show()`, `delete()`,
-  `expand_workers()`, `expand_addresses()`, `update_os()`). Methods
-  return values instead of printing them, and raise
-  `exceptions.K3sClusterException` subclasses instead of exiting.
+  `expand_workers()`, `remove_worker()`, `expand_addresses()`,
+  `update_os()`, `health()`). Methods return values instead of
+  printing them, and raise `exceptions.K3sClusterException`
+  subclasses instead of exiting.
 - **Namespace scoped lookups and stateless helpers (`primitives.py`)**
   -- work with no cluster identity: the two release lookups, whose
   caches live in *namespace* metadata rather than any one cluster's,
@@ -83,11 +85,12 @@ that; this section is only the shape.
   channel
 - **Cluster assembly**: the first control plane node is installed
   with `k3s server`, additional control plane nodes and workers join
-  using the node token, MetalLB is installed (from the official
-  metallb helm chart -- the Bitnami chart references versioned
-  docker.io/bitnami images which stopped being published in 2025)
-  and configured with floating addresses routed to the node network,
-  and Longhorn is installed for persistent volumes
+  using the node token, and, unless a caller opts out, MetalLB is
+  installed (from the official metallb helm chart -- the Bitnami
+  chart references versioned docker.io/bitnami images which stopped
+  being published in 2025) and configured with floating addresses
+  routed to the node network, and Longhorn is installed for
+  persistent volumes
 - **Join address**: nodes register through the cluster's
   `join_address` (namespace metadata), initially the first control
   plane node's in-network address. It is mutable cluster state, not
@@ -150,18 +153,48 @@ command is visible as a growing elapsed time, and idle waits describe
 the agent command currently executing rather than a bare operation
 count. The module is dependency free.
 
-The wait loops also detect failure: an agent operation which enters
-the `error` state aborts the command immediately with the operation
-uuid, the command it was on, and a pointer to `sf-client instance
-events` for the server side detail (operations in the error state
-never complete, so waiting on them would hang forever). Errored
-operations which predate the current wait are ignored, so a historical
-failure does not prevent later commands like `expand-workers` from
-running. If a single agent command runs for more than five minutes a
-one-off note flags that it may be stalled. Notes emitted mid-wait
-leave the wait block's per-item timers intact (and, on a TTY, redraw
-the status block below the note), so a stall note does not reset the
-very elapsed counter it is drawing attention to.
+The wait loops also detect failure. They enumerate the agent operation
+states rather than naming the endings they expect: `initial`,
+`preflight`, `queued` and `executing` are still in progress, `error`
+and `expired` are failures, and `complete` and `deleted` are over. That
+matters because Shaken Fist gives every agent operation a wall clock
+budget and moves one that overruns it to `expired`, which is
+deliberately distinct from `error`, and because `deleted` is reachable
+from every state: a loop that waited for `complete` or `error` by name
+spun forever on either. An ending which is not `complete` aborts the
+command with the operation uuid, its state, the command it was on, and
+a pointer to `sf-client instance events` for the server side detail.
+
+A state none of those name is one Shaken Fist added later, and the two
+kinds of wait answer that differently on purpose. Waiting for an
+instance to go idle waits for it, because an unrecognised state is more
+likely a new way of being in flight than a new ending, and running the
+next install step over a command still executing corrupts the node; it
+says so once, naming the state. Waiting for a command's output raises,
+because that output only exists for `complete`. Neither can wedge the
+way `expired` did, because the server moves every operation out of
+whatever state it is in within its deadline.
+
+A wait for an instance to be idle waits for every agent operation on it,
+because the next command must not race one that is still executing, but
+it only fails on the operations it was handed -- `execute_and_await()`
+passes the ones it just submitted. Anyone else's operation is waited for
+while it can still progress and then ignored, whatever it ended as, so
+neither a historical failure nor a `health()` probe the server later
+expires can abort an unrelated `expand-workers`.
+
+The one bounded wait is `health()`'s read-only probe, which carries a
+thirty second timeout and is skipped
+entirely when the node it would run on is not up -- an operation queued
+against an unreachable agent never leaves the queue, and that is the
+cluster the verb exists to describe. If a single agent command runs for
+more than five minutes a one-off note flags that it may be stalled.
+Every elapsed time here is measured on the monotonic clock, so a wall
+clock step mid-install cannot move a timeout or fire a stall note.
+Notes emitted mid-wait leave the wait block's per-item timers intact
+(and, on a TTY, redraw the status block below the note), so a stall
+note does not reset the very elapsed counter it is drawing attention
+to.
 
 ## Python Version Compatibility
 

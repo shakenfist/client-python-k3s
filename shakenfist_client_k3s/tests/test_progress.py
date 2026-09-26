@@ -22,7 +22,16 @@ from shakenfist_client_k3s.tests import fakes
 
 
 class FakeClock:
-    """A controllable stand-in for time.time()."""
+    """A controllable stand-in for time.monotonic().
+
+    monotonic() and not time(), because every elapsed time this package
+    measures is measured on the monotonic clock: a wall clock can step and an
+    elapsed time cannot. Patching progress.time.monotonic patches the name on
+    the time module itself, so this also stands in for cluster.py's readings
+    -- which is what WaitLoopTestCase relies on -- while leaving the release
+    cache timestamps in primitives.py, which are wall clock on purpose,
+    alone.
+    """
 
     def __init__(self, start=1000.0):
         self.now = start
@@ -130,7 +139,7 @@ class ProgressThroughCollectorTestCase(testtools.TestCase):
     def setUp(self):
         super().setUp()
         self.clock = FakeClock()
-        patcher = mock.patch('shakenfist_client_k3s.progress.time.time', self.clock)
+        patcher = mock.patch('shakenfist_client_k3s.progress.time.monotonic', self.clock)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -168,7 +177,7 @@ class ProgressLineModeTestCase(testtools.TestCase):
     def setUp(self):
         super().setUp()
         self.clock = FakeClock()
-        patcher = mock.patch('shakenfist_client_k3s.progress.time.time', self.clock)
+        patcher = mock.patch('shakenfist_client_k3s.progress.time.monotonic', self.clock)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -290,7 +299,7 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
         super().setUp()
         self.clock = FakeClock()
         for target, replacement in [
-                ('shakenfist_client_k3s.progress.time.time', self.clock),
+                ('shakenfist_client_k3s.progress.time.monotonic', self.clock),
                 ('shakenfist_client_k3s.progress.shutil.get_terminal_size',
                  lambda: os.terminal_size((80, 24)))]:
             patcher = mock.patch(target, replacement)
@@ -411,7 +420,7 @@ class WaitLoopTestCase(testtools.TestCase):
         super().setUp()
         self.clock = FakeClock()
         for target, replacement in [
-                ('shakenfist_client_k3s.progress.time.time', self.clock),
+                ('shakenfist_client_k3s.progress.time.monotonic', self.clock),
                 ('shakenfist_client_k3s.cluster.time.sleep',
                  lambda seconds: self.clock.advance(seconds))]:
             patcher = mock.patch(target, replacement)
@@ -441,8 +450,10 @@ class WaitLoopTestCase(testtools.TestCase):
     def test_await_idle_describes_running_command(self):
         client = mock.MagicMock()
         client.get_instance.return_value = {'name': 'node-001'}
+        # No leading empty answer: await_idle() no longer snapshots the
+        # operations which had already failed, because it judges the ones it
+        # was handed instead.
         client.get_instance_agentoperations.side_effect = [
-            [],
             [{
                 'uuid': 'aop-001',
                 'state': 'executing',
@@ -454,7 +465,7 @@ class WaitLoopTestCase(testtools.TestCase):
         stream = io.StringIO()
         cluster = self._make_cluster(client, stream)
 
-        cluster.await_idle(['uuid-001'])
+        cluster.await_idle(['uuid-001'], ['aop-001'])
 
         self.assertEqual(
             "  node-001: running 'apt-get update' (1 operation remaining) (0s)\n"
@@ -465,7 +476,6 @@ class WaitLoopTestCase(testtools.TestCase):
         client = mock.MagicMock()
         client.get_instance.return_value = {'name': 'node-001'}
         client.get_instance_agentoperations.side_effect = [
-            [],
             [{
                 'uuid': 'aop-002',
                 'instance_uuid': 'uuid-001',
@@ -481,7 +491,8 @@ class WaitLoopTestCase(testtools.TestCase):
         captured = io.StringIO()
         with mock.patch('sys.stdout', captured):
             e = self.assertRaises(
-                exceptions.AgentOperationError, cluster.await_idle, ['uuid-001'])
+                exceptions.AgentOperationError, cluster.await_idle,
+                ['uuid-001'], ['aop-002'])
 
         self.assertEqual('', captured.getvalue())
         self.assertEqual('aop-002', e.operation_uuid)
@@ -504,9 +515,12 @@ class WaitLoopTestCase(testtools.TestCase):
         stream = io.StringIO()
         cluster = self._make_cluster(client, stream)
 
-        # An operation which had already failed before the wait started must
-        # neither wedge the wait nor abort it.
-        cluster.await_idle(['uuid-001'])
+        # An operation this wait did not submit must neither wedge it nor
+        # abort it, whatever state it is in. This used to be a snapshot of
+        # what had already failed; it is now simply that the operation is
+        # not one of ours, which also covers the operation which fails
+        # while the wait is running.
+        cluster.await_idle(['uuid-001'], ['aop-ours'])
         self.assertIn('node-001: idle', stream.getvalue())
 
     def test_await_idle_notes_stalled_command(self):
@@ -524,11 +538,11 @@ class WaitLoopTestCase(testtools.TestCase):
         # the stall warning threshold with some slack to show the warning is
         # only emitted once.
         polls = cluster_module.STALL_WARNING_SECONDS // 5 + 10
-        client.get_instance_agentoperations.side_effect = [[]] + [[running]] * polls + [[]]
+        client.get_instance_agentoperations.side_effect = [[running]] * polls + [[]]
         stream = io.StringIO()
         cluster = self._make_cluster(client, stream)
 
-        cluster.await_idle(['uuid-001'])
+        cluster.await_idle(['uuid-001'], ['aop-001'])
 
         self.assertIn('may be stalled', stream.getvalue())
         self.assertIn('aop-001', stream.getvalue())
@@ -688,7 +702,10 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
         self.assertIn('Cluster banana is ready', output)
 
         # With no pre-existing local configuration the kubeconfig is
-        # written directly, pointing at the cluster's floating address.
+        # written directly, pointing at the cluster's floating address. This
+        # is also what pins the command line's --kubeconfig default: the
+        # library's write_kubeconfig defaults to False, so a k3s create
+        # which stopped passing True would leave no file here at all.
         with open(os.path.join(self.home, '.kube', 'config')) as f:
             kubeconfig = f.read()
         self.assertIn('192.168.10.100', kubeconfig)
@@ -752,3 +769,89 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
         output = self._create(['banana', '--network', 'net-1'])
         self._assert_phases_consistent(output)
         self.assertNotIn('Creating node network', output)
+
+    def test_create_with_no_metallb(self):
+        output = self._create(['banana', '--no-metallb'])
+        self._assert_phases_consistent(output)
+        self.assertNotIn('Setting up metallb', output)
+        self.assertIn('Setting up longhorn', output)
+
+    def test_create_with_no_longhorn(self):
+        output = self._create(['banana', '--no-longhorn'])
+        self._assert_phases_consistent(output)
+        self.assertIn('Setting up metallb', output)
+        self.assertNotIn('Setting up longhorn', output)
+
+    def test_create_with_neither_metallb_nor_longhorn(self):
+        output = self._create(['banana', '--no-metallb', '--no-longhorn'])
+        self._assert_phases_consistent(output)
+        self.assertNotIn('Setting up metallb', output)
+        self.assertNotIn('Setting up longhorn', output)
+        self.assertIn('Cluster banana is ready', output)
+
+    def test_create_with_no_kubeconfig(self):
+        output = self._create(['banana', '--no-kubeconfig'])
+        self._assert_phases_consistent(output)
+        self.assertNotIn('Updating local kubeconfig', output)
+        self.assertIn('Cluster banana is ready', output)
+
+        # And no file, which is the side effect the phase header stands for.
+        self.assertFalse(
+            os.path.exists(os.path.join(self.home, '.kube', 'config')))
+
+    def test_create_with_no_metallb_ignores_metal_address_count(self):
+        # --metal-address-count is meaningless without metallb; the CLI
+        # accepts the combination rather than rejecting it, per the option
+        # help on --metal-address-count and --metallb/--no-metallb.
+        output = self._create(
+            ['banana', '--no-metallb', '--metal-address-count', '99'])
+        self._assert_phases_consistent(output)
+        self.assertNotIn('Setting up metallb', output)
+
+    def test_create_with_manifests(self):
+        # --manifest is repeatable, and each file named is staged on the
+        # first control plane node. Staging is not a phase of its own -- the
+        # writes are extra commands inside the phase which installs k3s
+        # there -- so the headers have to stay consistent with the total
+        # create() advertised.
+        paths = []
+        for name, content in [('first.yaml', 'kind: One\n'),
+                              ('second.yaml', 'kind: Two\n')]:
+            path = os.path.join(self.home, name)
+            with open(path, 'w') as f:
+                f.write(content)
+            paths.append(path)
+
+        output = self._create(
+            ['banana', '--manifest', paths[0], '--manifest', paths[1]])
+
+        self._assert_phases_consistent(output)
+        self.assertIn('staging 2 manifests', output)
+        self.assertEqual(
+            ['cat - > %s/first.yaml' % cluster_module.K3S_MANIFEST_DIR,
+             'cat - > %s/second.yaml' % cluster_module.K3S_MANIFEST_DIR],
+            [' '.join(commandline.split(' ')[:4])
+             for _, commandline in self.client.executed
+             if commandline.startswith(
+                 'cat - > %s/' % cluster_module.K3S_MANIFEST_DIR)])
+
+    def test_create_without_manifests_stages_nothing(self):
+        output = self._create(['banana'])
+        self.assertNotIn('staging', output)
+        self.assertEqual(
+            [], [commandline for _, commandline in self.client.executed
+                 if cluster_module.K3S_MANIFEST_DIR in commandline])
+
+    def test_create_refuses_a_manifest_which_is_not_there(self):
+        # click.Path(exists=True) is the command line's half of the check,
+        # and it fires before create() is called at all, which is why this
+        # exits 2 rather than 1. read_manifests() is the other half, for a
+        # library caller whose paths click never saw.
+        result = CliRunner().invoke(
+            shakenfist_client_k3s.k3s,
+            ['create', 'banana', '--manifest',
+             os.path.join(self.home, 'absent.yaml')],
+            obj={'VERBOSE': False, 'CLIENT': self.client})
+
+        self.assertEqual(2, result.exit_code, result.output)
+        self.assertEqual({}, self.client.instances)

@@ -21,37 +21,127 @@ client is always asked not to block on the command's behalf.
 
 ### `create NAME`
 
-Builds a cluster and, on success, leaves it in `~/.kube/config` as the
-current context.
+Builds a cluster and, unless `--no-kubeconfig` is given, leaves it in
+`~/.kube/config` as the current context on success.
 
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `--control-plane-count` | 1 | Control plane nodes. More than one gives a highly available control plane. |
 | `--worker-count` | 2 | Worker nodes. |
-| `--metal-address-count` | 5 | Floating addresses routed into the cluster network for MetalLB to hand out. |
+| `--metal-address-count` | 5 | Floating addresses routed into the cluster network for MetalLB to hand out. Accepted but ignored when `--no-metallb` is given. |
 | `--network` | (a new one) | Join a pre-existing Shaken Fist network instead of creating one for this cluster. |
 | `--release-channel` | `stable` | A k3s release channel. `stable`, `latest`, or a version-pinned channel such as `v1.26`. |
 | `--refresh-version-cache` | off | Re-query the k3s and Longhorn release APIs instead of using the cached answers. |
 | `--sshkey` | none | A public key to place on every node, for debugging. |
+| `--metallb` / `--no-metallb` | on | Install MetalLB for load balancer addresses. |
+| `--longhorn` / `--no-longhorn` | on | Install Longhorn for persistent storage. |
+| `--kubeconfig` / `--no-kubeconfig` | on | Merge the new cluster into `~/.kube/config`; see below. The cluster's own kubeconfig is recorded either way and is always available from `getconfig`. |
+| `--manifest PATH` | none | Stage a local manifest into the cluster on first start. Repeatable; see below. |
 
 Each node is a Shaken Fist instance with 2 vCPUs, 2GB of RAM and a
 50GB disk on a Debian 12 base image, with a floating address and the
 `sf-agent2` side channel enabled. A full create is 15-25 minutes, and
 reports numbered phases with per-phase elapsed times as it goes.
+Skipping MetalLB, Longhorn or the local kubeconfig update also skips
+that phase's number, so a create that leaves all three out counts
+fewer phases rather than reporting a phase it never runs.
 
-The local kubeconfig is written directly if `~/.kube/config` does not
-exist. If it does, the merge shells out to `kubectl config view
---flatten`, so a local `kubectl` is required for that path; without
-one the create stops after the cluster is built and tells you to fetch
-the credentials with `getconfig`.
+With `--kubeconfig` (the default), the local kubeconfig is written
+directly if `~/.kube/config` does not exist. If it does, the merge
+shells out to `kubectl config view --flatten`, so a local `kubectl` is
+required for that path; without one the create stops after the
+cluster is built and tells you to fetch the credentials with
+`getconfig`. With `--no-kubeconfig`, none of this runs and
+`~/.kube/config` is left untouched.
+
+`--manifest` stages a local file, unmodified, into the new cluster's
+k3s auto-apply directory (`/var/lib/rancher/k3s/server/manifests/` on
+the first control plane node) before k3s is installed there, so k3s
+applies it itself the first time the server starts:
+
+- Only files ending in `.yaml`, `.yml` or `.json` are accepted; k3s's
+  own deploy controller only ever looks at those three suffixes, and
+  anything else would be copied onto the node and then silently
+  ignored.
+- Nothing is templated, and the order manifests are applied in is
+  k3s's business, not this command's. A payload that needs either
+  belongs in a Helm chart installed afterwards instead.
+- Two manifests sharing a filename are refused before anything is
+  built (instances included), because the destination filename is the
+  source basename and the second write would silently replace the
+  first on the node.
+- A file that cannot be read, cannot be decoded as UTF-8, does not
+  parse, or contains a line that collides with the internal transfer
+  marker is refused the same way. Manifests are read as UTF-8
+  regardless of the locale the command runs under, which is what YAML
+  and JSON both specify; a file in some other encoding is refused
+  rather than mis-decoded into something the cluster would then apply.
+- Whether a file is checked as JSON or as YAML is decided by its
+  content, not its name, because that is how k3s decides: leading
+  whitespace aside, a file starting with `{` goes to k3s's JSON
+  decoder untouched and anything else through its YAML parser. So a
+  tab indented `.json` manifest is accepted -- YAML forbids tabs for
+  indentation and JSON does not -- and a `.yaml` file that is really
+  JSON is accepted as JSON.
+- The filename must be a plain one: letters, digits, dots, underscores
+  and hyphens, starting with a letter or a digit. The filename is
+  interpolated into the command that writes the file on the control
+  plane node, so this is about the name rather than the content. The
+  directory the file came from is not carried along -- the destination
+  is the basename -- so `--manifest ~/work/net/policy.yaml` lands as
+  `policy.yaml`.
+- k3s ships its own manifests in the same directory --
+  `traefik.yaml`, `coredns.yaml`, `local-storage.yaml` and `ccm.yaml`
+  as of the k3s versions current when this was written -- and
+  reapplies them on every start. Naming a manifest one of those
+  filenames is not refused, because the list is version specific and
+  would go stale into false refusals, but k3s will overwrite it rather
+  than the other way around. Pick a filename that does not collide.
+
+A `create` for a name already holding a cluster is refused. If that
+name belongs to a working cluster the error just says the name is
+taken; if it belongs to a cluster an earlier `create` never finished
+building, the error instead names the state it was left in and points
+at `sf-client k3s delete NAME` as the way to clear it, because there is
+no way to resume a half built cluster -- only to remove it and start
+again. `show` and `health` (below) report a cluster in that state
+rather than refusing, and `expand-workers`, `remove-worker` and
+`expand-addresses` refuse to run against one for the same reason
+`create` refuses to build over it: the operation needs a first control
+plane node and a join token that an interrupted build may never have
+recorded.
+
+One gap in this is not yet closed: if `create` is killed in the narrow
+window after it claims the name in the namespace's cluster list but
+before it writes that cluster's own metadata document, the name is
+left claimed with nothing to report its state -- `delete NAME` says the
+cluster does not exist, because there is no metadata document for it to
+read. There is currently no supported way to free such a name from
+this plugin; see
+[shakenfist/client-python-k3s#72](https://github.com/shakenfist/client-python-k3s/issues/72).
+
+`delete` has the same two writes in the other order, and deliberately
+so: it releases the name from the cluster list first and removes the
+metadata document second, so a `delete` killed between them leaves a
+metadata document whose name is already free. Running `delete NAME`
+again finishes the job -- the instances and the network it had already
+removed stay removed -- which is why the window is recoverable on this
+side and not on the create side.
 
 ### `delete NAME`
 
 Deletes every instance in the cluster, unroutes its floating
 addresses, deletes the node network, and removes the cluster's
 namespace metadata. It then removes the cluster's entries from the
-local kubeconfig with `kubectl config unset`, so a local `kubectl` is
-required.
+local kubeconfig with `kubectl config unset`, unless `--no-kubeconfig`
+is given, in which case that step is skipped and a local `kubectl` is
+not needed.
+
+This also works on a cluster that never finished being built --
+indeed it is the supported way to clear one: whatever nodes, network
+and metadata an interrupted `create` managed to leave behind are
+removed the same way, and a note is printed first saying the cluster
+was interrupted rather than complete.
 
 Note that the node network is deleted whether the cluster created it
 or it was named with `create --network`, so deleting a cluster built
@@ -60,17 +150,100 @@ on a shared pre-existing network takes that network with it.
 ### `expand-workers NAME [--worker-count N]`
 
 Adds `N` more workers (default 2) to a running cluster. Existing
-nodes are untouched.
+nodes are untouched. Refuses to run against a cluster that never
+finished being built; see `create`, above.
+
+### `remove-worker NAME --worker UUID [--worker UUID ...]`
+
+Removes one or more workers from a running cluster, by the Shaken
+Fist instance UUID of each (`expand-workers` reports the UUID it
+created for each new worker). `--worker` is required and repeatable:
+
+```
+sf-client k3s remove-worker mycluster \
+    --worker 3fa85f64-5717-4562-b3fc-2c963f66afa6 \
+    --worker 7c9e6679-7425-40de-944b-e07fc1f90ae7
+```
+
+Every UUID given is checked against the cluster's worker list before
+anything happens, so a typo in the last of three fails the whole
+command rather than removing the first two and then failing. The same
+is true of the node names: every one is resolved from its instance up
+front, so a worker whose instance record cannot supply one is refused
+before any other worker has been touched.
+
+Each worker being removed is then drained (`kubectl drain
+--ignore-daemonsets --delete-emptydir-data --timeout=300s`) and
+removed from k3s (`kubectl delete node`) before its instance is
+deleted, so that pods running on it are rescheduled rather than left
+orphaned on a node object nobody will ever clean up. The workers not
+named are left alone entirely.
+
+Removing the last worker of a cluster is allowed -- a k3s server node
+is schedulable, so a cluster with no workers still works.
+
+A drain that cannot finish is bounded and undone. If a pod on the
+worker has nowhere else to go -- a PodDisruptionBudget refuses the
+eviction, an unmanaged pod would need `--force`, or the cluster has no
+other node with room -- `kubectl drain` gives up after its timeout and
+says which pod it could not move. Draining cordons the node as its
+first act, so the command then uncordons it before reporting the
+failure: a refused removal leaves the cluster as it found it rather
+than one node short of schedulable capacity. The same applies to the
+`kubectl delete node` that follows a drain that did succeed -- by then
+the node is not only cordoned but empty, so a failure there is the one
+that most needs putting back. If the uncordon fails as well, the
+output says so and names the `kubectl uncordon` to run by hand; the
+original reason is still what the command reports, because that is the
+part you can act on.
+
+One failure is not undone, because by then there is nothing left to
+undo: an instance delete that fails after the node object is already
+gone from k3s. The worker stays in the cluster's records, so `delete`
+still destroys the instance and `health` still reports it, and the
+output names the instance to delete by hand before running
+`remove-worker` for it again. Dropping the record instead would leave
+an instance running that no command here could see.
+
+A worker whose instance has already been deleted out of band is
+removed from the cluster's records rather than refused. There is no
+node to drain and no instance to destroy, so both are skipped. This is
+the only command that can clear such an entry, which `health` reports
+as a node that no longer exists.
+
+Refuses to run against a cluster that never finished being built; see
+`create`, above.
+
+Workers are named by instance UUID rather than by node name, which is
+also what makes a mixed case cluster name work here: Shaken Fist
+accepts a capital letter in an instance name and Kubernetes does not
+accept one in a node name, so on a cluster called `MyCluster` the
+instance `k3s-MyCluster-node-002` is the k3s node
+`k3s-mycluster-node-002`. The drain uses the name k3s registered.
 
 ### `expand-addresses NAME [--address-count N]`
 
 Routes `N` more floating addresses (default 2) into the cluster
-network and reconfigures MetalLB's pool to include them.
+network and reconfigures MetalLB's pool to include them. Refuses to
+run against a cluster that never finished being built; see `create`,
+above.
+
+Also refuses a cluster created with `--no-metallb`, before it routes
+anything. There is nothing to reconfigure on such a cluster, and the
+refusal is checked up front because the alternative is the worst shape
+of failure: the addresses get routed and charged for, and the command
+then fails looking for MetalLB workloads in a namespace that does not
+exist, leaving the caller paying for addresses nothing can hand out.
+Clusters created before this was recorded are treated as having
+MetalLB, which they do.
 
 ### `update-os NAME`
 
 Runs an OS package update on every control plane node and worker.
-This does not update k3s itself.
+This does not update k3s itself. Unlike the other expansion commands
+above, this one also runs on a cluster that never finished being
+built: it updates whichever nodes exist and does nothing if there are
+none, which is a truthful answer rather than a refusal.
 
 ## Inspection
 
@@ -82,11 +255,92 @@ Prints the names of the clusters recorded in the namespace.
 
 Prints the cluster's namespace metadata: node UUIDs, the network, the
 API addresses, the join address, the plugin version that created it,
-and the release versions in use.
+and the release versions in use. A cluster that never finished being
+built is shown rather than refused, with a note pointing out that its
+`state` is not `created` and that `delete` is how to clear it.
 
 Note that the metadata includes the node token and the kubeconfig, so
 the output is cluster-admin credentials. Do not paste it into a bug
 report.
+
+### `health NAME`
+
+Reports the state of the cluster and of every node in it: for each
+control plane node and worker, whether the Shaken Fist instance still
+exists and its instance and agent state; and whether the k3s API
+answers, by running `kubectl get nodes` through the first control
+plane node. It repairs nothing -- this is a report, not a fix -- and
+by default exits 0 whatever it found, because producing the report is
+what was asked for and it succeeded:
+
+```
+$ sf-client k3s health mycluster
+Cluster mycluster in namespace default is healthy
+  state: created
+  nodes:
+    [ok] k3s-mycluster-node-001 (3fa85f64-5717-4562-b3fc-2c963f66afa6, control plane): instance created, agent ready
+    [ok] k3s-mycluster-node-002 (7c9e6679-7425-40de-944b-e07fc1f90ae7, worker): instance created, agent ready
+  k3s API: answered on 3fa85f64-5717-4562-b3fc-2c963f66afa6
+    NAME                     STATUS   ROLES                  AGE   VERSION
+    k3s-mycluster-node-001   Ready    control-plane,master   10m   v1.30.2+k3s1
+    k3s-mycluster-node-002   Ready    <none>                 9m    v1.30.2+k3s1
+```
+
+A cluster that never finished being built is reported here too, rather
+than refused -- reporting on a broken cluster is what this command is
+for -- so its `state` line names the state it was interrupted in
+instead of `created`, and an instance the metadata names but which no
+longer exists is reported as gone rather than failing the command.
+
+The command never hangs, which matters most on exactly the clusters
+it is for. The `kubectl get nodes` probe is only attempted when the
+control plane node it would run on looks able to answer -- the report
+has already read that node's instance and agent state -- and it is
+given a thirty second budget even then, because a command queued
+against an instance whose agent is not connected is accepted and then
+never runs. Each of those outcomes is reported on the `k3s API:` line
+with the reason, rather than waited on.
+
+An abandoned probe leaves its `kubectl get nodes` queued against the
+control plane node, and the reason on the `k3s API:` line names the
+agent operation so it can be recognised later: until Shaken Fist's own
+deadline ends it, a subsequent `expand-workers` or `update-os` waits
+for it along with everything else. That is a delay in a later command,
+not a failure of it -- those commands wait for every agent operation on
+a node, because the next command must not race one still running, but
+they only fail on the ones they submitted themselves. It is still worth
+knowing about if you poll `health` in a loop against a cluster whose
+agent is intermittently slow.
+
+Pass `--strict` to exit 1 when the cluster is not healthy, which is
+what makes `health` usable from a shell:
+
+```
+sf-client k3s health mycluster --strict || exit 1
+```
+
+The report is printed identically either way -- only the exit code
+changes -- so one run gives both the text and the branch, and nothing
+has to parse the output.
+
+Be precise about what "healthy" means here, because it is narrower than
+it sounds: the cluster finished being built, every instance the metadata
+names exists and has a ready agent, and `kubectl get nodes` on the first
+control plane node exited zero. The node terms are Shaken Fist's view of
+the machines, not Kubernetes' view of the kubelets, so a cluster whose
+nodes are all `NotReady` still reports healthy -- the k3s API answered,
+which is all the last term asks. `--strict` is therefore a good gate for
+"did this cluster come up and is its control plane reachable" and not a
+substitute for waiting on workload readiness; this repo's own functional
+test uses both, `health --strict` and a separate `kubectl wait`. Folding
+Kubernetes node readiness into the report is
+[shakenfist/client-python-k3s#76](https://github.com/shakenfist/client-python-k3s/issues/76).
+
+The default stays at "always 0" because "the cluster is unwell" and
+"the health check could not run" are different answers, and a command
+whose exit code conflates them is worse than one that reports neither.
+A library caller reads `Cluster.health()`'s dictionary and does not
+need either.
 
 ### `getconfig NAME`
 

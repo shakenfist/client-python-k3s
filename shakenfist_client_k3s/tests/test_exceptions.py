@@ -171,6 +171,23 @@ class KubeconfigErrorTestCase(testtools.TestCase):
         self.assertEqual(
             'Could not unset kubectl config element users.banana.testns', str(e))
 
+    def test_unset_failed_with_stderr(self):
+        # Cluster.delete() captures the child's output, so this is the only
+        # place kubectl's account of the failure can still be seen.
+        e = exceptions.KubeconfigError.unset_failed(
+            'users.banana.testns', 'error: unable to parse config\n')
+        self.assertEqual('error: unable to parse config\n', e.stderr)
+        self.assertEqual(
+            'Could not unset kubectl config element users.banana.testns\n'
+            'error: unable to parse config\n', str(e))
+
+    def test_unset_failed_with_empty_stderr(self):
+        # A silent kubectl renders as it always did, rather than gaining a
+        # blank second line.
+        e = exceptions.KubeconfigError.unset_failed('users.banana.testns', '')
+        self.assertEqual(
+            'Could not unset kubectl config element users.banana.testns', str(e))
+
 
 class TotalAttributesTestCase(testtools.TestCase):
     """The two **fields exceptions answer every field, whoever built them.

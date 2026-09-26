@@ -27,8 +27,10 @@ SUBCOMMANDS = [
     'query-longhorn-version',
     'getconfig',
     'show',
+    'health',
     'delete',
     'expand-workers',
+    'remove-worker',
     'expand-addresses',
     'update-os',
 ]
@@ -43,6 +45,11 @@ class CliContractTestCase(testtools.TestCase):
     which was then deleted. They must not be hand-edited: if a later
     change in this phase alters this output, that is a bug, not a fixture
     update, per the phase plan's decision 7.
+
+    A phase which deliberately adds a command is the one exception, and it
+    grows the fixtures the same way: SUBCOMMANDS gains the name, and the
+    new fixture and the regenerated group.txt are produced by invoking
+    --help rather than typed. Nothing existing may change in the diff.
     """
 
     def setUp(self):

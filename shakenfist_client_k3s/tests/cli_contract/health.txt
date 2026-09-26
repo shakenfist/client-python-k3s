@@ -1,0 +1,11 @@
+Usage: k3s health [OPTIONS] NAME
+
+  Report the health of a k3s cluster
+
+Options:
+  --namespace TEXT        If you are an admin, you can report on a cluster in a
+                          different namespace.
+  --strict / --no-strict  Exit 1 when the cluster is not healthy, so that a
+                          shell can branch on the result. The report is printed
+                          either way; only the exit code changes.
+  --help                  Show this message and exit.

@@ -90,11 +90,23 @@ class GroupCatchClusterExceptions(click.Group):
     exiting the process, so that an in process caller -- the Ansible
     module this plan exists for -- can fail structurally and keep stdout
     for its own JSON result. The command line still has to behave exactly
-    as it did, so this is where the two meet: one handler which prints the
-    message the failing command used to print, on stdout where it has
-    always gone, and exits 1. Click's Group.invoke() is what resolves and
-    invokes the subcommand, so catching here covers every command,
-    including any added later.
+    as it did, exit code and message included, so this is where the two
+    meet: one handler which prints the message the failing command used to
+    print and exits 1. Click's Group.invoke() is what resolves and invokes
+    the subcommand, so catching here covers every command, including any
+    added later.
+
+    The message goes to stderr, not the stdout it used to reach before
+    this class existed. That earlier behaviour was never examined on its
+    own merits: phase 1 introduced this handler to reproduce it exactly,
+    deliberately deferring the fix so that phase's diff stayed about
+    exceptions rather than output streams. An error belongs on stderr on
+    ordinary Unix principle, and this package now has an extra reason --
+    it is a plugin loaded into a larger CLI whose own error handler
+    (GroupCatchExceptions in shakenfist_client.main, which logs through
+    LOG.error() and so also lands on stderr) already does the same, so
+    this handler matching it makes `sf-client`'s failures consistent
+    regardless of which layer caught them.
 
     Nothing from shakenfist_client.apiclient is caught here. The parent
     CLI's GroupCatchExceptions already maps every API exception to its own
@@ -108,8 +120,8 @@ class GroupCatchClusterExceptions(click.Group):
             # Terminal output, deliberately not routed through a reporter:
             # this is the Click layer converting a raised exception back
             # into the error line and exit code the command used to
-            # produce directly, on the process's own stdout.
-            print(str(e))
+            # produce directly, on the process's own stderr.
+            print(str(e), file=sys.stderr)
             sys.exit(1)
 
 
@@ -146,7 +158,8 @@ k3s.add_command(k3s_list)
               default=2)
 @click.option('--metal-address-count', type=click.INT,
               help=('The number of floating addresses to route into the virtual '
-                    'network for metallb to manage'),
+                    'network for metallb to manage. Ignored if --no-metallb is '
+                    'passed.'),
               default=5)
 @click.option('--namespace', type=click.STRING,
               help=('If you are an admin, you can create this cluster in a '
@@ -162,15 +175,42 @@ k3s.add_command(k3s_list)
                     '"v1.26".'))
 @click.option('--sshkey', type=click.Path(exists=True),
               help='An optional ssh public key to place onto instances.')
+@click.option('--metallb/--no-metallb', default=True,
+              help=('Install metallb for load balancer addresses. --metal-address-count '
+                    'is ignored when this is off.'))
+@click.option('--longhorn/--no-longhorn', default=True,
+              help='Install longhorn for persistent storage.')
+@click.option('--kubeconfig/--no-kubeconfig', default=True,
+              help=('Add the new cluster to your local ~/.kube/config, merging it '
+                    'into any existing configuration. Cluster credentials remain '
+                    "available from 'sf-client k3s getconfig' either way."))
+@click.option('--manifest', 'manifests', type=click.Path(exists=True),
+              multiple=True,
+              help=('A local .yaml, .yml or .json manifest to place in the new '
+                    "cluster's k3s auto-apply directory, so that k3s applies it "
+                    'when the cluster first starts. May be repeated. The file is '
+                    'copied verbatim under its own name: nothing is templated, '
+                    "and the order manifests are applied in is k3s's business "
+                    "rather than this command's."))
 @click.pass_context
 def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                metal_address_count=None,  namespace=None, network=None,
                refresh_version_cache=False, release_channel=None,
-               sshkey=None):
+               sshkey=None, metallb=True, longhorn=True, kubeconfig=True,
+               manifests=None):
     c = _bind_new_cluster_context(ctx, name, namespace)
+    # write_kubeconfig defaults to False in the library and True here: the
+    # command line's behaviour is unchanged, and a library caller does not
+    # have its ~/.kube/config edited unasked. Decision 6 of the phase 3 plan.
+    # click hands multiple=True options over as a tuple, and the library
+    # takes a list: the parameter is documented as a list of paths, and a
+    # library caller has no reason to be handed one shape by the CLI and
+    # asked for another.
     c.create(control_plane_count, worker_count, metal_address_count,
              network=network, refresh_version_cache=refresh_version_cache,
-             release_channel=release_channel, sshkey=sshkey)
+             release_channel=release_channel, sshkey=sshkey,
+             install_metallb=metallb, install_longhorn=longhorn,
+             write_kubeconfig=kubeconfig, manifests=list(manifests or []))
 
 
 k3s.add_command(k3s_create)
@@ -259,14 +299,118 @@ def k3s_show(ctx, name=None, namespace=None):
 k3s.add_command(k3s_show)
 
 
+@k3s.command(name='health', help='Report the health of a k3s cluster')
+@click.argument('name', type=click.STRING)
+@click.option('--namespace', type=click.STRING,
+              help=('If you are an admin, you can report on a cluster in a '
+                    'different namespace.'))
+@click.option('--strict/--no-strict', default=False,
+              help=('Exit 1 when the cluster is not healthy, so that a shell '
+                    'can branch on the result. The report is printed either '
+                    'way; only the exit code changes.'))
+@click.pass_context
+def k3s_health(ctx, name=None, namespace=None, strict=False):
+    c = _bind_cluster_context(ctx, name, namespace)
+    report = c.health()
+    _render_health(c.reporter, report)
+
+    # Nothing is printed here. The report above has already said what is
+    # wrong, in more detail than an exit code can, and a second line
+    # saying the same thing would be one more thing for a caller parsing
+    # this output to trip over. sys.exit() rather than a
+    # K3sClusterException, because nothing failed: the command did what
+    # it was asked and is reporting the answer in the one channel a shell
+    # can read without parsing. That also keeps it out of
+    # GroupCatchClusterExceptions, which prints str(e) for everything it
+    # catches.
+    if strict and not report['healthy']:
+        sys.exit(1)
+
+
+def _render_health(out, report):
+    """Render Cluster.health()'s report for a human.
+
+    This writes to the reporter rather than to print(), which the older
+    commands in this module use. Those pre-date the reporter and their
+    comments say so; there is no reason to add another bare print() now,
+    and a health check is the command most likely to be run by something
+    which is also using the process's stdout for its own output.
+
+    Nothing here decides anything, and by default neither does its
+    caller: an unhealthy cluster is reported and the command still exits
+    zero, because producing the report is what was asked for and it
+    succeeded. A library caller which wants to branch on the answer calls
+    Cluster.health() and reads the dict, which is the whole point of
+    decision 7 of the phase 3 plan; a shell caller which wants the same
+    thing passes --strict, which changes the exit code and nothing else.
+    The default stays as it is because "the cluster is unwell" and "the
+    health check could not run" are different answers and an exit code
+    which conflates them is worse than one which reports neither.
+    """
+    out.write('Cluster %s in namespace %s is %s\n' % (
+        report['name'], report['namespace'],
+        'healthy' if report['healthy'] else 'NOT healthy'))
+
+    if report['interrupted']:
+        out.write("  state: %s (interrupted: this cluster never finished being "
+                  'built)\n' % report['state'])
+    else:
+        out.write('  state: %s\n' % report['state'])
+
+    out.write('  nodes:\n')
+    if not report['nodes']:
+        out.write('    this cluster has no nodes\n')
+    for node in report['nodes']:
+        # 'control_plane' is the metadata's spelling, and is what the
+        # report carries; create_and_await_instances() does the same
+        # substitution for the same reason.
+        role = node['role'].replace('_', ' ')
+        marker = 'ok' if node['healthy'] else '!!'
+        if not node['exists']:
+            out.write('    [%s] %s (%s): this instance no longer exists\n'
+                      % (marker, node['uuid'], role))
+            continue
+        # 'or' on the name for the same reason as on the agent state:
+        # _node_health() reads every field with .get() so that a health
+        # check cannot crash on the instance it most needs to report, and
+        # the literal string None is not a name.
+        out.write('    [%s] %s (%s, %s): instance %s, agent %s\n' % (
+            marker, node['name'] or '(unnamed)', node['uuid'], role,
+            node['state'], node['agent_state'] or 'not yet contactable'))
+
+    api = report['api']
+    if api['answered']:
+        out.write('  k3s API: answered on %s\n' % api['instance_uuid'])
+    else:
+        out.write('  k3s API: did not answer (%s)\n' % api['error'])
+
+    # kubectl's own output, which is the most useful thing in the report
+    # when the API answered (it lists the k3s nodes and whether they are
+    # Ready) and the explanation when it did not.
+    for stream in ['stdout', 'stderr']:
+        for line in (api.get(stream) or '').rstrip().split('\n'):
+            if line:
+                out.write('    %s\n' % line)
+    out.flush()
+
+
+k3s.add_command(k3s_health)
+
+
 @k3s.command(name='delete', help='Destroy a k3s cluster')
 @click.argument('name', type=click.STRING)
 @click.option('--namespace', type=click.STRING,
               help=('If you are an admin, you can alter clusters in a '
                     'different namespace.'))
+@click.option('--kubeconfig/--no-kubeconfig', default=True,
+              help=('Remove the deleted cluster from your local ~/.kube/config. '
+                    'This is the counterpart of the same flag on create.'))
 @click.pass_context
-def k3s_delete(ctx, name=None, namespace=None):
-    _bind_cluster_context(ctx, name, namespace).delete()
+def k3s_delete(ctx, name=None, namespace=None, kubeconfig=True):
+    # As with create's --kubeconfig, the library default is off and the
+    # command line passes True, so this command behaves as it always has.
+    _bind_cluster_context(ctx, name, namespace).delete(
+        update_kubeconfig=kubeconfig)
 
 
 k3s.add_command(k3s_delete)
@@ -285,6 +429,26 @@ def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
 
 
 k3s.add_command(k3s_expand_workers)
+
+
+@k3s.command(name='remove-worker', help='Remove workers from a k3s cluster')
+@click.argument('name', type=click.STRING)
+@click.option('--worker', 'workers', type=click.STRING, multiple=True,
+              required=True,
+              help=('The instance UUID of a worker to remove. Repeat the '
+                    'option to remove more than one.'))
+@click.option('--namespace', type=click.STRING,
+              help=('If you are an admin, you can alter clusters in a '
+                    'different namespace.'))
+@click.pass_context
+def k3s_remove_worker(ctx, name=None, workers=None, namespace=None):
+    # workers is a tuple, because the option is multiple=True. The library
+    # API takes a list, so that a caller reading one back out of a result
+    # and passing it straight in does the obvious thing.
+    _bind_cluster_context(ctx, name, namespace).remove_worker(list(workers))
+
+
+k3s.add_command(k3s_remove_worker)
 
 
 @k3s.command(name='expand-addresses',

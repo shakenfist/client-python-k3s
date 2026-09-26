@@ -6,7 +6,8 @@ Options:
   --control-plane-count INTEGER   The number of control plane nodes
   --worker-count INTEGER          The number of workers
   --metal-address-count INTEGER   The number of floating addresses to route into
-                                  the virtual network for metallb to manage
+                                  the virtual network for metallb to manage.
+                                  Ignored if --no-metallb is passed.
   --namespace TEXT                If you are an admin, you can create this
                                   cluster in a different namespace.
   --network TEXT                  Specify a network here to add these nodes to a
@@ -19,4 +20,21 @@ Options:
                                   pre-pended with a v such as "v1.26".
   --sshkey PATH                   An optional ssh public key to place onto
                                   instances.
+  --metallb / --no-metallb        Install metallb for load balancer addresses.
+                                  --metal-address-count is ignored when this is
+                                  off.
+  --longhorn / --no-longhorn      Install longhorn for persistent storage.
+  --kubeconfig / --no-kubeconfig  Add the new cluster to your local
+                                  ~/.kube/config, merging it into any existing
+                                  configuration. Cluster credentials remain
+                                  available from 'sf-client k3s getconfig'
+                                  either way.
+  --manifest PATH                 A local .yaml, .yml or .json manifest to place
+                                  in the new cluster's k3s auto-apply directory,
+                                  so that k3s applies it when the cluster first
+                                  starts. May be repeated. The file is copied
+                                  verbatim under its own name: nothing is
+                                  templated, and the order manifests are applied
+                                  in is k3s's business rather than this
+                                  command's.
   --help                          Show this message and exit.

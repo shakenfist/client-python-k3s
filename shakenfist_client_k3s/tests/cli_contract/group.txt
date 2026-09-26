@@ -11,8 +11,10 @@ Commands:
   expand-addresses        Add floating addresses for metallb to a k3s cluster
   expand-workers          Add workers to a k3s cluster
   getconfig               Get kubeconfig for an existing k3s cluster
+  health                  Report the health of a k3s cluster
   list                    List managed k3s clusters
   query-k3s-version       Lookup the current version for a k3s release channel
   query-longhorn-version  Lookup the current longhorn version
+  remove-worker           Remove workers from a k3s cluster
   show                    Show details of a k3s cluster
   update-os               Update the OS on all nodes

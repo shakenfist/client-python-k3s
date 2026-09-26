@@ -88,38 +88,95 @@ Each command's body is a method taking that command's options, minus
 | `create(control_plane_count, worker_count, metal_address_count, network=None, ...)` | `k3s create` |
 | `get_kubeconfig()` | `k3s getconfig` |
 | `show()` | `k3s show` |
+| `health()` | `k3s health` |
 | `delete()` | `k3s delete` |
 | `expand_workers(worker_count)` | `k3s expand-workers` |
+| `remove_worker(instance_uuids)` | `k3s remove-worker` |
 | `expand_addresses(address_count)` | `k3s expand-addresses` |
 | `update_os()` | `k3s update-os` |
 
-Only these seven methods, plus `get_metadata()`,
+Only these nine methods, plus `get_metadata()`,
 `set_metadata(md)` and `delete_metadata()`, are this library's
 stable public surface. Phase 4 cuts `v0.1.0` to PyPI, so whatever
 is public at that point becomes a compatibility surface for
 external callers. Everything else `Cluster` exposes --
 `create_instance()`, `await_boot()`, `await_idle()`,
-`await_fetch()`, `reap_execute()`, `execute_and_await()`,
-`instance_os_update()`, `install_control_plane()`,
-`install_k3s_component()`, `install_extra_control_plane()`,
-`install_workers()`, `allocate_metallb_addresses()`,
-`configure_metallb_addresses()`, `setup_metallb()`,
-`setup_longhorn()`, `create_and_await_instances()` and
-`get_progress()` -- is internal orchestration the methods above
-are built from, not a supported entry point. Phase 3 intends to
-reshape several of them (an incremental `install_workers()`,
-conditional `setup_metallb()`/`setup_longhorn()`), so treat them
-as unstable even though nothing today stops a caller reaching
-them directly.
+`await_fetch()`, `await_execute()`, `reap_execute()`,
+`execute_and_await()`, `instance_os_update()`,
+`install_control_plane()`, `install_k3s_component()`,
+`install_extra_control_plane()`, `install_workers()`,
+`allocate_metallb_addresses()`, `configure_metallb_addresses()`,
+`setup_metallb()`, `setup_longhorn()`,
+`create_and_await_instances()`, `get_progress()`,
+`_interrupted_state()` and `_require_usable()` -- is internal
+orchestration the methods above are built from, not a supported
+entry point, so treat it as unstable even though nothing today
+stops a caller reaching it directly.
+
+One module level name in `cluster.py` is on the stable side of that
+line: `read_manifests(paths)`, which takes a list of local paths and
+returns a list of `(basename, content)` pairs, raising `ManifestError`
+for the first path it cannot stage. `create()` calls it before it
+allocates anything, and it is public deliberately so that a caller
+which wants to validate paths without building a cluster -- an Ansible
+module in check mode, a form which wants to reject a file before the
+operator waits twenty minutes -- can do the same check the real call
+will do. It touches no cluster and no API client.
+
+Phase 3 reshaped two of these rather than leaving them for later, and
+the reshaping is worth naming because it corrects what this page used
+to say about them. `install_workers()` now takes the instance uuids to
+install, with no default -- a caller which means "every worker" has to
+say so -- rather than gaining an incremental mode. That is deliberate:
+`create_and_await_instances()` already knows exactly which instances
+it just made, so passing that list along is the fix, and "incremental"
+was rejected as the framing for it. `install_control_plane()` gained
+an optional `manifests` argument, the same list of local paths
+`create()` reads and forwards to it. Skipping MetalLB or Longhorn, by
+contrast, is not a change to `setup_metallb()` or `setup_longhorn()`
+themselves -- they are exactly as unconditional as before -- it is
+`create()` deciding whether to call them at all.
 
 `create()`'s remaining keyword arguments (`refresh_version_cache`,
-`release_channel`, `sshkey`) mirror the command's options of the same
-name; see its docstring in `cluster.py` for the full signature.
-`create()` and `delete()` still write and merge `~/.kube/config`, and
-shell out to `kubectl config unset`, unconditionally -- that is
-unchanged CLI behaviour, not new library behaviour, and making it
-optional is future work. See `docs/usage.md` for what each command
-does; this page does not restate it.
+`release_channel`, `sshkey`, `install_metallb`, `install_longhorn`,
+`manifests`) mirror the command's options of the same name --
+`manifests` takes a list of local paths, where `--manifest` is given
+once per file; see its docstring in `cluster.py` for the full
+signature. See `docs/usage.md` for what each command does; this page
+does not restate it.
+
+### Kubeconfig side effects default off in the library
+
+`create(write_kubeconfig=...)` and `delete(update_kubeconfig=...)`
+govern the only two things either call does to the machine it runs on
+rather than to the cluster: writing and merging `~/.kube/config`, and
+shelling out to `kubectl config unset`. Both default to `False` here,
+which is the one place a `Cluster` method's default differs from what
+`sf-client k3s` does -- the command line passes `True` unless
+`--no-kubeconfig` was given, so `sf-client k3s` behaves as it always
+has, while a library caller's `~/.kube/config` is left alone unless it
+asks.
+
+The asymmetry is deliberate (decision 6 of
+`docs/plans/library-api-and-collection-phase-03-missing-verbs.md`).
+Both side effects run on the calling machine, not on the cluster, and a
+library whose default is to rewrite the caller's `~/.kube/config` is
+surprising: an Ansible module or a conductor reconcile loop calling
+`create()` from inside a process that manages its own kubectl
+configuration should not find that file edited unless it said so.
+Reversing the default costs nothing today because nothing has ever been
+released -- there are no git tags and `shakenfist_client_k3s` is not on
+PyPI, so `sf-client k3s` is the only caller in the tree. Phase 4 is the
+first PyPI release, so this is the last point at which the default
+could change for free; taking the other default "for symmetry with the
+CLI" would have made the surprise permanent at the one moment avoiding
+it cost nothing.
+
+The cluster's kubeconfig is recorded in `md['kubeconfig']` regardless of
+`write_kubeconfig`, and `get_kubeconfig()` serves it either way -- only
+the local file write, the `kubectl config view --flatten` merge, and
+the `kubectl config unset` cleanup are gated, never the credentials
+themselves.
 
 `k3s list`, `query-k3s-version` and `query-longhorn-version` name no
 cluster, so they stay module level functions rather than `Cluster`
@@ -177,12 +234,18 @@ a correct caller never needs to catch it.
 
 | Exception | Raised when |
 |-----------|-------------|
-| `ClusterExistsError` | `create()` is called for a name already in use |
+| `ClusterExistsError` | `create()` is called for a name already holding a finished cluster |
+| `ClusterInterruptedError` | `create()` is called for a name holding a cluster that never finished being built, or `expand_workers()`, `remove_worker()` or `expand_addresses()` is called against one |
 | `NetworkNotFoundError` | `create(network=...)` names a network that does not exist |
 | `ClusterNotFoundError` | the named cluster does not exist -- see method docstrings for which |
 | `ClusterIncompleteError` | `get_kubeconfig()` is called on a cluster that exists but has not finished `create()` |
+| `WorkerNotFoundError` | `remove_worker()` is given a uuid that is not one of the cluster's workers |
+| `WorkerUnnamedError` | `remove_worker()` finds a worker whose instance record has no name, so the k3s node it became cannot be identified |
+| `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable or not decodable as UTF-8, not valid YAML or JSON, or a line colliding with the staging marker |
+| `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
+| `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
-| `AgentOperationError` | a Shaken Fist agent operation enters the `error` state |
+| `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
 | `KubeconfigError` | a local `~/.kube/config` write, merge or `kubectl config unset` fails |
 
@@ -191,7 +254,87 @@ names the exact call site and the attributes it carries; several are
 built through classmethods (`ClusterNotFoundError.not_found(name)`,
 `KubeconfigError.merge_failed(...)`, and so on) rather than their
 constructors, because one class covers several call sites whose
-message text differs.
+message text differs. `ClusterInterruptedError` carries the state the
+cluster was left in (`state`) and, for its `not_usable()` form, which
+verb refused to run (`verb`); both of its messages name `sf-client k3s
+delete <name>` as the way out, because phase 3 deliberately built
+detection and teardown rather than a way to resume a half built
+cluster -- see decision 5 of
+`docs/plans/library-api-and-collection-phase-03-missing-verbs.md`. One
+gap that decision does not close: a `create()` interrupted between
+claiming its name and writing that cluster's own metadata document
+leaves a name `delete()` reports as not found at all, with no supported
+way to free it from this library --
+[shakenfist/client-python-k3s#72](https://github.com/shakenfist/client-python-k3s/issues/72).
+`health()` deliberately does not raise `ClusterInterruptedError`:
+reporting on an interrupted cluster, rather than refusing to look at
+it, is what that verb is for.
+
+`delete()` has the same two writes as `create()` in the other order --
+it releases the name from the cluster list before it removes the
+cluster's metadata document -- so an interrupted `delete()` leaves a
+document whose name is already free, and calling `delete()` again
+finishes the job. That is why #72 is a create-side gap rather than a
+gap on both sides.
+
+`AgentOperationError` carries the operation `state` which brought it
+about, and renders it only when it is not `error`. Shaken Fist gives
+every agent operation a deadline (600 seconds unless the creator asked
+for something else) and moves one that overruns it to `expired`, which
+it documents as deliberately distinct from `error`: "run it again with
+a longer deadline" and "the command is broken" are different next
+steps. Every wait in this library enumerates the states an operation
+can be in, rather than naming the two endings it used to expect, so
+`expired` and `deleted` end a wait instead of spinning in one.
+
+A state this library has never heard of is handled differently by the
+two kinds of wait, which is worth knowing if you are reading the
+source. A wait for an instance to become idle keeps waiting and says
+so, because an unrecognised state is more likely a new way of being in
+flight than a new ending, and starting the next command over one that
+is still running would corrupt the node. A wait for a command's output
+raises, because that output exists only for `complete`. Neither can
+wedge: the server moves every operation out of whatever state it is in
+within its deadline. `health()`'s probe names the state too, rather
+than reporting an ending it does not recognise as a completion with no
+result.
+
+`health()` is the exception to all of that, in the other direction: its
+`kubectl` probe carries a timeout, and it is skipped altogether when
+the node it would run on is not up. Both are reported as
+`api['probed'] is False` with an explanatory `api['error']`, and
+neither raises. An abandoned probe does leave its operation queued
+against the control plane node until the server's deadline ends it, and
+`api['error']` names that operation: a caller polling `health()` in a
+loop should know that a later `expand_workers()` or `update_os()` waits
+for those alongside its own commands.
+
+That wait is a delay and not a failure, and the mechanism is worth
+stating because the obvious implementation gets it wrong.
+`await_idle()` waits for *every* agent operation on an instance,
+because the next command must not race one still executing on the node,
+but it judges only the operations it was handed --
+`execute_and_await()` passes the ones it just submitted. An operation
+nobody named is waited for while it can still progress and ignored once
+it ends, whatever it ends as. Without that split, an abandoned probe
+which the server later expires would abort an unrelated
+`expand_workers()` with an `AgentOperationError` naming a `kubectl get
+nodes` the caller never ran.
+
+`remove_worker([])` is likewise an accepted no-op, so a caller computing
+the removal list programmatically does not need to guard the call.
+
+Every elapsed time this library measures -- the probe's timeout, the
+stall notes, the progress reporting -- is taken from `time.monotonic()`,
+so a wall clock adjustment during a long create cannot shorten a
+timeout or invent a stall.
+
+`ComponentNotInstalledError` is the one exception here which depends on
+how the cluster was built rather than on what state it is in.
+`create()` records `metallb_installed` and `longhorn_installed` in the
+cluster metadata, and a verb that drives one of those components reads
+it before it does anything. Metadata written before those keys existed
+is read as having both components, which every such cluster does.
 
 ## Worked example
 
@@ -211,36 +354,37 @@ cluster.create(control_plane_count=1, worker_count=1, metal_address_count=1)
 kubeconfig = cluster.get_kubeconfig()
 cluster.delete()
 
-# create() and get_kubeconfig() wrote nothing to sys.stdout;
-# delete() is the one exception below. Everything else is here.
+# Nothing above wrote to sys.stdout, or to the process's stdout
+# behind its back. Everything either of them said is here.
 print(reporter.getvalue())
 ```
 
-`create()` and `get_kubeconfig()` write nothing to `sys.stdout` at
-all; a caller that owns stdout for its own output (an Ansible
-module's JSON result, in particular) can run either and keep it
-that way. The same is true of `show()`, `expand_workers()`,
-`expand_addresses()` and `update_os()`. `delete()`, the third call
-in this example, is the one exception: its three `kubectl config
-unset` calls run with no captured output, so the child process
-inherits file descriptor 1 and kubectl's `Property "..." unset.`
-lines reach the real stdout directly, bypassing both `sys.stdout`
-and the reporter. This is a known, tracked gap, not an oversight --
-see `KubectlUnsetLeakTestCase` in
-`shakenfist_client_k3s/tests/test_library_api.py` and the phase 3
-row of `docs/plans/library-api-and-collection.md` -- and it is fixed
-by phase 3's kubeconfig side effects opt-out, not by this phase.
+No call here writes anything to `sys.stdout`; a caller that owns
+stdout for its own output (an Ansible module's JSON result, in
+particular) can run any of them and keep it that way. That includes
+`delete()`, which used to be an exception: its three `kubectl config
+unset` calls ran with no captured output, so the child process
+inherited file descriptor 1 and kubectl's `Property "..." unset.`
+lines reached the real stdout directly, bypassing both `sys.stdout`
+and the reporter. They now capture their output, and what kubectl
+says arrives through the reporter (at debug level) or, on a failure,
+on the `KubeconfigError` it raises.
+
 `reporter.getvalue()` holds the same numbered-phase, per-node
-progress text `sf-client k3s create` and `delete` print, for
-example:
+progress text `sf-client k3s create` prints, for example:
 
 ```
-[1/9] Creating node network
+[1/8] Creating node network
   created k3s-mycluster-node (uuid ...)
 ...
-[9/9] Updating local kubeconfig
+[8/8] Setting up longhorn version 1.6.0
 Cluster mycluster is ready (... total)
 ```
+
+The total follows what the call actually does, so the command line's
+nine-phase create becomes eight here: the example above did not ask
+for `write_kubeconfig`, so there is no `Updating local kubeconfig`
+phase to count.
 
 This exact call sequence -- `Cluster(...)`, `create()`,
 `get_kubeconfig()`, `delete()`, with a `CollectingReporter` -- is
