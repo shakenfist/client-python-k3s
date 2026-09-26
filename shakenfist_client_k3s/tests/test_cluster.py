@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1843,6 +1844,40 @@ class ShellQuotingTestCase(testtools.TestCase):
                              'have made into a word: %s' % probe)
 
 
+def _control_plane_and_metallb_commands():
+    """Every commandline a control plane install and a metallb reconfigure send.
+
+    Shared by the two test cases below which assert a property over the
+    generated commands rather than at each call site. Both want the same
+    two paths driven, and a second copy of this setup is a second thing to
+    forget to update.
+    """
+    client = fakes.FakeClusterClient()
+    client.metadata[MD_KEY] = {
+        'name': 'banana', 'namespace': 'testns', 'state': 'created',
+        'node_serial': 1, 'node_network': 'net-1', 'node_token': None,
+        'server_token': None, 'k3s_version': 'v1.33',
+        'api_address_floating': '192.168.10.100',
+        'api_address_inner': '10.0.0.4',
+        'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+        'routed_addresses': ['192.168.10.101', '192.168.10.102']
+    }
+    client.instances['inst-cp1'] = {
+        'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+        'state': 'created', 'agent_state': 'ready'}
+
+    with tempfile.TemporaryDirectory() as tempdir:
+        manifest = os.path.join(tempdir, 'staged.yaml')
+        with open(manifest, 'w') as f:
+            f.write('kind: One\n')
+
+        cluster = _make_cluster(client)
+        cluster.install_control_plane(manifests=[manifest])
+        _make_cluster(client).configure_metallb_addresses()
+
+    return [commandline for _, commandline in client.executed]
+
+
 class HeredocDelimiterTestCase(testtools.TestCase):
     """Every heredoc this module generates has a quoted delimiter.
 
@@ -1855,35 +1890,9 @@ class HeredocDelimiterTestCase(testtools.TestCase):
     back.
     """
 
-    def _commands(self):
-        client = fakes.FakeClusterClient()
-        client.metadata[MD_KEY] = {
-            'name': 'banana', 'namespace': 'testns', 'state': 'created',
-            'node_serial': 1, 'node_network': 'net-1', 'node_token': None,
-            'server_token': None, 'k3s_version': 'v1.33',
-            'api_address_floating': '192.168.10.100',
-            'api_address_inner': '10.0.0.4',
-            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
-            'routed_addresses': ['192.168.10.101', '192.168.10.102']
-        }
-        client.instances['inst-cp1'] = {
-            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
-            'state': 'created', 'agent_state': 'ready'}
-
-        with tempfile.TemporaryDirectory() as tempdir:
-            manifest = os.path.join(tempdir, 'staged.yaml')
-            with open(manifest, 'w') as f:
-                f.write('kind: One\n')
-
-            cluster = _make_cluster(client)
-            cluster.install_control_plane(manifests=[manifest])
-            _make_cluster(client).configure_metallb_addresses()
-
-        return [commandline for _, commandline in client.executed]
-
     def test_no_generated_heredoc_is_unquoted(self):
         heredocs = []
-        for commandline in self._commands():
+        for commandline in _control_plane_and_metallb_commands():
             for line in commandline.split('\n'):
                 if '<<' in line:
                     heredocs.append(line)
@@ -1895,6 +1904,51 @@ class HeredocDelimiterTestCase(testtools.TestCase):
                 introducer.startswith("'") and introducer.endswith("'"),
                 'this heredoc delimiter is not quoted, so the remote shell '
                 'expands the body: %s' % line)
+
+
+class ReadinessWaitsOnWorkloadsTestCase(testtools.TestCase):
+    """No readiness wait this module generates waits on a pod selector.
+
+    A pod wait resolves its label selector once and then spends a single
+    timeout budget across everything it matched, so one pod which can never
+    report Ready costs the whole timeout and then fails naming the healthy
+    pods the wait never reached. remove_worker() produces exactly such a
+    pod: drain leaves DaemonSet pods alone by design, so deleting the node
+    orphans the metallb speaker pod that node was running until the pod
+    garbage collector catches up, and an expand-addresses in that window
+    used to fail blaming three speakers which had been ready for minutes.
+    A workload wait reads the counts the controller keeps, and the node's
+    deletion corrects those.
+
+    Asserted over the generated commands rather than at the one call site,
+    because the failure mode is the next readiness wait written the old way
+    rather than this one changing back.
+    """
+
+    def test_metallb_readiness_is_waited_on_per_workload(self):
+        rollouts = [line
+                    for commandline in _control_plane_and_metallb_commands()
+                    for line in commandline.split('\n')
+                    if line.startswith('kubectl rollout status')]
+
+        self.assertNotEqual(
+            [], rollouts, 'no workload readiness wait was generated at all')
+        for workload in ('deployment/metallb-controller',
+                         'daemonset/metallb-speaker'):
+            self.assertTrue(
+                any(workload in line for line in rollouts),
+                'nothing waits for %s to roll out: %s' % (workload, rollouts))
+
+    def test_nothing_waits_on_a_pod(self):
+        for commandline in _control_plane_and_metallb_commands():
+            for line in commandline.split('\n'):
+                if not line.startswith('kubectl wait'):
+                    continue
+                self.assertIsNone(
+                    re.search(r'(?<![-\w])pods?(?![-\w])', line),
+                    'this waits on a snapshot of pods, so one pod which '
+                    'cannot become ready spends the whole timeout and the '
+                    'failure names the pods it never reached: %s' % line)
 
 
 class DeleteReleasesTheNameBeforeTheMetadataTestCase(testtools.TestCase):
@@ -1983,10 +2037,10 @@ class ExpandAddressesWithoutMetallbTestCase(testtools.TestCase):
     """expand-addresses refuses a cluster which was built without metallb.
 
     Without this the verb routes the addresses, commits them to the
-    metadata, and then waits five minutes for a metallb pod in a namespace
-    which does not exist before failing -- leaving the caller with routed
-    addresses nothing can hand out. The refusal has to come before the
-    allocation, which is what these assert.
+    metadata, and then fails looking for metallb workloads in a namespace
+    which does not exist -- leaving the caller with routed addresses
+    nothing can hand out. The refusal has to come before the allocation,
+    which is what these assert.
     """
 
     def _cluster(self, md_extra):

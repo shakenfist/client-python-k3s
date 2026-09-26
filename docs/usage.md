@@ -232,9 +232,10 @@ Also refuses a cluster created with `--no-metallb`, before it routes
 anything. There is nothing to reconfigure on such a cluster, and the
 refusal is checked up front because the alternative is the worst shape
 of failure: the addresses get routed and charged for, and the command
-then waits five minutes for a MetalLB pod in a namespace that does not
-exist before failing. Clusters created before this was recorded are
-treated as having MetalLB, which they do.
+then fails looking for MetalLB workloads in a namespace that does not
+exist, leaving the caller paying for addresses nothing can hand out.
+Clusters created before this was recorded are treated as having
+MetalLB, which they do.
 
 ### `update-os NAME`
 

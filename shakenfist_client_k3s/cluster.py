@@ -1133,11 +1133,26 @@ class Cluster:
                            'EOF\n'
                            % '/32\n  - '.join(md['routed_addresses']))
 
+        # Wait on the two workloads rather than on the pods they own. A
+        # pod wait resolves its label selector once and then spends a
+        # single timeout budget across everything it matched, so one pod
+        # which can never report Ready costs the whole five minutes and
+        # then fails naming the healthy pods it never reached. That is not
+        # hypothetical: remove_worker() drains with --ignore-daemonsets
+        # and then deletes the node, which leaves the speaker pod from
+        # that node in the API, orphaned and unable to become Ready, until
+        # the pod garbage collector catches up. rollout status is computed
+        # from the workload's own status counts, which the node's deletion
+        # corrects, so it never sees the orphan. Both workloads use the
+        # RollingUpdate strategy the chart defaults to, which is what
+        # rollout status requires.
         self.execute_and_await(
             [md['control_plane_nodes'][0]],
             [
-                ('kubectl wait --kubeconfig /etc/rancher/k3s/k3s.yaml -n metallb-system pod '
-                 '--for=condition=Ready -l app.kubernetes.io/name=metallb --timeout=300s'),
+                ('kubectl rollout status --kubeconfig /etc/rancher/k3s/k3s.yaml '
+                 '-n metallb-system deployment/metallb-controller --timeout=300s'),
+                ('kubectl rollout status --kubeconfig /etc/rancher/k3s/k3s.yaml '
+                 '-n metallb-system daemonset/metallb-speaker --timeout=300s'),
                 'mkdir -p /etc/sf',
                 metal_lb_config,
                 'kubectl apply -f /etc/sf/metallb-range-allocation.yaml'
@@ -1167,7 +1182,11 @@ class Cluster:
                  'upgrade --install -n metallb-system metallb metallb/metallb'),
             ])
 
-        # Let the metallb pods start
+        # Give helm's objects a moment to appear. The readiness wait in
+        # configure_metallb_addresses() asks after the controller
+        # deployment and the speaker daemonset by name, and a name which
+        # does not exist yet is an immediate error rather than something
+        # the wait sits through.
         time.sleep(5)
 
         # Add addresses
@@ -2247,13 +2266,12 @@ class Cluster:
         before an address is routed rather than after. The two halves of
         this are allocate_metallb_addresses(), which routes floating
         addresses and commits them to the metadata, and
-        configure_metallb_addresses(), whose first command waits five
-        minutes for a metallb pod. On a cluster created with
-        install_metallb=False that is five minutes of waiting for a
-        namespace which does not exist, ending in a CommandFailedError,
-        with the addresses already routed and charged for and nothing able
-        to hand them out. Refusing up front costs the caller an error
-        instead.
+        configure_metallb_addresses(), whose first commands ask metallb's
+        own workloads whether they have rolled out. On a cluster created
+        with install_metallb=False there are no such workloads, so that
+        fails, and it fails with the addresses already routed and charged
+        for and nothing able to hand them out. Refusing up front costs the
+        caller an error and nothing else.
         """
         md = self.get_metadata()
         if not md:
