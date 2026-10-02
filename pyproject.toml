@@ -1,10 +1,34 @@
 [build-system]
+# These are the packages needed to *build* this one, and the floors have
+# to be true: an sdist carries this table forever, so a wrong floor is
+# wrong for the life of the release. 77.0.1 is the first installable
+# setuptools which accepts the SPDX license string and the license-files
+# key used below -- 76.1.0 rejects them during pyproject validation, and
+# nothing warns, because an isolated build quietly installs something
+# newer. The setuptools_scm floor is 6.4.2 because that is the oldest
+# release this project has actually been built against: a wheel built
+# with setuptools_scm 6.4.2 and setuptools 77.0.1 comes out correct, with
+# the version derived and twelve entries. 6.2 understood the one key this
+# project sets, git_describe_command, and was the floor until the review
+# of #81 pointed out it had been reasoned about rather than built -- but
+# 6.2.0 is yanked from PyPI for a setuptools-interaction regression, so
+# naming it as the floor claimed something PyPI has retracted. The
+# [simple] extra this used to ask for did not exist until 9.2.0 and is
+# empty even there, so naming it only produced a silently ignored
+# request. build, twine and wheel are not build dependencies: the first
+# two are release tooling that release.yml installs into its own
+# virtualenv, and setuptools has supplied bdist_wheel itself for years.
+# Listing them here made every --no-build-isolation build demand them.
+#
+# One consequence worth knowing: setuptools has needed Python 3.9 or
+# newer since 76.0.0, so on 3.7 and 3.8 this package is wheel-only. The
+# wheel is py3-none-any and installs and runs there; building from the
+# sdist on those versions cannot resolve a backend. See
+# shakenfist/client-python-k3s#82, which also covers the fact that
+# nothing tests the declared floor.
 requires = [
-    "setuptools>=61.0",
-    "setuptools_scm[simple]>=6.2",
-    "wheel",
-    "build",
-    "twine"
+    "setuptools>=77.0.1",
+    "setuptools_scm>=6.4.2"
 ]
 build-backend = "setuptools.build_meta"
 
@@ -14,14 +38,14 @@ dynamic = ["version"]
 
 description = "A sf-client plugin which orchestrates k3s clusters on Shaken Fist"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     {name = "Michael Still", email = "mikal@stillhq.com"},
 ]
 classifiers = [
     "Intended Audience :: Information Technology",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
@@ -46,13 +70,21 @@ dependencies = [
 [project.entry-points."shakenfist_client.plugin"]
 k3s = "shakenfist_client_k3s:load"
 
+# include_package_data defaults to true under pyproject.toml, and
+# setuptools_scm installs a file finder that offers every git-tracked
+# file as package data. That re-adds the whole tests/ tree the
+# packages.find exclude below correctly drops as a *package* -- the
+# exclude is not the bug, this is. Nothing in this package reads a
+# data file at runtime, so there is nothing legitimate to lose.
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 include = ["shakenfist_client_k3s*"]
 exclude = ["shakenfist_client_k3s.tests*"]
 
 [tool.setuptools_scm]
 git_describe_command = "git describe --dirty --tags --match v* --first-parent"
-write_to = "shakenfist_client_k3s/_version.py"
 
 [project.optional-dependencies]
 test = [

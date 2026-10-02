@@ -268,5 +268,3 @@ the canonical copy lives in shakenfist/development at
  * Does `pip install -e .` succeed in a fresh venv alongside
    `shakenfist-client`?
  * Does `tox` pass?
- * Has `shakenfist_client_k3s/_version.py` stayed out of the
-   commit? It is generated and gitignored.
