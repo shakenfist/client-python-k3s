@@ -203,6 +203,14 @@ widest range of client platforms. The runtime version lookup uses
 `importlib.metadata` with the `importlib-metadata` backport on older
 Pythons.
 
+On 3.7 and 3.8 that support is wheel-only. The published wheel is
+`py3-none-any` and installs and runs there, which is what `pip install`
+gets; building from the sdist does not work, because `[build-system]`
+requires setuptools 77 or newer for the SPDX license metadata and
+setuptools itself has needed Python 3.9 or newer since 76.0.0. Nothing
+currently tests the declared floor either way --
+shakenfist/client-python-k3s#82 tracks both halves of that.
+
 ## Build and Packaging
 
 - **Build system**: `setuptools` with `pyproject.toml`

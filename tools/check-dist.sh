@@ -55,8 +55,16 @@ check_wheel() {
     # a stable interface. Taking the first whitespace-delimited field of
     # that listing would also truncate any path containing a space,
     # which is how an unwanted entry could slip past the grep below.
-    entries=$(python3 -c 'import sys, zipfile
-print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "${wheel}")
+    # A file which is not a zip raises BadZipFile, which set -e would
+    # turn into a correct non-zero exit preceded by a Python traceback.
+    # The exit status was never the problem; being told by a traceback at
+    # release time is.
+    if ! entries=$(python3 -c 'import sys, zipfile
+print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "${wheel}" \
+            2>/dev/null); then
+        echo "check-dist: ${wheel} is not a readable zip archive"
+        exit 1
+    fi
 
     # (^|/)tests/ rather than /tests/, so a tests/ directory at the
     # archive root is caught as well. The packages.find configuration

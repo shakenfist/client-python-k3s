@@ -143,6 +143,15 @@ class CheckDistTestCase(testtools.TestCase):
             'an empty archive was reported as acceptable: %s' % result.stdout)
         self.assertIn('no entries at all', result.stdout)
 
+    def test_a_file_that_is_not_a_zip_is_reported_not_traced(self):
+        path = os.path.join(self.tempdir, 'bad-0.1.0-py3-none-any.whl')
+        with open(path, 'w') as f:
+            f.write('this is not a zip archive\n')
+        result = self._run(path)
+        self.assertEqual(1, result.returncode)
+        self.assertIn('not a readable zip archive', result.stdout)
+        self.assertNotIn('Traceback', result.stderr)
+
     def test_no_arguments_is_a_usage_error(self):
         result = self._run()
         self.assertEqual(1, result.returncode)

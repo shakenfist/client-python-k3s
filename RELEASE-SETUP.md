@@ -67,9 +67,10 @@ The workflow will now be able to publish without any stored credentials.
 a different publishing method, you can add the trusted publisher alongside the
 existing setup and then remove the old API token once verified.
 
-**Getting any of the four values wrong** (owner, repository, workflow
-filename or environment name), under either flow, does not fail
-immediately: `build` and `sign-tag` both succeed first, so by the time
+**Getting any of these values wrong** (the PyPI project name, owner,
+repository, workflow filename or environment name -- five on the
+pending-publisher form, four when scoping to an existing project, which
+supplies its own name), under either flow, does not fail immediately: `build` and `sign-tag` both succeed first, so by the time
 `publish-pypi` rejects the OIDC claim, `sign-tag` has already signed and
 force-pushed the release tag. Because that push is a force-push, the
 tag cannot simply be corrected and re-pushed -- see "Tag Signature

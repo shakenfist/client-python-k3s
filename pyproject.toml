@@ -5,10 +5,16 @@
 # setuptools which accepts the SPDX license string and the license-files
 # key used below -- 76.1.0 rejects them during pyproject validation, and
 # nothing warns, because an isolated build quietly installs something
-# newer. setuptools_scm needs no particular version for the one key this
-# project sets, git_describe_command, which has been understood since
-# 6.x; the [simple] extra it used to ask for did not exist until 9.2.0
-# and is empty even there, so naming it only produced an ignored
+# newer. The setuptools_scm floor is 6.4.2 because that is the oldest
+# release this project has actually been built against: a wheel built
+# with setuptools_scm 6.4.2 and setuptools 77.0.1 comes out correct, with
+# the version derived and twelve entries. 6.2 understood the one key this
+# project sets, git_describe_command, and was the floor until the review
+# of #81 pointed out it had been reasoned about rather than built -- but
+# 6.2.0 is yanked from PyPI for a setuptools-interaction regression, so
+# naming it as the floor claimed something PyPI has retracted. The
+# [simple] extra this used to ask for did not exist until 9.2.0 and is
+# empty even there, so naming it only produced a silently ignored
 # request. build, twine and wheel are not build dependencies: the first
 # two are release tooling that release.yml installs into its own
 # virtualenv, and setuptools has supplied bdist_wheel itself for years.
@@ -22,7 +28,7 @@
 # nothing tests the declared floor.
 requires = [
     "setuptools>=77.0.1",
-    "setuptools_scm>=6.2"
+    "setuptools_scm>=6.4.2"
 ]
 build-backend = "setuptools.build_meta"
 
