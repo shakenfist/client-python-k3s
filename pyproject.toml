@@ -1,10 +1,21 @@
 [build-system]
+# These are the packages needed to *build* this one, and the floors have
+# to be true: an sdist carries this table forever, so a wrong floor is
+# wrong for the life of the release. 77.0.1 is the first installable
+# setuptools which accepts the SPDX license string and the license-files
+# key used below -- 76.1.0 rejects them during pyproject validation, and
+# nothing warns, because an isolated build quietly installs something
+# newer. setuptools_scm needs no particular version for the one key this
+# project sets, git_describe_command, which has been understood since
+# 6.x; the [simple] extra it used to ask for did not exist until 9.2.0
+# and is empty even there, so naming it only produced an ignored
+# request. build, twine and wheel are not build dependencies: the first
+# two are release tooling that release.yml installs into its own
+# virtualenv, and setuptools has supplied bdist_wheel itself for years.
+# Listing them here made every --no-build-isolation build demand them.
 requires = [
-    "setuptools>=61.0",
-    "setuptools_scm[simple]>=6.2",
-    "wheel",
-    "build",
-    "twine"
+    "setuptools>=77.0.1",
+    "setuptools_scm>=6.2"
 ]
 build-backend = "setuptools.build_meta"
 

@@ -162,7 +162,7 @@ with exclude: ['shakenfist_client_k3s']
 
 The built wheel nevertheless contains `shakenfist_client_k3s/tests/`
 in full -- `__init__.py`, `fakes.py`, eleven `test_*.py` and thirteen
-`cli_contract/*.txt` -- 39 entries where 13 would do. The exclusion
+`cli_contract/*.txt` -- 39 entries where 12 would do. The exclusion
 drops the *package*; `setuptools_scm`'s file finder plus
 `include_package_data`, which defaults to true under `pyproject.toml`,
 then re-adds every git-tracked file under the package directory as
@@ -173,9 +173,18 @@ package *data*. Adding
 include-package-data = false
 ```
 
-takes the wheel to 13 entries with no `tests/` path in it, verified by
+takes the wheel to 12 entries with no `tests/` path in it, verified by
 rebuilding. Nothing in the package reads a data file at runtime, so
 there is nothing legitimate for `include_package_data` to be carrying.
+
+The count is 12 and not 13 because step 4a also removes `write_to`, so
+`_version.py` is no longer generated and no longer shipped. This passage
+said 13 in both places until the review of #81 noticed that it disagreed
+with `MAX_ENTRIES` in `tools/check-dist.sh`; the script was right. The
+twelve are six modules under `shakenfist_client_k3s/` and six under
+`.dist-info`: `METADATA`, `WHEEL`, `entry_points.txt`, `top_level.txt`,
+`RECORD` and `licenses/LICENSE`, the last of those being a consequence
+of setting `license-files`.
 
 ### 5. Two deprecation warnings in the distribution metadata
 
@@ -322,6 +331,19 @@ rather than wrong.
    release chore, and doing it inside the release phase would mean
    publishing `0.1.0` with a compatibility claim changed in the same
    commit range that first made compatibility observable.
+
+   Filed as shakenfist/client-python-k3s#82, which the review of #81
+   prompted -- the issue had not actually been created, and the review
+   also sharpened what it needs to say. Raising the setuptools floor to
+   77.0.1 means 3.7 and 3.8 are wheel-only: the wheel is `py3-none-any`
+   and installs and runs there, but setuptools has needed Python 3.9 or
+   newer since 76.0.0, so anything building from the sdist on those
+   versions cannot resolve a build backend. The floor is therefore not
+   one claim any more but two, and the issue records both. Keeping
+   `license = {text = ...}` to avoid this was the alternative; it is
+   deprecated with a 2027-02-18 removal, so it would have traded a
+   documented wheel-only caveat for metadata which has to be changed
+   again before then anyway.
 
 7. **`write_to` is removed rather than documented.** Keeping it means
    `ARCHITECTURE.md` has to explain a generated file that no code

@@ -208,7 +208,8 @@ Pythons.
 - **Build system**: `setuptools` with `pyproject.toml`
 - **Versioning**: `setuptools_scm` derives the version from git tags
   into the distribution metadata, which `importlib.metadata.version()`
-  reads at `cluster.py:1397` to stamp `plugin_version`
+  reads in `Cluster.create()` to stamp `plugin_version` into the
+  cluster's namespace metadata
 - **Distribution**: published to PyPI as `shakenfist_client_k3s`
 - **Entry point**: `k3s = "shakenfist_client_k3s:load"` in the
   `shakenfist_client.plugin` group
