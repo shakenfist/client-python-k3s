@@ -128,3 +128,10 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# setuptools_scm's write_to used to generate this, and no longer does.
+# The entry stays because checkouts which were built before that change
+# still have the file sitting there untracked, where a git add -A would
+# commit it -- and a generated file is exactly what this list is for,
+# whether or not this project is still the thing generating it.
+shakenfist_client_k3s/_version.py

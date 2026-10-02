@@ -58,7 +58,12 @@ check_wheel() {
     entries=$(python3 -c 'import sys, zipfile
 print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "${wheel}")
 
-    test_entries=$(echo "${entries}" | grep '/tests/' || true)
+    # (^|/)tests/ rather than /tests/, so a tests/ directory at the
+    # archive root is caught as well. The packages.find configuration
+    # makes that shape unlikely, but this script is the backstop for the
+    # configuration being wrong, so it cannot assume the configuration is
+    # right.
+    test_entries=$(echo "${entries}" | grep -E '(^|/)tests/' || true)
     if [ -n "${test_entries}" ]; then
         echo "check-dist: ${wheel} contains test paths that must not ship:"
         indent "${test_entries}"

@@ -13,6 +13,13 @@
 # two are release tooling that release.yml installs into its own
 # virtualenv, and setuptools has supplied bdist_wheel itself for years.
 # Listing them here made every --no-build-isolation build demand them.
+#
+# One consequence worth knowing: setuptools has needed Python 3.9 or
+# newer since 76.0.0, so on 3.7 and 3.8 this package is wheel-only. The
+# wheel is py3-none-any and installs and runs there; building from the
+# sdist on those versions cannot resolve a backend. See
+# shakenfist/client-python-k3s#82, which also covers the fact that
+# nothing tests the declared floor.
 requires = [
     "setuptools>=77.0.1",
     "setuptools_scm>=6.2"

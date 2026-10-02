@@ -88,6 +88,21 @@ class CheckDistTestCase(testtools.TestCase):
             % result.stdout)
         self.assertIn('shakenfist_client_k3s/a b/tests/leak.py', result.stdout)
 
+    def test_a_root_level_tests_directory_fails(self):
+        """The match cannot require a leading slash.
+
+        A wheel built from a different packages.find configuration could
+        put the suite at the archive root as tests/, where a /tests/
+        match would not see it. The script is the backstop for the
+        configuration being wrong, so it cannot assume the shape the
+        current configuration produces.
+        """
+        result = self._run(self._wheel(GOOD_ENTRIES + ['tests/test_x.py']))
+        self.assertEqual(
+            1, result.returncode,
+            'a root-level tests/ entry was not noticed: %s' % result.stdout)
+        self.assertIn('tests/test_x.py', result.stdout)
+
     def test_too_many_entries_fails_and_lists_them(self):
         wheel = self._wheel(
             ['shakenfist_client_k3s/mod%02d.py' % n for n in range(13)])

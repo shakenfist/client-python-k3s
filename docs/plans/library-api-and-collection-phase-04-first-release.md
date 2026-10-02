@@ -437,16 +437,19 @@ Each of these is checkable, and most are one command:
   `python -c "from importlib.metadata import version;
   print(version('shakenfist_client_k3s'))"` prints `0.1.0`.
 - The wheel PyPI serves contains no path matching `/tests/`, and
-  `tools/check-dist.sh` exits non-zero when given a wheel that does --
-  demonstrated by reverting `include-package-data` and recorded in
-  4a's commit message.
+  `tools/check-dist.sh` exits non-zero when given a wheel that does.
+  The review of #81 replaced the original hand-demonstration of this
+  with `tests/test_check_dist.py`, so the criterion is now
+  `stestr run test_check_dist` passing, and `tools/check-wheel-build.sh`
+  running in the pull request tier rather than only at release time.
 - `python -m build` emits no warning mentioning `project.license` or
   license classifiers.
 - `git describe --tags --match 'v*'` on `develop` prints `v0.1.0`, and
   `git tag -v v0.1.0` shows a Sigstore signature.
-- `grep -n '_version' pyproject.toml` returns nothing, and no line of
-  `ARCHITECTURE.md` claims `_version.py` is where the version is read
-  from.
+- `grep -nE 'write_to|_version\.py' pyproject.toml` returns nothing,
+  and no line of `ARCHITECTURE.md` claims `_version.py` is where the
+  version is read from. (The pattern is not plain `_version`, which
+  matches the `python_version` environment marker in `dependencies`.)
 - `RELEASE-SETUP.md` contains the phrase "pending publisher", and no
   step instructs the reader to navigate to a PyPI project as the only
   way to add a trusted publisher.

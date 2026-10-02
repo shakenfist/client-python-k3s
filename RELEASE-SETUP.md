@@ -27,9 +27,11 @@ navigate to, so a project-scoped publisher cannot be created -- there is
 nothing to scope it to. Use PyPI's **pending publisher** flow instead:
 
 1. Log in to [pypi.org](https://pypi.org) with your account
-2. Go to your account's own publishing settings (account menu > **Your
-   projects**, then the account-level **Publishing** page) -- not a
-   project page, since the project does not exist yet
+2. Go to <https://pypi.org/manage/account/publishing/>, the
+   account-level publishing settings -- not a project page, since the
+   project does not exist yet. The direct link is given because this
+   form sits under account settings rather than anywhere under your
+   projects, which is where people look for it
 3. Click **Add a new pending publisher**
 4. Fill in the form:
    - **PyPI Project Name**: `shakenfist_client_k3s`
@@ -144,10 +146,9 @@ has never run against this repository before; adding an untested gate
 in front of that first run trades a real risk (a mistake in the
 ruleset or its bypass list breaking the only release that has ever
 happened) for a theoretical one (an unprotected tag namespace for the
-short window before the second release). `shakenfist/client-python-k3s`
-deliberately added this ruleset only after its first release (`v0.1.0`),
-so the first release run to exercise the signing path against the
-ruleset is its second release, not its first.
+short window before the second release). The consequence to be aware of
+is that the first release run which exercises the signing path *against*
+the ruleset is then the second release, not the first.
 
 1. Go to **Settings** > **Rules** > **Rulesets**
 2. Click **New ruleset** > **New tag ruleset**
