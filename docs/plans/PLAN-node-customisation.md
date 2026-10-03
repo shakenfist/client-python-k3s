@@ -121,10 +121,14 @@ phase 1 is now on two critical paths rather than one.
 
 This plan is independent of the in-progress
 [library API plan](PLAN-library-api-and-collection.md), but touches the
-same code. Its phase 4 (first PyPI release) is planned on the
-unpushed branch `library-api-phase-04`, and its phase 5 (the
+same code. Its phase 4 (first PyPI release) completed on 2026-10-03
+and `shakenfist_client_k3s` 0.1.0 is on PyPI, and its phase 5 (the
 `shakenfist.k3s` Ansible collection) will want to expose whatever
-options exist by then. See open question 2.
+options exist by then. Phase 5's plan decided not to wait for this
+one, on the grounds that every option here is a new *optional* module
+parameter and so an additive change to a published argument spec; it
+also records that 33fl cannot adopt the collection for CI runners
+until this plan lands. See open question 2, and phase 5's decision 8.
 
 ## Mission and problem statement
 
