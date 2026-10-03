@@ -1,0 +1,21 @@
+# Control-node Python requirements for the shakenfist.k3s collection.
+#
+# The sf_k3s_cluster module imports shakenfist_client_k3s to talk to the
+# Shaken Fist API. Install this on the Ansible control node with:
+#
+#     pip install -r requirements.txt
+#
+# 0.1.0 is a STATIC floor, not something tools/build-collection.py rewrites
+# alongside galaxy.yml's version. The two are facts about different things:
+# this floor says every verb the module's source calls shipped in
+# shakenfist_client_k3s 0.1.0, which is true regardless of which collection
+# version is being built. A build-time floor tied to the collection's own
+# version would instead say "this collection demands the plugin release with
+# the same number as itself" -- which is false for a locally built
+# development collection, since PyPI does not carry a plugin release to
+# match an unreleased collection version, and the install would fail for a
+# reason that has nothing to do with compatibility.
+#
+# Raise this floor in the commit that first makes the module call a verb
+# newer than 0.1.0 introduced -- not before, and not automatically.
+shakenfist_client_k3s>=0.1.0

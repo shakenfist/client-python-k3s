@@ -1,0 +1,19 @@
+# Ansible-lint configuration for the shakenfist.k3s collection.
+#
+# Run manually: ansible-lint collection/
+#
+# This mirrors the core shakenfist.shakenfist collection's permissive basic
+# profile, but does not copy that collection's full skip_list: two of its
+# three entries (var-naming[no-role-prefix], package-latest) exist because
+# that collection ships roles with tasks, and this collection ships no
+# roles at all -- there is nothing for either check to act on, so copying
+# them would be a skip that skips nothing. Verified by running ansible-lint
+# against this collection with no skip_list at all: only the entry below
+# fired.
+
+profile: basic
+
+skip_list:
+  # A galaxy changelog is not yet maintained for the collection. It will be
+  # added when the publish job lands (step 5f).
+  - galaxy[no-changelog]
