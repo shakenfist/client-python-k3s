@@ -260,6 +260,34 @@ updated to describe phase 5 as it is actually scoped.
    read-modify-write metadata document. A `worker_count` parameter
    would be the entire race, politely spelled.
 
+   **The creation-time count is `initial_workers`, and is never
+   reconciled.** Refined in step 5b, because the decision above and
+   `create()`'s signature pull in opposite directions: `create()`
+   requires a `worker_count` argument, so a module which creates
+   clusters has to say *something* about workers even though it must
+   never manage them. `initial_workers` (integer, default 0) is the
+   resolution. It is passed to `create()` only on the path which
+   creates a cluster, and is read nowhere else: an existing cluster
+   whose worker count differs from `initial_workers` is **not**
+   `changed`, is not reported as a difference, and is never resized.
+
+   The name carries that semantics on purpose, and is not negotiable
+   for the same reason the parameter it replaces is forbidden. A
+   parameter called `worker_count` invites the one-line "and if it
+   differs, expand" change that reintroduces the race; a parameter
+   called `initial_workers` makes that change read as the
+   contradiction it is. The default of 0 rather than the command
+   line's 2 follows from the same place: a play handing the cluster
+   straight to a scaler wants control plane nodes and nothing else.
+
+   The same never-reconciled rule applies to every other shape
+   parameter the module takes -- `control_plane_count`,
+   `metal_address_count`, `network`, `release_channel`, `sshkey`,
+   `install_metallb`, `install_longhorn` and `manifests` are all
+   creation-time only. Workers are the one singled out here because
+   they are the one with a competing writer; the rest are simply verbs
+   this library does not have.
+
 6. **Check mode is supported, and is how idempotency is tested.** A
    module that cannot say "nothing to do" without doing it cannot be
    trusted in a playbook that runs twice, and the cluster state this
@@ -383,7 +411,25 @@ Each of these is checkable, and most are one command:
   PyPI serves for `shakenfist_client_k3s`.
 - `tools/check-wheel-build.sh` still reports twelve entries, so the
   wheel never grew the collection.
-- `grep -rn 'worker_count' collection/` returns nothing.
+- `git grep -c worker_count -- collection/` reports exactly one match:
+  the `worker_count=module.params['initial_workers'],` argument in
+  `sf_k3s_cluster.py`'s single `create()` call. Anything else is a
+  regression.
+
+  This was `grep -rn 'worker_count' collection/` returns nothing until 5b,
+  which cannot hold once the module exists: `create()`'s second parameter
+  *is* called `worker_count`, and a module that creates clusters has to
+  pass it. Passing `create()`'s first three arguments positionally to keep
+  the bare grep clean was considered and rejected -- three unlabelled
+  integers into a ten-parameter call is worse code than the grep is a
+  check. Two other changes keep the new wording meaningful: `git grep`
+  rather than `grep -rn`, because `ansible-lint` leaves a gitignored copy
+  of the whole collection in `collection/.ansible/` which `grep -rn`
+  counts and CI's checkout order makes intermittent; and no comment under
+  `collection/` may spell the name either, so the count stays at one. What
+  is being asserted has not changed: no `worker_count` in the argument
+  spec, in the documentation, in the tests, or on any path comparing one
+  against a cluster that already exists.
 - `pre-commit run --all-files` and `tox -epy3` pass.
 - The master plan's phase 5 row is `Complete` with the collection
   version recorded, and `docs/plans/index.md` links this file.

@@ -135,3 +135,9 @@ dmypy.json
 # commit it -- and a generated file is exactly what this list is for,
 # whether or not this project is still the thing generating it.
 shakenfist_client_k3s/_version.py
+
+# ansible-lint's working tree. ansible-compat installs the collection into
+# collection/.ansible/ so that the module resolves by its fully qualified
+# name, which means every pre-commit run leaves one behind. galaxy.yml's
+# build_ignore keeps it out of the built collection as well.
+collection/.ansible/
