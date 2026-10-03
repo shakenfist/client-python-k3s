@@ -1,4 +1,4 @@
-# Cumulative health signals: what the health verb cannot see
+# Node customisation: per-role sizing and k3s configuration pass-through
 
 ## Prompt
 
@@ -48,130 +48,270 @@ copy lives in shakenfist/development at
 
 ## Situation
 
-**This is a placeholder. It records a real problem and the evidence
-for it, so that the work is not lost and does not have to be
-rediscovered, but its phases are deliberately unplanned. Flesh it out
-before executing anything.**
+`sf-client k3s create` builds every node identically and gives the
+caller almost no say in how k3s is configured. That was fine for the
+workloads it was written for, but it rules out anything heavier. The
+motivating case is a prototype OpenStack-Helm deployment on top of a
+plugin-built cluster, in `homelab-deployments-lfs` (private), as the
+first step towards a Kerbside deployment path that is not
+kolla-ansible. The same limits would bite any other substantial
+workload.
 
-`Cluster.health()` (`cluster.py:1603`) answers one question, and
-answers it well: are this cluster's node instances up, and is the k3s
-API responding. Per decision 7 of
-[phase 3 of the library API plan][p3]
-it returns structured data rather than text so that an Ansible module
-can branch on it, and it deliberately repairs nothing, on the grounds
-that a verb which silently fixes things cannot be used to decide
-whether to fix things. `_node_health()` (`cluster.py:849`) builds each
-node's entry: `uuid`, `role`, `name`, `exists`, `state`,
-`agent_state`, `healthy`.
+What the code does today:
 
-Every one of those is a reading of *current* state, and that is the
-gap. On 2026-10-03, while health testing the cluster 33fl's
-`docs/plans/PLAN-k3s-ci-runners.md` intends to use,
-`sf-client k3s health` reported a cluster healthy
-minutes after its control plane node had been driven into global OOM,
-had k3s restarted under it by systemd, and had spent about thirty
-seconds refusing API connections. Nothing in the report was wrong.
-Every node was up and the API was answering again by the time it was
-asked. The verb simply has no way to say "and it was broken an hour
-ago".
+* **Node sizing is hardcoded.** `Cluster.create_instance()`
+  (`shakenfist_client_k3s/cluster.py:416-442`) creates every node,
+  control plane or worker, with 2 vCPUs, 2048 MB of RAM and one 50 GB
+  disk based on `BASE_OS_VERSION` (`cluster.py:51`, `debian:12`).
+  `create_instance()` takes no arguments and does not know which role
+  it is building for; the role is known only one frame up, in
+  `create_and_await_instances(count, node_type)` (`cluster.py:668`).
+  OpenStack-Helm's control services alone want something like 16-24 GB,
+  and a compute node needs room for guests on top of libvirt and Open
+  vSwitch.
+* **k3s configuration is fixed.** The first control plane node gets an
+  `/etc/rancher/k3s/config.yaml` with exactly three keys:
+  `write-kubeconfig-mode`, `tls-san` (the floating API address) and
+  `cluster-init` (`cluster.py:949-956`). Additional control plane nodes
+  and workers are installed by `install_k3s_component()`
+  (`cluster.py:1038-1065`) with no config file at all, just
+  `INSTALL_K3S_CHANNEL`, `K3S_URL` and `K3S_TOKEN` in the installer
+  environment. So there is no way to disable a packaged component
+  (Traefik, servicelb), apply node labels or taints at join, change
+  the cluster or service CIDRs, or pass kubelet arguments. The only
+  payload hook is `--manifest` (phase 3 of the library API plan),
+  which stages static manifests and cannot change how k3s itself
+  runs.
+* **Cluster state lives in namespace metadata**
+  (`orchestrated_k3s_cluster_<name>`, via `get_metadata()` /
+  `set_metadata()`, `cluster.py:293-316`). `expand_workers()`
+  (`cluster.py:1944`) builds new workers from that state, so anything
+  that should apply to later workers must be recorded there rather
+  than only passed to `create()`.
+* **A latent bug:** `install_k3s_component()` runs a bare
+  `sudo apt-get install -y` with no package named (`cluster.py:1052`).
+  apt treats that as a successful no-op, so it has gone unnoticed.
 
-The signals that would have caught it are all cumulative -- a counter,
-or a log entry -- and all cheap to read through the `sf-agent2` side
-channel the plugin already uses for everything else:
+What OpenStack-Helm needs from the cluster, confirmed against
+openstack-helm master at `a606f21` (2026-09-24):
 
-- **`systemctl show k3s -p NRestarts`.** The single best signal. It
-  read 5 and then 7 across that testing while
-  `systemctl show k3s -p ActiveState` said `active` throughout.
-- **The kernel's OOM kill count.** Read it from `journalctl -k`, not
-  `dmesg`: during the same testing the `dmesg` count went *down* from
-  2 to 1 as the ring buffer wrapped, and a counter that can decrease
-  is not a counter.
-- **`MemAvailable` from `/proc/meminfo`.** Warning before the cliff
-  rather than forensics after it.
-- **The etcd data directory size.** 383 MB of data plus 80 MB of
-  snapshots on a 2 GB node, growing, watched by nothing.
-- **`lastState.terminated.reason == OOMKilled` on pods.** Via the API
-  rather than the agent. Machine readable, timestamped, and it
-  distinguishes real damage from the first-boot ordering races every
-  cluster carries -- a distinction a plain restart count cannot make,
-  and which 33fl's `tools/k3s-health-check.py` currently has to
-  approximate with a pod age heuristic.
+* Node labels `openstack-control-plane=enabled`,
+  `openstack-compute-node=enabled` and `openvswitch=enabled`
+  (`doc/source/install/prerequisites.rst:284-298`).
+* No Ingress controller. Charts no longer ship Ingress templates; the
+  documented way in is Gateway API with Envoy Gateway on a MetalLB
+  address (`doc/source/install/openstack.rst:7-60`). k3s's bundled
+  Traefik is therefore dead weight at best.
+* MetalLB, which the plugin already installs. k3s's own servicelb
+  (klipper-lb) also claims `LoadBalancer` services, and the plugin
+  does not disable it today. Both run at once -- verified on a live
+  cluster on 2026-10-03, see open question 1.
 
-A second example from the same cluster, found incidentally:
-`metallb-controller` had been logging `AdditionalAssignFailed` every
-few minutes -- 184 occurrences over 25 days -- because a Service asked
-for dual-stack against an IPv4-only pool. Harmless, and invisible to
-every reading of current state.
+**A second consumer arrived on 2026-10-03.** 33fl's
+`docs/plans/PLAN-k3s-ci-runners.md` migrates the GitHub Actions static
+runner pool onto a plugin-built k3s cluster running ARC, and its
+phase 2 cannot start until per-role sizing exists: health-testing the
+candidate host cluster `runners.static-ci` found the hardcoded
+2 vCPU / 2048 MB is wrong for both roles, and that no amount of
+configuration fixes it from outside the plugin. That plan records this
+one as its blocking prerequisite 8, with `--disable` as 9 and control
+plane tainting as 11. Its measurements are cited below where they
+answer questions this plan had left open. The practical effect is that
+phase 1 is now on two critical paths rather than one.
 
-[p3]: library-api-and-collection-phase-03-missing-verbs.md
+This plan is independent of the in-progress
+[library API plan](PLAN-library-api-and-collection.md), but touches the
+same code. Its phase 4 (first PyPI release) is planned on the
+unpushed branch `library-api-phase-04`, and its phase 5 (the
+`shakenfist.k3s` Ansible collection) will want to expose whatever
+options exist by then. See open question 2.
 
 ## Mission and problem statement
 
-Let `health()` report what has happened to a cluster since it was last
-looked at, not only what is true at the instant it is asked, so that a
-daily poll can distinguish "fine" from "fine right now".
+Let the caller size control plane and worker nodes independently, and
+pass arbitrary k3s configuration to server and agent nodes, through
+both the CLI and the `Cluster` library API. Record both in cluster
+metadata so that `expand-workers` builds new workers the same way as
+the originals. Taint control plane nodes by default, so that the
+scheduler cannot put a workload on the node holding etcd and the
+apiserver.
 
-**Explicit non-goal: this plan does not automate recovery.** The
-"repairs nothing" contract is the reason the verb is usable as an
-input to a decision, and it should survive. Recovery is a separate
-verb and, on current evidence, a separate plan -- see open question 4,
-because the two node roles are not symmetrical and the control plane
-has no recovery path at all today.
+Non-goals, deferred to Future work: choosing the base OS image,
+attaching additional NICs or disks, and per-invocation sizing
+overrides on `expand-workers`.
+
+### Decisions
+
+These were settled with the operator on 2026-09-27, before the plan
+was written.
+
+1. **k3s configuration is a generic YAML pass-through, not a set of
+   curated flags.** The CLI gains `--server-config PATH` and
+   `--agent-config PATH`; `Cluster.create()` gains matching
+   `server_config` and `agent_config` parameters that take a mapping.
+   This covers `disable`, `node-label`, `node-taint`, `cluster-cidr`,
+   `service-cidr`, `flannel-backend`, `kubelet-arg` and anything else
+   k3s grows, without a new flag each time. The cost is weaker
+   validation, which the plugin partly recovers by rejecting keys it
+   owns (decision 3).
+2. **Sizing is per role.** The CLI gains
+   `--control-plane-cpus`, `--control-plane-memory`,
+   `--control-plane-disk`, `--worker-cpus`, `--worker-memory` and
+   `--worker-disk`. Memory is in MB and disk in GB, matching the
+   Shaken Fist API. The defaults stay at 2 / 2048 / 50, so existing
+   invocations build exactly what they built before.
+
+### Design
+
+3. **User configuration goes in a drop-in file, not merged into
+   `config.yaml`.** k3s reads `/etc/rancher/k3s/config.yaml` and then
+   every file in `/etc/rancher/k3s/config.yaml.d/` in lexical order.
+   Later files override scalar keys, and replace list keys unless the
+   key is written with a `+` suffix, in which case they append. The
+   plugin writes its own keys to `config.yaml` as today, and the
+   caller's mapping, re-serialised with `yaml.safe_dump`, to
+   `config.yaml.d/50-sf-client-k3s.yaml`. That leaves merging to k3s
+   and keeps the plugin's keys visible on the node.
+
+   Plugin-owned keys are rejected, with an error naming them, before
+   any instance is created: `write-kubeconfig-mode`, `tls-san`,
+   `cluster-init`, `server` and `token`. A caller who needs more SANs
+   writes `tls-san+`, which k3s appends to the plugin's list; this
+   should be documented. Validation also rejects a document that is
+   not a single mapping. The whole check is a pure function, so it
+   can be unit tested without mocks.
+
+   **Needs verifying in phase planning:** the k3s release that
+   introduced `config.yaml.d` and the `+` suffix (believed to be
+   around v1.21 to v1.22). If `--release-channel` can resolve to
+   anything older, either refuse the combination or document the
+   floor.
+4. **Server configuration applies to every control plane node, and
+   agent configuration to every worker.** That includes additional
+   control plane nodes (which currently get no config file) and
+   workers added later by `expand-workers`. The drop-in has to exist
+   before the installer runs, because the installer starts the
+   service.
+5. **Both are recorded in cluster metadata.** The new keys are
+   `node_sizes`
+   (`{'control_plane': {'cpus', 'memory', 'disk'}, 'worker': {...}}`),
+   `server_config` and `agent_config`. Clusters created before this
+   change have none of these keys, and the code reads them with
+   today's values as defaults (`{}` for the two configs), in the same
+   way `join_address` falls back to `api_address_inner`
+   (`cluster.py:1046`). `show` should display the sizes.
+6. **`create_instance()` takes the role.** Called as
+   `create_instance(node_type)`, it looks up `md['node_sizes']`.
+   `create_and_await_instances()` already has `node_type` and passes
+   it down.
+
+7. **Control plane nodes are tainted by default.** Added 2026-10-03.
+   Decision 1 already makes `node-taint` reachable through the
+   pass-through, but reachable is not the same as applied: on
+   `runners.static-ci` all three nodes report `taints=NONE`, so a
+   workload pod can be scheduled straight onto the single etcd and
+   apiserver host. Combined with the OOM behaviour in open question 3,
+   that is how one CI job takes the API server -- and therefore the
+   whole cluster -- down. The 33fl sizing test had to work around it
+   with an explicit `nodeAffinity` stanza, which every future manifest
+   would otherwise have to repeat.
+
+   So the plugin writes
+   `node-taint: ['node-role.kubernetes.io/control-plane:NoSchedule']`
+   into the control plane's own `config.yaml`, for every control plane
+   node including the extras from `install_extra_control_plane()`.
+
+   **It is plugin-defaulted, not plugin-owned.** Unlike the keys
+   decision 3 rejects, a caller may set `node-taint` in
+   `--server-config` and have it replace the plugin's value, because
+   k3s's drop-in precedence replaces list keys outright. Writing
+   `node-taint: []` is therefore the documented opt-out, and no new
+   flag is needed.
+
+   This is a behaviour change for clusters created after it lands, and
+   the honest cost is that it is not free on small clusters: a
+   three-node cluster gives up a third of its schedulable capacity.
+   The OpenStack-Helm prototype may well want the opt-out, and phase 3
+   should check whether it does rather than assume. The default is
+   still the right way round -- a control plane that competes with
+   workloads for memory is a correctness problem, and the opt-out is
+   one line for the caller who has measured and decided otherwise.
 
 ## Open questions
 
-All of these need answering before this plan has phases. None of them
-are answered yet.
+1. ~~Should the plugin disable servicelb whenever it installs
+   MetalLB?~~ **Answered on 2026-10-03 against the live cluster
+   `runners.static-ci`: yes.** Both controllers run at once.
+   `svclb-traefik-*` pods are present on all three nodes, so klipper
+   is active, while the address traefik actually holds was assigned by
+   MetalLB -- the Service carries
+   `metallb.io/ip-allocated-from-pool: empty`. So MetalLB wins the
+   assignment and servicelb runs one pod per node accomplishing
+   nothing. The recommendation this question carried stands: add
+   `servicelb` to the plugin-owned server configuration whenever
+   `install_metallb` is true, and note it in the release notes.
 
-1. **Where do cumulative signals live in the returned structure?**
-   Per-node alongside `agent_state`, or under a new top-level key? The
-   return value is a documented contract that phase 5's Ansible module
-   branches on, so adding keys is cheaper than moving existing ones,
-   but the shape should be decided once rather than grown.
-2. **How is "since when" expressed?** This is the sharpest design
-   question. A counter is only meaningful against a previous reading,
-   so either the caller stores the baseline and the verb reports raw
-   values, or the plugin stores last-seen values in cluster metadata
-   and reports deltas. The second is friendlier and makes `health()`
-   *write*, which collides with it being the read-only verb you reach
-   for when you do not trust the cluster. Recommendation to be tested
-   during planning: report raw cumulative values and let the caller
-   diff, keeping the verb read-only.
-3. **Does `health()` gain opinions, or only facts?** `MemAvailable` is
-   a number; "this node is about to OOM" is a judgement with a
-   threshold in it. A verb that reports facts stays useful as
-   workloads change; a verb with thresholds baked in starts lying when
-   they are wrong.
-4. **What is the recovery story, and whose plan is it?** The roles are
-   asymmetrical. A worker is already replaceable with `remove-worker`
-   plus `expand-workers`, and 33fl's phase 4 conductor scale loop
-   would do that as a matter of course. A control plane node is not
-   replaceable at all: there is one etcd member and no verb to replace
-   it, so `--control-plane-count 3` for quorum may be the whole
-   answer. Decide whether that belongs here, in its own plan, or in
-   neither.
-5. **Is any of this worth doing before the cluster it was found on is
-   rebuilt?** The evidence above came from nodes of the old hardcoded
-   2 vCPU / 2048 MB size. Once
-   [node customisation](node-customisation.md) lands and clusters are
-   built at sane sizes, control plane OOM should become rare. Rare is
-   not never, and a silent failure that happens rarely is worse than
-   one that happens often, but it is a fair question whether this is
-   next or much later.
+   Two details for whoever implements it. The pods are BestEffort
+   with no resource requests, which on a small control plane makes
+   them OOM-kill candidates ahead of anything that matters. And
+   `metallb-controller` was logging
+   `AdditionalAssignFailed ... cannot assign additional IP in
+   PreferDualStack` every few minutes -- 184 occurrences over 25 days
+   -- because the Service asks for dual-stack while the pool is IPv4
+   only. Harmless, since the IPv4 address is assigned, but it is
+   permanent error noise that nothing noticed, and it goes away with
+   traefik. Worth confirming it is traefik's Service and not
+   something the plugin configures.
+2. **Should this plan land before or after the library API plan's
+   phase 4 (first PyPI release)?** This work is small and does not
+   change existing behaviour, so it does not need to hold up the
+   release. The collection in phase 5 exposes whatever `create()`
+   parameters exist when it is written. Recommendation: do not block
+   phase 4 on this plan; if this plan lands first, phase 5 picks the
+   new options up for free, and if not, they are a follow-on release.
+3. ~~Is there a sensible floor on sizing?~~ **Answered on
+   2026-10-03: validate positive integers only, but document a
+   realistic floor.** The recommendation this question carried was
+   right about validation and too relaxed about the default. Measured
+   on `runners.static-ci`, whose nodes are exactly today's hardcoded
+   2 vCPU / 2048 MB:
+
+   - `k3s-server` -- one process holding apiserver, controllers,
+     scheduler and etcd -- is **709 MB RSS** on its own, 36% of the
+     node, and it grows from ~190 MB after a restart as its caches
+     warm. That leaves roughly 400 MB for containerd, every system
+     pod and the kernel.
+   - A burst of 20 to 60 pod creations drove the node into *global*
+     OOM. The kernel killed `longhorn-manager` and `traefik` (both
+     BestEffort), systemd restarted k3s, and the API server refused
+     connections for ~30s. Those were the only OOM kills in that
+     node's 25 day life.
+   - It is not a clean threshold: an identical burst succeeded
+     minutes earlier. Whether 2 GB survives depends on how recently
+     k3s restarted, which makes it a random production failure rather
+     than a reproducible one.
+
+   So k3s's documented 2 GB server minimum is a floor at which a
+   control plane runs and does not work. The plugin should still
+   reject only non-positive integers -- a hard minimum would be
+   guesswork about workloads it cannot see -- but 2048 MB should not
+   remain a silent default that appears fine until the first busy
+   day. Phase 1 should say so in `docs/usage.md`, and the CI runner
+   plan's figure of 4 GB minimum for a control plane is a reasonable
+   number to document.
 
 ## Execution
 
-**Unplanned. This is the placeholder's main gap.** The phases below
-are a guess at the shape, not a plan: each needs its open questions
-resolved and its own detail before anyone starts. The push audit row
-is mandatory and is the only row that is certainly correct.
+Each phase is small enough that its detail lives in this table.
+`/next-phase` can split out a phase file if planning one reveals more
+than expected.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Agent-read signals | `NRestarts`, the `journalctl -k` OOM count, `MemAvailable` and the etcd directory size, read through the agent and added to each node's entry. Needs open questions 1, 2 and 3 answered first | Proposed | |
-| 2. API-read signals | `OOMKilled` terminations, and whatever else the API exposes that current state discards. Needs open question 1 | Proposed | |
-| 3. Live validation | Provoke each signal on a throwaway cluster and assert the verb reports it. 33fl's `tools/k3s-health-check.py` tier 3 is a ready-made way to provoke control plane OOM | Proposed | |
-| 4. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-3 against `develop` | Proposed | |
+| 1. Per-role sizing | `create_instance(node_type)`; `node_sizes` in metadata with fallback defaults for existing clusters; six CLI flags and matching `create()` parameters; `show` displays sizes; drop the bare `apt-get install -y` at `cluster.py:1052`; unit tests for the metadata fallback and for the sizes reaching `client.create_instance`; regenerate the `tests/cli_contract/` snapshots; update `docs/usage.md` and `docs/library-api.md`. Unit tests can verify everything except the live build. | Not started | |
+| 2. k3s configuration pass-through | Resolve open questions 1 and 3 and the `config.yaml.d` version floor; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; write the default control plane `node-taint` per design 7 and `servicelb` into the plugin-owned server config whenever `install_metallb` is true, per open question 1; unit tests for validation, the file content, `expand-workers` reusing the recorded config, the default taint being present, and a caller's `node-taint: []` replacing it; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels) and the documented sizing floor from open question 3. The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | Not started | |
+| 3. Live validation | Extend `tools/ci_deploy_test.sh` to create with non-default sizes and both config files (disable Traefik, label control plane and workers differently), then assert with `kubectl`: no Traefik pods, no `svclb-*` pods, the expected labels on each node, the default `NoSchedule` taint on every control plane node, the recorded sizes in `show`, and a worker added by `expand-workers` carrying the agent labels. Also assert a second create passing `node-taint: []` leaves the control plane schedulable, since that is the documented opt-out. Run the merge-tier workflow. Then run the homelab OpenStack-Helm prototype's provision stage against the branch as a second, heavier consumer, and establish whether it wants the taint opt-out on a three node cluster (design 7). | Not started | |
+| 4. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-3 against `develop` | Not started | |
 
 <!-- shared-block: plan-push-audit-phase v3 -->
 Push audit phase (shared block; do not edit -- the canonical
@@ -536,7 +676,19 @@ We should list obvious extensions, known issues, unrelated bugs we
 encountered, and anything else we should one day do but have
 chosen to defer to here, so that we do not forget them.
 
-...
+* Choosing the base image (`BASE_OS_VERSION` is a module constant).
+  Debian 13 is the obvious next target. The apt-specific commands
+  throughout `cluster.py` mean non-Debian bases are a much larger
+  change.
+* Additional NICs per role, for example a second interface for a
+  Neutron provider bridge. The OpenStack-Helm prototype can manage
+  without one by using a dummy interface.
+* Additional disks per role, for example a dedicated Longhorn or
+  Ceph disk.
+* Per-invocation sizing and config overrides on `expand-workers`, for
+  heterogeneous worker pools.
+* Surfacing the new options in the `shakenfist.k3s` collection, if
+  phase 5 of the library API plan is written before this plan lands.
 
 ### Bugs fixed during this work
 
@@ -546,7 +698,8 @@ where one exists, for directly related issues that we should
 either resolve as part of this master plan or at least be aware of
 while planning it.
 
-...
+* `install_k3s_component()` runs a bare `sudo apt-get install -y`
+  with no package named (`cluster.py:1052`). Fixed in phase 1.
 
 ### Back brief
 

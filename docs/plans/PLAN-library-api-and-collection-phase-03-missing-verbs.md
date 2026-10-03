@@ -14,7 +14,7 @@ Two external documents matter. `33fl/docs/plans/PLAN-k3s-ci-runners.md`
 is the consumer: design decisions 2, 3 and 5 and the "Upstream
 prerequisites" section state what conductor actually needs, and this
 phase exists to deliver six of those seven prerequisites. The master
-plan `library-api-and-collection.md` carries the phase row this plan
+plan `PLAN-library-api-and-collection.md` carries the phase row this plan
 expands, the sub-agent execution model, and the model roster.
 
 Remember that orchestration behaviour can only be fully validated

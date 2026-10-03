@@ -7,7 +7,7 @@
 # package data -- the packages.find exclude for
 # shakenfist_client_k3s.tests* drops the tests *package* correctly,
 # but the tests came back as data anyway, and nothing failed to say
-# so. See docs/plans/library-api-and-collection-phase-04-first-release.md.
+# so. See docs/plans/PLAN-library-api-and-collection-phase-04-first-release.md.
 #
 # Usage: tools/check-dist.sh <path-to-wheel> [<path-to-wheel> ...]
 

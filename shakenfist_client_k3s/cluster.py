@@ -3,7 +3,7 @@
 This replaces the click context the orchestration primitives used to be
 handed. Anything which reads or writes cluster metadata, or drives this
 cluster's nodes, is a method here (see decision 2 in
-``docs/plans/library-api-and-collection-phase-01-library-api.md``), so
+``docs/plans/PLAN-library-api-and-collection-phase-01-library-api.md``), so
 that a library caller does not have to fabricate a click context to reach
 it. What remains in ``primitives`` is namespace scoped or stateless: the
 two release lookups, whose caches live in namespace metadata rather than
@@ -1605,7 +1605,7 @@ class Cluster:
 
         This is the body of ``sf-client k3s health``, which renders what
         this returns. Per decision 7 of
-        ``docs/plans/library-api-and-collection-phase-03-missing-verbs.md``
+        ``docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md``
         it returns structured data rather than text, so that phase 5's
         Ansible module can branch on it without parsing anything, and it
         performs no repair: a verb which silently fixes things cannot be
@@ -1971,7 +1971,7 @@ class Cluster:
         in the cluster forever, and the workloads which were running on it
         are only rescheduled once the node controller's eviction timeout
         expires. See decision 3 in
-        ``docs/plans/library-api-and-collection-phase-03-missing-verbs.md``.
+        ``docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md``.
 
         The drain needs a cluster to drain the node out of, so a cluster
         which never finished being built is refused rather than allowed to
