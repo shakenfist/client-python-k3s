@@ -1,7 +1,7 @@
 # Release Infrastructure Setup
 
-This document describes how to configure PyPI and GitHub to enable automated
-releases using GitHub Actions with Sigstore signing.
+This document describes how to configure PyPI, Ansible Galaxy and GitHub
+to enable automated releases using GitHub Actions with Sigstore signing.
 
 ## Overview
 
@@ -9,6 +9,8 @@ The release process uses:
 
 - **PyPI Trusted Publishers (OIDC)**: No API tokens needed; PyPI trusts the
   GitHub Actions workflow directly
+- **Ansible Galaxy API Token**: A stored secret, because Galaxy has no
+  trusted-publisher equivalent
 - **Sigstore/gitsign**: Keyless signing for git tags (no GPG private key
   management)
 - **GitHub Environments**: Required reviewer approval before releases proceed
@@ -82,18 +84,65 @@ This gap in the shared release template -- step 1 as originally written
 only covered the project-scoped case -- is tracked upstream as
 [shakenfist/development#188](https://github.com/shakenfist/development/issues/188).
 
-### 2. Create GitHub Environment with Required Reviewers
+### 2. Configure an Ansible Galaxy API Token
+
+Unlike PyPI, `publish-collection` has no trusted-publisher flow to fall
+back to -- Galaxy authenticates with a long-lived API key passed as
+`--api-key`, so this step stores one as a GitHub Actions secret rather
+than configuring OIDC.
+
+The `shakenfist` namespace on Galaxy already exists, but it has **zero**
+published collection versions. `shakenfist.k3s` is the first thing this
+namespace will ever publish, which matters for recovery: Galaxy, like
+PyPI, does not allow a published version to be replaced. If
+`publish-collection` fails after `sign-tag` has already pushed the tag,
+the recovery is the same as PyPI's -- move to the next version, do not
+retry the tag.
+
+1. Log in to [galaxy.ansible.com](https://galaxy.ansible.com) with an
+   account that holds `shakenfist` namespace permission
+2. Go to <https://galaxy.ansible.com/ui/token/>
+3. Copy the API token shown there (or regenerate one if none is shown)
+4. Add it as a GitHub Actions secret named `ANSIBLE_GALAXY_TOKEN`, either
+   on this repository or at the organisation level:
+   - Repository: `shakenfist/client-python-k3s` > **Settings** >
+     **Secrets and variables** > **Actions** > **New repository secret**
+   - Organisation: organisation **Settings** > **Secrets and variables**
+     > **Actions** > **New organization secret**, with repository access
+     including `client-python-k3s`
+
+**At the time of writing, this secret does not exist** -- neither at the
+repository level nor, as far as could be established without
+`admin:org` scope, at the organisation level. Do not assume either step
+above has already been done.
+
+**Verify this step by command, not by memory of having done it**:
+
+```bash
+gh api repos/shakenfist/client-python-k3s/actions/secrets \
+  --jq '.secrets[].name'
+```
+
+This must list `ANSIBLE_GALAXY_TOKEN` if the secret was added at the
+repository level. A repository-level listing cannot see an
+organisation-level secret of the same name; confirming that one covers
+this repository needs `admin:org` scope
+(`gh auth refresh -h github.com -s admin:org`) and a look at the
+organisation's secret visibility settings.
+
+### 3. Create GitHub Environment with Required Reviewers
 
 This ensures releases only happen after explicit approval, and it is
 **not optional**, even though nothing in the workflow enforces it.
 
-`sign-tag` and `publish-pypi` both declare `environment: release`. If no
-`release` environment exists yet, GitHub creates one implicitly the
-first time the workflow references it -- **with no protection rules at
-all**. A release run before this step has been done does not fail: it
-simply runs straight through to PyPI without ever pausing for approval.
-Because nothing fails, there is nothing to notice; this step has to be
-verified by command, not by having visited the UI (see below).
+`sign-tag`, `publish-pypi` and `publish-collection` all declare
+`environment: release`. If no `release` environment exists yet, GitHub
+creates one implicitly the first time the workflow references it --
+**with no protection rules at all**. A release run before this step has
+been done does not fail: it simply runs straight through to PyPI and
+Galaxy without ever pausing for approval. Because nothing fails, there
+is nothing to notice; this step has to be verified by command, not by
+having visited the UI (see below).
 
 1. Go to the repository on GitHub: `shakenfist/client-python-k3s`
 2. Click **Settings** > **Environments**
@@ -130,7 +179,7 @@ its protection rules. If it prints nothing, or prints `release` with an
 empty second column, the environment either does not exist or exists
 unprotected, and no release should be tagged until it is fixed.
 
-### 3. Configure Protected Tags (Recommended)
+### 4. Configure Protected Tags (Recommended)
 
 This stops unauthorised users creating and deleting release tags. It
 does not stop them *rewriting* one -- see the note at the end of this
@@ -184,7 +233,7 @@ and would then make an Actions bypass genuinely necessary for
 today, so this one does not either -- a single repository diverging on
 tag protection is harder to reason about than the shared gap.
 
-### 4. Verify Sigstore/Rekor Access
+### 5. Verify Sigstore/Rekor Access
 
 No configuration needed. Sigstore is a public service that:
 
@@ -204,6 +253,8 @@ Verification can be done by anyone using `cosign` or `gitsign verify`.
    - Creates a signed git tag using gitsign (Sigstore)
    - Generates Sigstore attestations for the built artifacts
    - Publishes to PyPI using OIDC (no tokens)
+   - Publishes the `shakenfist.k3s` collection to Ansible Galaxy using
+     the `ANSIBLE_GALAXY_TOKEN` secret
    - Creates a GitHub Release with the artifacts
 
 ## Verifying Releases
