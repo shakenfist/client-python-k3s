@@ -117,10 +117,22 @@ Develop branch	branch
 restricting creations and deletions, with **GitHub Actions** on the
 bypass list) has not been done. Its absence is not a release blocker:
 the `sign-tag` job's `git push origin "${TAG_NAME}" --force` succeeds
-precisely because nothing restricts it. But the step is half a
-mechanism -- adding the ruleset *without* the Actions bypass breaks
-every release at the signing step, which is what that paragraph in
-`RELEASE-SETUP.md` warns about.
+precisely because nothing restricts it.
+
+**Corrected in 4f.** The rest of this finding used to say that adding
+the ruleset without the Actions bypass "breaks every release at the
+signing step", because that is what `RELEASE-SETUP.md` warns. The
+warning is false, and so was this. `sign-tag` collides with none of the
+three rules the fleet's rulesets use: it runs only from a tag *push*,
+so the ref exists before it pushes and `creation` does not apply; it
+deletes the tag only in its own checkout, so `deletion` does not apply;
+and `non_fast_forward` is not enforced against tag updates.
+`shakenfist/client-python` has carried this exact ruleset with no
+Actions bypass since 2026-03-22 and force-pushed a Sigstore-signed
+`v0.8.3` tag through it in July 2026. The same false claim is in the
+shared template at
+`shakenfist/development/templates/release-automation/RELEASE-SETUP.md`,
+so every repository that copied it has it.
 
 ### 3. `RELEASE-SETUP.md` step 1 cannot be followed as written
 
@@ -314,11 +326,12 @@ rather than wrong.
    before it.** This is the decision most likely to be argued with,
    and the argument against it is good: restricting who may create a
    `v*` tag is worth having *before* anyone can create one. The reason
-   to defer is survey finding 2. The ruleset is only safe in
-   combination with a GitHub Actions bypass, because `sign-tag`
-   force-pushes the tag it just signed; a ruleset added with that
-   bypass wrong fails the release at the signing step, after the
-   artefacts are built and after the tag is public. The first release
+   to defer is survey finding 2. (That finding's stated reason -- that
+   the ruleset is only safe combined with a GitHub Actions bypass,
+   since `sign-tag` force-pushes the tag it just signed -- turned out
+   to be false, and 4f corrects it. The deferral is still right, for
+   the weaker and more general reason that any untested gate in front
+   of a pipeline that has never run is a bad trade.) The first release
    is the one run where nothing about this pipeline has ever executed,
    and adding an untested gate to it trades a real risk for a
    theoretical one -- the set of people who can push a tag to this
@@ -370,7 +383,7 @@ rather than wrong.
 | 4c | low | -- | none | **Management session, no commit. Done: run [36833525105](https://github.com/shakenfist/client-python-k3s/actions/runs/36833525105).** Dry run `release.yml`, then confirm from the run that `build` passed, `twine check` passed, `tools/check-dist.sh` passed, and that `sign-tag`, `publish-pypi` and `github-release` were all skipped -- the event guard is what makes that safe, so if any of the three ran, stop and report rather than tagging. Dispatch it against **this phase's branch**, not `develop`: the wheel check is added by 4a and so does not exist on `develop` until this phase lands, and a dispatch against `develop` would pass while proving nothing about the wheel. This brief originally said `--ref develop`, which was wrong for that reason. The run also showed why an untagged dispatch cannot publish even if a guard were wrong: `setuptools_scm` derived `0.1.dev187+gf69b52de4`, a local version identifier, which PyPI refuses. |
 | 4d | low | -- | none | **Management session, no commit.** Tag and release. `git tag v0.1.0 <develop head>` and push it; approve the `release` environment when GitHub asks; then confirm all four jobs succeeded. If `publish-pypi` fails, do not re-push the tag -- decision 8 -- report and plan `v0.1.1`. |
 | 4e | low | sonnet | none | **Commit subject: `Record the first release.`** Verification and close-out, after 4d has succeeded. In a throwaway virtualenv outside the repository, `pip install shakenfist_client_k3s`, then assert three things and record the output in the commit message: the installed version is `0.1.0`; `python -c 'import shakenfist_client_k3s'` is silent; and the wheel that pip fetched has no `tests/` path in it (`pip download --no-deps` and list the archive). Then set the master plan's phase 4 row to `Complete` with `v0.1.0` in the `Merged` cell, and update its `docs/plans/index.md` Phases cell. Check whether `ARCHITECTURE.md`'s "published to PyPI" bullet and `README.md:15`'s `pip install` line are now true and say so in the commit message; neither should need editing, and if either does, that is a finding worth stating rather than a silent fix. |
-| 4f | low | -- | none | **Management session, no commit.** Add the `Release tags` ruleset per the corrected `RELEASE-SETUP.md` step 3, with GitHub Actions on the bypass list, now that a release has run once without it. Then verify the bypass by dispatching `release.yml` once more -- it must still build and skip -- and record that the next real release will exercise the signing path against the ruleset for the first time. |
+| 4f | low | -- | none | **Done 2026-10-03; needed a commit after all, folded into `Record the first release.`'s branch.** Ruleset [24410172](https://github.com/shakenfist/client-python-k3s/rules/24410172) over `refs/tags/v*`, rules `creation`, `deletion`, `non_fast_forward`, bypass `RepositoryRole` 5 -- byte-identical in shape to `shakenfist/client-python`'s. The brief said to put GitHub Actions on the bypass list; that was **not** done, because the reason for it is false (survey finding 2, as corrected). Michael chose to match the siblings exactly rather than diverge. The brief also said to "verify the bypass by dispatching `release.yml`", which a dispatch structurally cannot do: the event guard skips `sign-tag`, the only job that touches a tag. What was verified instead is the check that matters -- `gh api .../rulesets/24410172 --jq .current_user_can_bypass` prints `always`, so the human who pushes the next tag still passes the `creation` restriction. Dispatch [37105884526](https://github.com/shakenfist/client-python-k3s/actions/runs/37105884526) confirmed `build` still succeeds and all three publishing jobs still skip with the ruleset active. The next real release is the first to exercise the signing path against it. |
 
 Only half of that gate was genuinely un-automatable, which this plan
 originally got wrong. The PyPI pending publisher has no API and had to be
@@ -405,7 +418,7 @@ change and not two.
 | The PyPI pending publisher is created with a value that does not match the workflow -- filename, environment name, or owner -- and `publish-pypi` fails after `sign-tag` has already pushed a signed `v0.1.0`. | Decision 8: burn the version and go to `v0.1.1` rather than force-pushing over a signed tag. The dry run in 4c cannot catch this, because the guards deliberately skip the publishing jobs, so the mitigation is the recovery plan rather than prevention. |
 | `tools/check-dist.sh` asserts an entry count that drifts the first time a legitimate module is added, and someone raises the number without looking. | Make the failure message say what to check rather than what number to change, and have the script name the offending paths. The `/tests/` assertion is the load-bearing half; the count is a tripwire. |
 | Removing `write_to` breaks something that reads `_version` in a way grep missed. | `grep -rn '_version' --include='*.py'` over the tree finds only `pyproject.toml` and `k3s_version`/`plugin_version` metadata keys. 4a's brief says to check `.gitignore` rather than assume; the same care applies here, and the smoke tier plus `python -c 'import shakenfist_client_k3s'` would catch an import error immediately. |
-| The tag ruleset is added in 4f with the bypass misconfigured, and the *next* release fails at signing -- the failure this phase deferred rather than removed. | 4f's dispatch verification, plus the note it records. A release that fails at `sign-tag` has not published, so the recovery is to fix the bypass and re-run, not to burn a version. |
+| The tag ruleset is added in 4f with the bypass misconfigured, and the *next* release fails -- the failure this phase deferred rather than removed. | Narrower than this row assumed, since `sign-tag` needs no bypass (survey finding 2, as corrected): the only rule a release meets is `creation`, when the human pushes the tag. 4f verified that directly with `current_user_can_bypass`, which is worth more than the dispatch this row relied on. A release that fails before `publish-pypi` has not published, so the recovery is to fix the ruleset and re-run rather than burn a version. |
 | `0.1.0` implies more stability than a package whose library API is three phases old actually has. | Out of this phase's hands and deliberately not solved with a version number: the master plan's phase 4 row says `v0.1.0`, and `0.x` already signals it. Phase 3's risk table established there are no existing library callers to break. |
 
 ## Open questions
@@ -455,9 +468,14 @@ Each of these is checkable, and most are one command:
   way to add a trusted publisher.
 - The issue filed against `shakenfist/development` about the release
   template is linked from `RELEASE-SETUP.md`.
-- A `Release tags` ruleset exists over `v*` with GitHub Actions on its
-  bypass list, and a `workflow_dispatch` run of `release.yml` after it
-  was added still builds and still skips all three publishing jobs.
+- A `Release tags` ruleset exists over `refs/tags/v*` restricting
+  `creation`, `deletion` and `non_fast_forward`, its
+  `current_user_can_bypass` reads `always` for the maintainer who
+  pushes release tags, and a `workflow_dispatch` run of `release.yml`
+  after it was added still builds and still skips all three publishing
+  jobs. This criterion used to require GitHub Actions on the bypass
+  list; 4f established that `sign-tag` does not need one and that no
+  sibling repository grants it.
 - `pre-commit run --all-files` and `tox -epy3` pass.
 - The master plan's phase 4 row is `Complete` with `v0.1.0` recorded,
   and `docs/plans/index.md` links this file.
