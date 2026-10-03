@@ -188,6 +188,14 @@ Constraints:
   `publish-collection` job pair in that repository's `release.yml`;
   both repositories already share the same release template.
 
+  *Corrected by phase 5's survey:* copyable, but not proven. That
+  repository has never run its release workflow and has never cut a
+  release, so both jobs are unexecuted code. Phase 5 is the first
+  exercise of either, in either repository, and it plans accordingly --
+  `build-collection` is dry-run before anything is tagged, and
+  `publish-collection` carries phase 4's burn-the-version recovery
+  because Galaxy, like PyPI, will not replace a published version.
+
 - **The module ensures existence and shape; it never manages worker
   count.** Cluster state is read-modify-write namespace metadata with
   no locking, and conductor is the other writer. Splitting by
@@ -230,6 +238,13 @@ Constraints:
    namespace-permission path is validated on the component we
    understand best. Awaiting an answer; it only affects ordering.
 
+   *Settled by phase 5, against this recommendation.* The core
+   repository has never run its release workflow at all, so "let a core
+   release go first" waits on something with no schedule. `shakenfist.k3s`
+   publishes first and validates the token and namespace-permission path
+   for the namespace; the core collection inherits a walked path. Phase
+   5's decision 1.
+
 2. **What does `remove-worker` do about the k8s Node object?**
    *Settled by phase 3, and not as recommended here.* This entry
    recommended acting on the Node through the Kubernetes API using the
@@ -256,7 +271,7 @@ Constraints:
 | 2. Client construction | [PLAN-library-api-and-collection-phase-02-client-construction.md](PLAN-library-api-and-collection-phase-02-client-construction.md) -- take the client from `ctx.obj['CLIENT']` so the root `--apiurl`/`--key`/`--namespace` are honoured, and add the `api_url`/`namespace`/`key` plus `suppress_configuration_lookup=True` factory that `sf_namespace._make_client()` uses. Phase 1 collapsed the two overwrite sites this row used to cite into one, `_bind_namespace_context()` at `__init__.py:24`; the root builds its client at `client-python/shakenfist_client/main.py:229-237` and stores it at `:236`. The root's `--async` default is `pause` (`main.py:199`) and this code needs `ASYNC_CONTINUE`, which is why the root client cannot simply be used as it stands | Complete | `1c32d12` (#63, plan only), `4e76704` (#65, decision 2 settled), `871f6ee` (#68, steps 2a-2d), `539b50d` (#69, review follow-up) |
 | 3. Missing verbs | [PLAN-library-api-and-collection-phase-03-missing-verbs.md](PLAN-library-api-and-collection-phase-03-missing-verbs.md) -- `remove-worker`; install k3s only on the workers being added; read the cluster state we already write; a health verb; `--no-longhorn`/`--no-metallb`; kubeconfig side effects opt-out (including the `kubectl config unset` calls in `Cluster.delete()`, which run without `capture_output` and so write to the process's real stdout, bypassing the reporter -- found during phase 1 and pinned by `KubectlUnsetLeakTestCase`); route `GroupCatchClusterExceptions`'s `print(str(e))` to `sys.stderr` instead of `sys.stdout` (found during phase 1 -- pre-existing CLI behaviour, deferred because phase 1 changes no user-visible output); give `Cluster.get_progress()`'s lazy default a real `total_phases` so a library caller invoking a mid-level method directly gets `[n/total]` headers instead of un-numbered `[n]` ones (found during phase 1; no CLI path hits this today); manifest payload hook. Phase 3's survey corrected two claims this row used to make. Making `install_workers()` incremental is a defect rather than a feature: `expand_workers()` (`cluster.py:875-889`) installs over all of `md['worker_nodes']`, so adding one worker re-runs the k3s agent installer on every existing one. And there is no `state: initial` reconcile to finish -- `md['state']` is written at `:633`, `:735` and `:842` and read nowhere, so phase 3 starts reading it; resume is deferred to Future work by that phase's decision 5 | Complete | `d51cf59` (#75) |
 | 4. First release | [PLAN-library-api-and-collection-phase-04-first-release.md](PLAN-library-api-and-collection-phase-04-first-release.md) -- cut `v0.1.0` so `shakenfist_client_k3s` exists on PyPI and `setuptools_scm` has a real version to stamp, which is also what makes `README.md`'s `pip install` line and `ARCHITECTURE.md`'s "published to PyPI" bullet true. `release.yml` is already the complete shared release template, so phase 4's work is the metadata it will publish and the accounts it publishes through: the wheel currently ships the whole test suite (`setuptools_scm`'s file finder re-adds it as package data, which the `packages.find` exclusion cannot stop), the `license` table and license classifier are both deprecated, `write_to` writes a `_version.py` nothing reads, the `release` environment does not exist so a release would publish without pausing for approval, and `RELEASE-SETUP.md` step 1 cannot be followed for a project which is not on PyPI yet -- a first release needs PyPI's pending-publisher flow. Two steps need Michael's browser and are a hard gate | Complete | `2506c19` (#81, steps 4a-4c), `d2e43d1` (#86, steps 4e-4f); released as `v0.1.0` |
-| 5. The collection | `shakenfist.k3s` with `sf_k3s_cluster`; `tools/build-collection.py`; `build-collection` and `publish-collection` jobs in `release.yml`; ansible-lint in pre-commit and CI; docs | Not started | |
+| 5. The collection | [PLAN-library-api-and-collection-phase-05-collection.md](PLAN-library-api-and-collection-phase-05-collection.md) -- `shakenfist.k3s` with `sf_k3s_cluster`; `tools/build-collection.py`; `build-collection` and `publish-collection` jobs in `release.yml`; ansible-lint in pre-commit and CI; docs. Phase 5's survey corrected three claims this row and the decisions below used to make. The build machinery is copyable but **unproven**: `shakenfist/shakenfist` has never run its `release.yml` and has never cut a release, so neither `build-collection` nor `publish-collection` has executed anywhere. `secrets.ANSIBLE_GALAXY_TOKEN`, which `publish-collection` needs, is set in neither repository, so this phase carries a human gate of the same kind phase 4 did. And the connection half is already built: `shakenfist_client_k3s/client.py`, added by phase 2 with `sf_k3s_cluster` named in its docstring, means the module needs no copy of the server collection's `sf_connection.py` | In progress | |
 | 6. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-5 against `develop` | Not started | |
 
 Phase ordering is forced by dependency rather than convenience.
