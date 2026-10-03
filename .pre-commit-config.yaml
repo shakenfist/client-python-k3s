@@ -21,3 +21,22 @@ repos:
         files: ^tools/
         types_or: [sh, bash, shell]
         args: ['-x']
+
+  # Lints the shakenfist.k3s collection. Local, as in the server
+  # repository, because the upstream pre-commit hook has Python 3.13
+  # compatibility issues; this requires ansible-lint to be installed in
+  # PATH. --config-file is explicit because ansible-lint does not discover
+  # a config file below the invocation cwd: "ansible-lint collection/" run
+  # from the repository root silently ignores collection/.ansible-lint and
+  # reports a false failure.
+  #
+  # Requires: pip install ansible-lint
+  - repo: local
+    hooks:
+      - id: ansible-lint
+        name: Lint the shakenfist.k3s collection
+        description: Checks the Ansible collection for practices and behavior that could be improved
+        entry: ansible-lint --config-file collection/.ansible-lint collection/
+        language: system
+        files: ^collection/
+        pass_filenames: false

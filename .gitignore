@@ -141,3 +141,7 @@ shakenfist_client_k3s/_version.py
 # name, which means every pre-commit run leaves one behind. galaxy.yml's
 # build_ignore keeps it out of the built collection as well.
 collection/.ansible/
+
+# tools/build-collection.py's output, built by the build-collection job in
+# release.yml and by a local run of the script.
+dist-collection/

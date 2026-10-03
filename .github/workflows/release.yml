@@ -59,6 +59,36 @@ jobs:
           name: dist
           path: dist/
 
+  build-collection:
+    name: Build ansible collection
+    runs-on: [self-hosted, static]
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # Full history needed for setuptools_scm
+
+      - name: Install build dependencies
+        run: |
+          rm -rf collection-venv
+          python3 -m venv collection-venv
+          collection-venv/bin/pip3 install --upgrade pip
+          collection-venv/bin/pip3 install ansible-core setuptools_scm packaging
+
+      - name: Build collection
+        run: |
+          collection-venv/bin/python3 tools/build-collection.py
+
+      - name: Upload collection artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: collection
+          path: dist-collection/
+
   # The three publishing jobs are guarded so that a workflow_dispatch
   # run only ever exercises the build and the twine check. The event
   # is tested as well as the ref because a dispatch can be aimed at a
