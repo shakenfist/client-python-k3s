@@ -70,7 +70,8 @@ existing setup and then remove the old API token once verified.
 **Getting any of these values wrong** (the PyPI project name, owner,
 repository, workflow filename or environment name -- five on the
 pending-publisher form, four when scoping to an existing project, which
-supplies its own name), under either flow, does not fail immediately: `build` and `sign-tag` both succeed first, so by the time
+supplies its own name), under either flow, does not fail immediately:
+`build` and `sign-tag` both succeed first, so by the time
 `publish-pypi` rejects the OIDC claim, `sign-tag` has already signed and
 force-pushed the release tag. Because that push is a force-push, the
 tag cannot simply be corrected and re-pushed -- see "Tag Signature
@@ -131,25 +132,19 @@ unprotected, and no release should be tagged until it is fixed.
 
 ### 3. Configure Protected Tags (Recommended)
 
-This prevents unauthorized users from creating release tags. **The
-ruleset and the GitHub Actions entry on its bypass list are one
-change, not two: they go in together, or neither goes in.** The
-release workflow's `sign-tag` job re-creates and force-pushes the
-release tag as `github-actions[bot]` using `GITHUB_TOKEN`. Adding the
-ruleset without also adding the Actions bypass is worse than not adding
-the ruleset at all -- it rejects that push and fails every release at
-the signing step, silently turning a working release pipeline into a
-broken one. Add both parts of step 3 in the same sitting.
+This stops unauthorised users creating and deleting release tags. It
+does not stop them *rewriting* one -- see the note at the end of this
+step, which is a known gap rather than an oversight.
 
-For the same reason, do this only once at least one release has
-succeeded without it. The first release exercises a signing path that
-has never run against this repository before; adding an untested gate
-in front of that first run trades a real risk (a mistake in the
-ruleset or its bypass list breaking the only release that has ever
-happened) for a theoretical one (an unprotected tag namespace for the
-short window before the second release). The consequence to be aware of
-is that the first release run which exercises the signing path *against*
-the ruleset is then the second release, not the first.
+Do this only once at least one release has succeeded without it. The
+first release exercises a signing path that has never run against this
+repository before, and putting an untested gate in front of that run
+trades a real risk (a mistake in the ruleset breaking the only release
+that has ever happened) for a theoretical one (an unprotected tag
+namespace for the short window before the second release). The
+consequence to be aware of is that the first release run which
+exercises the signing path *against* the ruleset is the second release,
+not the first.
 
 1. Go to **Settings** > **Rules** > **Rulesets**
 2. Click **New ruleset** > **New tag ruleset**
@@ -157,14 +152,37 @@ the ruleset is then the second release, not the first.
    - **Ruleset name**: `Release tags`
    - **Enforcement status**: `Active`
    - **Target tags**: Add pattern `v*`
-   - **Rules**: Check **Restrict creations** and **Restrict deletions**
-   - **Bypass list**: Add repository admins or specific maintainers,
-     **and GitHub Actions** (add the "GitHub Actions" app to the bypass
-     list). The release workflow's sign-tag job re-creates and
-     force-pushes the release tag as `github-actions[bot]` using
-     `GITHUB_TOKEN`; without the Actions bypass that push is rejected
-     by this ruleset and every release fails at the signing step.
+   - **Rules**: Check **Restrict creations**, **Restrict deletions** and
+     **Block force pushes**
+   - **Bypass list**: Add repository admins or specific maintainers. Do
+     **not** add GitHub Actions; see below for why it is not needed.
+     Whoever pushes the release tag does need to be on this list,
+     because **Restrict creations** applies to them, so check it:
+     `gh api repos/OWNER/REPO/rulesets/ID --jq .current_user_can_bypass`
+     must print `always`.
 4. Click **Create**
+
+The `sign-tag` job needs no bypass of its own. It re-creates and
+force-pushes the release tag as `github-actions[bot]`, which sounds
+like it should collide with all three rules, and collides with none of
+them: the job runs only from a tag *push*, so the ref already exists by
+the time it pushes and **Restrict creations** does not apply; it
+deletes the tag only inside its own checkout (`git tag -d`), so nothing
+reaches **Restrict deletions**; and **Block force pushes**
+(`non_fast_forward`) is not enforced against tag updates. That last
+point is the load-bearing one and it is observed rather than deduced:
+`shakenfist/client-python` has had this exact ruleset, with no Actions
+entry on its bypass list, since 2026-03-22, and its `v0.8.3` release in
+July 2026 force-pushed a Sigstore-signed tag through it as
+`github-actions[bot]`.
+
+The gap that leaves: since nothing restricts tag *updates*, any actor
+with write access can rewrite an already-released signed tag to point
+at a different commit. Checking **Restrict updates** would close it,
+and would then make an Actions bypass genuinely necessary for
+`sign-tag` rather than decorative. No repository in the fleet does that
+today, so this one does not either -- a single repository diverging on
+tag protection is harder to reason about than the shared gap.
 
 ### 4. Verify Sigstore/Rekor Access
 
