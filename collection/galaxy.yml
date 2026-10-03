@@ -29,6 +29,16 @@ tags:
 # a cloud that was not deployed with it -- see the library-api master plan's
 # first decision.
 dependencies: {}
+# ansible-lint installs the collection into collection/.ansible/ as it
+# runs -- ansible-compat builds a throwaway collection tree there so that
+# the module can be resolved by its fully qualified name. That directory is
+# not part of the collection, but it is a sibling of the files which are, so
+# a build run after a lint would otherwise ship a nested copy of the whole
+# collection inside the tarball. It is also in .gitignore; this entry is the
+# half which protects what gets published.
+build_ignore:
+  - .ansible
+
 repository: https://github.com/shakenfist/client-python-k3s
 homepage: https://github.com/shakenfist/client-python-k3s
 issues: https://github.com/shakenfist/client-python-k3s/issues
