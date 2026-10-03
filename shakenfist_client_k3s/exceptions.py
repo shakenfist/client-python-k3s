@@ -154,7 +154,7 @@ class ClusterInterruptedError(K3sClusterException):
     ``md['state']`` is written by ``Cluster.create()`` and
     ``Cluster.delete()`` and, until phase 3, was read nowhere at all (survey
     finding 2 of
-    ``docs/plans/library-api-and-collection-phase-03-missing-verbs.md``).
+    ``docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md``).
     Anything other than ``created`` means a create or a delete stopped part
     way through, so the cluster's nodes, tokens and kubeconfig are in an
     unknown combination of present and absent.
