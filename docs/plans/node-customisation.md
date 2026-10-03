@@ -104,8 +104,20 @@ openstack-helm master at `a606f21` (2026-09-24):
   Traefik is therefore dead weight at best.
 * MetalLB, which the plugin already installs. k3s's own servicelb
   (klipper-lb) also claims `LoadBalancer` services, and the plugin
-  does not disable it today. Whether the two currently fight, or
-  MetalLB simply wins, is unverified; see open question 1.
+  does not disable it today. Both run at once -- verified on a live
+  cluster on 2026-10-03, see open question 1.
+
+**A second consumer arrived on 2026-10-03.** 33fl's
+`docs/plans/PLAN-k3s-ci-runners.md` migrates the GitHub Actions static
+runner pool onto a plugin-built k3s cluster running ARC, and its
+phase 2 cannot start until per-role sizing exists: health-testing the
+candidate host cluster `runners.static-ci` found the hardcoded
+2 vCPU / 2048 MB is wrong for both roles, and that no amount of
+configuration fixes it from outside the plugin. That plan records this
+one as its blocking prerequisite 8, with `--disable` as 9 and control
+plane tainting as 11. Its measurements are cited below where they
+answer questions this plan had left open. The practical effect is that
+phase 1 is now on two critical paths rather than one.
 
 This plan is independent of the in-progress
 [library API plan](library-api-and-collection.md), but touches the
@@ -120,7 +132,9 @@ Let the caller size control plane and worker nodes independently, and
 pass arbitrary k3s configuration to server and agent nodes, through
 both the CLI and the `Cluster` library API. Record both in cluster
 metadata so that `expand-workers` builds new workers the same way as
-the originals.
+the originals. Taint control plane nodes by default, so that the
+scheduler cannot put a workload on the node holding etcd and the
+apiserver.
 
 Non-goals, deferred to Future work: choosing the base OS image,
 attaching additional NICs or disks, and per-invocation sizing
@@ -191,17 +205,63 @@ was written.
    `create_and_await_instances()` already has `node_type` and passes
    it down.
 
+7. **Control plane nodes are tainted by default.** Added 2026-10-03.
+   Decision 1 already makes `node-taint` reachable through the
+   pass-through, but reachable is not the same as applied: on
+   `runners.static-ci` all three nodes report `taints=NONE`, so a
+   workload pod can be scheduled straight onto the single etcd and
+   apiserver host. Combined with the OOM behaviour in open question 3,
+   that is how one CI job takes the API server -- and therefore the
+   whole cluster -- down. The 33fl sizing test had to work around it
+   with an explicit `nodeAffinity` stanza, which every future manifest
+   would otherwise have to repeat.
+
+   So the plugin writes
+   `node-taint: ['node-role.kubernetes.io/control-plane:NoSchedule']`
+   into the control plane's own `config.yaml`, for every control plane
+   node including the extras from `install_extra_control_plane()`.
+
+   **It is plugin-defaulted, not plugin-owned.** Unlike the keys
+   decision 3 rejects, a caller may set `node-taint` in
+   `--server-config` and have it replace the plugin's value, because
+   k3s's drop-in precedence replaces list keys outright. Writing
+   `node-taint: []` is therefore the documented opt-out, and no new
+   flag is needed.
+
+   This is a behaviour change for clusters created after it lands, and
+   the honest cost is that it is not free on small clusters: a
+   three-node cluster gives up a third of its schedulable capacity.
+   The OpenStack-Helm prototype may well want the opt-out, and phase 3
+   should check whether it does rather than assume. The default is
+   still the right way round -- a control plane that competes with
+   workloads for memory is a correctness problem, and the opt-out is
+   one line for the caller who has measured and decided otherwise.
+
 ## Open questions
 
-1. **Should the plugin disable servicelb whenever it installs
-   MetalLB?** Two load balancer controllers claiming the same
-   `Service` objects is at best untidy and at worst flaky. Answering
-   this needs a live cluster: inspect a current plugin-built cluster
-   for `svclb-*` pods and check which controller assigned the
-   LoadBalancer address in `tools/ci_deploy_test.sh`'s nginx test.
-   Recommendation: if both are active, add `servicelb` to the
-   plugin-owned server configuration whenever `install_metallb` is
-   true, and note it in the release notes.
+1. ~~Should the plugin disable servicelb whenever it installs
+   MetalLB?~~ **Answered on 2026-10-03 against the live cluster
+   `runners.static-ci`: yes.** Both controllers run at once.
+   `svclb-traefik-*` pods are present on all three nodes, so klipper
+   is active, while the address traefik actually holds was assigned by
+   MetalLB -- the Service carries
+   `metallb.io/ip-allocated-from-pool: empty`. So MetalLB wins the
+   assignment and servicelb runs one pod per node accomplishing
+   nothing. The recommendation this question carried stands: add
+   `servicelb` to the plugin-owned server configuration whenever
+   `install_metallb` is true, and note it in the release notes.
+
+   Two details for whoever implements it. The pods are BestEffort
+   with no resource requests, which on a small control plane makes
+   them OOM-kill candidates ahead of anything that matters. And
+   `metallb-controller` was logging
+   `AdditionalAssignFailed ... cannot assign additional IP in
+   PreferDualStack` every few minutes -- 184 occurrences over 25 days
+   -- because the Service asks for dual-stack while the pool is IPv4
+   only. Harmless, since the IPv4 address is assigned, but it is
+   permanent error noise that nothing noticed, and it goes away with
+   traefik. Worth confirming it is traefik's Service and not
+   something the plugin configures.
 2. **Should this plan land before or after the library API plan's
    phase 4 (first PyPI release)?** This work is small and does not
    change existing behaviour, so it does not need to hold up the
@@ -209,10 +269,36 @@ was written.
    parameters exist when it is written. Recommendation: do not block
    phase 4 on this plan; if this plan lands first, phase 5 picks the
    new options up for free, and if not, they are a follow-on release.
-3. **Is there a sensible floor on sizing?** k3s documents a 2 GB
-   server minimum. Recommendation: validate only that values are
-   positive integers, and leave workload-appropriate sizing to the
-   caller.
+3. ~~Is there a sensible floor on sizing?~~ **Answered on
+   2026-10-03: validate positive integers only, but document a
+   realistic floor.** The recommendation this question carried was
+   right about validation and too relaxed about the default. Measured
+   on `runners.static-ci`, whose nodes are exactly today's hardcoded
+   2 vCPU / 2048 MB:
+
+   - `k3s-server` -- one process holding apiserver, controllers,
+     scheduler and etcd -- is **709 MB RSS** on its own, 36% of the
+     node, and it grows from ~190 MB after a restart as its caches
+     warm. That leaves roughly 400 MB for containerd, every system
+     pod and the kernel.
+   - A burst of 20 to 60 pod creations drove the node into *global*
+     OOM. The kernel killed `longhorn-manager` and `traefik` (both
+     BestEffort), systemd restarted k3s, and the API server refused
+     connections for ~30s. Those were the only OOM kills in that
+     node's 25 day life.
+   - It is not a clean threshold: an identical burst succeeded
+     minutes earlier. Whether 2 GB survives depends on how recently
+     k3s restarted, which makes it a random production failure rather
+     than a reproducible one.
+
+   So k3s's documented 2 GB server minimum is a floor at which a
+   control plane runs and does not work. The plugin should still
+   reject only non-positive integers -- a hard minimum would be
+   guesswork about workloads it cannot see -- but 2048 MB should not
+   remain a silent default that appears fine until the first busy
+   day. Phase 1 should say so in `docs/usage.md`, and the CI runner
+   plan's figure of 4 GB minimum for a control plane is a reasonable
+   number to document.
 
 ## Execution
 
@@ -223,8 +309,8 @@ than expected.
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
 | 1. Per-role sizing | `create_instance(node_type)`; `node_sizes` in metadata with fallback defaults for existing clusters; six CLI flags and matching `create()` parameters; `show` displays sizes; drop the bare `apt-get install -y` at `cluster.py:1052`; unit tests for the metadata fallback and for the sizes reaching `client.create_instance`; regenerate the `tests/cli_contract/` snapshots; update `docs/usage.md` and `docs/library-api.md`. Unit tests can verify everything except the live build. | Not started | |
-| 2. k3s configuration pass-through | Resolve open questions 1 and 3 and the `config.yaml.d` version floor; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; unit tests for validation, the file content, and `expand-workers` reusing the recorded config; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels). The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | Not started | |
-| 3. Live validation | Extend `tools/ci_deploy_test.sh` to create with non-default sizes and both config files (disable Traefik, label control plane and workers differently), then assert with `kubectl`: no Traefik pods, the expected labels on each node, the recorded sizes in `show`, and a worker added by `expand-workers` carrying the agent labels. Run the merge-tier workflow. Then run the homelab OpenStack-Helm prototype's provision stage against the branch as a second, heavier consumer. | Not started | |
+| 2. k3s configuration pass-through | Resolve open questions 1 and 3 and the `config.yaml.d` version floor; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; write the default control plane `node-taint` per design 7 and `servicelb` into the plugin-owned server config whenever `install_metallb` is true, per open question 1; unit tests for validation, the file content, `expand-workers` reusing the recorded config, the default taint being present, and a caller's `node-taint: []` replacing it; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels) and the documented sizing floor from open question 3. The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | Not started | |
+| 3. Live validation | Extend `tools/ci_deploy_test.sh` to create with non-default sizes and both config files (disable Traefik, label control plane and workers differently), then assert with `kubectl`: no Traefik pods, no `svclb-*` pods, the expected labels on each node, the default `NoSchedule` taint on every control plane node, the recorded sizes in `show`, and a worker added by `expand-workers` carrying the agent labels. Also assert a second create passing `node-taint: []` leaves the control plane schedulable, since that is the documented opt-out. Run the merge-tier workflow. Then run the homelab OpenStack-Helm prototype's provision stage against the branch as a second, heavier consumer, and establish whether it wants the taint opt-out on a three node cluster (design 7). | Not started | |
 | 4. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-3 against `develop` | Not started | |
 
 <!-- shared-block: plan-push-audit-phase v3 -->
