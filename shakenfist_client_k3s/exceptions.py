@@ -609,7 +609,8 @@ class ReleaseLookupError(_ReasonedK3sException):
     - ``no_usable_k3s_channels(url, response_snippet)``: raised by
       ``primitives.get_k3s_release()`` when the channel response parsed
       but yielded no channels at all. ``response_snippet`` is the
-      caller's already-truncated ``json.dumps(d)[:512]``.
+      caller's already-truncated ``json.dumps(d)``, bounded by
+      ``primitives.RESPONSE_SNIPPET_BYTES``.
     - ``unknown_channel(release_channel)``: raised by
       ``primitives.get_k3s_release()`` when the requested channel is not
       in the (possibly cached) release map.

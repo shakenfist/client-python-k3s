@@ -705,9 +705,13 @@ def run_module():
     #
     # K3sClusterException alone is not enough, which the review of #90
     # pointed out and cluster.py confirms: it catches
-    # apiclient.APIException at particular call sites (:761, :2203, :2250)
-    # precisely because the client raises it unwrapped, so every other call
-    # through the client can hand one straight out. An UnauthorizedException
+    # apiclient.APIException at particular call sites -- _probe_k3s_api(),
+    # remove_worker() and _uncordon() -- precisely because the client
+    # raises it unwrapped, so every other call through the client can hand
+    # one straight out. Named by method rather than by line number, which
+    # is how this comment was written: all three numbers it gave were
+    # already wrong one merge window later, and one of them had become a
+    # line of docstring prose. An UnauthorizedException
     # from the first get_namespace_metadata(), a namespace which does not
     # exist, a connection dropped twenty minutes into a create, or a
     # requests error from the GitHub release lookups in primitives.py were
