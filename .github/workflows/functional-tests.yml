@@ -181,18 +181,6 @@ jobs:
         timeout-minutes: 5
         run: tools/check-wheel-build.sh
 
-      # --config-file is explicit for the same reason the pre-commit hook
-      # spells it out: ansible-lint does not discover a config file below
-      # the invocation cwd, so "ansible-lint collection/" run from the
-      # repository root would silently ignore collection/.ansible-lint and
-      # report a false failure.
-      - name: Lint the shakenfist.k3s collection
-        timeout-minutes: 5
-        run: |
-          . /tmp/venv-test/bin/activate
-          uv pip install ansible-core ansible-lint
-          ansible-lint --config-file collection/.ansible-lint collection/
-
   automated_reviewer:
     name: "Automated reviewer"
     # The needs: list is the "review only once CI has passed" gate: a

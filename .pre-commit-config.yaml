@@ -22,21 +22,29 @@ repos:
         types_or: [sh, bash, shell]
         args: ['-x']
 
-  # Lints the shakenfist.k3s collection. Local, as in the server
-  # repository, because the upstream pre-commit hook has Python 3.13
-  # compatibility issues; this requires ansible-lint to be installed in
-  # PATH. --config-file is explicit because ansible-lint does not discover
-  # a config file below the invocation cwd: "ansible-lint collection/" run
-  # from the repository root silently ignores collection/.ansible-lint and
-  # reports a false failure.
+  # Lints the shakenfist.k3s collection. Local rather than the upstream
+  # pre-commit repository, as in the server repository, because that
+  # hook has Python 3.13 compatibility issues -- but language: python
+  # with additional_dependencies rather than language: system, so the
+  # hook installs what it needs into its own virtualenv. It was
+  # language: system first, which passed locally and failed on the
+  # runner with "Executable `ansible-lint` not found": a system hook
+  # inherits whatever happens to be on PATH, so it was really testing
+  # the author's shell. That also pins the version here, next to the
+  # revs of the other three hooks, instead of leaving it to whatever a
+  # contributor last installed.
   #
-  # Requires: pip install ansible-lint
+  # --config-file is explicit because ansible-lint does not discover a
+  # config file below the invocation cwd: "ansible-lint collection/"
+  # run from the repository root silently ignores
+  # collection/.ansible-lint and reports a false failure.
   - repo: local
     hooks:
       - id: ansible-lint
         name: Lint the shakenfist.k3s collection
         description: Checks the Ansible collection for practices and behavior that could be improved
         entry: ansible-lint --config-file collection/.ansible-lint collection/
-        language: system
+        language: python
+        additional_dependencies: ['ansible-lint==26.9.0']
         files: ^collection/
         pass_filenames: false
