@@ -53,4 +53,13 @@ Options:
   --worker-memory INTEGER RANGE   The memory for each worker node, in MB.
                                   [x>=1]
   --worker-disk INTEGER RANGE     The disk for each worker node, in GB.  [x>=1]
+  --server-config FILE            A YAML mapping of k3s configuration keys,
+                                  applied to every control plane node. A few
+                                  keys the plugin depends on are refused. See
+                                  docs/usage.md.
+  --agent-config FILE             A YAML mapping of k3s configuration keys,
+                                  applied to every worker, including workers
+                                  added later by expand-workers. A few keys the
+                                  plugin depends on are refused. See
+                                  docs/usage.md.
   --help                          Show this message and exit.
