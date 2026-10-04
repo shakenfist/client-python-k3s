@@ -4,5 +4,11 @@
         "id": 20595671,
         "name": "Develop branch",
         "target": "branch"
+    },
+    {
+        "enforcement": "active",
+        "id": 24410172,
+        "name": "Release tags",
+        "target": "tag"
     }
 ]
