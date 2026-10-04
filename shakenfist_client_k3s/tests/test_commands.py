@@ -1,5 +1,6 @@
 import copy
 import io
+import os
 import tempfile
 import time
 
@@ -12,6 +13,7 @@ import testtools
 
 import shakenfist_client_k3s
 from shakenfist_client_k3s import cluster as cluster_module
+from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.tests import fakes
@@ -204,6 +206,43 @@ class CreateNodeSizingOptionsTestCase(testtools.TestCase):
         self.assertEqual(2, result.exit_code)
         self.assertIn('--worker-memory', result.output)
         self.create.assert_not_called()
+
+    def _write_config(self, text):
+        f = tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False)
+        self.addCleanup(os.unlink, f.name)
+        f.write(text)
+        f.close()
+        return f.name
+
+    def test_the_config_files_are_forwarded_as_mappings(self):
+        server = self._write_config('disable: [traefik]\nnode-label: [a=b]\n')
+        agent = self._write_config('node-label: [c=d]\n')
+
+        result = self._invoke('--server-config', server, '--agent-config', agent)
+
+        self.assertEqual(0, result.exit_code, result.output)
+        kwargs = self.create.call_args[1]
+        self.assertEqual({'disable': ['traefik'], 'node-label': ['a=b']}, kwargs['server_config'])
+        self.assertEqual({'node-label': ['c=d']}, kwargs['agent_config'])
+
+    def test_omitting_the_config_files_passes_none(self):
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        kwargs = self.create.call_args[1]
+        self.assertIsNone(kwargs['server_config'])
+        self.assertIsNone(kwargs['agent_config'])
+
+    def test_a_refused_key_exits_before_create_is_called(self):
+        server = self._write_config('token: x\n')
+
+        result = self._invoke('--server-config', server)
+
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn('token', result.output)
+        self.assertIn(str(exceptions.K3sConfigError.owned_key('server', 'token')), result.output)
+        self.create.assert_not_called()
+        self.client.create_namespace.assert_not_called()
 
 
 # A cluster which has finished being created, in the shape the three
