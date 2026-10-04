@@ -468,6 +468,70 @@ class ActionLogClient(fakes.FakeClusterClient):
         return super(ActionLogClient, self).delete_instance(instance_ref)
 
 
+class DeleteClearsTheKeysCreateWroteTestCase(testtools.TestCase):
+    """delete() clears the address keys create() actually writes.
+
+    It cleared api_floating_address and api_inner_address, while create()
+    writes api_address_floating and api_address_inner and the two install
+    methods read those -- the words transposed. So the write in the middle
+    of delete() invented two keys nothing in the package has ever used and
+    carried the two real ones through unchanged.
+
+    The effect was cosmetic, because the document is deleted a few lines
+    later, and it stayed invisible for the same reason: nothing reads the
+    intermediate write, so nothing noticed. These assertions read it.
+    """
+
+    def _delete_and_capture(self):
+        """Run a delete, returning every metadata document it wrote."""
+        written = []
+
+        class CapturingClient(ActionLogClient):
+            def set_namespace_metadata_item(self, namespace, key, value):
+                if key == MD_KEY:
+                    written.append(copy.deepcopy(value))
+                return super(CapturingClient, self).\
+                    set_namespace_metadata_item(namespace, key, value)
+
+        client = CapturingClient()
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 2, 'node_network': 'net-1',
+            'node_token': 'node-token', 'k3s_version': 'v1.33',
+            'api_address_inner': '10.0.0.4',
+            'api_address_floating': '192.168.10.100',
+            'kubeconfig': 'apiVersion: v1\n',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': []}
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            _make_cluster(client).delete()
+
+        self.assertNotEqual([], written)
+        return written
+
+    def test_the_address_keys_are_the_ones_create_writes(self):
+        for md in self._delete_and_capture():
+            self.assertNotIn('api_floating_address', md)
+            self.assertNotIn('api_inner_address', md)
+
+        # And the real ones were actually cleared, which is the half the
+        # transposition was costing.
+        self.assertIsNone(self._delete_and_capture()[-1]['api_address_inner'])
+        self.assertIsNone(
+            self._delete_and_capture()[-1]['api_address_floating'])
+
+    def test_the_network_key_is_cleared_to_none_not_a_list(self):
+        """Everywhere else this key is a network uuid string."""
+        for md in self._delete_and_capture():
+            self.assertNotEqual([], md.get('node_network'))
+        self.assertIsNone(self._delete_and_capture()[-1]['node_network'])
+
+
 class RemoveWorkerTestCase(testtools.TestCase):
     """remove-worker drains a worker out of k3s before it destroys it.
 

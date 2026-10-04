@@ -2140,8 +2140,14 @@ class Cluster:
 
         md['control_plane_nodes'] = []
         md['worker_nodes'] = []
-        md['api_floating_address'] = None
-        md['api_inner_address'] = None
+        # api_address_floating and api_address_inner, which is what create()
+        # writes and what install_control_plane() and install_k3s_component()
+        # read. This used to clear api_floating_address and
+        # api_inner_address -- the words transposed -- so it invented two
+        # keys nothing else in the package has ever used and left the two
+        # real ones in the document.
+        md['api_address_floating'] = None
+        md['api_address_inner'] = None
         md['k3s_version'] = None
         md['kubeconfig'] = None
         md['node_token'] = None
@@ -2166,7 +2172,9 @@ class Cluster:
             # preserved here deliberately: this step moves code without
             # changing what it does, and the fix belongs in its own change.
             self.client.delete_network(md['node_network'])
-            md['node_network'] = []
+            # None, not []: everywhere else this key holds a network uuid
+            # string, and create_instance() reads it as one.
+            md['node_network'] = None
 
         md['state'] = 'deleted'
         self.set_metadata(md)
