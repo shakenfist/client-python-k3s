@@ -26,11 +26,6 @@ from shakenfist_client_k3s.tests import fakes
 MD_KEY = cluster_module.METADATA_KEY % 'banana'
 
 
-class FakeTty(io.StringIO):
-    def isatty(self):
-        return True
-
-
 def _make_cluster(client):
     return Cluster(client, 'banana', 'testns',
                    reporter=progress.CollectingReporter())
@@ -159,7 +154,7 @@ class ClusterProgressTestCase(testtools.TestCase):
         # mode when verbose. Driven from a terminal, the Cluster must pass
         # both the verbosity and the terminal through, because between
         # them they choose the CLI's entire output format.
-        with mock.patch('sys.stdout', FakeTty()):
+        with mock.patch('sys.stdout', fakes.FakeTty()):
             quiet = Cluster(mock.MagicMock(), 'banana', 'testns',
                             reporter=progress.Reporter(verbose=False))
             self.assertTrue(quiet.get_progress().interactive)

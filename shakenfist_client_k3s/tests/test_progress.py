@@ -44,11 +44,6 @@ class FakeClock:
         self.now += seconds
 
 
-class FakeTty(io.StringIO):
-    def isatty(self):
-        return True
-
-
 class FormatElapsedTestCase(testtools.TestCase):
     def test_formats(self):
         self.assertEqual('0s', progress.format_elapsed(0))
@@ -80,7 +75,7 @@ class ReporterTestCase(testtools.TestCase):
         # answers without asking the real stream silently switches the CLI
         # between in place updates and line mode.
         r = progress.Reporter()
-        with mock.patch('sys.stdout', FakeTty()):
+        with mock.patch('sys.stdout', fakes.FakeTty()):
             self.assertTrue(r.isatty())
         with mock.patch('sys.stdout', io.StringIO()):
             self.assertFalse(r.isatty())
@@ -108,7 +103,7 @@ class CollectingReporterTestCase(testtools.TestCase):
         self.assertEqual(['one', 'two'], r.lines)
 
     def test_is_never_a_tty(self):
-        with mock.patch('sys.stdout', FakeTty()):
+        with mock.patch('sys.stdout', fakes.FakeTty()):
             self.assertFalse(progress.CollectingReporter().isatty())
 
     def test_lines_are_split_across_writes(self):
@@ -291,7 +286,7 @@ class ProgressLineModeTestCase(testtools.TestCase):
         self.assertEqual('Cluster banana is ready (2m05s total)\n', stream.getvalue())
 
     def test_verbose_forces_line_mode(self):
-        p = progress.Progress(stream=FakeTty(), verbose=True)
+        p = progress.Progress(stream=fakes.FakeTty(), verbose=True)
         self.assertFalse(p.interactive)
 
 
@@ -308,7 +303,7 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
             self.addCleanup(patcher.stop)
 
     def test_updates_rewrite_in_place(self):
-        stream = FakeTty()
+        stream = fakes.FakeTty()
         p = progress.Progress(stream=stream)
         p.phase('Booting')
 
@@ -326,7 +321,7 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
             stream.getvalue())
 
     def test_unchanged_status_age_grows(self):
-        stream = FakeTty()
+        stream = fakes.FakeTty()
         p = progress.Progress(stream=stream)
         p.phase('Booting')
 
@@ -341,7 +336,7 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
             stream.getvalue())
 
     def test_note_mid_wait_redraws_block_without_duplicates(self):
-        stream = FakeTty()
+        stream = fakes.FakeTty()
         p = progress.Progress(stream=stream)
         p.phase('Waiting')
         p.update('node-001', 'running')
@@ -362,7 +357,7 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
             stream.getvalue())
 
     def test_lines_truncated_to_terminal_width(self):
-        stream = FakeTty()
+        stream = fakes.FakeTty()
         p = progress.Progress(stream=stream)
         p.update('node-001', 'x' * 200)
 
