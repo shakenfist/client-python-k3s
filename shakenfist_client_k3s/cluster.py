@@ -1251,6 +1251,133 @@ class Cluster:
             ]
         )
 
+    # Every node is given up to three k3s configuration files, written
+    # before its installer runs so that they are there when the installer
+    # first starts the service. k3s reads config.yaml and then every file
+    # in config.yaml.d/ in lexical order, and a key in a later file
+    # replaces the same key in an earlier one, unless the later key ends
+    # in '+', in which case it appends to it.
+    #
+    # 1. /etc/rancher/k3s/config.yaml holds what the plugin sets or
+    #    defaults for the node. On a server that is the kubeconfig mode,
+    #    the floating API address as a SAN, cluster-init on the first
+    #    server only, and the control plane taint. On an agent it is a
+    #    single comment line: the plugin sets nothing there, but k3s
+    #    releases from before mid-2024 ignored the drop-ins for the handful
+    #    of keys k3s looks up before parsing its configuration whenever
+    #    config.yaml itself was missing (survey finding 3 of
+    #    docs/plans/PLAN-node-customisation-phase-02-k3s-config.md). A main
+    #    file on every node means that never arises, and that anyone
+    #    looking at a node can find where its configuration comes from.
+    # 2. config.yaml.d/50-sf-client-k3s.yaml holds the caller's
+    #    server_config or agent_config, as validate_k3s_config() dumped it,
+    #    and is written only when that mapping is non-empty. Read after
+    #    config.yaml, so a caller's key replaces the plugin's default:
+    #    node-taint: [] is how a caller removes the taint.
+    # 3. config.yaml.d/90-sf-client-k3s-enforced.yaml holds what must
+    #    survive the caller's file. Today that is disable+: [servicelb], on
+    #    servers, when MetalLB is installed: MetalLB answers for
+    #    LoadBalancer services, and servicelb alongside it is a second
+    #    controller doing nothing useful. It cannot go in config.yaml,
+    #    because a caller's disable: [traefik] in the 50 file would replace
+    #    it and silently bring servicelb back (survey finding 4). Nor on
+    #    the installer's command line, where k3s lets a repeatable argument
+    #    replace every file's value, the caller's disable included. Read
+    #    last and written with '+', it appends to whatever the caller
+    #    wrote, so disable: [traefik] becomes [traefik, servicelb]. A
+    #    caller who wants servicelb wants --no-metallb, which turns this
+    #    off.
+    #
+    # The control plane taint is only written when the cluster has workers.
+    # MetalLB's controller does not tolerate it, and create() waits for
+    # that controller to roll out, so tainting the only node a zero-worker
+    # cluster has fails every such create after five minutes (survey
+    # finding 7). md['worker_nodes'] is the test because create() builds
+    # every instance before installing k3s on any of them, so it is already
+    # populated when the control plane is installed. The cost is that a
+    # cluster created without workers stays untainted once expand-workers
+    # adds some; nothing rewrites a running server's configuration.
+    #
+    # Every body goes through a heredoc with a quoted delimiter, per rule 2
+    # above read_manifests(). The paths are literals of this method, so
+    # rule 1 has nothing to quote; the floating address is substituted into
+    # a YAML document rather than into a command line, and yaml.safe_dump()
+    # quotes it as YAML needs.
+    def _k3s_config_commands(self, md, role, first_server=False):
+        """The shell commands which write a node's k3s configuration files.
+
+        role is ``'server'`` or ``'agent'``, as k3s spells them, and
+        first_server marks the server which initialises the cluster.
+        Returns a list of commands, the directory first, for the caller to
+        run before the k3s installer; the comment above this method says
+        what each file holds and why.
+
+        The role's configuration is validated again here, although create()
+        validated it before anything was built. A library caller can reach
+        the install methods without going through create(), with metadata
+        nothing has checked, and the delimiter check has to hold for the
+        text actually written rather than for text written somewhere else.
+        For such a caller that means a K3sConfigError part way through an
+        install, which is intended: it is better than a node whose
+        configuration ended its heredoc early.
+        """
+        if role == 'server':
+            plugin_config = {
+                # A string, so that safe_dump quotes it. Unquoted, YAML
+                # would read 0644 as a number, and k3s wants the mode.
+                'write-kubeconfig-mode': '0644',
+                # The floating address is the server address in every
+                # kubeconfig the plugin hands out, so it has to be in the
+                # serving certificate. Extra servers carry it too, so that
+                # whichever server answers presents a certificate which
+                # matches it.
+                'tls-san': [md['api_address_floating']],
+            }
+            if first_server:
+                plugin_config['cluster-init'] = True
+            if md.get('worker_nodes'):
+                plugin_config['node-taint'] = [
+                    'node-role.kubernetes.io/control-plane:NoSchedule']
+            main = yaml.safe_dump(plugin_config, default_flow_style=False,
+                                  sort_keys=True)
+        elif role == 'agent':
+            main = ('# Written by shakenfist_client_k3s; caller '
+                    'configuration is in config.yaml.d/.\n')
+        else:
+            # A programming error rather than a caller's, as in
+            # validate_k3s_config().
+            raise ValueError(
+                "role must be 'server' or 'agent', not %r" % (role,))
+
+        def write(path, body):
+            # Every body here already ends in exactly one newline, which
+            # puts the delimiter on a line of its own without a blank line
+            # in the file before it.
+            return ("cat - > %s << '%s'\n%s%s\n"
+                    % (path, K3S_CONFIG_DELIMITER, body,
+                       K3S_CONFIG_DELIMITER))
+
+        cmds = ['mkdir -p /etc/rancher/k3s/config.yaml.d',
+                write('/etc/rancher/k3s/config.yaml', main)]
+
+        caller_config = validate_k3s_config(
+            md.get(role + '_config', {}), role)
+        if caller_config:
+            cmds.append(write(
+                '/etc/rancher/k3s/config.yaml.d/50-sf-client-k3s.yaml',
+                caller_config))
+
+        # Missing means True, as create()'s comment on the key says: a
+        # cluster built before the key existed has MetalLB.
+        if role == 'server' and md.get('metallb_installed', True):
+            cmds.append(write(
+                '/etc/rancher/k3s/config.yaml.d/'
+                '90-sf-client-k3s-enforced.yaml',
+                yaml.safe_dump({'disable+': ['servicelb']},
+                               default_flow_style=False, sort_keys=True)))
+
+        return cmds
+
     def install_control_plane(self, manifests=None, staged=None):
         """Prepare the first control plane node, and install k3s on it.
 
@@ -1293,23 +1420,14 @@ class Cluster:
 
         p.phase('Installing k3s on the first control plane node')
 
-        # Write a configuration file with the external address to the first control
-        # plane node. This is needed so that the SSL certificate includes this
-        # external name.
-        #
-        # The heredoc delimiter is quoted, per rule 2 at the top of this
-        # module: Python has already substituted the address by the time
-        # the remote shell sees this, so there is nothing here the shell
-        # should be expanding.
-        cmds.append('mkdir -p /etc/rancher/k3s/')
-        cmds.append(
-            "cat - > /etc/rancher/k3s/config.yaml << 'EOF'\n"
-            'write-kubeconfig-mode: "0644"\n'
-            'tls-san:\n'
-            '  - "%s"\n'
-            'cluster-init: true\n'
-            'EOF\n'
-            % md['api_address_floating'])
+        # Write the k3s configuration files before k3s is installed. Among
+        # other things they carry the floating address as a SAN, which is
+        # needed so that the TLS certificate the API serves includes the
+        # external address every kubeconfig the plugin hands out points
+        # at; and cluster-init, which makes this node the embedded etcd
+        # cluster the other servers join. The comment above
+        # _k3s_config_commands() has the rest.
+        cmds.extend(self._k3s_config_commands(md, 'server', first_server=True))
 
         # Stage the caller's manifests, before the install below rather
         # than after it: k3s applies this directory when the server first
@@ -1401,9 +1519,15 @@ class Cluster:
         # existed only have api_address_inner.
         join_address = md.get('join_address', md['api_address_inner'])
 
+        # The k3s configuration files go first, so that they are on the
+        # node when the installer starts the service: k3s reads its
+        # configuration at startup, and a file which arrives afterwards
+        # is not read until something restarts it. node_role is k3s's own
+        # name for the subcommand, 'server' or 'agent', which is also how
+        # _k3s_config_commands() names a role.
         self.execute_and_await(
             instance_uuids,
-            [
+            self._k3s_config_commands(md, node_role) + [
                 'sudo apt-get update',
                 (
                     'curl -sfL https://get.k3s.io | '
@@ -1678,9 +1802,16 @@ class Cluster:
         worker, as a drop-in in /etc/rancher/k3s/config.yaml.d/ which k3s
         reads after the plugin's own config.yaml, so a caller's key
         replaces the plugin's default for it and a key written with a
-        trailing ``+`` appends to it instead. None, the default, and an
-        empty mapping both mean no drop-in at all. Both are checked by
-        validate_k3s_config() before anything is built: a mapping is
+        trailing ``+`` appends to it instead. The plugin's defaults include
+        a ``node-role.kubernetes.io/control-plane:NoSchedule`` taint on
+        every control plane node when the cluster has workers, which
+        ``node-taint: []`` in server_config removes. The one default a
+        caller cannot override is that servicelb is disabled when MetalLB
+        is installed: a further drop-in, read after the caller's, appends
+        servicelb to ``disable``, so a caller's ``disable`` is extended
+        rather than bringing servicelb back. None, the default, and an
+        empty mapping both mean no caller drop-in at all. Both are checked
+        by validate_k3s_config() before anything is built: a mapping is
         refused if it sets a key the plugin sets itself or depends on
         (K3S_SERVER_OWNED_KEYS and K3S_AGENT_OWNED_KEYS name each one and
         why; ``tls-san+`` is allowed, and is how to add SANs), if it cannot
@@ -1868,14 +1999,15 @@ class Cluster:
             # building. Readers must treat a missing key as True, because
             # every cluster built before this key existed has both.
             #
-            # Only metallb_installed has a reader today, in
-            # expand_addresses(). longhorn_installed is written for the
-            # same reason and read by nothing, because no verb drives
-            # Longhorn after create(); health() growing a storage check is
-            # the obvious first reader. That is the position md['state']
-            # was in for this package's whole history until phase 3 found
-            # it (survey finding 2), so it is said out loud here rather
-            # than left for somebody to rediscover.
+            # Only metallb_installed has readers today: expand_addresses(),
+            # and _k3s_config_commands(), which disables servicelb on the
+            # servers of a cluster with MetalLB. longhorn_installed is
+            # written for the same reason and read by nothing, because no
+            # verb drives Longhorn after create(); health() growing a
+            # storage check is the obvious first reader. That is the
+            # position md['state'] was in for this package's whole history
+            # until phase 3 found it (survey finding 2), so it is said out
+            # loud here rather than left for somebody to rediscover.
             'metallb_installed': install_metallb,
             'longhorn_installed': install_longhorn,
 
