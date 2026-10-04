@@ -5,7 +5,7 @@ import sys
 from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
-from shakenfist_client_k3s.cluster import Cluster
+from shakenfist_client_k3s.cluster import Cluster, DEFAULT_NODE_SIZE
 
 
 def _bind_namespace_context(ctx, namespace):
@@ -192,12 +192,34 @@ k3s.add_command(k3s_list)
                     'copied verbatim under its own name: nothing is templated, '
                     "and the order manifests are applied in is k3s's business "
                     "rather than this command's."))
+@click.option('--control-plane-cpus', type=click.IntRange(min=1),
+              default=DEFAULT_NODE_SIZE['cpus'],
+              help='The number of vCPUs for each control plane node.')
+@click.option('--control-plane-memory', type=click.IntRange(min=1),
+              default=DEFAULT_NODE_SIZE['memory'],
+              help=('The memory for each control plane node, in MB. 2048 runs a '
+                    'control plane but does not hold up under load; 4096 or more '
+                    'is recommended.'))
+@click.option('--control-plane-disk', type=click.IntRange(min=1),
+              default=DEFAULT_NODE_SIZE['disk'],
+              help='The disk for each control plane node, in GB.')
+@click.option('--worker-cpus', type=click.IntRange(min=1),
+              default=DEFAULT_NODE_SIZE['cpus'],
+              help='The number of vCPUs for each worker node.')
+@click.option('--worker-memory', type=click.IntRange(min=1),
+              default=DEFAULT_NODE_SIZE['memory'],
+              help='The memory for each worker node, in MB.')
+@click.option('--worker-disk', type=click.IntRange(min=1),
+              default=DEFAULT_NODE_SIZE['disk'],
+              help='The disk for each worker node, in GB.')
 @click.pass_context
 def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                metal_address_count=None,  namespace=None, network=None,
                refresh_version_cache=False, release_channel=None,
                sshkey=None, metallb=True, longhorn=True, kubeconfig=True,
-               manifests=None):
+               manifests=None, control_plane_cpus=None, control_plane_memory=None,
+               control_plane_disk=None, worker_cpus=None, worker_memory=None,
+               worker_disk=None):
     c = _bind_new_cluster_context(ctx, name, namespace)
     # write_kubeconfig defaults to False in the library and True here: the
     # command line's behaviour is unchanged, and a library caller does not
@@ -210,7 +232,12 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
              network=network, refresh_version_cache=refresh_version_cache,
              release_channel=release_channel, sshkey=sshkey,
              install_metallb=metallb, install_longhorn=longhorn,
-             write_kubeconfig=kubeconfig, manifests=list(manifests or []))
+             write_kubeconfig=kubeconfig, manifests=list(manifests or []),
+             control_plane_cpus=control_plane_cpus,
+             control_plane_memory=control_plane_memory,
+             control_plane_disk=control_plane_disk,
+             worker_cpus=worker_cpus, worker_memory=worker_memory,
+             worker_disk=worker_disk)
 
 
 k3s.add_command(k3s_create)

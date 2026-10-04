@@ -46,10 +46,12 @@ class CliContractTestCase(testtools.TestCase):
     change in this phase alters this output, that is a bug, not a fixture
     update, per the phase plan's decision 7.
 
-    A phase which deliberately adds a command is the one exception, and it
-    grows the fixtures the same way: SUBCOMMANDS gains the name, and the
-    new fixture and the regenerated group.txt are produced by invoking
-    --help rather than typed. Nothing existing may change in the diff.
+    A phase which deliberately adds a command, or an option to an existing
+    command, is the one exception, and it grows the fixtures the same way:
+    for a new command SUBCOMMANDS gains the name, and the new fixture and
+    the regenerated group.txt are produced by invoking --help rather than
+    typed; for a new option the command's fixture is regenerated the same
+    way. Nothing existing may change in the diff.
     """
 
     def setUp(self):
