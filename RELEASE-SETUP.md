@@ -123,24 +123,36 @@ half that has consumed a version number nobody can reuse.
      > **Actions** > **New organization secret**, with repository access
      including `client-python-k3s`
 
-**At the time of writing, this secret does not exist** -- neither at the
-repository level nor, as far as could be established without
-`admin:org` scope, at the organisation level. Do not assume either step
-above has already been done.
+**This secret exists as a `release` *environment* secret**, which is a
+third place to look that the two bullets above do not mention and the
+correct one here: `publish-collection` declares `environment: release`,
+so it resolves environment secrets, and a repository-level listing
+cannot see one. Add it under the environment rather than the repository
+if it ever has to be replaced.
 
 **Verify this step by command, not by memory of having done it**:
 
 ```bash
-gh api repos/shakenfist/client-python-k3s/actions/secrets \
+gh api repos/shakenfist/client-python-k3s/environments/release/secrets \
   --jq '.secrets[].name'
 ```
 
-This must list `ANSIBLE_GALAXY_TOKEN` if the secret was added at the
-repository level. A repository-level listing cannot see an
-organisation-level secret of the same name; confirming that one covers
-this repository needs `admin:org` scope
+This must list `ANSIBLE_GALAXY_TOKEN`. The repository-level listing
+(`gh api repos/shakenfist/client-python-k3s/actions/secrets`) does *not*
+show it and never did, which is worth knowing because an empty answer
+there reads as "the secret was never created". An organisation-level
+secret of the same name would not appear in either listing; confirming
+one covers this repository needs `admin:org` scope
 (`gh auth refresh -h github.com -s admin:org`) and a look at the
 organisation's secret visibility settings.
+
+One more thing the first release established, because the token
+authenticating is not the same as the token being allowed to publish:
+`publish-collection` failed its first run with HTTP 403
+`permission_denied`. The token authenticates as the Galaxy user
+`shakenfist-bot`, which held no role on the `shakenfist` namespace.
+Granting that account `collection_namespace_owner` on the namespace and
+re-running the one failed job completed the release.
 
 ### 3. Create GitHub Environment with Required Reviewers
 

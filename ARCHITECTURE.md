@@ -259,7 +259,6 @@ nothing to do with compatibility. `publish-collection` in
 `release.yml` publishes to Ansible Galaxy under the same release
 workflow and the same tag that triggers `publish-pypi`, with its own
 credential (`ANSIBLE_GALAXY_TOKEN`); see `RELEASE-SETUP.md` for both.
-As of this writing the collection has not yet had a first release --
-the credential and the first tag are both outstanding -- so
-`ansible-galaxy collection install shakenfist.k3s` does not resolve;
-`docs/collection.md` covers the tarball install that works today.
+`ansible-galaxy collection install shakenfist.k3s` resolves against
+Galaxy, and `docs/collection.md` covers both that and the tarball build
+needed to work against an unreleased checkout.
