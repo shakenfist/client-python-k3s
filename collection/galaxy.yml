@@ -1,0 +1,44 @@
+---
+# Ansible Galaxy collection metadata for shakenfist.k3s.
+#
+# NOTE: the version below is a placeholder. tools/build-collection.py (added
+# in phase 5d) injects the real version, derived from setuptools_scm, into
+# this file at build time -- the same way the core shakenfist.shakenfist
+# collection derives its version from the shakenfist server package, so the
+# collection and the shakenfist_client_k3s package never drift.
+namespace: shakenfist
+name: k3s
+version: 0.0.0
+readme: README.md
+authors:
+  - Michael Still and contributors
+description: >-
+  An Ansible module for orchestrating k3s clusters on Shaken Fist, built on
+  the shakenfist_client_k3s sf-client plugin.
+license:
+  - Apache-2.0
+tags:
+  - cloud
+  - infrastructure
+  - shakenfist
+  - kubernetes
+  - k3s
+# Deliberately empty. The module talks to the Shaken Fist API through the
+# shakenfist_client SDK (via shakenfist_client_k3s) and uses nothing from the
+# shakenfist.shakenfist collection, so this collection stays usable against
+# a cloud that was not deployed with it -- see the library-api master plan's
+# first decision.
+dependencies: {}
+# ansible-lint installs the collection into collection/.ansible/ as it
+# runs -- ansible-compat builds a throwaway collection tree there so that
+# the module can be resolved by its fully qualified name. That directory is
+# not part of the collection, but it is a sibling of the files which are, so
+# a build run after a lint would otherwise ship a nested copy of the whole
+# collection inside the tarball. It is also in .gitignore; this entry is the
+# half which protects what gets published.
+build_ignore:
+  - .ansible
+
+repository: https://github.com/shakenfist/client-python-k3s
+homepage: https://github.com/shakenfist/client-python-k3s
+issues: https://github.com/shakenfist/client-python-k3s/issues

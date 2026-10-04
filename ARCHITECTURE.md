@@ -221,3 +221,45 @@ shakenfist/client-python-k3s#82 tracks both halves of that.
 - **Distribution**: published to PyPI as `shakenfist_client_k3s`
 - **Entry point**: `k3s = "shakenfist_client_k3s:load"` in the
   `shakenfist_client.plugin` group
+
+## The `shakenfist.k3s` Ansible collection
+
+This repository ships a second artefact alongside the Python package:
+an Ansible collection at `collection/`, `shakenfist.k3s`, carrying one
+native module, `sf_k3s_cluster`. `docs/collection.md` is the full
+reference -- its parameters, the connection rules, check mode, and why
+it does not manage worker count; this section is only the shape and
+where it sits relative to the rest of this inventory.
+
+The module is a fourth caller of the same orchestration the "Three
+layers, not two" section above describes for the Click commands: it
+imports `shakenfist_client_k3s.client.make_client()` and
+`shakenfist_client_k3s.cluster.Cluster` directly, exactly as a
+conductor reconcile loop would, and contains no orchestration of its
+own -- argument parsing in, `Cluster` method calls out, same as the
+Click command bodies are for `__init__.py`. It carries no copy of
+anything Ansible-connection-shaped from the `shakenfist.shakenfist`
+collection; `shakenfist_client_k3s/client.py` (see `docs/library-api.md`)
+already does what a `module_utils/sf_connection.py` would, which is
+why none exists here.
+
+The two artefacts are versioned and built together but published
+separately. `tools/build-collection.py`, run by the `build-collection`
+CI job, reads the same `setuptools_scm`-derived version described
+above and rewrites `collection/galaxy.yml`'s version to match before
+`ansible-galaxy collection build` runs, so collection and package never
+carry two different version numbers for one commit. The dependency
+runs the other way at install time: `collection/requirements.txt` pins
+a static floor on `shakenfist_client_k3s` from PyPI (`>=0.1.0`, raised
+only when the module starts calling a newer verb) rather than a
+build-time match to the collection's own version, because a locally
+built development collection demanding the plugin release with its own
+unreleased version number would fail to install for a reason that has
+nothing to do with compatibility. `publish-collection` in
+`release.yml` publishes to Ansible Galaxy under the same release
+workflow and the same tag that triggers `publish-pypi`, with its own
+credential (`ANSIBLE_GALAXY_TOKEN`); see `RELEASE-SETUP.md` for both.
+As of this writing the collection has not yet had a first release --
+the credential and the first tag are both outstanding -- so
+`ansible-galaxy collection install shakenfist.k3s` does not resolve;
+`docs/collection.md` covers the tarball install that works today.

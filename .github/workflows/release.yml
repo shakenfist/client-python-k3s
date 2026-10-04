@@ -59,7 +59,37 @@ jobs:
           name: dist
           path: dist/
 
-  # The three publishing jobs are guarded so that a workflow_dispatch
+  build-collection:
+    name: Build ansible collection
+    runs-on: [self-hosted, static]
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # Full history needed for setuptools_scm
+
+      - name: Install build dependencies
+        run: |
+          rm -rf collection-venv
+          python3 -m venv collection-venv
+          collection-venv/bin/pip3 install --upgrade pip
+          collection-venv/bin/pip3 install ansible-core setuptools_scm packaging
+
+      - name: Build collection
+        run: |
+          collection-venv/bin/python3 tools/build-collection.py
+
+      - name: Upload collection artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: collection
+          path: dist-collection/
+
+  # The four publishing jobs are guarded so that a workflow_dispatch
   # run only ever exercises the build and the twine check. The event
   # is tested as well as the ref because a dispatch can be aimed at a
   # tag: the ref test alone passes there, and the run re-signs and
@@ -169,6 +199,58 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+  publish-collection:
+    name: Publish ansible collection to Galaxy
+    needs: [build-collection, sign-tag]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, static]
+    environment: release
+
+    permissions: {}
+
+    steps:
+      # Unlike publish-pypi above, and like github-release below: no
+      # checkout, because the step that consumes the artifact is a
+      # plain "run:" invocation of ansible-galaxy executing on the
+      # runner host, not a container action, so it reads an absolute
+      # runner.temp path happily. Downloading into the per-job
+      # runner.temp is then the cheaper way to get a directory nothing
+      # else has written to, without paying for a checkout to clean
+      # one -- the same guarantee runner.temp buys the other job.
+      #
+      # The glob below matches exactly one file: build-collection
+      # uploads a single tarball. github-release's
+      # fail_on_unmatched_files guards the equivalent case there
+      # because action-gh-release treats an unmatched glob as a
+      # warning and still reports success. ansible-galaxy has no such
+      # flag, but it does not need one: "ansible-galaxy collection
+      # publish" takes exactly one path argument, and when a glob
+      # matches nothing, bash passes the literal unexpanded pattern
+      # through as that one argument. GalaxyAPI.publish_collection()
+      # checks os.path.exists() on that path before it ever uploads
+      # anything, and raises AnsibleError("... does not exist.") when
+      # it is missing -- a loud failure, not a silent success. No
+      # extra guard step is added here because there is nothing for it
+      # to catch that ansible-galaxy does not already catch itself.
+      - name: Download collection artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: collection
+          path: ${{ runner.temp }}/dist-collection/
+
+      - name: Install ansible-core
+        run: |
+          rm -rf publish-venv
+          python3 -m venv publish-venv
+          publish-venv/bin/pip3 install --upgrade pip
+          publish-venv/bin/pip3 install ansible-core
+
+      - name: Publish to Ansible Galaxy
+        run: |
+          publish-venv/bin/ansible-galaxy collection publish \
+              ${{ runner.temp }}/dist-collection/*.tar.gz \
+              --api-key "${{ secrets.ANSIBLE_GALAXY_TOKEN }}"
 
   github-release:
     name: Create GitHub Release

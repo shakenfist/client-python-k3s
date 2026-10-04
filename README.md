@@ -47,5 +47,8 @@ sf-client k3s delete mycluster
   -- every command, its options, and where cluster state lives.
 * [The library API](https://github.com/shakenfist/client-python-k3s/blob/develop/docs/library-api.md)
   -- calling the same orchestration from Python, with no Click involved.
+* [The shakenfist.k3s Ansible collection](https://github.com/shakenfist/client-python-k3s/blob/develop/docs/collection.md)
+  -- the `sf_k3s_cluster` module, its connection rules, and why it does not
+  manage worker count.
 * [Testing and CI](https://github.com/shakenfist/client-python-k3s/blob/develop/docs/testing.md)
   -- how to run the tests, and what the two CI tiers cover.

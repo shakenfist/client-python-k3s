@@ -6,7 +6,7 @@
 # runner carries under-cloud credentials in ~/.shakenfist which name its
 # per-job namespace, the plugin defaults to that namespace, and the
 # namespace (and so anything this script leaks on failure) is torn down
-# with the runner. See docs/plans/functional-ci.md for the design.
+# with the runner. See docs/plans/PLAN-functional-ci.md for the design.
 
 set -e
 set -o pipefail

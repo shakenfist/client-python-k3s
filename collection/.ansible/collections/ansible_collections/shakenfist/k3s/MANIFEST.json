@@ -1,0 +1,36 @@
+{
+ "collection_info": {
+  "namespace": "shakenfist",
+  "name": "k3s",
+  "version": "0.0.0",
+  "authors": [
+   "Michael Still and contributors"
+  ],
+  "readme": "README.md",
+  "tags": [
+   "cloud",
+   "infrastructure",
+   "shakenfist",
+   "kubernetes",
+   "k3s"
+  ],
+  "description": "An Ansible module for orchestrating k3s clusters on Shaken Fist, built on the shakenfist_client_k3s sf-client plugin.",
+  "license": [
+   "Apache-2.0"
+  ],
+  "license_file": null,
+  "dependencies": {},
+  "repository": "https://github.com/shakenfist/client-python-k3s",
+  "documentation": null,
+  "homepage": "https://github.com/shakenfist/client-python-k3s",
+  "issues": "https://github.com/shakenfist/client-python-k3s/issues"
+ },
+ "file_manifest_file": {
+  "name": "FILES.json",
+  "ftype": "file",
+  "chksum_type": "sha256",
+  "chksum_sha256": "31a769cdb5043fc515c5a6be72acb02607fc84063087658cf9392e6b6fb295a4",
+  "format": 1
+ },
+ "format": 1
+}
