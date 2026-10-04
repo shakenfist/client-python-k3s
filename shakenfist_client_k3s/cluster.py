@@ -1708,14 +1708,39 @@ class Cluster:
         # here. See create()'s docstring, and decision 6 of the phase 3 plan.
         if write_kubeconfig:
             p.phase('Updating local kubeconfig')
+            # Every component of these paths is chosen by this module -- the
+            # user's home directory, a fixed directory name, a fixed file
+            # name, and below a tempfile directory -- so the joins need no
+            # containment check and there is nothing for a realpath() guard
+            # to prove. An outside value appearing in one of them later
+            # would need both.
             kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
             main_config_path = os.path.join(kube_dir, 'config')
-            os.makedirs(kube_dir, exist_ok=True)
+
+            # 0700, rather than whatever the process umask makes of 0777. A
+            # k3s kubeconfig embeds client-certificate-data and
+            # client-key-data for a cluster-admin identity, so on a default
+            # umask 022 host this directory and the file below were readable
+            # by every local user -- which is the normal situation on a
+            # shared jump box or a CI runner. exist_ok leaves an existing
+            # directory's mode alone, so a user who has already tightened
+            # theirs keeps it, and one who has loosened it is not silently
+            # overridden.
+            os.makedirs(kube_dir, mode=0o700, exist_ok=True)
 
             if not os.path.exists(main_config_path):
                 # There is no existing configuration to preserve, so no merge is
                 # required and we don't need a local kubectl.
-                with open(main_config_path, 'w', encoding='utf-8') as f:
+                #
+                # os.open() with an explicit mode rather than open() and a
+                # chmod afterwards, so that the file is never briefly
+                # world readable between being created and being tightened.
+                # Only this branch creates the file: the merge branch below
+                # rewrites one which already exists, which keeps the mode
+                # the user's own kubeconfig had.
+                fd = os.open(main_config_path,
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with open(fd, 'w', encoding='utf-8') as f:
                     f.write(yaml.dump(kc))
             else:
                 if not shutil.which('kubectl'):

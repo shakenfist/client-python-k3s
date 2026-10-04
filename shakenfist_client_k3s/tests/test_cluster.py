@@ -3576,6 +3576,16 @@ class FileEncodingIsStatedTestCase(testtools.TestCase):
                 elif isinstance(node.func, ast.Attribute):
                     if node.func.attr != 'open':
                         continue
+                    # os.open() is the file descriptor call, not the text
+                    # one: it returns an int, takes a mode rather than an
+                    # encoding, and raises TypeError if given one. It is
+                    # how a file is created with an explicit permission
+                    # mode, which the kubeconfig write needs; the open()
+                    # wrapped around the descriptor it returns is a
+                    # separate call and is still checked here.
+                    if (isinstance(node.func.value, ast.Name)
+                            and node.func.value.id == 'os'):
+                        continue
                 else:
                     continue
                 # A binary mode open has no encoding to state.

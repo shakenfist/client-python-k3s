@@ -11,6 +11,7 @@ import copy
 import io
 import os
 import re
+import stat
 import tempfile
 
 # The PyPI mock backport is used for consistency with the other tests in
@@ -774,6 +775,41 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
             written = yaml.safe_load(f)
         self.assertEqual('banana.testns', written['current-context'])
         self.assertIn('Updating local kubeconfig', self.reporter.getvalue())
+
+    def test_a_new_kubeconfig_and_its_directory_are_private(self):
+        """A k3s kubeconfig is a cluster-admin credential, so 0600 and 0700.
+
+        Both were created at the process umask, which on a default umask
+        022 host is 0755 and 0644 -- readable by every local user on the
+        machine that ran create. That is the normal situation on a shared
+        jump box or a CI runner, and the file embeds
+        client-certificate-data and client-key-data for a cluster-admin
+        identity, so it is full control of the cluster rather than read
+        access to it.
+        """
+        # Not inherited from the test runner's: a umask which already
+        # happened to be 077 would make this pass without the fix.
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+
+        self._cluster().create(1, 1, 1, write_kubeconfig=True)
+
+        path = self._kubeconfig_path()
+        self.assertEqual(
+            0o600, stat.S_IMODE(os.stat(path).st_mode),
+            'a new kubeconfig is readable by other local users')
+        self.assertEqual(
+            0o700, stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode),
+            '~/.kube is readable by other local users')
+
+    def test_an_existing_kube_directory_keeps_its_own_mode(self):
+        """exist_ok, so a user who tightened or loosened theirs decides."""
+        kube_dir = os.path.join(self.home, '.kube')
+        os.makedirs(kube_dir, mode=0o750)
+
+        self._cluster().create(1, 1, 1, write_kubeconfig=True)
+
+        self.assertEqual(0o750, stat.S_IMODE(os.stat(kube_dir).st_mode))
 
     def test_create_leaves_an_existing_kubeconfig_alone_by_default(self):
         # The sharper version of the first test: with a file already there,
