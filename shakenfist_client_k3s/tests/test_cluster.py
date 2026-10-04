@@ -3598,6 +3598,36 @@ class FileEncodingIsStatedTestCase(testtools.TestCase):
 
         self.assertEqual([], offenders)
 
+    def test_no_subprocess_call_asks_for_a_shell(self):
+        """Rule 3 at the top of cluster.py, as a property of the tree.
+
+        Every local command this package runs has an argument list
+        available, so none of them needs a shell to parse a string -- and
+        the one which asked for one was a constant, which is how a reader
+        comparing it with the unset calls beside it was left to work out
+        for themselves that the difference did not matter. The useful
+        property is that there is no next one, written with an
+        interpolation in it.
+        """
+        offenders = []
+
+        for path in self._python_files():
+            name = os.path.relpath(path, os.path.dirname(os.path.dirname(
+                os.path.abspath(cluster_module.__file__))))
+            with open(path, encoding='utf-8') as f:
+                tree = ast.parse(f.read(), filename=path)
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                for kw in node.keywords:
+                    if (kw.arg == 'shell'
+                            and isinstance(kw.value, ast.Constant)
+                            and kw.value.value):
+                        offenders.append('%s:%s' % (name, node.lineno))
+
+        self.assertEqual([], offenders)
+
     def test_no_pathlib_text_call_leaves_the_encoding_to_the_locale(self):
         """The same defect through Path.read_text() and Path.write_text().
 

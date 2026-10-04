@@ -730,8 +730,9 @@ def _is_kubectl_unset(command):
 def _is_kubectl_config_view(command):
     """Is this subprocess.run() first argument create's merge command?
 
-    This one is a shell string, unlike the unset calls: it interpolates
-    nothing, so it never needed to stop being one.
+    An argument list, like the unset calls. The string form is still
+    recognised so that this helper describes the call rather than the
+    spelling of the day.
     """
     if isinstance(command, str):
         return command.startswith('kubectl config view')

@@ -187,8 +187,11 @@ K3S_MANIFEST_DELIMITER = 'SFK3SMANIFEST'
 #    rest of the body is read by the shell as commands. So every heredoc is
 #    built by heredoc() below, which refuses such a body.
 #
-# Cluster.delete()'s kubectl invocation is the third form of the same rule:
-# where a real argument list is available, it is used instead.
+# 3. Where a real argument list is available, it is used instead of a
+#    shell command line, so that no shell parses the value at all. Both
+#    local kubectl invocations -- create()'s merge and delete()'s unset
+#    calls -- are argument lists. The agent commands cannot be, because
+#    the agent takes a command line.
 
 
 def heredoc(remote_path, body, delimiter='EOF'):
@@ -1751,8 +1754,18 @@ class Cluster:
                     new_config_path = os.path.join(tempdir, 'config')
                     with open(new_config_path, 'w', encoding='utf-8') as f:
                         f.write(yaml.dump(kc))
+                    # An argument list, per the third form of the rule
+                    # at the top of this module. Nothing here is
+                    # interpolated, so the shell had nothing to find and
+                    # this is consistency rather than a fix -- but a reader
+                    # comparing this with delete()'s unset calls should not
+                    # have to work out for themselves that the difference
+                    # does not matter, and spawning a shell to run a
+                    # constant buys nothing. The two paths travel as
+                    # environment values rather than as argv either way.
                     merged = subprocess.run(
-                        'kubectl config view --flatten', shell=True, capture_output=True,
+                        ['kubectl', 'config', 'view', '--flatten'],
+                        capture_output=True,
                         env={**os.environ,
                              'KUBECONFIG': '%s:%s' % (main_config_path, new_config_path)})
                     if merged.returncode != 0:
