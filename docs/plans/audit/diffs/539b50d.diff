@@ -1,0 +1,296 @@
+diff --git a/docs/library-api.md b/docs/library-api.md
+index a3969fa..6011eb8 100644
+--- a/docs/library-api.md
++++ b/docs/library-api.md
+@@ -58,10 +58,15 @@ client = make_client(api_url='https://api.example.com',
+ With no arguments it finds configuration exactly as `sf-client` does,
+ from the environment, `~/.shakenfist` and `/etc/sf/shakenfist.json`.
+ Supplying all three of `api_url`, `namespace` and `key` uses them
+-verbatim and suppresses that discovery, which is the rule the Shaken
+-Fist Ansible collection's own modules follow; supplying only some of
+-them is treated as supplying none, so a client is never configured
+-with holes. `apiclient.UnconfiguredException` propagates when
++verbatim and suppresses that discovery.
++
++Supplying only some of them is a `ValueError`. Falling back to
++discovery in that case would hand back a client pointed at whatever
++cloud the environment names rather than the one the caller asked for,
++with nothing said about it -- which is the failure this package just
++removed from the CLI. A caller building its arguments from partially
++populated configuration is the likeliest one to hit it, so it fails
++loudly instead. `apiclient.UnconfiguredException` propagates when
+ discovery finds nothing, rather than being translated into a message
+ or an exit code -- that choice belongs to the caller.
+ 
+@@ -73,9 +78,10 @@ builds a client from its own `--apiurl`, `--key` and `--namespace`
+ options and the plugin uses that one, which is what keeps those
+ options meaningful (see `docs/usage.md`).
+ 
+-Each command's body is now a method taking that command's options,
+-minus `name` and `namespace`, and returning a value instead of
+-printing one:
++### The `Cluster` methods
++
++Each command's body is a method taking that command's options, minus
++`name` and `namespace`, and returning a value instead of printing one:
+ 
+ | Method | Command it replaces |
+ |--------|---------------------|
+@@ -163,6 +169,12 @@ hierarchy catches an `OSError` or `YAMLError` escaping from local
+ work, so a caller that wants to catch everything needs a third
+ `except` clause.
+ 
++`make_client()` can also raise `ValueError`, when some but not all of
++`api_url`, `namespace` and `key` are supplied (see "Constructing the
++client" above). That is a programming error in the caller rather than
++a cluster failure, which is why it is not a `K3sClusterException`, and
++a correct caller never needs to catch it.
++
+ | Exception | Raised when |
+ |-----------|-------------|
+ | `ClusterExistsError` | `create()` is called for a name already in use |
+diff --git a/docs/plans/library-api-and-collection-phase-02-client-construction.md b/docs/plans/library-api-and-collection-phase-02-client-construction.md
+index 286ed45..3c77310 100644
+--- a/docs/plans/library-api-and-collection-phase-02-client-construction.md
++++ b/docs/plans/library-api-and-collection-phase-02-client-construction.md
+@@ -253,6 +253,29 @@ incidental churn: see decision 1.
+    `shakenfist_client.apiclient`, which `__init__.py` imports already,
+    so it adds nothing to the cost of the unguarded plugin load.
+ 
++   **Amended during review of the implementation, on 2026-09-23.** The
++   mirroring is no longer exact. `_make_client()` treats a partial
++   connection set as no connection set and falls back to discovery,
++   which silently hands back a client pointed at whatever cloud the
++   environment names rather than the one the caller asked for -- the
++   same failure this phase removes from the CLI, reappearing one layer
++   up in the library. The automated reviewer raised it, the operator
++   settled it, and `make_client()` now raises `ValueError` when some
++   but not all of `api_url`, `namespace` and `key` are supplied. Both
++   working paths are unchanged: all three still means verbatim, none
++   still means discovery.
++
++   The divergence is temporary by intent. The five copies of
++   `_make_client()` in the server repository's collection modules
++   (`sf_namespace`, `sf_network`, `sf_claim`, `sf_instance`,
++   `sf_snapshot`) are to be changed to fail the same way, with
++   `module.fail_json()` rather than `ValueError` since they are Ansible
++   modules; that change is
++   [shakenfist/shakenfist#4311](https://github.com/shakenfist/shakenfist/pull/4311).
++   Until it lands, this package and the collection disagree,
++   and the docstring says so rather than claiming a parity it no longer
++   has.
++
+ 4. **`make_client()` is not called by the CLI.** Under decision 1 the
+    CLI already has a client, and giving it a `make_client()` call
+    would resurrect precisely the construction path decision 1
+diff --git a/docs/plans/library-api-and-collection.md b/docs/plans/library-api-and-collection.md
+index 6041026..6fe8166 100644
+--- a/docs/plans/library-api-and-collection.md
++++ b/docs/plans/library-api-and-collection.md
+@@ -251,7 +251,7 @@ Constraints:
+ | Phase | Work | Status | Merged |
+ |-------|------|--------|--------|
+ | 1. Library API | [library-api-and-collection-phase-01-library-api.md](library-api-and-collection-phase-01-library-api.md) -- extract orchestration from the Click command bodies into a callable `Cluster` layer; replace `sys.exit(1)` with an exception hierarchy; route `print()` through a reporter; make the Click commands thin wrappers | Complete | `7fb29e5` (#55) |
+-| 2. Client construction | [library-api-and-collection-phase-02-client-construction.md](library-api-and-collection-phase-02-client-construction.md) -- take the client from `ctx.obj['CLIENT']` so the root `--apiurl`/`--key`/`--namespace` are honoured, and add the `api_url`/`namespace`/`key` plus `suppress_configuration_lookup=True` factory that `sf_namespace._make_client()` uses. Phase 1 collapsed the two overwrite sites this row used to cite into one, `_bind_namespace_context()` at `__init__.py:24`; the root builds its client at `client-python/shakenfist_client/main.py:229-237` and stores it at `:236`. The root's `--async` default is `pause` (`main.py:199`) and this code needs `ASYNC_CONTINUE`, which is why the root client cannot simply be used as it stands | In progress | `1c32d12` (#63, plan only), `4e76704` (#65, decision 2 settled) |
++| 2. Client construction | [library-api-and-collection-phase-02-client-construction.md](library-api-and-collection-phase-02-client-construction.md) -- take the client from `ctx.obj['CLIENT']` so the root `--apiurl`/`--key`/`--namespace` are honoured, and add the `api_url`/`namespace`/`key` plus `suppress_configuration_lookup=True` factory that `sf_namespace._make_client()` uses. Phase 1 collapsed the two overwrite sites this row used to cite into one, `_bind_namespace_context()` at `__init__.py:24`; the root builds its client at `client-python/shakenfist_client/main.py:229-237` and stores it at `:236`. The root's `--async` default is `pause` (`main.py:199`) and this code needs `ASYNC_CONTINUE`, which is why the root client cannot simply be used as it stands | In progress | `1c32d12` (#63, plan only), `4e76704` (#65, decision 2 settled), `871f6ee` (#68, steps 2a-2d) |
+ | 3. Missing verbs | `remove-worker`; make `install_workers()` incremental; reconcile/crash recovery for `state: initial`; a health verb; `--no-longhorn`/`--no-metallb`; kubeconfig side effects opt-out (including the `kubectl config unset` calls in `Cluster.delete()`, which run without `capture_output` and so write to the process's real stdout, bypassing the reporter -- found during phase 1 and recorded in its plan under "The kubectl unset leak"); route `GroupCatchClusterExceptions`'s `print(str(e))` to `sys.stderr` instead of `sys.stdout` (found during phase 1 -- pre-existing CLI behaviour, deferred because phase 1 changes no user-visible output); give `Cluster.get_progress()`'s lazy default a real `total_phases` so a library caller invoking a mid-level method directly gets `[n/total]` headers instead of un-numbered `[n]` ones (found during phase 1; no CLI path hits this today); manifest payload hook | Not started | |
+ | 4. First release | Cut `v0.1.0` so `shakenfist-client-k3s` exists on PyPI and `setuptools_scm` has a real version to stamp | Not started | |
+ | 5. The collection | `shakenfist.k3s` with `sf_k3s_cluster`; `tools/build-collection.py`; `build-collection` and `publish-collection` jobs in `release.yml`; ansible-lint in pre-commit and CI; docs | Not started | |
+diff --git a/docs/usage.md b/docs/usage.md
+index 6bd1e6e..d1fd561 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -9,13 +9,13 @@ Every command takes `--namespace`. Without it the client's own
+ namespace is used; an administrator can name a different one to work
+ on a cluster they do not own.
+ 
+-The root `sf-client` options are a separate thing, and two of them are
+-worth knowing about here. `--apiurl`, `--key` and `--namespace`
+-configure the client these commands use, so the cloud they talk to and
+-the namespace referred to above both follow what you pass there. The
+-root `--async` has no effect on `k3s` commands: each one runs its own
+-wait loops and reports progress as it goes, so the client is always
+-asked not to block on the command's behalf.
++The root `sf-client` options are a separate thing, and two of them
++matter here. The connection options -- `--apiurl`, `--key` and
++`--namespace` -- configure the client these commands use, so the cloud
++they talk to and the namespace referred to above both follow what you
++pass there. The root `--async` has no effect on `k3s` commands: each
++one runs its own wait loops and reports progress as it goes, so the
++client is always asked not to block on the command's behalf.
+ 
+ ## Cluster lifecycle
+ 
+diff --git a/shakenfist_client_k3s/client.py b/shakenfist_client_k3s/client.py
+index 97bd1d6..f9f5d16 100644
+--- a/shakenfist_client_k3s/client.py
++++ b/shakenfist_client_k3s/client.py
+@@ -8,11 +8,27 @@ the callers which have no Click context at all: the sf_k3s_cluster
+ Ansible module, conductor, and anyone else importing Cluster as a
+ library.
+ 
+-It mirrors _make_client() in the Shaken Fist server repository at
+-deploy/collection/plugins/modules/sf_namespace.py, so that a caller who
+-supplies nothing gets the same environment, ~/.shakenfist and
+-/etc/sf/shakenfist.json discovery the CLI gets, and one who supplies all
+-three connection parameters gets them used verbatim.
++It follows _make_client() in the Shaken Fist server repository's
++collection modules, so that a caller who supplies nothing gets the same
++environment, ~/.shakenfist and /etc/sf/shakenfist.json discovery the CLI
++gets, and one who supplies all three connection parameters gets them
++used verbatim.
++
++It departs from those modules in one way, deliberately. They treat a
++partial connection set as no connection set and fall back to discovery,
++which means a caller who passes api_url and namespace but forgets key
++is silently pointed at whatever cloud discovery finds -- the same
++failure this package just removed from the CLI, one layer up. Here that
++is a ValueError.
++
++shakenfist/shakenfist#4311 makes the collection modules refuse a
++partial set too, but not identically, and the difference is not an
++oversight in either place. There, the namespace parameter names the
++namespace to operate in as well as the one to authenticate as, so
++passing it alone is ordinary and only api_url and key are held to the
++rule. Here namespace is nothing but the namespace to authenticate as --
++a Cluster is told separately which namespace it lives in -- so all
++three are connection parameters and all three are held to it.
+ """
+ 
+ from shakenfist_client import apiclient
+@@ -23,11 +39,21 @@ def make_client(api_url=None, namespace=None, key=None):
+ 
+     Supply all three of api_url, namespace and key to use them verbatim, or
+     none of them to auto-discover configuration the way the CLI does.
+-    Supplying only some is treated as supplying none, which is the rule the
+-    Shaken Fist Ansible collection's own modules follow.
++    Supplying only some of them raises ValueError rather than quietly
++    discovering the rest, because the client that would produce can be
++    pointed at an entirely different cloud than the caller named.
+ 
+     apiclient.UnconfiguredException propagates when discovery finds nothing.
+     """
++    supplied = [name for name, value in (('api_url', api_url),
++                                         ('namespace', namespace),
++                                         ('key', key)) if value]
++    if supplied and len(supplied) != 3:
++        raise ValueError(
++            'make_client() takes all of api_url, namespace and key, or none '
++            'of them. Got only %s, which would be discarded in favour of '
++            'discovered configuration.' % ', '.join(supplied))
++
+     kwargs = {
+         'verbose': False,
+         # ASYNC_CONTINUE rather than the collection's ASYNC_BLOCK: this
+@@ -41,7 +67,7 @@ def make_client(api_url=None, namespace=None, key=None):
+         # single HTTP call waits for orchestration to finish.
+         'async_strategy': apiclient.ASYNC_CONTINUE,
+     }
+-    if api_url and namespace and key:
++    if len(supplied) == 3:
+         kwargs.update({
+             'base_url': api_url,
+             'namespace': namespace,
+diff --git a/shakenfist_client_k3s/tests/test_client.py b/shakenfist_client_k3s/tests/test_client.py
+index 59f40c9..808a8c9 100644
+--- a/shakenfist_client_k3s/tests/test_client.py
++++ b/shakenfist_client_k3s/tests/test_client.py
+@@ -1,11 +1,13 @@
+ """make_client() builds the client a library caller needs.
+ 
+ The CLI does not use this factory -- it is handed a client by sf-client --
+-so nothing else in the suite covers it, and the behaviour it has to get
+-right is the all-three-or-auto-discover rule the Shaken Fist Ansible
+-collection's own modules follow. Getting that wrong half way, by passing
+-two of the three connection parameters through with configuration lookup
+-still suppressed, would produce a client pointed at nothing in particular.
++so nothing else in the suite covers it. The rule it has to get right is
++all three of api_url, namespace and key used verbatim, none of them
++meaning discovery, and anything in between a ValueError: falling back to
++discovery for a partial set would hand back a client pointed at whatever
++cloud the environment names, with nothing said about it. That departs
++deliberately from the Shaken Fist Ansible collection's _make_client(),
++which falls back; client.py's docstring says why.
+ """
+ 
+ # The PyPI mock backport is used rather than unittest.mock for consistency
+@@ -47,18 +49,31 @@ class MakeClientTestCase(testtools.TestCase):
+         for name in SUPPLIED:
+             self.assertNotIn(name, kwargs)
+ 
+-    def test_a_partial_set_auto_discovers_too(self):
+-        # Each of the three omitted in turn. Passing the rest through with
+-        # the lookup still suppressed is the failure this pins: the client
+-        # would be configured with holes rather than falling back.
++    def test_a_partial_set_is_an_error(self):
++        # Each of the three omitted in turn. Falling back to discovery here
++        # would hand back a client pointed at whatever cloud the
++        # environment names, with nothing said about it. The last case
++        # records that an empty string counts as absent, not as supplied.
+         for call in [{'namespace': 'ns', 'key': 'k'},
+                      {'api_url': 'https://api.example.com', 'key': 'k'},
+-                     {'api_url': 'https://api.example.com', 'namespace': 'ns'}]:
++                     {'api_url': 'https://api.example.com', 'namespace': 'ns'},
++                     {'api_url': 'https://api.example.com', 'namespace': 'ns',
++                      'key': ''}]:
+             self.mock_client.reset_mock()
+-            kwargs = self._kwargs(**call)
+ 
+-            for name in SUPPLIED:
+-                self.assertNotIn(name, kwargs, call)
++            error = self.assertRaises(
++                ValueError, client_module.make_client, **call)
++
++            # The message names exactly what was passed, so the caller can
++            # see which of the three it forgot. The check is against the
++            # variable clause only: the fixed prefix names all three.
++            detail = str(error).split('Got only ', 1)[1]
++            for name in ('api_url', 'namespace', 'key'):
++                if call.get(name):
++                    self.assertIn(name, detail, call)
++                else:
++                    self.assertNotIn(name, detail, call)
++            self.mock_client.assert_not_called()
+ 
+     def test_the_strategy_is_continue_either_way(self):
+         for call in [{}, {'api_url': 'https://api.example.com',
+diff --git a/shakenfist_client_k3s/tests/test_root_options.py b/shakenfist_client_k3s/tests/test_root_options.py
+index f048277..9ef90b2 100644
+--- a/shakenfist_client_k3s/tests/test_root_options.py
++++ b/shakenfist_client_k3s/tests/test_root_options.py
+@@ -8,10 +8,12 @@ so an operator who configures by environment variable got the right
+ credentials by accident, and only one who passed the flags was silently
+ pointed at another cloud. That is invisible to every test which invokes
+ the k3s group directly, because the group never sees the root options at
+-all, so the two tests here are deliberately the other shape: one asserts
+-the construction is gone, and one drives the real root group end to end.
++all, so the three tests here are deliberately the other shape: one
++asserts the construction is gone, one asserts a caller which is not
++sf-client fails by name on the missing 'CLIENT' key rather than getting a
++second client, and one drives the real root group end to end.
+ 
+-The second test reaches the k3s group through the shakenfist_client.plugin
++The last test reaches the k3s group through the shakenfist_client.plugin
+ entry point, which means it only works when this package is installed.
+ "tox -epy3" installs it and CI runs tox, so that is the supported way to
+ run these; a bare stestr run in a tree where the package is not installed
+@@ -60,6 +62,19 @@ class NoClientConstructionTestCase(testtools.TestCase):
+         mock_client.assert_not_called()
+         self.assertEqual(0, result.exit_code, result.output)
+ 
++    def test_a_missing_client_raises_keyerror(self):
++        # The subscript is deliberately fallback free, so that a caller
++        # which is not sf-client fails by name. A later ctx.obj.get(
++        # 'CLIENT') or a try/except around it would pass every other test
++        # here while restoring the second construction path this removed:
++        # a None client fails downstream with an AttributeError, which the
++        # test above cannot tell from success.
++        result = CliRunner().invoke(
++            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False})
++
++        self.assertIsInstance(result.exception, KeyError)
++        self.assertIn('CLIENT', str(result.exception))
++
+ 
+ class RootOptionsTestCase(testtools.TestCase):
+     """The client built from --apiurl, --key and --namespace is the one used.
