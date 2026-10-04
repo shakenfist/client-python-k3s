@@ -1,0 +1,26 @@
+# Ansible-lint configuration for the shakenfist.k3s collection.
+#
+# Run manually: ansible-lint collection/
+#
+# This mirrors the core shakenfist.shakenfist collection's permissive basic
+# profile, but does not copy that collection's full skip_list: two of its
+# three entries (var-naming[no-role-prefix], package-latest) exist because
+# that collection ships roles with tasks, and this collection ships no
+# roles at all -- there is nothing for either check to act on, so copying
+# them would be a skip that skips nothing. Verified by running ansible-lint
+# against this collection with no skip_list at all: only the entry below
+# fired.
+
+profile: basic
+
+skip_list:
+  # The collection maintains no changelogs/changelog.yaml. This used to
+  # say one would be added "when the publish job lands (step 5f)"; that
+  # job landed in this pull request and no changelog came with it, so the
+  # comment described a past event which did not happen. The honest state
+  # is that nothing has been released yet, so there is nothing a changelog
+  # would have an entry for -- the first one is worth writing against the
+  # first published version rather than invented ahead of it. Revisit at
+  # the first release; until then this skip is what keeps the lint honest
+  # rather than what hides a gap.
+  - galaxy[no-changelog]

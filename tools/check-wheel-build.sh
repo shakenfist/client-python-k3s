@@ -52,3 +52,33 @@ echo "check-wheel-build: building from ${ROOT} the way release.yml does"
 "${WORKDIR}/venv/bin/python" -m build --outdir "${WORKDIR}/dist" "${ROOT}"
 
 "${HERE}/check-dist.sh" "${WORKDIR}"/dist/*.whl
+
+# The sdist is checked separately, and for a different thing. check-dist.sh
+# asserts what the *wheel* ships, and the wheel is narrow: packages.find is
+# anchored to shakenfist_client_k3s*, so a stray top level directory cannot
+# reach it. The sdist is the opposite -- setuptools_scm's file finder puts
+# every tracked file in it -- so it is where an accidentally committed
+# build or lint artefact shows up, and nothing was looking. One did:
+# ansible-lint's .ansible/ working tree was committed by a "git add -A"
+# whose tree predated the .gitignore entry for it, and rode into the sdist
+# as eighteen paths while the wheel stayed at twelve entries and the gate
+# stayed green.
+#
+# Checking for tracked artefacts rather than for .ansible by name, because
+# the next one will have a different name. These are the directories a
+# build or a lint leaves behind which .gitignore is expected to cover.
+echo "check-wheel-build: checking the sdist for committed build artefacts"
+sdist=$(echo "${WORKDIR}"/dist/*.tar.gz)
+artefacts=$(tar tzf "${sdist}" \
+    | grep -E '(^|/)(\.ansible|__pycache__|\.tox|\.eggs|build|dist-collection)/' \
+    || true)
+if [ -n "${artefacts}" ]; then
+    echo "check-wheel-build: the sdist carries build or lint artefacts:"
+    while IFS= read -r line; do
+        echo "  ${line}"
+    done <<< "${artefacts}"
+    echo "check-wheel-build: these are tracked in git and should not be."
+    echo "check-wheel-build: check .gitignore, then git rm --cached them."
+    exit 1
+fi
+echo "check-wheel-build: $(basename "${sdist}") OK (no build artefacts)"

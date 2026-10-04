@@ -59,7 +59,37 @@ jobs:
           name: dist
           path: dist/
 
-  # The three publishing jobs are guarded so that a workflow_dispatch
+  build-collection:
+    name: Build ansible collection
+    runs-on: [self-hosted, static]
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # Full history needed for setuptools_scm
+
+      - name: Install build dependencies
+        run: |
+          rm -rf collection-venv
+          python3 -m venv collection-venv
+          collection-venv/bin/pip3 install --upgrade pip
+          collection-venv/bin/pip3 install ansible-core setuptools_scm packaging
+
+      - name: Build collection
+        run: |
+          collection-venv/bin/python3 tools/build-collection.py
+
+      - name: Upload collection artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: collection
+          path: dist-collection/
+
+  # The four publishing jobs are guarded so that a workflow_dispatch
   # run only ever exercises the build and the twine check. The event
   # is tested as well as the ref because a dispatch can be aimed at a
   # tag: the ref test alone passes there, and the run re-signs and
@@ -169,6 +199,84 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+  publish-collection:
+    name: Publish ansible collection to Galaxy
+    # publish-pypi is in the needs list, which the server repository's
+    # template does not do, and the divergence is deliberate. The two
+    # indexes are not independent: collection/requirements.txt names
+    # shakenfist_client_k3s, so the collection is only useful once the
+    # plugin is on PyPI. Without the dependency a release whose PyPI
+    # upload failed still published to Galaxy, leaving a version public on
+    # one index and absent from the other -- and because the recovery for
+    # a failed publish is to burn the version and tag the next one, the
+    # following release would skip a collection version that is already
+    # out there. Ordering them makes "half published" mean "PyPI only",
+    # which is the half that can be fixed by publishing the other.
+    #
+    # This is a different question from whether github-release should wait
+    # for the collection, which was considered in 5f and left matching the
+    # template: that one is about which files a GitHub release carries,
+    # and nothing depends on the answer.
+    needs: [build-collection, sign-tag, publish-pypi]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, static]
+    environment: release
+
+    permissions: {}
+
+    steps:
+      # Unlike publish-pypi above, and like github-release below: no
+      # checkout, because the step that consumes the artifact is a
+      # plain "run:" invocation of ansible-galaxy executing on the
+      # runner host, not a container action, so it reads an absolute
+      # runner.temp path happily. Downloading into the per-job
+      # runner.temp is then the cheaper way to get a directory nothing
+      # else has written to, without paying for a checkout to clean
+      # one -- the same guarantee runner.temp buys the other job.
+      #
+      # The glob below matches exactly one file: build-collection
+      # uploads a single tarball. github-release's
+      # fail_on_unmatched_files guards the equivalent case there
+      # because action-gh-release treats an unmatched glob as a
+      # warning and still reports success. ansible-galaxy has no such
+      # flag, but it does not need one: "ansible-galaxy collection
+      # publish" takes exactly one path argument, and when a glob
+      # matches nothing, bash passes the literal unexpanded pattern
+      # through as that one argument. GalaxyAPI.publish_collection()
+      # checks os.path.exists() on that path before it ever uploads
+      # anything, and raises AnsibleError("... does not exist.") when
+      # it is missing -- a loud failure, not a silent success. No
+      # extra guard step is added here because there is nothing for it
+      # to catch that ansible-galaxy does not already catch itself.
+      - name: Download collection artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: collection
+          path: ${{ runner.temp }}/dist-collection/
+
+      - name: Install ansible-core
+        run: |
+          rm -rf publish-venv
+          python3 -m venv publish-venv
+          publish-venv/bin/pip3 install --upgrade pip
+          publish-venv/bin/pip3 install ansible-core
+
+      # The token arrives through env: rather than being interpolated
+      # into the script. Actions expands ${{ }} into the script text
+      # before bash sees it, so interpolating a secret writes it into the
+      # generated script file on the runner -- masked in the log, present
+      # on a persistent self-hosted disk, and the shape template
+      # injection linters flag. Every other secret in this repository's
+      # workflows already arrives this way; this step was the only one
+      # that did not.
+      - name: Publish to Ansible Galaxy
+        env:
+          ANSIBLE_GALAXY_TOKEN: ${{ secrets.ANSIBLE_GALAXY_TOKEN }}
+        run: |
+          publish-venv/bin/ansible-galaxy collection publish \
+              "${RUNNER_TEMP}"/dist-collection/*.tar.gz \
+              --api-key "${ANSIBLE_GALAXY_TOKEN}"
 
   github-release:
     name: Create GitHub Release

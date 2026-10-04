@@ -158,7 +158,7 @@ has, while a library caller's `~/.kube/config` is left alone unless it
 asks.
 
 The asymmetry is deliberate (decision 6 of
-`docs/plans/library-api-and-collection-phase-03-missing-verbs.md`).
+`docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md`).
 Both side effects run on the calling machine, not on the cluster, and a
 library whose default is to rewrite the caller's `~/.kube/config` is
 surprising: an Ansible module or a conductor reconcile loop calling
@@ -260,7 +260,7 @@ verb refused to run (`verb`); both of its messages name `sf-client k3s
 delete <name>` as the way out, because phase 3 deliberately built
 detection and teardown rather than a way to resume a half built
 cluster -- see decision 5 of
-`docs/plans/library-api-and-collection-phase-03-missing-verbs.md`. One
+`docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md`. One
 gap that decision does not close: a `create()` interrupted between
 claiming its name and writing that cluster's own metadata document
 leaves a name `delete()` reports as not found at all, with no supported

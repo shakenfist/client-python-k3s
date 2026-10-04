@@ -1,0 +1,8 @@
+---
+# Matches the core shakenfist.shakenfist collection's floor. Galaxy
+# enforces this at install time, so it is a promise rather than a hint --
+# and it is currently an untested one: the suite installs whatever
+# ansible-core the resolver picks, which is far newer. Two behaviour
+# changes inside the declared range have already turned up in this
+# collection's own tests. Tracked in shakenfist/client-python-k3s#91.
+requires_ansible: '>=2.15.0'

@@ -135,3 +135,22 @@ dmypy.json
 # commit it -- and a generated file is exactly what this list is for,
 # whether or not this project is still the thing generating it.
 shakenfist_client_k3s/_version.py
+
+# ansible-lint's working tree. ansible-compat installs the collection into
+# collection/.ansible/ so that the module resolves by its fully qualified
+# name, which means every pre-commit run leaves one behind. galaxy.yml's
+# build_ignore keeps it out of the built collection as well.
+collection/.ansible/
+
+# The same working tree, at the repository root. ansible-lint writes a
+# .ansible/ here too (a .lock, and a collections/ cache) whenever it runs
+# from the root, which is how this project invokes it. Both entries are
+# needed: .gitignore patterns containing a slash are anchored, so
+# "collection/.ansible/" does not match "/.ansible/". The root one was
+# committed once, by a "git add -A" in a commit whose tree predated the
+# entry above, which is also how the collection copy got in.
+/.ansible/
+
+# tools/build-collection.py's output, built by the build-collection job in
+# release.yml and by a local run of the script.
+dist-collection/
