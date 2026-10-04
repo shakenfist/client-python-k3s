@@ -1049,7 +1049,6 @@ class Cluster:
             instance_uuids,
             [
                 'sudo apt-get update',
-                'sudo apt-get install -y',
                 (
                     'curl -sfL https://get.k3s.io | '
                     'INSTALL_K3S_CHANNEL=%s '

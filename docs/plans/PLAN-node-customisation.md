@@ -708,7 +708,7 @@ either resolve as part of this master plan or at least be aware of
 while planning it.
 
 * `install_k3s_component()` runs a bare `sudo apt-get install -y`
-  with no package named (`cluster.py:1052`). Fixed in phase 1.
+  with no package named (`cluster.py:1052`). Fixed in phase 1, step 1a.
 
 ### Back brief
 
