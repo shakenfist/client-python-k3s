@@ -1,5 +1,7 @@
 import ast
+import collections
 import copy
+import datetime
 import io
 import json
 import os
@@ -388,7 +390,9 @@ class CreateInstallsWorkersTestCase(testtools.TestCase):
         self.addCleanup(patcher.stop)
 
         # The release lookups reach the internet, and have their own tests.
-        for target, release in [('get_k3s_release', 'stable'),
+        # A real release rather than a channel name, because create()
+        # refuses one it cannot parse (check_k3s_release()).
+        for target, release in [('get_k3s_release', 'v1.33.4+k3s1'),
                                 ('get_longhorn_release', '1.6.0')]:
             patcher = mock.patch(
                 'shakenfist_client_k3s.primitives.%s' % target,
@@ -730,10 +734,12 @@ class CreateOverInterruptedClusterTestCase(testtools.TestCase):
         # order of create()'s two guards matter.
         self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
 
-        # create() looks up the k3s release before it looks at the name.
+        # create() looks up the k3s release before it looks at the name,
+        # and checks it against K3S_RELEASE_FLOOR, so this is a release
+        # rather than a channel name.
         patcher = mock.patch(
             'shakenfist_client_k3s.primitives.get_k3s_release',
-            return_value='stable')
+            return_value='v1.33.4+k3s1')
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -972,10 +978,15 @@ class ShowReportsNodeSizesTestCase(testtools.TestCase):
         self.assertEqual(2048, cluster_module.DEFAULT_NODE_SIZE['memory'])
 
     def test_recorded_sizes_are_returned_as_stored(self):
+        # The two k3s configuration keys are stored too, as every cluster
+        # created since they existed has them, because show() fills those
+        # as well and this test is about a document with nothing to fill.
         stored = _interrupted_md(state='created')
         stored['node_sizes'] = {
             'control_plane': {'cpus': 4, 'memory': 8192, 'disk': 100},
             'worker': {'cpus': 2, 'memory': 4096, 'disk': 60}}
+        stored['server_config'] = {}
+        stored['agent_config'] = {}
         expected = copy.deepcopy(stored)
 
         shown, client = self._show(stored)
@@ -998,6 +1009,63 @@ class ShowReportsNodeSizesTestCase(testtools.TestCase):
             shown['node_sizes'])
         self.assertEqual(expected_stored, stored)
         client.set_namespace_metadata_item.assert_not_called()
+
+
+class ShowReportsK3sConfigTestCase(testtools.TestCase):
+    """show() reports both k3s configurations, as {} for clusters which never recorded them.
+
+    The same exact fill as node_sizes: a cluster created before the keys
+    existed had no way to be given a configuration, so an empty one is a
+    fact about it rather than a guess. And the same rule: nothing is
+    written back, and the cached document is not changed in place.
+    """
+
+    def _show(self, md):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {MD_KEY: md}
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        return cluster.show(), client
+
+    def test_a_cluster_without_configs_reports_empty_ones(self):
+        stored = _interrupted_md(state='created')
+        shown, client = self._show(stored)
+
+        self.assertEqual({}, shown['server_config'])
+        self.assertEqual({}, shown['agent_config'])
+        # node_sizes is filled on the same copy.
+        self.assertIn('node_sizes', shown)
+
+        client.set_namespace_metadata_item.assert_not_called()
+        self.assertNotIn('server_config', stored)
+        self.assertNotIn('agent_config', stored)
+        self.assertEqual(_interrupted_md(state='created'), stored)
+
+    def test_recorded_configs_are_returned_as_stored(self):
+        stored = _interrupted_md(state='created')
+        stored['node_sizes'] = {
+            'control_plane': {'cpus': 2, 'memory': 2048, 'disk': 50},
+            'worker': {'cpus': 2, 'memory': 2048, 'disk': 50}}
+        stored['server_config'] = {'disable': ['traefik']}
+        stored['agent_config'] = {'node-label': ['a=b']}
+        expected = copy.deepcopy(stored)
+
+        shown, client = self._show(stored)
+
+        self.assertEqual(expected, shown)
+        # Nothing to fill, so no copy either: the cached dictionary itself.
+        self.assertIs(stored, shown)
+        client.set_namespace_metadata_item.assert_not_called()
+
+    def test_one_missing_config_is_filled_alone(self):
+        stored = _interrupted_md(state='created')
+        stored['server_config'] = {'disable': ['traefik']}
+
+        shown, _ = self._show(stored)
+
+        self.assertEqual({'disable': ['traefik']}, shown['server_config'])
+        self.assertEqual({}, shown['agent_config'])
+        self.assertNotIn('agent_config', stored)
 
 
 class InterruptedClusterVerbsTestCase(testtools.TestCase):
@@ -1741,6 +1809,308 @@ class ValidateNodeSizesTestCase(testtools.TestCase):
 
     def test_none_is_refused(self):
         self._assert_refused('control_plane', 'memory', None)
+
+
+# The keys each role refuses, written out rather than read from the
+# frozensets, so that a key leaving or joining a set is a change this file
+# has to make on purpose.
+SERVER_OWNED_KEYS = (
+    'cluster-init', 'data-dir', 'https-listen-port', 'node-name', 'server',
+    'tls-san', 'token', 'token-file', 'with-node-id', 'write-kubeconfig',
+    'write-kubeconfig-mode')
+AGENT_OWNED_KEYS = (
+    'data-dir', 'node-name', 'server', 'token', 'token-file', 'with-node-id')
+
+
+class ValidateK3sConfigTestCase(testtools.TestCase):
+    """validate_k3s_config() accepts configuration it can write, and refuses the rest.
+
+    Another of create()'s checks before the name is registered, so each
+    refusal here is one a caller hears about before anything exists to
+    clean up. What it refuses is what the plugin cannot live with -- a key
+    it owns, a value the JSON metadata cannot record, text that would end
+    its own heredoc -- and nothing about whether k3s knows the key.
+    """
+
+    REALISTIC = {
+        'disable': ['traefik'],
+        'node-label': ['openstack-control-plane=enabled'],
+        'tls-san+': ['k3s.example.com'],
+        'node-taint': [],
+        'kubelet-arg': ['max-pods=250'],
+    }
+
+    def _assert_refused(self, reason, config, role='server'):
+        e = self.assertRaises(
+            exceptions.K3sConfigError, cluster_module.validate_k3s_config,
+            config, role)
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual(reason, e.reason)
+        self.assertEqual(role, e.role)
+        return e
+
+    def test_the_owned_key_sets_are_exactly_the_plans(self):
+        self.assertEqual(frozenset(SERVER_OWNED_KEYS),
+                         cluster_module.K3S_SERVER_OWNED_KEYS)
+        self.assertEqual(frozenset(AGENT_OWNED_KEYS),
+                         cluster_module.K3S_AGENT_OWNED_KEYS)
+
+    def test_an_empty_mapping_is_no_text(self):
+        for role in ('server', 'agent'):
+            self.assertEqual(
+                '', cluster_module.validate_k3s_config({}, role))
+
+    def test_none_is_an_empty_mapping(self):
+        # What an empty file and a library caller's default both produce.
+        for role in ('server', 'agent'):
+            self.assertEqual(
+                '', cluster_module.validate_k3s_config(None, role))
+
+    def test_a_realistic_mapping_is_returned_as_sorted_block_yaml(self):
+        text = cluster_module.validate_k3s_config(self.REALISTIC, 'server')
+
+        self.assertEqual(self.REALISTIC, yaml.safe_load(text))
+        self.assertEqual(
+            yaml.safe_dump(self.REALISTIC, default_flow_style=False,
+                           sort_keys=True),
+            text)
+        # Block style and sorted, so the file on the node reads the same
+        # whatever order the caller's mapping happened to be in.
+        top_level = [line.split(':')[0] for line in text.split('\n')
+                     if line and not line.startswith(('-', ' '))]
+        self.assertEqual(sorted(self.REALISTIC), top_level)
+
+    def test_a_dict_subclass_is_written_as_plain_yaml(self):
+        # yaml.safe_dump() refuses to represent an OrderedDict. The text is
+        # dumped from the JSON round trip, which is plain dicts, so a
+        # library caller's mapping type does not decide whether this works.
+        config = collections.OrderedDict([('node-label', ['a=b'])])
+        self.assertEqual(
+            'node-label:\n- a=b\n',
+            cluster_module.validate_k3s_config(config, 'agent'))
+
+    def test_a_list_is_refused(self):
+        e = self._assert_refused('not_a_mapping', ['disable', 'traefik'])
+        self.assertIn('not list', str(e))
+
+    def test_a_string_is_refused(self):
+        # What a file holding one bare line of text parses to.
+        e = self._assert_refused('not_a_mapping', 'disable traefik', 'agent')
+        self.assertIn('not str', str(e))
+
+    def test_an_integer_key_is_refused(self):
+        e = self._assert_refused('non_string_key', {1: 'x'})
+        self.assertEqual(1, e.key)
+
+    def test_a_date_value_is_refused(self):
+        # yaml.safe_load reads an unquoted 2026-10-05 as a datetime.date,
+        # which json.dumps() cannot serialise at all, so set_metadata()
+        # would fail with the name already registered.
+        value = datetime.date(2026, 10, 5)
+        e = self._assert_refused(
+            'not_representable', {'node-label': ['ok=yes'], 'kubelet-arg': value})
+        self.assertEqual('kubelet-arg', e.key)
+        self.assertIs(value, e.value)
+        self.assertIn('JSON', str(e))
+
+    def test_a_value_json_changes_is_refused(self):
+        # Serialisable, but not unchanged: JSON turns the integer key into
+        # '1', so what the metadata recorded would not be what was written.
+        e = self._assert_refused(
+            'not_representable', {'node-label': {1: 'a'}}, 'agent')
+        self.assertEqual('node-label', e.key)
+
+    def test_every_server_owned_key_is_refused_with_and_without_plus(self):
+        for key in SERVER_OWNED_KEYS:
+            for spelling in (key, key + '+'):
+                if spelling == 'tls-san+':
+                    continue
+                e = self._assert_refused('owned_key', {spelling: 'x'})
+                self.assertEqual(spelling, e.key)
+                self.assertIn(spelling, str(e))
+
+    def test_every_agent_owned_key_is_refused_with_and_without_plus(self):
+        for key in AGENT_OWNED_KEYS:
+            for spelling in (key, key + '+'):
+                e = self._assert_refused(
+                    'owned_key', {spelling: 'x'}, 'agent')
+                self.assertEqual(spelling, e.key)
+
+    def test_bare_tls_san_is_refused_and_the_message_says_what_to_write(self):
+        e = self._assert_refused('owned_key', {'tls-san': ['k3s.example.com']})
+        self.assertIn('tls-san+', str(e))
+
+    def test_tls_san_plus_is_allowed_on_a_server(self):
+        # The one '+' spelling of an owned key which is allowed: it is how
+        # a caller adds SANs to the floating address the plugin sets.
+        text = cluster_module.validate_k3s_config(
+            {'tls-san+': ['k3s.example.com']}, 'server')
+        self.assertEqual({'tls-san+': ['k3s.example.com']},
+                         yaml.safe_load(text))
+
+    def test_a_doubled_plus_is_still_an_owned_key(self):
+        # Only exactly tls-san+ is excused; anything else which strips to
+        # an owned key is that key.
+        self._assert_refused('owned_key', {'tls-san++': ['x']})
+        self._assert_refused('owned_key', {'token++': 'x'}, 'agent')
+
+    def test_ownership_is_per_role(self):
+        # write-kubeconfig-mode is a server's concern only: an agent writes
+        # no kubeconfig, and k3s ignores the key there itself.
+        self.assertNotEqual(
+            '', cluster_module.validate_k3s_config(
+                {'write-kubeconfig-mode': '0600'}, 'agent'))
+
+    def test_a_value_holding_the_delimiter_is_written_indented(self):
+        # The check is on the text that will be written, not on the input.
+        # PyYAML indents every continuation line of a value in a mapping,
+        # so the delimiter on a line of its own inside a value never
+        # reaches column zero, and refusing it would refuse configuration
+        # which can be written perfectly well.
+        config = {'node-label': 'a\n%s\nb' % cluster_module.K3S_CONFIG_DELIMITER,
+                  cluster_module.K3S_CONFIG_DELIMITER: ['x']}
+        text = cluster_module.validate_k3s_config(config, 'server')
+        self.assertNotIn(cluster_module.K3S_CONFIG_DELIMITER, text.split('\n'))
+        self.assertEqual(config, yaml.safe_load(text))
+
+    def test_text_with_a_delimiter_line_is_refused(self):
+        # No mapping makes today's PyYAML emit a line which is exactly
+        # SFK3SCONFIG (see the test above), so the check is exercised by
+        # pointing it at a line this dump does emit. That still runs the
+        # real dumper and the real comparison; only the marker differs.
+        with mock.patch.object(cluster_module, 'K3S_CONFIG_DELIMITER',
+                               '- traefik'):
+            e = self._assert_refused('delimiter_collision',
+                                     {'disable': ['traefik']})
+        self.assertEqual('- traefik', e.delimiter)
+
+    def test_an_unknown_role_is_a_programming_error(self):
+        self.assertRaises(ValueError, cluster_module.validate_k3s_config,
+                          {}, 'worker')
+
+
+class ReadK3sConfigTestCase(testtools.TestCase):
+    """read_k3s_config() reads one YAML mapping, and keeps every failure in the hierarchy."""
+
+    def setUp(self):
+        super(ReadK3sConfigTestCase, self).setUp()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.tempdir = tempdir.name
+
+    def _write_bytes(self, content, name='config.yaml'):
+        path = os.path.join(self.tempdir, name)
+        with open(path, 'wb') as f:
+            f.write(content)
+        return path
+
+    def _assert_unreadable(self, path):
+        e = self.assertRaises(
+            exceptions.K3sConfigError, cluster_module.read_k3s_config,
+            path, 'server')
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('unreadable', e.reason)
+        self.assertEqual(path, e.path)
+        self.assertIn(path, str(e))
+        return e
+
+    def test_the_mapping_is_returned_not_the_text(self):
+        path = self._write_bytes(
+            b'disable:\n- traefik\nnode-label:\n- a=b\n')
+        self.assertEqual({'disable': ['traefik'], 'node-label': ['a=b']},
+                         cluster_module.read_k3s_config(path, 'server'))
+
+    def test_an_empty_file_is_an_empty_mapping(self):
+        path = self._write_bytes(b'')
+        self.assertEqual({}, cluster_module.read_k3s_config(path, 'agent'))
+
+    def test_a_missing_file_is_refused(self):
+        self._assert_unreadable(os.path.join(self.tempdir, 'missing.yaml'))
+
+    def test_a_file_which_is_not_utf8_is_refused(self):
+        # A UnicodeDecodeError is a ValueError, not an OSError, and has to
+        # be named to stay inside the hierarchy.
+        self._assert_unreadable(self._write_bytes(b'node-label:\n- \xff\xfe\n'))
+
+    def test_invalid_yaml_is_refused(self):
+        self._assert_unreadable(self._write_bytes(b'disable: [traefik\n'))
+
+    def test_two_documents_are_refused(self):
+        # yaml.safe_load raises for a stream holding more than one
+        # document, which is a YAMLError like any other parse failure.
+        self._assert_unreadable(
+            self._write_bytes(b'disable:\n- traefik\n---\ntoken: x\n'))
+
+    def test_what_is_read_is_validated(self):
+        path = self._write_bytes(b'token: x\n')
+        e = self.assertRaises(
+            exceptions.K3sConfigError, cluster_module.read_k3s_config,
+            path, 'agent')
+        self.assertEqual('owned_key', e.reason)
+        self.assertEqual('agent', e.role)
+
+    def test_a_file_holding_a_list_is_refused_as_not_a_mapping(self):
+        path = self._write_bytes(b'- disable\n- traefik\n')
+        e = self.assertRaises(
+            exceptions.K3sConfigError, cluster_module.read_k3s_config,
+            path, 'server')
+        self.assertEqual('not_a_mapping', e.reason)
+
+
+class CheckK3sReleaseTestCase(testtools.TestCase):
+    """check_k3s_release() refuses anything older than v1.21.1, and anything it cannot read.
+
+    v1.21.0 is the boundary worth pinning: it reads drop-in files but not
+    the '+' suffix, so a cluster built on it would take tls-san+ and
+    disable+ as keys with other names and say nothing.
+    """
+
+    def test_the_floor_is_v1_21_1(self):
+        self.assertEqual((1, 21, 1), cluster_module.K3S_RELEASE_FLOOR)
+
+    def test_supported_releases_are_accepted(self):
+        for release in ('v1.21.1+k3s1', 'v1.36.5+k3s1', 'v2.0.0+k3s1'):
+            self.assertIsNone(
+                cluster_module.check_k3s_release(release, 'stable'))
+
+    def _assert_too_old(self, release, channel):
+        e = self.assertRaises(
+            exceptions.UnsupportedReleaseError,
+            cluster_module.check_k3s_release, release, channel)
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('too_old', e.reason)
+        self.assertEqual(release, e.release)
+        self.assertEqual(channel, e.channel)
+        self.assertEqual((1, 21, 1), e.floor)
+        self.assertIn(release, str(e))
+        self.assertIn(channel, str(e))
+        self.assertIn('v1.21.1', str(e))
+        return e
+
+    def test_v1_21_0_is_refused(self):
+        self._assert_too_old('v1.21.0+k3s1', 'v1.21')
+
+    def test_the_last_v1_20_is_refused(self):
+        self._assert_too_old('v1.20.15+k3s1', 'v1.20')
+
+    def test_a_release_candidate_is_compared_by_its_numbers(self):
+        # What the testing channel has resolved to.
+        self._assert_too_old('v1.18.2-rc3+k3s1', 'testing')
+
+    def test_a_channel_name_is_unparseable(self):
+        e = self.assertRaises(
+            exceptions.UnsupportedReleaseError,
+            cluster_module.check_k3s_release, 'stable', 'stable')
+        self.assertEqual('unparseable', e.reason)
+        self.assertEqual('stable', e.release)
+        self.assertIsNone(e.floor)
+        self.assertIn("'stable'", str(e))
+
+    def test_none_is_unparseable(self):
+        e = self.assertRaises(
+            exceptions.UnsupportedReleaseError,
+            cluster_module.check_k3s_release, None, 'stable')
+        self.assertEqual('unparseable', e.reason)
 
 
 class ManifestHeredocTestCase(testtools.TestCase):

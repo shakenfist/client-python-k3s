@@ -85,7 +85,9 @@ class LibraryTestCase(testtools.TestCase):
         # The release lookups are namespace scoped functions with their own
         # tests, and left real they would both reach the internet and write
         # a version cache into the namespace metadata these tests assert on.
-        for target, release in [('get_k3s_release', 'stable'),
+        # A real release rather than a channel name, because create()
+        # refuses one it cannot parse (check_k3s_release()).
+        for target, release in [('get_k3s_release', 'v1.33.4+k3s1'),
                                 ('get_longhorn_release', '1.6.0')]:
             patcher = mock.patch(
                 'shakenfist_client_k3s.primitives.%s' % target,
@@ -559,6 +561,100 @@ class NodeSizingTestCase(LibraryTestCase):
             self.client.instance_sizes[-1])
 
 
+class K3sConfigTestCase(LibraryTestCase):
+    """create() records both k3s configurations, and refuses a bad one or an old release first.
+
+    The refusals are NodeSizingTestCase's claim again, for two more checks:
+    a configuration validate_k3s_config() refuses, and a release older
+    than K3S_RELEASE_FLOOR, must each raise before the name is registered,
+    or the caller is left with a claimed name and a metadata document
+    stuck in 'initial'. The release check is the one worth reading
+    closely, because it cannot sit with the others at the top of create():
+    it needs the resolved release, so it has to sit between the lookup
+    and the registration.
+
+    As in NodeSizingTestCase, the recording is asserted against the stored
+    document rather than through show(), which fills both keys in when they
+    are absent.
+    """
+
+    SERVER = {'disable': ['traefik'],
+              'node-label': ['openstack-control-plane=enabled']}
+    AGENT = {'node-label': ['openstack-compute-node=enabled',
+                            'openvswitch=enabled']}
+
+    def _stored(self):
+        return self.client.metadata[MD_KEY]
+
+    def _assert_refused_before_anything_is_built(self, exception, **kwargs):
+        e = self.assertRaises(
+            exception, self._cluster().create, 1, 1, 1, **kwargs)
+
+        self.assertEqual(
+            [], self.client.calls,
+            'the cluster was registered or an instance created before the '
+            'refusal')
+        self.assertEqual({}, self.client.metadata)
+        self.assertEqual([], self.client.allocated_networks)
+        self.assertEqual({}, self.client.instances)
+        self.assertEqual([], self.client.executed)
+        return e
+
+    def test_an_owned_server_key_registers_nothing(self):
+        e = self._assert_refused_before_anything_is_built(
+            exceptions.K3sConfigError,
+            server_config={'disable': ['traefik'], 'cluster-init': False})
+        self.assertEqual('owned_key', e.reason)
+        self.assertEqual('server', e.role)
+        self.assertEqual('cluster-init', e.key)
+
+    def test_an_owned_agent_key_registers_nothing(self):
+        e = self._assert_refused_before_anything_is_built(
+            exceptions.K3sConfigError,
+            server_config=self.SERVER, agent_config={'node-name': 'w'})
+        self.assertEqual('owned_key', e.reason)
+        self.assertEqual('agent', e.role)
+        self.assertEqual('node-name', e.key)
+
+    def test_a_release_below_the_floor_registers_nothing(self):
+        with mock.patch('shakenfist_client_k3s.primitives.get_k3s_release',
+                        return_value='v1.20.15+k3s1'):
+            e = self._assert_refused_before_anything_is_built(
+                exceptions.UnsupportedReleaseError, release_channel='v1.20')
+        self.assertEqual('too_old', e.reason)
+        self.assertEqual('v1.20.15+k3s1', e.release)
+        self.assertEqual('v1.20', e.channel)
+
+    def test_both_configs_are_recorded(self):
+        self._cluster().create(1, 1, 1, server_config=self.SERVER,
+                               agent_config=self.AGENT)
+
+        self.assertEqual('created', self._stored()['state'])
+        self.assertEqual(self.SERVER, self._stored()['server_config'])
+        self.assertEqual(self.AGENT, self._stored()['agent_config'])
+
+    def test_a_default_create_records_empty_configs(self):
+        # Recorded, not left to show()'s fill: a default create is a
+        # cluster created after these keys existed like any other.
+        self._cluster().create(1, 1, 1)
+
+        self.assertEqual({}, self._stored()['server_config'])
+        self.assertEqual({}, self._stored()['agent_config'])
+
+    def test_the_configs_are_recorded_before_anything_is_built(self):
+        # As node_sizes is: a create which dies before its first instance
+        # still describes what it was building.
+        with mock.patch.object(Cluster, 'create_and_await_instances',
+                               side_effect=RuntimeError('boom')):
+            self.assertRaises(RuntimeError, self._cluster().create, 1, 1, 1,
+                              server_config=self.SERVER,
+                              agent_config=self.AGENT)
+
+        self.assertEqual('initial', self._stored()['state'])
+        self.assertEqual(self.SERVER, self._stored()['server_config'])
+        self.assertEqual(self.AGENT, self._stored()['agent_config'])
+
+
 class ClusterAccessorTestCase(testtools.TestCase):
     """show() and get_kubeconfig(), which return rather than print."""
 
@@ -569,13 +665,16 @@ class ClusterAccessorTestCase(testtools.TestCase):
                        reporter=progress.CollectingReporter())
 
     def test_show_returns_the_metadata(self):
-        # node_sizes is stored here because it is the one key show() fills
-        # in when it is absent, which is not what this test is about; the
-        # fill is ShowReportsNodeSizesTestCase's, in tests/test_cluster.py.
+        # node_sizes, server_config and agent_config are stored here
+        # because they are the keys show() fills in when they are absent,
+        # which is not what this test is about; the fills are
+        # ShowReportsNodeSizesTestCase's and ShowReportsK3sConfigTestCase's,
+        # in tests/test_cluster.py.
         md = {'name': 'banana', 'state': 'created',
               'node_sizes': {
                   'control_plane': {'cpus': 2, 'memory': 2048, 'disk': 50},
-                  'worker': {'cpus': 2, 'memory': 2048, 'disk': 50}}}
+                  'worker': {'cpus': 2, 'memory': 2048, 'disk': 50}},
+              'server_config': {}, 'agent_config': {}}
         self.assertEqual(md, self._cluster({MD_KEY: md}).show())
 
     def test_show_raises_for_an_unknown_cluster(self):
