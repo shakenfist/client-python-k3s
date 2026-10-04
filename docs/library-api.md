@@ -145,8 +145,8 @@ once per file. So do the six sizing arguments, `control_plane_cpus`,
 `control_plane_memory`, `control_plane_disk`, `worker_cpus`,
 `worker_memory` and `worker_disk`, which are vCPUs, MB and GB
 respectively and default to 2, 2048 and 50; see its docstring in
-`cluster.py` for the full signature. See `docs/usage.md` for what each command does; this page
-does not restate it.
+`cluster.py` for the full signature. See `docs/usage.md` for what each
+command does; this page does not restate it.
 
 ### Kubeconfig side effects default off in the library
 

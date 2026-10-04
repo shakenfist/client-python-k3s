@@ -323,6 +323,22 @@ class ExpandWorkersTestCase(testtools.TestCase):
         self.assertNotIn('node_sizes', cluster.get_metadata())
         self.assertEqual([(2, 2048, 50)], self._built_sizes(cluster))
 
+    def test_a_partial_record_falls_back_per_field(self):
+        # The plugin never writes this shape -- create() records every
+        # field for both roles -- but namespace metadata can be edited by
+        # anything with the namespace's credentials. A recorded field is
+        # used, a missing one comes from the default, and a missing role
+        # is the default whole, rather than a KeyError mid-expand.
+        cluster, _ = self._expand(
+            ['uuid-w-001'], 1,
+            [{'uuid': 'uuid-w-002', 'name': 'k3s-banana-node-002'}],
+            node_sizes={'worker': {'cpus': 4}})
+
+        self.assertEqual([(4, 2048, 50)], self._built_sizes(cluster))
+        self.assertEqual(
+            {'cpus': 2, 'memory': 2048, 'disk': 50},
+            cluster._node_size(cluster.get_metadata(), 'control_plane'))
+
 
 class CreateInstallsWorkersTestCase(testtools.TestCase):
     """Creating a cluster installs k3s on every worker it just created.
@@ -965,6 +981,22 @@ class ShowReportsNodeSizesTestCase(testtools.TestCase):
         shown, client = self._show(stored)
 
         self.assertEqual(expected, shown)
+        client.set_namespace_metadata_item.assert_not_called()
+
+    def test_a_partial_record_is_reported_as_expand_would_build_it(self):
+        # Not a shape the plugin writes; see _node_size(). show() reports
+        # what expand-workers would build, and still writes nothing.
+        stored = _interrupted_md(state='created')
+        stored['node_sizes'] = {'worker': {'cpus': 4}}
+        expected_stored = copy.deepcopy(stored)
+
+        shown, client = self._show(stored)
+
+        self.assertEqual(
+            {'control_plane': {'cpus': 2, 'memory': 2048, 'disk': 50},
+             'worker': {'cpus': 4, 'memory': 2048, 'disk': 50}},
+            shown['node_sizes'])
+        self.assertEqual(expected_stored, stored)
         client.set_namespace_metadata_item.assert_not_called()
 
 

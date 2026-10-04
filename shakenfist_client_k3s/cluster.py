@@ -306,6 +306,11 @@ def validate_node_sizes(sizes):
     A pure function, like read_manifests(), so that it can be tested
     without a client and so that create() can call it before it has talked
     to the API at all.
+
+    It checks the values it is given and not the shape they come in: a
+    missing role or field is not reported. Its one caller, create(), always
+    builds the complete mapping, so there is nothing to catch today; a new
+    caller handing it something partial has to check the shape itself.
     """
     for role, size in sizes.items():
         for field, value in size.items():
@@ -483,10 +488,18 @@ class Cluster:
         one at any other size, so an expand-workers on such a cluster builds
         exactly what its create did.
 
+        The fallback is per field rather than per role. The plugin only
+        ever records all three fields for both roles, but namespace
+        metadata is editable by anything holding the namespace's
+        credentials, and a role recorded without one of its fields would
+        otherwise be a bare KeyError from the middle of an expand-workers.
+        Filling the gap from the default is the same answer this method
+        gives for a cluster with no record at all.
+
         A copy, so that a caller which adjusts what it is handed changes
         neither the cached metadata nor the module's default.
         """
-        return dict(md.get('node_sizes', {}).get(node_type, DEFAULT_NODE_SIZE))
+        return dict(DEFAULT_NODE_SIZE, **md.get('node_sizes', {}).get(node_type, {}))
 
     def create_instance(self, node_type):
         """Create one node of node_type, sized as this cluster records for that role.
@@ -1416,12 +1429,14 @@ class Cluster:
         # The node sizes are checked here for the same reason, and the
         # placement matters more than it looks. The name is registered in
         # the cluster list a few lines below, and the metadata document
-        # written in state 'initial' shortly after; a size the API refuses
-        # once those exist -- or one it accepts and should not have, like
-        # cpus=True -- leaves a claimed name and a document stuck in
-        # 'initial' that only a delete clears. Moving this one line later
-        # turns a typo into that, which is what
-        # test_an_invalid_size_registers_nothing pins.
+        # written in state 'initial' shortly after; a size which can never
+        # be valid (zero, a string, True) discovered once those exist
+        # leaves a claimed name and a document stuck in 'initial' that only
+        # a delete clears. Moving this one line later turns a typo into
+        # that, which is what test_an_invalid_size_registers_nothing pins.
+        # This is not a check of what Shaken Fist will accept: a valid size
+        # the API still refuses, for quota or because no hypervisor has the
+        # room, fails mid-create, as any other API refusal there does.
         staged_manifests = read_manifests(manifests)
         node_sizes = {
             'control_plane': {
@@ -1755,9 +1770,12 @@ class Cluster:
         stored document is neither changed nor rewritten -- which is why
         the fill is on a deep copy rather than on the cached dictionary.
 
-        When the key is present it is returned as stored, and the metadata
-        is the cached dictionary itself, exactly as it was before this key
-        existed.
+        A record which is present but partial -- which the plugin never
+        writes, but anything holding the namespace's credentials could -- is
+        completed per field in the same way, for the same reason: it is
+        what expand-workers would build. When the record is complete it is
+        returned as stored, and the metadata is the cached dictionary
+        itself, exactly as it was before this key existed.
         """
         md = self.get_metadata()
         if not md:
@@ -1772,14 +1790,17 @@ class Cluster:
                 % (self.name, interrupted, self.name))
 
         # Filled through _node_size() rather than from DEFAULT_NODE_SIZE
-        # directly, so that what show reports for an old cluster and what
-        # create_instance() builds for it come from the same line.
-        if 'node_sizes' not in md:
+        # directly, so that what show reports and what create_instance()
+        # builds come from the same line -- for an old cluster with no
+        # record, and for a record somebody else left partial, which
+        # _node_size() completes per field.
+        node_sizes = {
+            node_type: self._node_size(md, node_type)
+            for node_type in ('control_plane', 'worker')
+        }
+        if md.get('node_sizes') != node_sizes:
             md = copy.deepcopy(md)
-            md['node_sizes'] = {
-                node_type: self._node_size(md, node_type)
-                for node_type in ('control_plane', 'worker')
-            }
+            md['node_sizes'] = node_sizes
 
         return md
 
