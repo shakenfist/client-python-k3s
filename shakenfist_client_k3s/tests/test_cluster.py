@@ -2089,6 +2089,166 @@ def _control_plane_and_metallb_commands():
     return [commandline for _, commandline in client.executed]
 
 
+class SecretRedactionTestCase(testtools.TestCase):
+    """The node token must not survive into an error message.
+
+    install_k3s_component() has to put K3S_TOKEN= on the command line,
+    because that is how the k3s installer is told which cluster to join.
+    The Shaken Fist API echoes the submitted command line back in
+    commands[0]['commandline'], so a worker install which exits non-zero
+    hands the cluster's node token to CommandFailedError -- and from there
+    to stderr, to an Ansible play's registered variables, and to a public
+    CI job log. A transient apt failure is enough to trigger it.
+
+    The command line these tests feed to reap_execute() is the real one,
+    built by the real install_k3s_component(), so that a future change to
+    the installer template which named the credential differently would
+    fail here rather than silently stop being redacted.
+    """
+
+    TOKEN = 'K10SECRETNODETOKEN::server:ffffffff'
+
+    def _install_commandline(self):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {MD_KEY: {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'k3s_version': 'v1.33', 'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1']}}
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        with mock.patch.object(Cluster, 'execute_and_await') as ea:
+            cluster.install_k3s_component(['inst-w1'], self.TOKEN, 'agent')
+        commands = list(ea.call_args[0][1])
+
+        installs = [c for c in commands if 'K3S_TOKEN=' in c]
+        self.assertEqual(1, len(installs), commands)
+        # The premise: the real command line does carry the token. Without
+        # this the rest of the test would pass against a template which
+        # had stopped including it, proving nothing.
+        self.assertIn(self.TOKEN, installs[0])
+        return installs[0]
+
+    def _failed_op(self, commandline, state='complete', return_code=1):
+        return {
+            'uuid': 'aop-100',
+            'instance_uuid': 'inst-w1',
+            'state': state,
+            'commands': [{'command': 'execute', 'commandline': commandline}],
+            'results': {'0': {'return-code': return_code,
+                              'stdout': 'running %s\n' % commandline,
+                              'stderr': 'E: Unable to fetch some archives'}}
+        }
+
+    def test_a_failed_install_does_not_report_the_node_token(self):
+        commandline = self._install_commandline()
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'k3s-banana-node-002'}
+        cluster = _make_cluster(client)
+
+        e = self.assertRaises(exceptions.CommandFailedError,
+                              cluster.reap_execute,
+                              self._failed_op(commandline))
+
+        self.assertNotIn(self.TOKEN, str(e))
+        self.assertIn('K3S_TOKEN=%s' % progress.REDACTED, str(e))
+        # The rest of the command line is what makes the message useful,
+        # so redaction must not have eaten it.
+        self.assertIn('INSTALL_K3S_CHANNEL=', str(e))
+        self.assertIn('E: Unable to fetch some archives', str(e))
+
+    def test_the_stored_attributes_carry_no_token_either(self):
+        """Not only __str__, because the attributes are the public surface."""
+        commandline = self._install_commandline()
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'k3s-banana-node-002'}
+        cluster = _make_cluster(client)
+
+        e = self.assertRaises(exceptions.CommandFailedError,
+                              cluster.reap_execute,
+                              self._failed_op(commandline))
+
+        self.assertNotIn(self.TOKEN, e.commandline)
+        self.assertNotIn(self.TOKEN, e.stdout)
+        self.assertNotIn(self.TOKEN, e.stderr)
+
+    def test_an_agent_operation_error_does_not_report_the_node_token(self):
+        """The other rendering site: a state which did not run the command."""
+        commandline = self._install_commandline()
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'k3s-banana-node-002'}
+        cluster = _make_cluster(client)
+
+        e = self.assertRaises(
+            exceptions.AgentOperationError, cluster.reap_execute,
+            self._failed_op(commandline, state='expired', return_code=0))
+
+        self.assertNotIn(self.TOKEN, str(e))
+        self.assertNotIn(self.TOKEN, e.command_description)
+        self.assertNotIn(self.TOKEN, json.dumps(e.results))
+        self.assertIn('K3S_TOKEN=%s' % progress.REDACTED,
+                      e.command_description)
+
+    def test_delete_does_not_debug_log_the_cluster_secrets(self):
+        """delete() dumps the metadata document, so it has to redact it.
+
+        sf_k3s_cluster.py leaves its reporter non-verbose and calls that a
+        security property because of this loop, which makes the property
+        hold only for as long as one caller remembers a flag. -v is also
+        exactly the flag somebody adds when a delete is failing, which is
+        when the output gets pasted into a bug report.
+        """
+        md = _interrupted_md(state='created',
+                             control_plane_nodes=['inst-001'])
+        md['node_token'] = 'SECRET-NODE-TOKEN'
+        md['server_token'] = 'SECRET-SERVER-TOKEN'
+        md['kubeconfig'] = 'apiVersion: v1\nSECRET-KUBECONFIG\n'
+        md['ssh_key'] = 'ssh-rsa SECRET-SSH-KEY'
+
+        client = ActionLogClient()
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        client.metadata[MD_KEY] = md
+        client.instances['inst-001'] = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        reporter = progress.CollectingReporter(verbose=True)
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            Cluster(client, 'banana', 'testns', reporter=reporter).delete()
+
+        out = reporter.getvalue()
+        for secret in ('SECRET-NODE-TOKEN', 'SECRET-SERVER-TOKEN',
+                       'SECRET-KUBECONFIG', 'SECRET-SSH-KEY'):
+            self.assertNotIn(secret, out)
+        for key in cluster_module.SECRET_METADATA_KEYS:
+            self.assertIn('%s = %s' % (key, progress.REDACTED), out)
+
+        # The point of a debug dump is the rest of the document, which
+        # must still be there for it to be worth having.
+        self.assertIn('node_network = net-1', out)
+        self.assertIn('state = created', out)
+
+    def test_an_absent_secret_is_not_reported_as_redacted(self):
+        """A None token is not a secret being hidden, and saying so misleads."""
+        client = ActionLogClient()
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        client.metadata[MD_KEY] = _interrupted_md()
+        reporter = progress.CollectingReporter(verbose=True)
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            Cluster(client, 'banana', 'testns', reporter=reporter).delete()
+
+        self.assertIn('node_token = None', reporter.getvalue())
+
+    def test_progress_output_during_the_install_carries_no_token(self):
+        """await_idle() describes what it is waiting on, from the same text."""
+        commandline = self._install_commandline()
+        aop = self._failed_op(commandline, return_code=0)
+        aop['results'] = {}
+
+        self.assertNotIn(self.TOKEN,
+                         progress.describe_agent_op(aop, max_len=None))
+
+
 class HeredocDelimiterTestCase(testtools.TestCase):
     """Every heredoc this module generates has a quoted delimiter.
 

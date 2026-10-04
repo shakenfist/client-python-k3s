@@ -289,9 +289,20 @@ pass through Ansible's own variable and logging machinery.
 progress output collected rather than printed -- useful for debugging
 a create that failed partway through -- and carries no more secret
 material than the cluster's own progress announcements already do
-(none; `verbose` is left off for exactly this reason, since a `create()`
-or `delete()` run at debug level does log the whole metadata document,
-secrets included).
+(none; `verbose` is left off as a second line of defence, since a
+`create()` or `delete()` run at debug level logs the whole metadata
+document with its secret values replaced by `<redacted>`).
+
+`msg` is covered too, which takes more than `no_log` to arrange. The
+`key` parameter is `no_log`, so Ansible's own scrubbing removes it from
+anything this module returns -- but the cluster's k3s node token is not
+a module parameter, and an agent command has to carry it on its command
+line for the k3s installer to join the right cluster. A worker install
+which exits non-zero therefore used to put that command line, token and
+all, into the failure message. The library now redacts secret
+environment assignments inside the two exceptions which report a failed
+agent command, so no raiser or caller has to remember; see
+`progress.redact_command_line()`.
 
 ## See also
 

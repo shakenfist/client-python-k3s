@@ -1,3 +1,4 @@
+import re
 import shutil
 import sys
 import time
@@ -27,6 +28,69 @@ def count_str(count, noun):
     return '%d %ss' % (count, noun)
 
 
+# The names of environment variable assignments whose values are secrets
+# when they appear on a command line this package builds. Agent commands
+# run through a shell on the guest, so a credential the command needs has
+# to be in the command line -- and the API echoes that command line back,
+# which is how it reaches an exception message. Adding a name here is the
+# whole of what is needed to cover a new credential; nothing else has to
+# be found and changed.
+SECRET_ENVIRONMENT_NAMES = ('K3S_TOKEN',)
+
+REDACTED = '<redacted>'
+
+# A value, as it appears on a command line: a run of non-whitespace,
+# except that a quoted section may contain whitespace. That covers both
+# forms shlex.quote() produces -- a bare word when the value needs no
+# quoting, which is what a k3s token normally is, and a single quoted
+# string when it does, including the '"'"' idiom shlex uses for an
+# embedded quote, where the three adjacent quoted sections match in turn.
+# Written as two literals so that neither quote character needs escaping.
+_VALUE_RE = "(?:'[^']*'" '|"[^"]*"' r"|[^\s])*"
+
+# One assignment, matched from the name to the end of its value. The
+# lookbehind is so that SOME_OTHER_K3S_TOKEN is left alone rather than
+# rewritten as SOME_OTHER_<redacted>.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r'(?<![A-Za-z0-9_])(%s)=%s'
+    % ('|'.join(SECRET_ENVIRONMENT_NAMES), _VALUE_RE))
+
+
+def redact_command_line(text):
+    """Replace the value of every secret environment assignment in text.
+
+    Called from AgentOperationError and CommandFailedError's constructors
+    and from describe_agent_op(), rather than from the places which raise
+    or print, so that the dangerous text is never stored in the first
+    place and a rendering site added later cannot forget to ask. That is
+    the same reasoning the two shell rules at the top of cluster.py are
+    stated under: a rule, because the next reader cannot be expected to
+    re-derive which values are attacker reachable.
+
+    Non-string input is returned unchanged, because the fields this is
+    applied to are whatever the API put in them.
+    """
+    if not isinstance(text, str):
+        return text
+    return _SECRET_ASSIGNMENT_RE.sub(r'\1=' + REDACTED, text)
+
+
+def redact_structure(value):
+    """Apply redact_command_line() through a nested dict or list of strings.
+
+    Agent operation results are a dict of per command stdout and stderr,
+    so a command which echoes its own invocation -- a shell started with
+    set -x, an installer printing what it is about to run -- puts the
+    credential in there too. Walking the structure costs a line and
+    removes the need to reason about what any particular installer prints.
+    """
+    if isinstance(value, dict):
+        return dict((k, redact_structure(v)) for k, v in value.items())
+    if isinstance(value, list):
+        return [redact_structure(v) for v in value]
+    return redact_command_line(value)
+
+
 def describe_agent_op(aop, max_len=60):
     """Return a short human readable description of the command an agent operation is up to."""
     commands = aop.get('commands', [])
@@ -44,6 +108,13 @@ def describe_agent_op(aop, max_len=60):
         desc = c.get('command', 'unknown')
         if c.get('path'):
             desc += ' %s' % c['path']
+
+    # Before the first line and length reductions below, so that what they
+    # shorten is already safe to show. await_idle() passes the default
+    # max_len, which happens to truncate before the token in the one
+    # command line that carries one -- a margin nothing states or tests,
+    # and _agent_op_error() disables it with max_len=None anyway.
+    desc = redact_command_line(desc)
 
     # Multi-line commands (for example heredocs) would break the one line
     # per item status display, so describe them by their first line.

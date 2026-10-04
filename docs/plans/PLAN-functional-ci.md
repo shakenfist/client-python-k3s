@@ -192,14 +192,13 @@ because the following statements will be true:
   (shakenfist/shakenfist#3661) would make deployment CI logs
   far more diagnosable.
 * Teach `k3s show` to honour the client's `--json` output flag,
-  redacting secret metadata keys (`node_token`, `kubeconfig`,
-  `ssh_key`). That gives the CI assertions a stable format to
-  parse instead of grepping the human output, and stops
-  interactive `show` printing cluster admin credentials.
-* Redact the node token from the command line
-  `primitives.reap_execute()` echoes when an agent operation
-  fails; today a failed worker install prints `K3S_TOKEN=...` to
-  the log.
+  redacting secret metadata keys (`node_token`, `server_token`,
+  `kubeconfig`, `ssh_key`). That gives the CI assertions a stable
+  format to parse instead of grepping the human output, and stops
+  interactive `show` printing cluster admin credentials. The key
+  set to redact is `cluster.SECRET_METADATA_KEYS`, which `delete()`
+  already uses; this list used to omit `server_token`, which the
+  metadata also holds.
 
 ### Bugs fixed during this work
 

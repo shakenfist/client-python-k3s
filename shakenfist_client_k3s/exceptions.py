@@ -15,8 +15,9 @@ rather than stdout because ``get-kubeconfig`` and the ``--json`` outputs
 put machine readable text on stdout, and an error printed there is text a
 pipeline would parse. Because
 ``shakenfist_client_k3s`` is imported unconditionally by the ``sf-client``
-plugin loader, this module must import nothing beyond the standard
-library.
+plugin loader, this module must import nothing beyond the standard library
+and siblings which do the same -- ``progress``, for the redaction two of
+these classes apply to the command text they are handed.
 
 ``K3sClusterException`` deliberately does not subclass anything from
 ``shakenfist_client.apiclient``: the parent CLI's ``GroupCatchExceptions``
@@ -26,6 +27,8 @@ hierarchy must not be caught by that machinery.
 """
 
 import json
+
+from shakenfist_client_k3s import progress
 
 
 class K3sClusterException(Exception):
@@ -617,6 +620,14 @@ class AgentOperationError(K3sClusterException):
     fixed "no results were recorded" line is rendered instead of a JSON
     dump.
 
+    ``command_description`` and ``results`` are redacted on the way in,
+    not on the way out: an agent command carries a credential when the
+    command needs one, the API echoes the command line back, and the
+    agent's own stdout may repeat it. Redacting in the constructor means
+    no raiser has to remember and nothing dangerous is ever stored, so a
+    rendering site added later is covered by construction. See
+    ``progress.redact_command_line()``.
+
     ``state`` is the operation state which brought us here, and is
     rendered only when it is not ``error``. That keeps the message
     byte for byte what it was for the case which has always raised this,
@@ -631,8 +642,9 @@ class AgentOperationError(K3sClusterException):
         self.instance_name = instance_name
         self.instance_uuid = instance_uuid
         self.operation_uuid = operation_uuid
-        self.command_description = command_description
-        self.results = results
+        self.command_description = progress.redact_command_line(
+            command_description)
+        self.results = progress.redact_structure(results)
         self.state = state
         super(AgentOperationError, self).__init__(instance_name)
 
@@ -661,18 +673,23 @@ class CommandFailedError(K3sClusterException):
 
     Raised by ``Cluster.reap_execute()`` from its return-code check, as
     distinct from its agent operation state check, which raises
-    ``AgentOperationError``. ``stdout`` and ``stderr`` are the raw
-    strings from the agent operation's results; ``__str__`` re-joins each
+    ``AgentOperationError``. ``stdout`` and ``stderr`` are the strings
+    from the agent operation's results; ``__str__`` re-joins each
     on its own prefixed line exactly as the original ``print()`` calls did.
+
+    ``commandline``, ``stdout`` and ``stderr`` are redacted on the way in,
+    for the reason ``AgentOperationError`` gives: this is the exception a
+    failed k3s install raises, and the command line the API echoes back
+    carries the cluster's node or server token.
     """
 
     def __init__(self, instance_name, instance_uuid, commandline, return_code, stdout, stderr):
         self.instance_name = instance_name
         self.instance_uuid = instance_uuid
-        self.commandline = commandline
+        self.commandline = progress.redact_command_line(commandline)
         self.return_code = return_code
-        self.stdout = stdout
-        self.stderr = stderr
+        self.stdout = progress.redact_command_line(stdout)
+        self.stderr = progress.redact_command_line(stderr)
         super(CommandFailedError, self).__init__(instance_name)
 
     def __str__(self):

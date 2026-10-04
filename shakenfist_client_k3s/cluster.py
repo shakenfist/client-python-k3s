@@ -48,6 +48,16 @@ from shakenfist_client_k3s import progress
 # document per cluster.
 METADATA_KEY = 'orchestrated_k3s_cluster_%s'
 
+# The keys in that document whose values are credentials. node_token
+# registers an agent, which is scheduling rights on the cluster;
+# server_token joins a control plane node, which is cluster admin;
+# kubeconfig carries a cluster-admin client certificate and key; ssh_key
+# is whatever the cluster was built with. Named here rather than at each
+# site which must not print them, so that a site added later has
+# somewhere to ask rather than a list to rediscover.
+SECRET_METADATA_KEYS = ('node_token', 'server_token', 'kubeconfig',
+                        'ssh_key')
+
 BASE_OS_VERSION = 'debian:12'
 
 # The size every node is built at unless create() is told otherwise, per
@@ -2006,9 +2016,18 @@ class Cluster:
                 'finished being built.\nRemoving whatever it did create.\n'
                 % (self.name, interrupted))
 
+        # Redacted here rather than relied on not being reached. The
+        # Ansible module leaves its reporter non-verbose and calls that a
+        # security property because of this loop, which makes a security
+        # property that holds only while one caller remembers a flag; and
+        # -v is exactly the flag somebody adds when a delete is failing,
+        # which is also when they paste the output into a bug report.
         self.reporter.debug('Cluster metadata:')
         for k in md:
-            self.reporter.debug('    %s = %s' % (k, md[k]))
+            if k in SECRET_METADATA_KEYS and md[k] is not None:
+                self.reporter.debug('    %s = %s' % (k, progress.REDACTED))
+            else:
+                self.reporter.debug('    %s = %s' % (k, md[k]))
 
         # Delete instances
         waiting = []
