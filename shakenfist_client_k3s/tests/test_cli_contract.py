@@ -83,3 +83,20 @@ class CliContractTestCase(testtools.TestCase):
     def test_subcommand_help(self):
         for name in SUBCOMMANDS:
             self._assert_help_matches([name, '--help'], '%s.txt' % name)
+
+    def test_subcommands_is_the_group(self):
+        """SUBCOMMANDS is a literal, so something has to tie it to the group.
+
+        Adding a command without adding its fixture does fail today, but
+        indirectly: the group's own --help changes, so test_group_help
+        fails against group.txt and the author has to read the class
+        docstring to work out what else is missing. This says it instead.
+
+        It is also what registers the commands: every one of them is
+        registered by its @k3s.command() decorator, and eleven trailing
+        k3s.add_command() calls which re-registered what the decorator had
+        already added have been removed. getconfig never had one and was
+        always in the group, which is how they were found.
+        """
+        self.assertEqual(sorted(SUBCOMMANDS),
+                         sorted(shakenfist_client_k3s.k3s.commands))

@@ -147,9 +147,6 @@ def k3s_list(ctx, namespace=None, ):
         print(cluster)
 
 
-k3s.add_command(k3s_list)
-
-
 @k3s.command(name='create', help='Create a new k3s cluster')
 @click.argument('name', type=click.STRING)
 @click.option('--control-plane-count', type=click.INT,
@@ -240,9 +237,6 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
              worker_disk=worker_disk)
 
 
-k3s.add_command(k3s_create)
-
-
 @k3s.command(name='query-k3s-version',
              help='Lookup the current version for a k3s release channel')
 @click.argument('release_channel', type=click.STRING)
@@ -266,9 +260,6 @@ def k3s_query_k3s_version(ctx, release_channel=None, namespace=None,
           'latest version.')
 
 
-k3s.add_command(k3s_query_k3s_version)
-
-
 @k3s.command(name='query-longhorn-version',
              help='Lookup the current longhorn version')
 @click.option('--namespace', type=click.STRING,
@@ -287,9 +278,6 @@ def k3s_query_longhorn_version(ctx, namespace=None, refresh_version_cache=False)
     # caller calls primitives.get_longhorn_release() and gets
     # target_release.
     print(f'Longhorn has {target_release} as its latest version.')
-
-
-k3s.add_command(k3s_query_longhorn_version)
 
 
 @k3s.command(name='getconfig', help='Get kubeconfig for an existing k3s cluster')
@@ -321,9 +309,6 @@ def k3s_show(ctx, name=None, namespace=None):
     print('Cluster metadata:')
     for k in md:
         print('    %s = %s' % (k, md[k]))
-
-
-k3s.add_command(k3s_show)
 
 
 @k3s.command(name='health', help='Report the health of a k3s cluster')
@@ -421,9 +406,6 @@ def _render_health(out, report):
     out.flush()
 
 
-k3s.add_command(k3s_health)
-
-
 @k3s.command(name='delete', help='Destroy a k3s cluster')
 @click.argument('name', type=click.STRING)
 @click.option('--namespace', type=click.STRING,
@@ -440,9 +422,6 @@ def k3s_delete(ctx, name=None, namespace=None, kubeconfig=True):
         update_kubeconfig=kubeconfig)
 
 
-k3s.add_command(k3s_delete)
-
-
 @k3s.command(name='expand-workers', help='Add workers to a k3s cluster')
 @click.argument('name', type=click.STRING)
 @click.option('--worker-count', type=click.INT, help='The number of workers',
@@ -453,9 +432,6 @@ k3s.add_command(k3s_delete)
 @click.pass_context
 def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
     _bind_cluster_context(ctx, name, namespace).expand_workers(worker_count)
-
-
-k3s.add_command(k3s_expand_workers)
 
 
 @k3s.command(name='remove-worker', help='Remove workers from a k3s cluster')
@@ -475,9 +451,6 @@ def k3s_remove_worker(ctx, name=None, workers=None, namespace=None):
     _bind_cluster_context(ctx, name, namespace).remove_worker(list(workers))
 
 
-k3s.add_command(k3s_remove_worker)
-
-
 @k3s.command(name='expand-addresses',
              help='Add floating addresses for metallb to a k3s cluster')
 @click.argument('name', type=click.STRING)
@@ -491,9 +464,6 @@ def k3s_expand_addresses(ctx, name=None, address_count=None, namespace=None):
     _bind_cluster_context(ctx, name, namespace).expand_addresses(address_count)
 
 
-k3s.add_command(k3s_expand_addresses)
-
-
 @k3s.command(name='update-os', help='Update the OS on all nodes')
 @click.argument('name', type=click.STRING)
 @click.option('--namespace', type=click.STRING,
@@ -502,9 +472,6 @@ k3s.add_command(k3s_expand_addresses)
 @click.pass_context
 def k3s_update_os(ctx, name=None, namespace=None):
     _bind_cluster_context(ctx, name, namespace).update_os()
-
-
-k3s.add_command(k3s_update_os)
 
 
 def load(cli):
