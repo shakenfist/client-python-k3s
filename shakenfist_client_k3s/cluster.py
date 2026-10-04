@@ -555,7 +555,7 @@ class Cluster:
         inst = self.client.get_instance(aop['instance_uuid'])
         return exceptions.AgentOperationError(
             inst['name'], aop['instance_uuid'], aop['uuid'],
-            primitives._describe_agent_op(aop, max_len=None),
+            progress.describe_agent_op(aop, max_len=None),
             aop.get('results', {}) or {},
             state=aop.get('state'))
 
@@ -658,7 +658,7 @@ class Cluster:
                     waiting.remove(instance_uuid)
                 else:
                     aop = incomplete[0]
-                    desc = primitives._describe_agent_op(aop)
+                    desc = progress.describe_agent_op(aop)
                     remaining = progress.count_str(len(incomplete), 'operation')
                     if desc:
                         p.update(inst['name'], "running '%s' (%s remaining)" % (desc, remaining))
@@ -890,7 +890,7 @@ class Cluster:
         if aop['state'] in AGENT_OP_FAILED_STATES:
             probe['error'] = (
                 'the agent operation for %s entered the %s state'
-                % (primitives._describe_agent_op(aop, max_len=None) or command,
+                % (progress.describe_agent_op(aop, max_len=None) or command,
                    aop['state']))
             return probe
 

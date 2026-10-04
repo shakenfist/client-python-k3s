@@ -15,7 +15,6 @@ import testtools
 import shakenfist_client_k3s
 from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import exceptions
-from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.cluster import Cluster
 from shakenfist_client_k3s.tests import fakes
@@ -378,10 +377,10 @@ class DescribeAgentOpTestCase(testtools.TestCase):
             ],
             'results': {}
         }
-        self.assertEqual('apt-get update', primitives._describe_agent_op(aop))
+        self.assertEqual('apt-get update', progress.describe_agent_op(aop))
 
         aop['results'] = {'0': {'return-code': 0}}
-        self.assertEqual('apt-get dist-upgrade -y', primitives._describe_agent_op(aop))
+        self.assertEqual('apt-get dist-upgrade -y', progress.describe_agent_op(aop))
 
     def test_non_execute_command_uses_path(self):
         aop = {
@@ -389,14 +388,14 @@ class DescribeAgentOpTestCase(testtools.TestCase):
             'results': {}
         }
         self.assertEqual('get-file /etc/rancher/k3s/k3s.yaml',
-                         primitives._describe_agent_op(aop))
+                         progress.describe_agent_op(aop))
 
     def test_long_commands_truncated(self):
         aop = {
             'commands': [{'command': 'execute', 'commandline': 'x' * 100}],
             'results': {}
         }
-        desc = primitives._describe_agent_op(aop)
+        desc = progress.describe_agent_op(aop)
         self.assertEqual(60, len(desc))
         self.assertTrue(desc.endswith('...'))
 
@@ -409,10 +408,10 @@ class DescribeAgentOpTestCase(testtools.TestCase):
             'results': {}
         }
         self.assertEqual('cat - > /etc/sf/thing.yaml << EOF ...',
-                         primitives._describe_agent_op(aop))
+                         progress.describe_agent_op(aop))
 
     def test_no_commands(self):
-        self.assertIsNone(primitives._describe_agent_op({'commands': [], 'results': {}}))
+        self.assertIsNone(progress.describe_agent_op({'commands': [], 'results': {}}))
 
 
 class WaitLoopTestCase(testtools.TestCase):

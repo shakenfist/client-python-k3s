@@ -610,8 +610,9 @@ class AgentOperationError(K3sClusterException):
     Built by ``Cluster._agent_op_error()`` and raised by its three
     callers: ``Cluster.await_idle()``, ``Cluster.await_fetch()`` and
     ``Cluster.reap_execute()``.
-    ``command_description`` is the value ``_describe_agent_op(aop,
-    max_len=None)`` returns, and is only rendered when truthy. ``results``
+    ``command_description`` is the value
+    ``progress.describe_agent_op(aop, max_len=None)`` returns, and is
+    only rendered when truthy. ``results``
     is the agent operation's results dict; when it is empty (or falsy) a
     fixed "no results were recorded" line is rendered instead of a JSON
     dump.

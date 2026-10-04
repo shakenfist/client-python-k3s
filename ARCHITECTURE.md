@@ -57,8 +57,8 @@ that; this section is only the shape.
   subclasses instead of exiting.
 - **Namespace scoped lookups and stateless helpers (`primitives.py`)**
   -- work with no cluster identity: the two release lookups, whose
-  caches live in *namespace* metadata rather than any one cluster's,
-  and `_describe_agent_op()`. `list`, `query-k3s-version` and
+  caches live in *namespace* metadata rather than any one cluster's.
+  `list`, `query-k3s-version` and
   `query-longhorn-version` call these directly rather than building a
   `Cluster`. Imports run one way only -- `cluster.py` imports
   `primitives`, never the reverse.

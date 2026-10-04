@@ -27,6 +27,34 @@ def count_str(count, noun):
     return '%d %ss' % (count, noun)
 
 
+def describe_agent_op(aop, max_len=60):
+    """Return a short human readable description of the command an agent operation is up to."""
+    commands = aop.get('commands', [])
+    results = aop.get('results', {}) or {}
+
+    # Results are recorded per command index as they complete, so the number
+    # of results is the index of the currently executing command.
+    idx = min(len(results), len(commands) - 1)
+    if idx < 0:
+        return None
+
+    c = commands[idx]
+    desc = c.get('commandline')
+    if not desc:
+        desc = c.get('command', 'unknown')
+        if c.get('path'):
+            desc += ' %s' % c['path']
+
+    # Multi-line commands (for example heredocs) would break the one line
+    # per item status display, so describe them by their first line.
+    if '\n' in desc:
+        desc = desc.split('\n', 1)[0] + ' ...'
+
+    if max_len and len(desc) > max_len:
+        desc = desc[:max_len - 3] + '...'
+    return desc
+
+
 class Reporter:
     """Where library output goes, and whether debug output is emitted.
 
