@@ -272,7 +272,7 @@ Constraints:
 | 3. Missing verbs | [PLAN-library-api-and-collection-phase-03-missing-verbs.md](PLAN-library-api-and-collection-phase-03-missing-verbs.md) -- `remove-worker`; install k3s only on the workers being added; read the cluster state we already write; a health verb; `--no-longhorn`/`--no-metallb`; kubeconfig side effects opt-out (including the `kubectl config unset` calls in `Cluster.delete()`, which run without `capture_output` and so write to the process's real stdout, bypassing the reporter -- found during phase 1 and pinned by `KubectlUnsetLeakTestCase`); route `GroupCatchClusterExceptions`'s `print(str(e))` to `sys.stderr` instead of `sys.stdout` (found during phase 1 -- pre-existing CLI behaviour, deferred because phase 1 changes no user-visible output); give `Cluster.get_progress()`'s lazy default a real `total_phases` so a library caller invoking a mid-level method directly gets `[n/total]` headers instead of un-numbered `[n]` ones (found during phase 1; no CLI path hits this today); manifest payload hook. Phase 3's survey corrected two claims this row used to make. Making `install_workers()` incremental is a defect rather than a feature: `expand_workers()` (`cluster.py:875-889`) installs over all of `md['worker_nodes']`, so adding one worker re-runs the k3s agent installer on every existing one. And there is no `state: initial` reconcile to finish -- `md['state']` is written at `:633`, `:735` and `:842` and read nowhere, so phase 3 starts reading it; resume is deferred to Future work by that phase's decision 5 | Complete | `d51cf59` (#75) |
 | 4. First release | [PLAN-library-api-and-collection-phase-04-first-release.md](PLAN-library-api-and-collection-phase-04-first-release.md) -- cut `v0.1.0` so `shakenfist_client_k3s` exists on PyPI and `setuptools_scm` has a real version to stamp, which is also what makes `README.md`'s `pip install` line and `ARCHITECTURE.md`'s "published to PyPI" bullet true. `release.yml` is already the complete shared release template, so phase 4's work is the metadata it will publish and the accounts it publishes through: the wheel currently ships the whole test suite (`setuptools_scm`'s file finder re-adds it as package data, which the `packages.find` exclusion cannot stop), the `license` table and license classifier are both deprecated, `write_to` writes a `_version.py` nothing reads, the `release` environment does not exist so a release would publish without pausing for approval, and `RELEASE-SETUP.md` step 1 cannot be followed for a project which is not on PyPI yet -- a first release needs PyPI's pending-publisher flow. Two steps need Michael's browser and are a hard gate | Complete | `2506c19` (#81, steps 4a-4c), `d2e43d1` (#86, steps 4e-4f); released as `v0.1.0` |
 | 5. The collection | [PLAN-library-api-and-collection-phase-05-collection.md](PLAN-library-api-and-collection-phase-05-collection.md) -- `shakenfist.k3s` with `sf_k3s_cluster`; `tools/build-collection.py`; `build-collection` and `publish-collection` jobs in `release.yml`; ansible-lint in pre-commit and CI; docs. Phase 5's survey corrected three claims this row and the decisions below used to make. The build machinery is copyable but **unproven**: `shakenfist/shakenfist` has never run its `release.yml` and has never cut a release, so neither `build-collection` nor `publish-collection` has executed anywhere. `secrets.ANSIBLE_GALAXY_TOKEN`, which `publish-collection` needs, is set in neither repository, so this phase carries a human gate of the same kind phase 4 did. And the connection half is already built: `shakenfist_client_k3s/client.py`, added by phase 2 with `sf_k3s_cluster` named in its docstring, means the module needs no copy of the server collection's `sf_connection.py`. All eight steps are done. `ANSIBLE_GALAXY_TOKEN` exists as a `release` environment secret, and `v0.2.0` published the plugin to PyPI and `shakenfist.k3s` 0.2.0 to Galaxy, so `ansible-galaxy collection install shakenfist.k3s` resolves. `publish-collection` failed once with HTTP 403 `permission_denied`, because the token authenticates as Galaxy user `shakenfist-bot` which held no role on the `shakenfist` namespace; granting it `collection_namespace_owner` and re-running that one job finished the release without a new tag | Complete | `eb248bd` (#90); released as `v0.2.0` |
-| 6. Push audit | [PLAN-library-api-and-collection-phase-06-push-audit.md](PLAN-library-api-and-collection-phase-06-push-audit.md) -- run `PUSH-AUDIT.md` over the union of the ten merge commits the `Merged` cells above name, each diffed against its own first parent. That is 74 files and 18,122 insertions. It is deliberately not `73bd499..develop`, which is 78 files and 20,115 insertions because two other master plans (`node-customisation`, `cumulative-health-signals`) and sixteen unrelated merges landed in the same window; the `plan-push-audit-phase` shared block calls a range anchored that way "far too wide". This phase records no `Merged` cell, because it closes itself out in its own pull request | In progress | |
+| 6. Push audit | [PLAN-library-api-and-collection-phase-06-push-audit.md](PLAN-library-api-and-collection-phase-06-push-audit.md) -- run `PUSH-AUDIT.md` over the union of the ten merge commits the `Merged` cells above name, each diffed against its own first parent. That is 74 files and 18,122 insertions. It is deliberately not `73bd499..develop`, which is 78 files and 20,115 insertions because two other master plans (`node-customisation`, `cumulative-health-signals`) and sixteen unrelated merges landed in the same window; the `plan-push-audit-phase` shared block calls a range anchored that way "far too wide". This phase records no `Merged` cell, because it closes itself out in its own pull request | Complete | |
 
 Phase ordering is forced by dependency rather than convenience.
 Phase 1 is the keystone: phases 3 and 5 are both much easier after it,
@@ -563,7 +563,14 @@ because the following statements will be true:
   `~/.kube/config` side effects.
 * `ansible-galaxy collection install shakenfist.k3s` followed by a
   playbook using `shakenfist.k3s.sf_k3s_cluster` brings up a cluster,
-  is idempotent on a second run, and supports `--check`.
+  is idempotent on a second run, and supports `--check`. **Half true,
+  and the half that is missing is the verification.** The install
+  resolves and `ansible-doc` renders, and the module's idempotence
+  and `--check` handling are covered by unit tests against a faked
+  `apiclient.Client`. But no playbook has ever run the module against
+  a real Shaken Fist API, because no CI tier installs Ansible --
+  phase 6 confirmed this rather than discovering it, and it is
+  [#89](https://github.com/shakenfist/client-python-k3s/issues/89).
 * `pip install shakenfist-client-k3s` works from PyPI.
 * Installing neither the plugin nor the collection leaves a Shaken
   Fist deployment unchanged: `shakenfist.shakenfist` is not modified
@@ -571,7 +578,16 @@ because the following statements will be true:
 * Behaviour which can only be validated against a live Shaken
   Fist cluster -- every phase 3 verb, and the collection's
   end-to-end bringup -- has been exercised there (manually or via
-  the functional CI) before merge.
+  the functional CI) before merge. **True of phase 3, not true of
+  the collection.** Phase 6's tests lens established that every verb
+  and flag phase 3 added has an assertion in `tools/ci_deploy_test.sh`
+  that would have failed before `d51cf59` and passes after. The
+  collection's end-to-end bringup has never run: see the criterion
+  above and #89. Phase 6 also found that phase 2's `make_client()`
+  has no functional coverage either
+  ([#102](https://github.com/shakenfist/client-python-k3s/issues/102)),
+  which this criterion did not think to ask about because phase 2's
+  work is not a verb.
 * User-visible changes are documented in `docs/`. `AGENTS.md` changes
   only if a *convention* changed; `ARCHITECTURE.md` only if the
   *shape of the system* changed; `README.md` only if the pitch,
@@ -627,6 +643,41 @@ file, with a one line summary in the index's `Intent` column.
 - Shrinking control plane count, and any declarative reconciliation of
   worker count, are deliberately out of scope while conductor owns
   worker membership.
+- **Type hints and mypy**
+  ([#100](https://github.com/shakenfist/client-python-k3s/issues/100)).
+  The `python-version-discipline` shared block requires new code to
+  carry type hints and mypy to be clean over it. Across the eight
+  non-test source files this plan touched there are 128 function
+  definitions and no annotations, and mypy is configured in no file.
+  Phase 6 declined this deliberately (its decision 5): there is no
+  staged rollout to hold new code to, annotating it all would be a
+  larger change than any phase of this plan, and unlike a 3.10
+  construct on a 3.7 floor it costs nothing at runtime. Adopting it
+  is a plan of its own.
+- **The functional tier does not reach everything this plan built.**
+  `tools/ci_deploy_test.sh` exercises nine of the twelve subcommands;
+  `update-os` runs `apt-get dist-upgrade` on real nodes and is never
+  run, and nothing keeps the script in sync with `k3s.commands`
+  ([#101](https://github.com/shakenfist/client-python-k3s/issues/101)).
+  Phase 2's `make_client()` is never run against a live API, so the
+  bug phase 2 existed to fix is structurally invisible to the merge
+  tier ([#102](https://github.com/shakenfist/client-python-k3s/issues/102)),
+  and `tools/build-collection.py`'s `main()` has no coverage at all
+  ([#103](https://github.com/shakenfist/client-python-k3s/issues/103)).
+- **External API shapes are read optimistically in two places**
+  ([#104](https://github.com/shakenfist/client-python-k3s/issues/104),
+  [#105](https://github.com/shakenfist/client-python-k3s/issues/105)).
+  The k3s update lookup has eight tests including a malformed
+  response; the Longhorn lookup hard-indexes `reldata['tag_name']`,
+  and two agent-operation readers index `aop['results']['0']` where
+  three siblings in the same module guard it.
+- **A bare `stestr run` can report a pass for code it never loaded**
+  ([#106](https://github.com/shakenfist/client-python-k3s/issues/106)).
+  The Ansible module harness runs as a script, so the repository root
+  is not on `sys.path` and those tests import the installed package.
+  `tox -epy3` reinstalls and is unaffected. This is filed because it
+  actually bit during phase 6: a bare `stestr run` passed against the
+  unredacted code of the token leak below.
 
 ### Bugs fixed during this work
 
@@ -648,6 +699,43 @@ Phase 3 fixed four, none of which had an issue of its own:
   budget and the failure then named the healthy pods the wait had
   never reached. Found by the merge queue, fixed in `3eddbaf` before
   #75 landed.
+
+Phase 6's push audit fixed eight more, none of which had an issue of
+its own:
+
+- **The cluster's k3s node token reached error output.**
+  `cluster.py` interpolates `K3S_TOKEN=` into the installer command
+  line, `CommandFailedError` was handed that command line verbatim,
+  and `AgentOperationError` was handed
+  `describe_agent_op(aop, max_len=None)` -- the one call site that
+  disabled the truncation protecting every other path. A worker
+  install that exited non-zero therefore published the token to
+  stderr, to the functional CI job log, and through the Ansible
+  module's `fail_json` message, which falsified
+  `docs/collection.md`'s heading "Secrets never come back in the
+  module's output". `tools/ci_deploy_test.sh` already refused to dump
+  `k3s show` because job logs are world-readable, so the deliberate
+  narrow path was guarded while a wider accidental one stayed open.
+  Fixed with a `redact_command_line()` helper called inside both
+  exception constructors rather than at any raise site, so no future
+  raiser has to remember, and pinned by eleven tests.
+- Two heredoc bodies interpolated namespace metadata raw. The quoted
+  delimiter stops expansion but not early termination, so a value
+  containing a newline and an `EOF` line was root command execution.
+- The local kubeconfig was created world-readable.
+- `delete()`'s debug dump printed secret-bearing metadata keys, and
+  cleared two of them under transposed names, so they survived.
+- `kubectl config view` ran through a shell.
+- The release lookup interpolated an unbounded response body into its
+  error.
+- Four byte-identical exception `__init__`/`__str__` pairs: phase 1
+  introduced the pattern for two classes and phase 3 copied it into
+  two more, so the duplicate existed only because both landed. This
+  is the finding that justifies auditing the accumulated diff rather
+  than each phase alone.
+- Eleven dead `k3s.add_command()` calls, the `Progress` construction
+  open-coded six times, and four documentation pages still saying the
+  collection was unpublished a day after `v0.2.0` published it.
 
 Note that
 [#41](https://github.com/shakenfist/client-python-k3s/issues/41) --
