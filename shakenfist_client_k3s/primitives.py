@@ -30,6 +30,13 @@ CLUSTER_LIST = 'orchestrated_k3s_clusters'
 K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
 LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
 
+# How much of a third-party HTTP response body is quoted back in an error
+# message. Enough to recognise a proxy error page or a rate limit notice,
+# and bounded because the party choosing those bytes is not this one: an
+# unbounded body is an unbounded error message in somebody's log, and a
+# vehicle for terminal escape sequences in somebody's terminal.
+RESPONSE_SNIPPET_BYTES = 512
+
 
 def list_clusters(client, namespace):
     """Return the names of the managed k3s clusters in a namespace.
@@ -73,8 +80,12 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
                 'User-Agent': apiclient.get_user_agent()
             })
         if r.status_code not in [200, 201, 204]:
+            # Truncated, like the json.dumps(d)[:512] below: whoever
+            # controls this response -- the upstream, or a proxy holding a
+            # certificate the client trusts -- otherwise decides how many
+            # bytes reach the user's terminal and an Ansible msg.
             raise exceptions.ReleaseLookupError.http_status(
-                'k3s', url, r.status_code, r.text)
+                'k3s', url, r.status_code, r.text[:RESPONSE_SNIPPET_BYTES])
 
         d = r.json()
         releases = {}
@@ -95,7 +106,7 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
         # get_longhorn_release().
         if not releases:
             raise exceptions.ReleaseLookupError.no_usable_k3s_channels(
-                url, json.dumps(d)[:512])
+                url, json.dumps(d)[:RESPONSE_SNIPPET_BYTES])
 
         version_cache['releases'] = releases
         version_cache['updated'] = time.time()
@@ -142,8 +153,10 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
                 })
 
             if r.status_code not in [200, 201, 204]:
+                # Truncated, per get_k3s_release() above.
                 raise exceptions.ReleaseLookupError.http_status(
-                    'Longhorn', url, r.status_code, r.text)
+                    'Longhorn', url, r.status_code,
+                    r.text[:RESPONSE_SNIPPET_BYTES])
 
             d = r.json()
             reporter.debug('Fetched release data:')

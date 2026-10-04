@@ -591,7 +591,10 @@ class ReleaseLookupError(K3sClusterException):
       by ``primitives.get_k3s_release()`` on its channel fetch (with
       ``product='k3s'``) and by ``primitives.get_longhorn_release()`` on
       its release fetch (with ``product='Longhorn'``); both render
-      identically apart from the product name.
+      identically apart from the product name. ``response_text`` is
+      bounded by the caller to ``primitives.RESPONSE_SNIPPET_BYTES``,
+      because it is third-party text and whoever serves it would
+      otherwise choose the length of this message.
     - ``no_usable_k3s_channels(url, response_snippet)``: raised by
       ``primitives.get_k3s_release()`` when the channel response parsed
       but yielded no channels at all. ``response_snippet`` is the

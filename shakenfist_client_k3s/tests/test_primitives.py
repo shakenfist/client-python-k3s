@@ -24,10 +24,15 @@ def _reporter():
     return progress.Reporter()
 
 
-def _fake_response(payload, status_code=200):
+def _fake_response(payload, status_code=200, text=None):
     resp = mock.MagicMock()
     resp.status_code = status_code
     resp.json.return_value = payload
+    # A real string, not the MagicMock attribute, whenever a test cares:
+    # slicing a MagicMock yields another MagicMock, so a truncation
+    # assertion against the default would pass without any truncation.
+    if text is not None:
+        resp.text = text
     return resp
 
 
@@ -182,6 +187,30 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         # '{url}' from a missing f-string prefix.
         self.assertIn('GET https://update.k3s.io/v1-release/channels', str(e))
 
+    def test_the_quoted_response_body_is_bounded(self):
+        """Whoever serves the error does not get to choose its length.
+
+        update.k3s.io, or a proxy holding a certificate this client
+        trusts, otherwise decides how many bytes -- and which bytes --
+        reach the operator's terminal and an Ansible msg. The practical
+        harms are an unbounded error line in a log and terminal escape
+        sequences rendered by an emulator, not execution.
+        """
+        client = mock.MagicMock()
+        body = 'x' * (primitives.RESPONSE_SNIPPET_BYTES * 3)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(
+                            None, status_code=502, text=body)):
+            e = self.assertRaises(
+                exceptions.ReleaseLookupError, primitives.get_k3s_release,
+                client, NAMESPACE, _reporter(), force_cache_update=True,
+                release_channel='stable')
+
+        self.assertEqual(primitives.RESPONSE_SNIPPET_BYTES,
+                         len(e.response_text))
+        self.assertNotIn(body, str(e))
+
 
 # A cut down version of real data from the GitHub releases API for
 # longhorn/longhorn. Prereleases and tags which are not valid PEP 440
@@ -259,6 +288,22 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
         self.assertIn('Unable to determine latest Longhorn release version', str(e))
         self.assertIn('GET https://api.github.com/repos/longhorn/longhorn/releases',
                       str(e))
+
+    def test_the_quoted_response_body_is_bounded(self):
+        client = mock.MagicMock()
+        body = 'y' * (primitives.RESPONSE_SNIPPET_BYTES * 3)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(
+                            None, status_code=502, text=body)):
+            e = self.assertRaises(
+                exceptions.ReleaseLookupError,
+                primitives.get_longhorn_release,
+                client, NAMESPACE, _reporter(), force_cache_update=True)
+
+        self.assertEqual(primitives.RESPONSE_SNIPPET_BYTES,
+                         len(e.response_text))
+        self.assertNotIn(body, str(e))
 
 
 class DebugRoutingTestCase(testtools.TestCase):
