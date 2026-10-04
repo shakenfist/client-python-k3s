@@ -480,6 +480,49 @@ class SshKeyError(K3sClusterException):
         return 'Could not read ssh key %s: %s' % (self.path, self.detail)
 
 
+class NodeSizeError(K3sClusterException):
+    """Raised when a node size handed to ``Cluster.create()`` is not a positive integer.
+
+    ``create()`` takes a vCPU count, a memory size in MB and a disk size in
+    GB for each of the two roles, and ``validate_node_sizes()`` in
+    ``cluster.py`` checks all six before the cluster's name is registered.
+    That is the point of raising early: a size discovered to be unusable
+    once the name is in the namespace's cluster list leaves a claimed name
+    and a metadata document stuck in ``initial``, which only a delete
+    clears. The command line also refuses these with
+    ``click.IntRange(min=1)``, in click's own style, but a library caller
+    has no click, and an Ansible variable or a YAML document is exactly
+    where ``0``, ``'2'`` or ``yes`` comes from.
+
+    Only "not a positive integer" is refused. ``bool`` counts as not an
+    integer, because ``True`` is an ``int`` in Python and would otherwise
+    build a one vCPU node. A size which is positive but too small to be
+    useful is accepted on purpose: a realistic floor depends on the
+    workload, which this library cannot see. See
+    ``validate_node_sizes()`` for the reasoning.
+
+    ``role`` is ``'control_plane'`` or ``'worker'`` as the metadata spells
+    it, ``field`` is ``'cpus'``, ``'memory'`` or ``'disk'``, and ``value``
+    is what was passed, unchanged. The message spells the role with a
+    space and renders the value with ``repr()``, so that ``'2'`` and ``2``
+    are told apart.
+    """
+
+    def __init__(self, role, field, value):
+        self.role = role
+        self.field = field
+        self.value = value
+        super(NodeSizeError, self).__init__(role, field, value)
+
+    @classmethod
+    def not_positive_integer(cls, role, field, value):
+        return cls(role, field, value)
+
+    def __str__(self):
+        return '%s %s must be a positive integer, not %r' % (
+            self.role.replace('_', ' '), self.field, self.value)
+
+
 class ReleaseLookupError(K3sClusterException):
     """Raised when looking up a k3s or Longhorn release fails.
 

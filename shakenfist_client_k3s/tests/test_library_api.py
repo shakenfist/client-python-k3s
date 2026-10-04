@@ -427,6 +427,138 @@ class OptionalMetallbLonghornTestCase(LibraryTestCase):
         self.assertEqual('created', c.show()['state'])
 
 
+class NodeSizingTestCase(LibraryTestCase):
+    """create() sizes each role as asked, records it, and refuses a size first.
+
+    The six sizing arguments reach the API per role, and are recorded in
+    the metadata as node_sizes so that expand_workers() builds the same.
+    The recording is asserted against the stored document rather than
+    through show(), because show() fills node_sizes in when it is absent
+    and would make a create which forgot to record it look as though it
+    had.
+
+    The refusal is the claim worth reading closely rather than trusting
+    (risk 2 of the phase plan): validate_node_sizes() has to run before
+    the name is registered, or a typo becomes a claimed name and a
+    metadata document stuck in 'initial'.
+    """
+
+    CONTROL_PLANE = {'cpus': 4, 'memory': 8192, 'disk': 100}
+    WORKER = {'cpus': 2, 'memory': 4096, 'disk': 60}
+
+    def _sized_kwargs(self):
+        kwargs = {}
+        for role, size in (('control_plane', self.CONTROL_PLANE),
+                           ('worker', self.WORKER)):
+            for field, value in size.items():
+                kwargs['%s_%s' % (role, field)] = value
+        return kwargs
+
+    def _stored(self):
+        return self.client.metadata[MD_KEY]
+
+    def _assert_refused_before_anything_is_built(self, **kwargs):
+        e = self.assertRaises(
+            exceptions.NodeSizeError, self._cluster().create, 1, 1, 1,
+            **kwargs)
+
+        self.assertEqual(
+            [], self.client.calls,
+            'the cluster was registered or an instance created before the '
+            'node sizes were validated')
+        # Neither the cluster list nor this cluster's own document.
+        self.assertEqual({}, self.client.metadata)
+        self.assertEqual([], self.client.allocated_networks)
+        self.assertEqual({}, self.client.instances)
+        self.assertEqual([], self.client.executed)
+        return e
+
+    def test_an_invalid_size_registers_nothing(self):
+        e = self._assert_refused_before_anything_is_built(worker_memory=0)
+        self.assertEqual('worker', e.role)
+        self.assertEqual('memory', e.field)
+        self.assertEqual(
+            'worker memory must be a positive integer, not 0', str(e))
+
+    def test_a_bool_size_registers_nothing(self):
+        # The one an int check alone would let through, as a one vCPU node.
+        e = self._assert_refused_before_anything_is_built(
+            control_plane_cpus=True)
+        self.assertEqual('control_plane', e.role)
+        self.assertEqual('cpus', e.field)
+
+    def test_the_name_is_free_after_a_refusal(self):
+        # The consequence the ordering exists for: the caller fixes the
+        # typo and runs the same create again, and it is not told the name
+        # is taken or that an earlier attempt was interrupted.
+        self.assertRaises(exceptions.NodeSizeError, self._cluster().create,
+                          1, 1, 1, control_plane_disk=-1)
+        self._cluster().create(1, 1, 1)
+        self.assertEqual('created', self._stored()['state'])
+
+    def test_each_role_is_built_at_its_own_size(self):
+        self._cluster().create(1, 2, 1, **self._sized_kwargs())
+
+        cp, w = self.CONTROL_PLANE, self.WORKER
+        self.assertEqual(
+            [('k3s-banana-node-001', cp['cpus'], cp['memory'], cp['disk']),
+             ('k3s-banana-node-002', w['cpus'], w['memory'], w['disk']),
+             ('k3s-banana-node-003', w['cpus'], w['memory'], w['disk'])],
+            self.client.instance_sizes)
+
+    def test_the_sizes_are_recorded_in_the_metadata(self):
+        self._cluster().create(1, 1, 1, **self._sized_kwargs())
+
+        self.assertEqual(
+            {'control_plane': self.CONTROL_PLANE, 'worker': self.WORKER},
+            self._stored()['node_sizes'])
+
+    def test_a_default_create_builds_every_node_at_the_default(self):
+        # Literals rather than DEFAULT_NODE_SIZE: this is the claim that an
+        # existing invocation builds exactly what it built before these
+        # arguments existed, and that is 2 vCPUs, 2048 MB and 50 GB
+        # whatever the constant says.
+        self._cluster().create(3, 2, 1)
+
+        self.assertEqual(5, len(self.client.instance_sizes))
+        self.assertEqual(
+            {(2, 2048, 50)},
+            {sizes[1:] for sizes in self.client.instance_sizes})
+
+        # And it is recorded, not left to the fallback: a default create
+        # is a cluster created after node_sizes existed like any other.
+        self.assertEqual(
+            {'control_plane': {'cpus': 2, 'memory': 2048, 'disk': 50},
+             'worker': {'cpus': 2, 'memory': 2048, 'disk': 50}},
+            self._stored()['node_sizes'])
+
+    def test_the_sizes_are_recorded_before_anything_is_built(self):
+        # As metallb_installed is: a create which dies before its first
+        # instance still describes what it was building.
+        with mock.patch.object(Cluster, 'create_and_await_instances',
+                               side_effect=RuntimeError('boom')):
+            self.assertRaises(RuntimeError, self._cluster().create, 1, 1, 1,
+                              **self._sized_kwargs())
+
+        self.assertEqual('initial', self._stored()['state'])
+        self.assertEqual(
+            {'control_plane': self.CONTROL_PLANE, 'worker': self.WORKER},
+            self._stored()['node_sizes'])
+
+    def test_expand_workers_builds_at_the_size_create_recorded(self):
+        # The reason node_sizes is recorded at all, end to end through the
+        # library: the new worker is the size the create asked for, not
+        # the default and not the control plane's.
+        c = self._cluster()
+        c.create(1, 1, 1, **self._sized_kwargs())
+        c.expand_workers(1)
+
+        w = self.WORKER
+        self.assertEqual(
+            ('k3s-banana-node-003', w['cpus'], w['memory'], w['disk']),
+            self.client.instance_sizes[-1])
+
+
 class ClusterAccessorTestCase(testtools.TestCase):
     """show() and get_kubeconfig(), which return rather than print."""
 
@@ -437,7 +569,13 @@ class ClusterAccessorTestCase(testtools.TestCase):
                        reporter=progress.CollectingReporter())
 
     def test_show_returns_the_metadata(self):
-        md = {'name': 'banana', 'state': 'created'}
+        # node_sizes is stored here because it is the one key show() fills
+        # in when it is absent, which is not what this test is about; the
+        # fill is ShowReportsNodeSizesTestCase's, in tests/test_cluster.py.
+        md = {'name': 'banana', 'state': 'created',
+              'node_sizes': {
+                  'control_plane': {'cpus': 2, 'memory': 2048, 'disk': 50},
+                  'worker': {'cpus': 2, 'memory': 2048, 'disk': 50}}}
         self.assertEqual(md, self._cluster({MD_KEY: md}).show())
 
     def test_show_raises_for_an_unknown_cluster(self):

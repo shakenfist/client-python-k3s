@@ -44,6 +44,25 @@ class ClusterIncompleteErrorTestCase(testtools.TestCase):
             'No kubeconfig for this cluster. Is it fully installed?', str(e))
 
 
+class NodeSizeErrorTestCase(testtools.TestCase):
+    def test_not_positive_integer(self):
+        e = exceptions.NodeSizeError.not_positive_integer(
+            'control_plane', 'memory', 0)
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('control_plane', e.role)
+        self.assertEqual('memory', e.field)
+        self.assertEqual(0, e.value)
+        self.assertEqual(
+            'control plane memory must be a positive integer, not 0', str(e))
+
+    def test_the_value_is_rendered_with_repr(self):
+        # So that the string a YAML document or an Ansible variable handed
+        # over is told apart from the integer it looks like.
+        e = exceptions.NodeSizeError.not_positive_integer('worker', 'cpus', '2')
+        self.assertEqual(
+            "worker cpus must be a positive integer, not '2'", str(e))
+
+
 class ReleaseLookupErrorTestCase(testtools.TestCase):
     def test_http_status_k3s(self):
         e = exceptions.ReleaseLookupError.http_status(
