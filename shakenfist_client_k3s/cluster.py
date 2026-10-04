@@ -180,10 +180,42 @@ K3S_MANIFEST_DELIMITER = 'SFK3SMANIFEST'
 # 2. Any heredoc carrying interpolated content uses a quoted delimiter, so
 #    the remote shell expands nothing inside the body. Python has already
 #    substituted the values by the time the shell sees them, so a quoted
-#    delimiter costs nothing and removes the whole question.
+#    delimiter costs nothing and removes the whole question. A quoted
+#    delimiter is necessary and not sufficient: it does not stop an
+#    interpolated value from *ending* the heredoc, which a value containing
+#    a newline followed by a line equal to the delimiter does, and then the
+#    rest of the body is read by the shell as commands. So every heredoc is
+#    built by heredoc() below, which refuses such a body.
 #
 # Cluster.delete()'s kubectl invocation is the third form of the same rule:
 # where a real argument list is available, it is used instead.
+
+
+def heredoc(remote_path, body, delimiter='EOF'):
+    """Build the command which writes body to remote_path on a cluster node.
+
+    The in-guest agent runs a shell command line and nothing else, so a
+    file reaches a node as the body of a heredoc. Every such command in
+    this module is built here, for the reason rule 2 above gives: the
+    quoted delimiter is what stops the remote shell expanding the body,
+    and refusing a body which contains the delimiter on a line of its own
+    is what stops the body ending the heredoc and becoming commands. Both
+    halves have to hold for either to be worth anything, so they live
+    together rather than at each call site.
+
+    The path is quoted per rule 1, which is free for the literal paths and
+    is the point for the manifest destination, whose basename is the
+    caller's. Exactly one trailing newline, because the delimiter needs a
+    line of its own and a body which already ends in a newline must not
+    gain a blank line.
+    """
+    if body and not body.endswith('\n'):
+        body += '\n'
+    if delimiter in body.split('\n'):
+        raise exceptions.GuestFileError.delimiter_collision(
+            remote_path, delimiter)
+    return ("cat - > %s << '%s'\n%s%s\n"
+            % (shlex.quote(remote_path), delimiter, body, delimiter))
 
 
 def read_manifests(paths):
@@ -1050,19 +1082,17 @@ class Cluster:
         # plane node. This is needed so that the SSL certificate includes this
         # external name.
         #
-        # The heredoc delimiter is quoted, per rule 2 at the top of this
-        # module: Python has already substituted the address by the time
-        # the remote shell sees this, so there is nothing here the shell
-        # should be expanding.
+        # Through heredoc(), per rule 2 at the top of this module. The
+        # address is a namespace metadata value, so it is interpolated into
+        # a body a third party could have written.
         cmds.append('mkdir -p /etc/rancher/k3s/')
-        cmds.append(
-            "cat - > /etc/rancher/k3s/config.yaml << 'EOF'\n"
+        cmds.append(heredoc(
+            '/etc/rancher/k3s/config.yaml',
             'write-kubeconfig-mode: "0644"\n'
             'tls-san:\n'
             '  - "%s"\n'
             'cluster-init: true\n'
-            'EOF\n'
-            % md['api_address_floating'])
+            % md['api_address_floating']))
 
         # Stage the caller's manifests, before the install below rather
         # than after it: k3s applies this directory when the server first
@@ -1097,24 +1127,18 @@ class Cluster:
                 'mkdir -p -m 0700 /var/lib/rancher /var/lib/rancher/k3s '
                 '/var/lib/rancher/k3s/server %s' % K3S_MANIFEST_DIR)
             for basename, content in staged:
-                # Exactly one trailing newline, because the heredoc needs
-                # its delimiter on a line of its own and a file which
-                # already ends in a newline must not gain a blank line.
-                body = content if content.endswith('\n') else content + '\n'
-                # Quoted per rule 1 at the top of this module. The
-                # basename is the caller's, by way of os.path.basename()
-                # of a path nothing else has looked at;
-                # read_manifests() refuses the shapes which would be
-                # unreadable in the operation log, and this makes the
-                # ones it allows unable to mean anything to the shell.
-                # A basename of plain filename characters quotes to
-                # itself, so the common case is byte for byte what it
-                # was.
-                cmds.append(
-                    "cat - > %s << '%s'\n%s%s\n"
-                    % (shlex.quote('%s/%s' % (K3S_MANIFEST_DIR, basename)),
-                       K3S_MANIFEST_DELIMITER, body,
-                       K3S_MANIFEST_DELIMITER))
+                # heredoc() quotes the destination per rule 1 and
+                # normalises the trailing newline. The basename is the
+                # caller's, by way of os.path.basename() of a path nothing
+                # else has looked at; read_manifests() refuses the shapes
+                # which would be unreadable in the operation log, and the
+                # quoting makes the ones it allows unable to mean anything
+                # to the shell. A basename of plain filename characters
+                # quotes to itself, so the common case is byte for byte
+                # what it was.
+                cmds.append(heredoc(
+                    '%s/%s' % (K3S_MANIFEST_DIR, basename), content,
+                    delimiter=K3S_MANIFEST_DELIMITER))
 
         # Instruct the first control plane node to install k3s and helm
         cmds.append('curl -sfL https://get.k3s.io | '
@@ -1222,24 +1246,25 @@ class Cluster:
         # Setup metallb for traffic ingress, guided by
         # https://itnext.io/kubernetes-loadbalancer-service-for-on-premises-6b7f75187be8
         #
-        # Quoted delimiter per rule 2 at the top of this module.
-        metal_lb_config = ("cat - > /etc/sf/metallb-range-allocation.yaml << 'EOF'\n"
-                           'apiVersion: metallb.io/v1beta1\n'
-                           'kind: IPAddressPool\n'
-                           'metadata:\n'
-                           '  name: empty\n'
-                           '  namespace: metallb-system\n'
-                           'spec:\n'
-                           '  addresses:\n'
-                           '  - %s/32\n'
-                           '---\n'
-                           'apiVersion: metallb.io/v1beta1\n'
-                           'kind: L2Advertisement\n'
-                           'metadata:\n'
-                           '  name: empty\n'
-                           '  namespace: metallb-system\n'
-                           'EOF\n'
-                           % '/32\n  - '.join(md['routed_addresses']))
+        # Through heredoc(), per rule 2 at the top of this module. The
+        # addresses are namespace metadata values.
+        metal_lb_config = heredoc(
+            '/etc/sf/metallb-range-allocation.yaml',
+            'apiVersion: metallb.io/v1beta1\n'
+            'kind: IPAddressPool\n'
+            'metadata:\n'
+            '  name: empty\n'
+            '  namespace: metallb-system\n'
+            'spec:\n'
+            '  addresses:\n'
+            '  - %s/32\n'
+            '---\n'
+            'apiVersion: metallb.io/v1beta1\n'
+            'kind: L2Advertisement\n'
+            'metadata:\n'
+            '  name: empty\n'
+            '  namespace: metallb-system\n'
+            % '/32\n  - '.join(md['routed_addresses']))
 
         # Wait on the two workloads rather than on the pods they own. A
         # pod wait resolves its label selector once and then spends a

@@ -452,6 +452,60 @@ class ManifestError(K3sClusterException):
                    delimiter=delimiter)
 
 
+class GuestFileError(K3sClusterException):
+    """Raised when a file this library writes onto a cluster node cannot be written.
+
+    The in-guest agent runs a shell command line, so every file this
+    library puts on a node is written by a ``cat - > path << DELIMITER``
+    heredoc. Rule 2 at the top of ``cluster.py`` keeps the delimiter
+    quoted, which stops the remote shell expanding anything inside the
+    body -- and that is not the whole of what a body can do. A body
+    containing a line which is exactly the delimiter ends the heredoc
+    early, and everything after it is read by the shell as commands,
+    running as root on the node.
+
+    So an interpolated value is refused rather than written:
+
+    - ``delimiter_collision(path, delimiter)``: the body contains a line
+      equal to the delimiter. The values which reach these bodies are
+      addresses out of the namespace metadata document, which anything
+      holding the namespace's credentials can write and which conductor
+      also writes, so "the API would not return that" is not an argument
+      this package makes -- rule 1 says so in as many words.
+
+    ``ManifestError.delimiter_collision`` is the same refusal for a
+    caller's own manifest file, checked earlier so that the message can
+    name the local path the operator passed; this is the backstop which
+    covers every heredoc, including ones added later.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    FIELDS = ('path', 'delimiter')
+
+    def __init__(self, reason, message, **fields):
+        self.reason = reason
+        self.message = message
+        for key in self.FIELDS:
+            setattr(self, key, None)
+        for key, value in fields.items():
+            setattr(self, key, value)
+        super(GuestFileError, self).__init__(message)
+
+    def __str__(self):
+        return self.message
+
+    @classmethod
+    def delimiter_collision(cls, path, delimiter):
+        message = (
+            'Refusing to write %s on the cluster node: the content contains a\n'
+            'line which is exactly %s, which is the marker used to write it,\n'
+            'so the rest of the content would be run as commands instead.'
+        ) % (path, delimiter)
+        return cls('delimiter_collision', message, path=path,
+                   delimiter=delimiter)
+
+
 class SshKeyError(K3sClusterException):
     """Raised when the ssh key handed to ``Cluster.create()`` cannot be read.
 

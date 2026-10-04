@@ -2250,15 +2250,19 @@ class SecretRedactionTestCase(testtools.TestCase):
 
 
 class HeredocDelimiterTestCase(testtools.TestCase):
-    """Every heredoc this module generates has a quoted delimiter.
+    """Every heredoc this module generates has a quoted delimiter, and no
+    body which ends it early.
 
-    Rule 2 at the top of cluster.py. An unquoted delimiter lets the remote
-    shell expand $, backticks and $( ) inside the body, and every heredoc
-    here carries a value Python already substituted, so there is nothing
-    for the shell to be expanding. This asserts the rule over the
-    generated commands rather than per site, because the failure mode is a
-    new heredoc written the old way rather than one of these two changing
-    back.
+    Rule 2 at the top of cluster.py, both halves. An unquoted delimiter
+    lets the remote shell expand $, backticks and $( ) inside the body, and
+    every heredoc here carries a value Python already substituted, so there
+    is nothing for the shell to be expanding. A quoted delimiter is
+    necessary and not sufficient: it does not stop an interpolated value
+    from ending the heredoc, and whatever follows the delimiter line is
+    then read by the shell as commands, running as root on the node. Both
+    are asserted over the generated commands rather than per site, because
+    the failure mode is a new heredoc written the old way rather than one
+    of these changing back.
     """
 
     def test_no_generated_heredoc_is_unquoted(self):
@@ -2275,6 +2279,65 @@ class HeredocDelimiterTestCase(testtools.TestCase):
                 introducer.startswith("'") and introducer.endswith("'"),
                 'this heredoc delimiter is not quoted, so the remote shell '
                 'expands the body: %s' % line)
+
+    def test_a_metadata_address_cannot_end_the_heredoc(self):
+        """The namespace metadata document is third party writable.
+
+        Anything holding the namespace's credentials can write this
+        document, and conductor writes it too, so a value containing a
+        newline is not something the API's own validation rules out on
+        this package's behalf -- rule 1 says so in as many words. Without
+        the refusal, these two bodies would carry 'kubectl ...' or anything
+        else the writer chose, as root on the first control plane node.
+        """
+        hostile = '10.0.0.1"\nEOF\ntouch /pwned\ncat - > /dev/null << \'EOF\'\nx'
+
+        client = ActionLogClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'k3s_version': 'v1.33', 'api_address_floating': hostile,
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': [hostile]}
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        e = self.assertRaises(exceptions.GuestFileError,
+                              _make_cluster(client).install_control_plane)
+        self.assertEqual('delimiter_collision', e.reason)
+        self.assertEqual('/etc/rancher/k3s/config.yaml', e.path)
+
+        e = self.assertRaises(
+            exceptions.GuestFileError,
+            _make_cluster(client).configure_metallb_addresses)
+        self.assertEqual('/etc/sf/metallb-range-allocation.yaml', e.path)
+
+        # Nothing was executed on the node before the refusal.
+        self.assertEqual([], [a for a in client.actions if a[0] == 'execute'])
+
+    def test_heredoc_builds_what_it_used_to_build(self):
+        """The builder is a refactor of three identical string literals."""
+        self.assertEqual(
+            "cat - > /etc/sf/thing.yaml << 'EOF'\nkey: value\nEOF\n",
+            cluster_module.heredoc('/etc/sf/thing.yaml', 'key: value\n'))
+
+    def test_heredoc_adds_exactly_one_trailing_newline(self):
+        self.assertEqual(
+            "cat - > /etc/sf/thing.yaml << 'EOF'\nkey: value\nEOF\n",
+            cluster_module.heredoc('/etc/sf/thing.yaml', 'key: value'))
+
+    def test_heredoc_quotes_the_destination(self):
+        self.assertIn(
+            "cat - > '/etc/sf/a b.yaml'",
+            cluster_module.heredoc('/etc/sf/a b.yaml', 'x\n'))
+
+    def test_heredoc_honours_a_custom_delimiter(self):
+        e = self.assertRaises(
+            exceptions.GuestFileError, cluster_module.heredoc,
+            '/etc/sf/thing.yaml', 'SFK3SMANIFEST\n',
+            cluster_module.K3S_MANIFEST_DELIMITER)
+        self.assertEqual(cluster_module.K3S_MANIFEST_DELIMITER, e.delimiter)
 
 
 class ReadinessWaitsOnWorkloadsTestCase(testtools.TestCase):
