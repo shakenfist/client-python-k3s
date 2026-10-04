@@ -262,9 +262,14 @@ class ConnectionTestCase(ModuleTestCase):
         # than something the module's own suffix could supply: the suffix
         # names auth_namespace and namespace, so a message which named no
         # parameters at all would still contain both words.
-        self.assertIn('api_url', expected)
-        self.assertIn('namespace', expected)
-        self.assertNotIn('key', expected.split('Got only')[-1])
+        # What this module owes is that make_client()'s message arrives
+        # intact, which the assertion above proves. Which parameters that
+        # message names is make_client()'s contract and is tested in
+        # client.py's own tests -- the previous version of this line split
+        # on the literal phrase 'Got only', which is the same brittleness
+        # the review of #90 asked to have removed, relocated rather than
+        # deleted. Whether the rule itself is right is not this file's
+        # question.
         # And that the module owns the one translation it owes: its
         # parameter for make_client()'s namespace has a different name,
         # so a message naming "namespace" is ambiguous without this.
@@ -695,9 +700,113 @@ class ApiFailureTestCase(ModuleTestCase):
         self.assertNotIn('Traceback', run.stderr)
         self.assertIn('Could not reach the Shaken Fist API', run.msg)
         self.assertIn('connection refused', run.msg)
-        # A partly built cluster is the state this leaves behind, and the
-        # remedy belongs in the message rather than in the documentation.
+        # This failure is the first metadata read, before anything has been
+        # touched, so the advice is to re-run and nothing more. An earlier
+        # version of this test asserted 'state: absent' here, which pinned
+        # exactly the misleading wording _Mutation was introduced to
+        # remove: telling an operator to delete a cluster this run had not
+        # created. The review of #90 found the test locking in the bug.
+        self.assertIn('Nothing was changed', run.msg)
+        self.assertNotIn('state: absent', run.msg)
+        self.assertNotIn('partly built', run.msg)
+        self.assertFalse(run.result['changed'])
+
+
+class ShapeRangeTestCase(ModuleTestCase):
+    """Values a playbook can produce that a human would not type.
+
+    A templated control_plane_count which resolved to 0, or an empty
+    inventory variable coerced to an int, builds a cluster with no control
+    plane -- and says so tens of minutes later, from somewhere that does
+    not mention the option. Raised by the review of #90, which noted a
+    declarative module is far likelier to receive such a value than the
+    CLI is.
+    """
+
+    def test_a_cluster_with_no_control_plane_is_refused(self):
+        run = self.run_module(base_params(control_plane_count=0),
+                              expect_failure=True)
+
+        self.assertIn('control_plane_count must be at least 1', run.msg)
+        # Refused before anything was asked of the API, which is the point:
+        # the alternative is finding out after the instances exist.
+        self.assertEqual([], run.diagnostics['cluster_calls'])
+        self.assertEqual([], run.diagnostics['client_calls'])
+
+    def test_a_negative_worker_count_is_refused(self):
+        run = self.run_module(base_params(initial_workers=-1),
+                              expect_failure=True)
+
+        self.assertIn('initial_workers must be at least 0', run.msg)
+
+    def test_a_negative_address_count_is_refused(self):
+        run = self.run_module(base_params(metal_address_count=-5),
+                              expect_failure=True)
+
+        self.assertIn('metal_address_count must be at least 0', run.msg)
+
+    def test_the_checks_do_not_apply_to_a_delete(self):
+        """None of the three means anything when removing a cluster.
+
+        Refusing them there would fail a task whose request is perfectly
+        clear, over values it will never read.
+        """
+        run = self.run_module(base_params(state='absent',
+                                          control_plane_count=0))
+
+        self.assertFalse(run.failed)
+        self.assertFalse(run.result['changed'])
+
+
+class MutationStateTestCase(ModuleTestCase):
+    """What the failure paths say, and whether they admit to a change.
+
+    One object records how far a run got, and both the advice and the
+    changed flag are read off it, so these tests pin the three cases
+    together rather than one message at a time. The review of #90 found
+    all three wrong in the same direction: unconditional "may be partly
+    built" advice, and fail_json() without changed.
+    """
+
+    def test_a_failure_before_any_mutation_admits_no_change(self):
+        run = self.run_module(base_params(), metadata_raises='api',
+                              expect_failure=True)
+
+        self.assertFalse(run.result['changed'])
+        self.assertIn('Nothing was changed', run.msg)
+        self.assertEqual([], run.diagnostics['cluster_calls'])
+
+    def test_a_failure_during_a_create_reports_the_change(self):
+        """The case handlers and callbacks are misled by.
+
+        create() has booted instances and written metadata by the time it
+        raises, so a task reported as unchanged tells every handler keyed
+        on changed that there is nothing to react to.
+        """
+        run = self.run_module(base_params(), fake_create=True,
+                              create_raises=True, expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertTrue(run.result['changed'])
+        # And the advice that fits a half-built cluster.
+        self.assertIn('partly built', run.msg)
         self.assertIn('state: absent', run.msg)
+
+    def test_a_failure_during_a_delete_says_the_delete_was_interrupted(self):
+        """Not 'state: absent removes whatever exists', which is circular.
+
+        The operator already asked for state: absent. Telling them to do
+        it again is only useful if the message says why -- that the delete
+        itself stopped part way.
+        """
+        run = self.run_module(
+            base_params(state='absent'), cluster_exists=True,
+            instance_state='created', delete_raises=True,
+            expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertTrue(run.result['changed'])
+        self.assertIn('delete was interrupted', run.msg)
 
 
 class ProbeFailureTestCase(ModuleTestCase):

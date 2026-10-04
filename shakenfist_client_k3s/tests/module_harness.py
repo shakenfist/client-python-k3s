@@ -166,6 +166,9 @@ def _build_spec(path):
                        That is where create() really reads the ssh key:
                        after the name and the network are settled, so
                        there is already output to lose.
+    delete_raises      make delete_instance() raise an APIException part
+                       way through a delete, which is a delete stopping
+                       after it has already removed something.
     health_raises      make the per node get_instance() health() calls
                        raise an APIException, which is a probe failing
                        while the cluster is fine.
@@ -182,7 +185,8 @@ def _build_spec(path):
                        cluster.py catches apiclient.APIException only at
                        particular call sites.
     """
-    spec = json.load(io.open(path, encoding='utf-8'))
+    with io.open(path, encoding='utf-8') as f:
+        spec = json.load(f)
     spec.setdefault('cluster_exists', False)
     spec.setdefault('cluster_state', 'created')
     spec.setdefault('worker_nodes', 1)
@@ -193,6 +197,7 @@ def _build_spec(path):
     spec.setdefault('metadata_raises', None)
     spec.setdefault('client_raises', False)
     spec.setdefault('health_raises', False)
+    spec.setdefault('delete_raises', False)
     return spec
 
 
@@ -253,6 +258,11 @@ def build_fake_client(spec):
     # how a probe fails while the cluster itself is fine -- which is the
     # case the review of #90 found reported as a possibly-partly-built
     # create, advising an operator to delete a working cluster.
+    if spec['delete_raises']:
+        client.delete_instance.side_effect = apiclient.APIException(
+            'the server could not delete that instance', 'DELETE',
+            'http://sf-1:13000/instances/worker-uuid-0', 500, 'boom')
+
     if spec['health_raises']:
         client.get_instance.side_effect = apiclient.APIException(
             'the server is too busy to answer', 'GET',

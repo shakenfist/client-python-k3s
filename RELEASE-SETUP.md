@@ -99,6 +99,18 @@ PyPI, does not allow a published version to be replaced. If
 the recovery is the same as PyPI's -- move to the next version, do not
 retry the tag.
 
+The two publishing jobs are ordered rather than parallel, which is worth
+knowing when a release goes wrong. `publish-collection` needs
+`publish-pypi`, so a failed PyPI upload stops the collection from
+publishing at all. That is deliberate: the collection's
+`requirements.txt` names `shakenfist_client_k3s`, so a collection on
+Galaxy without its plugin on PyPI is published and unusable, and the
+burn-the-version recovery would then make the *next* release skip a
+collection version which is already public. With the ordering, a
+half-published release always means "on PyPI, not on Galaxy" -- which is
+the half that can be finished by publishing the other, rather than the
+half that has consumed a version number nobody can reuse.
+
 1. Log in to [galaxy.ansible.com](https://galaxy.ansible.com) with an
    account that holds `shakenfist` namespace permission
 2. Go to <https://galaxy.ansible.com/ui/token/>

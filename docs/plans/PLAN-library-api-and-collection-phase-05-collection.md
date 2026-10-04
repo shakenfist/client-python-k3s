@@ -483,6 +483,47 @@ and epoch shapes.
 
 Mutations stand at **35**, all killed. Tests stand at 425.
 
+### Round three, and why it is the last
+
+1 `fix` / 2 `document` / 5 `consider` / 1 `none`. The `fix` count went
+3 -> 1 -> 1, and this round's `fix` was in code round two added, which is
+the signal to stop: the reviewer is now reviewing the consequences of its
+own previous suggestions rather than the change this phase set out to
+make. Every item was taken; no fourth round was requested.
+
+The `fix` and the `consider` beside it shared one cause, and fixing the
+reported instance would have left the others. `_probe()` had taught two
+call sites that advice depends on how far a run got, and the three outer
+handlers still gave create advice unconditionally: a failure on the first
+metadata read told an operator to delete a cluster this run never created,
+and a failure during a *delete* advised `state: absent`, which is what
+they had already asked for. The same handlers called `fail_json()` without
+`changed`, so a create that built instances and then failed reported the
+task as unchanged -- which is what handlers and callbacks key on. One
+`_Mutation` object now records what was attempted, and both the advice and
+the `changed` flag are read off it, including on the
+`K3sClusterException` path the review did not mention.
+
+One of this round's findings was that **a test from round one pinned the
+bug**: `test_an_unreachable_api_says_so_and_says_what_to_do` asserted
+`state: absent` appeared in the message for a scenario where nothing had
+been touched. It failed the moment the advice became conditional, which is
+the correct outcome and a reminder that a test asserting current behaviour
+is not the same as a test asserting intended behaviour.
+
+Also taken: the counts are range-checked, so a templated
+`control_plane_count: 0` is refused before a client is built rather than
+producing a cluster with no control plane tens of minutes later -- the
+library-level version of that check is #96, deliberately left out because
+it changes a signature's contract for every caller. The two publishing
+jobs are now ordered, `publish-collection` needing `publish-pypi`, so a
+half-published release always means "on PyPI, not on Galaxy" -- the half
+that can be finished rather than the half that has consumed a version
+number. And the `'Got only'` split survived round two's fix by being
+relocated rather than deleted; it is gone.
+
+Mutations stand at **40**, all killed. Tests stand at 432.
+
 ## Definition of done
 
 Each of these is checkable, and most are one command:

@@ -190,9 +190,11 @@ authenticate as" above for why that mapping exists at all.
 
 `sf_k3s_cluster` supports check mode (`supports_check_mode=True`) and
 it is how this module's idempotency is meant to be verified: run a
-play twice, the second time with `--check`, and a cluster already at
-the requested shape reports `changed: false` without touching
-anything. Specifically:
+play twice, the second time with `--check`, and a cluster which already
+exists and has finished building reports `changed: false` -- whatever
+its shape -- without touching anything. "Whatever its shape" is not a
+hedge: shape is never compared, for the reason the next section gives.
+Specifically:
 
 - `state: present` against a cluster that does not exist reports
   `changed: true` in check mode, and creates nothing -- no instance,

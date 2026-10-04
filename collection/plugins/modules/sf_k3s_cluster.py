@@ -363,7 +363,59 @@ log:
 """
 
 
-def _probe(module, cluster, reporter, created):
+class _Mutation:
+    """What this run has started doing to the cloud, if anything.
+
+    Three of the module's failure paths need to know this, and the review
+    of #90 found all three getting it wrong in the same way: the handlers
+    said "the cluster may be partly built; state: absent removes whatever
+    exists" unconditionally, so a failure on the very first metadata read
+    -- before anything had been touched -- told the operator to delete a
+    cluster this run had not created, and a failure during a delete gave
+    advice that was circular. They also called fail_json() without
+    changed, so a create which built instances and then failed part way
+    reported the task as unchanged, which is what handlers and callbacks
+    key on.
+
+    Fixing the three messages separately would have left the fourth
+    failure path to be found later. This is the derivable answer instead:
+    one object records what was attempted, and both the advice and the
+    changed flag are read off it.
+    """
+
+    def __init__(self):
+        self.started = None
+
+    def creating(self):
+        self.started = 'create'
+
+    def deleting(self):
+        self.started = 'delete'
+
+    @property
+    def changed(self):
+        """Whether the cloud may have been modified by this run.
+
+        Deliberately pessimistic: it goes true immediately *before* the
+        call rather than after it, because a create which raised part way
+        through has still built instances, and reporting changed=False in
+        that case is the error being fixed here.
+        """
+        return self.started is not None
+
+    def advice(self):
+        """What to tell the operator, given how far this run had got."""
+        if self.started == 'create':
+            return ('The cluster may be partly built; "state: absent" '
+                    'removes whatever exists.')
+        if self.started == 'delete':
+            return ('The delete was interrupted, so the cluster may be '
+                    'partly removed; run again with "state: absent" to '
+                    'finish it.')
+        return 'Nothing was changed, so the task can simply be run again.'
+
+
+def _probe(module, cluster, reporter, mutation):
     """Run health(), without letting a probe failure read as a cluster failure.
 
     health() does not wrap what the client raises: it calls get_instance()
@@ -378,7 +430,7 @@ def _probe(module, cluster, reporter, created):
     the probe of a cluster which already existed, where the advice is
     equally wrong for a different reason.
 
-    created says which of those two it is, and is the whole of the
+    mutation says which of those two it is, and is the whole of the
     difference. After a create the module has mutated the cloud, so the
     result must say so and the probe is downgraded to a warning. Before any
     create it has not, so this is a failure -- but one about the probe
@@ -389,7 +441,7 @@ def _probe(module, cluster, reporter, created):
         return cluster.health()
     except (apiclient.APIException,
             requests.exceptions.RequestException) as e:
-        if created:
+        if mutation.changed:
             module.warn(
                 'The cluster was created. The health probe afterwards failed '
                 '(%s), so no health report is included -- re-run this task to '
@@ -404,7 +456,7 @@ def _probe(module, cluster, reporter, created):
             health=None, log=reporter.lines)
 
 
-def _present(module, cluster, reporter):
+def _present(module, cluster, reporter, mutation):
     """Ensure the cluster exists, and report whether that took a change."""
     # get_metadata() rather than health() for the existence decision: this
     # is a single namespace metadata read, which is the cheap check decision
@@ -433,6 +485,7 @@ def _present(module, cluster, reporter):
         # outside its own business; refresh_version_cache stays False
         # because a cache refresh is a thing a human asks for once, not a
         # property of the cluster a play is declaring.
+        mutation.creating()
         cluster.create(
             control_plane_count=module.params['control_plane_count'],
             worker_count=module.params['initial_workers'],
@@ -447,14 +500,14 @@ def _present(module, cluster, reporter):
         # health() which raises there loses the fact that a create just
         # succeeded.
         module.exit_json(
-            changed=True, health=_probe(module, cluster, reporter, True),
+            changed=True, health=_probe(module, cluster, reporter, mutation),
             log=reporter.lines)
 
     # The cluster exists. health() is what says whether it is a cluster at
     # all: it returns structure rather than text precisely so that this
     # module can branch on it, and it is the only public way to learn that a
     # cluster never finished being built.
-    report = _probe(module, cluster, reporter, False)
+    report = _probe(module, cluster, reporter, mutation)
     if report['interrupted']:
         module.fail_json(
             msg=('Cluster %s is in state %s rather than created: an earlier '
@@ -471,7 +524,7 @@ def _present(module, cluster, reporter):
     module.exit_json(changed=False, health=report, log=reporter.lines)
 
 
-def _absent(module, cluster, reporter):
+def _absent(module, cluster, reporter, mutation):
     """Ensure the cluster does not exist, and report whether that took a change."""
     if cluster.get_metadata() is None:
         module.exit_json(changed=False, health=None, log=reporter.lines)
@@ -484,6 +537,7 @@ def _absent(module, cluster, reporter):
     # machine which happened to run this module is not part of the cluster,
     # and editing it would also shell out to kubectl, which this module does
     # not require to be installed.
+    mutation.deleting()
     cluster.delete()
     module.exit_json(changed=True, health=None, log=reporter.lines)
 
@@ -544,6 +598,34 @@ def run_module():
                         'Python packages, so the pip install in '
                         'requirements.txt is a separate step')),
             exception=SF_K3S_IMPORT_ERROR)
+
+    # Range checked here rather than in the argument spec, which has no way
+    # to express a minimum. A module fed from inventory variables meets
+    # these values far more often than a human typing the CLI does: a
+    # templated control_plane_count which resolved to 0 or an empty string
+    # coerced to 0 builds a cluster with no control plane, and the failure
+    # arrives tens of minutes later from somewhere that does not mention
+    # the count. Only for state: present, because none of the three means
+    # anything on a delete and refusing them there would fail a task whose
+    # request is perfectly clear.
+    #
+    # Deliberately not pushed down into Cluster.create() even though the
+    # CLI would benefit, which the review of #90 suggested: that changes a
+    # library signature's contract for every caller and belongs in its own
+    # change rather than in a review round on a collection. Tracked in
+    # shakenfist/client-python-k3s#96.
+    if module.params['state'] == 'present':
+        floors = (('control_plane_count', 1), ('initial_workers', 0),
+                  ('metal_address_count', 0))
+        for name, floor in floors:
+            if module.params[name] < floor:
+                module.fail_json(
+                    msg=('%s must be at least %d, and is %d. A cluster built '
+                         'with that value would either fail during the build '
+                         'or come up unusable, tens of minutes from now and '
+                         'with an error that does not mention this option.'
+                         % (name, floor, module.params[name])),
+                    health=None, log=[])
 
     # Where the orchestration's output goes. A Reporter is file like and
     # Progress writes to it as a stream, so this one object catches
@@ -633,24 +715,35 @@ def run_module():
     # log, which is the one thing a half-finished create leaves behind
     # worth reading. requests.exceptions.RequestException is the transport
     # layer under apiclient; APIException does not derive from it.
+    mutation = _Mutation()
     try:
         if module.params['state'] == 'present':
-            _present(module, cluster, reporter)
+            _present(module, cluster, reporter, mutation)
         else:
-            _absent(module, cluster, reporter)
+            _absent(module, cluster, reporter, mutation)
     except sf_exceptions.K3sClusterException as e:
-        module.fail_json(msg=str(e), health=None, log=reporter.lines)
+        # The advice is appended here too, not only to the two API
+        # handlers. The library's own sentence explains what went wrong and
+        # says nothing about what the run had already built: an ssh key
+        # which cannot be read is reported from inside create(), by which
+        # point the network exists. Whether debris is left behind is a
+        # property of how far the run got, not of which exception ended it,
+        # which is the whole reason that question has one answer.
+        module.fail_json(
+            changed=mutation.changed,
+            msg='%s %s' % (e, mutation.advice()),
+            health=None, log=reporter.lines)
     except apiclient.APIException as e:
         module.fail_json(
-            msg=('The Shaken Fist API refused a request: %s. The cluster may '
-                 'be partly built; "state: absent" removes whatever exists.'
-                 % e),
+            changed=mutation.changed,
+            msg=('The Shaken Fist API refused a request: %s. %s'
+                 % (e, mutation.advice())),
             health=None, log=reporter.lines)
     except requests.exceptions.RequestException as e:
         module.fail_json(
-            msg=('Could not reach the Shaken Fist API: %s. The cluster may '
-                 'be partly built; "state: absent" removes whatever exists.'
-                 % e),
+            changed=mutation.changed,
+            msg=('Could not reach the Shaken Fist API: %s. %s'
+                 % (e, mutation.advice())),
             health=None, log=reporter.lines)
 
 

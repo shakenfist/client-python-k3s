@@ -202,7 +202,23 @@ jobs:
 
   publish-collection:
     name: Publish ansible collection to Galaxy
-    needs: [build-collection, sign-tag]
+    # publish-pypi is in the needs list, which the server repository's
+    # template does not do, and the divergence is deliberate. The two
+    # indexes are not independent: collection/requirements.txt names
+    # shakenfist_client_k3s, so the collection is only useful once the
+    # plugin is on PyPI. Without the dependency a release whose PyPI
+    # upload failed still published to Galaxy, leaving a version public on
+    # one index and absent from the other -- and because the recovery for
+    # a failed publish is to burn the version and tag the next one, the
+    # following release would skip a collection version that is already
+    # out there. Ordering them makes "half published" mean "PyPI only",
+    # which is the half that can be fixed by publishing the other.
+    #
+    # This is a different question from whether github-release should wait
+    # for the collection, which was considered in 5f and left matching the
+    # template: that one is about which files a GitHub release carries,
+    # and nothing depends on the answer.
+    needs: [build-collection, sign-tag, publish-pypi]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: [self-hosted, static]
     environment: release
