@@ -485,46 +485,60 @@ class Cluster:
             raise exceptions.ClusterInterruptedError.not_usable(
                 self.name, state, verb)
 
+    def start_progress(self, total_phases):
+        """Begin progress reporting for an operation of total_phases phases.
+
+        The one place a Progress is constructed. What is repetitive about
+        it is not the constructor but the wiring -- the reporter is both
+        the stream written to and the source of the verbose flag, which is
+        Cluster's knowledge rather than Progress's -- and every entry point
+        which knows its own phase count needs exactly that wiring. Five of
+        them wrote it out by hand, so the sixth was going to as well.
+
+        This replaces whatever Progress is already there, which is what an
+        entry point wants: it is starting an operation, and the count it
+        knows is the right one. get_progress() is the other half of the
+        arrangement and deliberately does not replace.
+        """
+        self.progress = progress.Progress(
+            total_phases=total_phases, verbose=self.reporter.verbose,
+            stream=self.reporter)
+        return self.progress
+
     def get_progress(self, total_phases=1):
         """Return the Progress reporter for this operation, making a default if needed.
 
-        Commands which know how many phases they have build their own and
-        assign it; everything else gets one lazily, so a method called
-        directly by a library caller still reports progress somewhere
-        sensible.
+        Commands which know how many phases they have call
+        start_progress(); everything else gets one lazily from here, so a
+        method called directly by a library caller still reports progress
+        somewhere sensible.
 
         total_phases is the count the lazy default is built with, and is
         ignored when there is already a Progress to return -- it says how
         many phases *this* method is about to open, not how many the
-        operation has. It defaults to 1 because all but one of the methods
-        which call get_progress() themselves -- rather than inheriting a
-        Progress an entry point like create() or expand_workers() already
-        built -- open exactly one phase and do their work inside it:
-        create_and_await_instances(), install_extra_control_plane(),
-        install_workers(), setup_metallb() and setup_longhorn(). 1 is
-        therefore not a placeholder guess but the true count for those
-        callers, giving a library caller who invokes one of them directly
-        an honest "[1/1]" instead of the un-numbered "[n]" this used to
-        print.
-
-        The exception is install_control_plane(), which opens a second
-        phase through install_extra_control_plane() when the cluster has
-        more than one control plane node, and so passes the count it works
-        out from the metadata rather than taking the default.
+        operation has. It defaults to 1 because the methods which call
+        get_progress() themselves, rather than inheriting a Progress an
+        entry point already started, open exactly one phase and do their
+        work inside it. 1 is therefore the true count for those callers
+        and not a placeholder guess, which is what gives a library caller
+        who invokes one of them directly an honest "[1/1]" instead of the
+        un-numbered "[n]" this used to print. install_control_plane() is
+        the exception: it opens a second phase through
+        install_extra_control_plane() when the cluster has more than one
+        control plane node, so it works its count out from the metadata
+        rather than taking the default.
 
         This is one Progress per Cluster instance, cached for its life
         (see __init__), so it is only accurate for a single such call. A
         library caller who invokes two of these methods in sequence on the
         same Cluster shares the one lazily built Progress between them --
         the second call's phase header becomes "[2/1]", which is worse
-        than un-numbered. A caller doing that should build its own
-        progress.Progress with the real total and assign it to
-        self.progress first, the way create() and expand_workers() do.
+        than un-numbered. A caller doing that should call start_progress()
+        with the real total first, the way create() and expand_workers()
+        do.
         """
         if not self.progress:
-            self.progress = progress.Progress(
-                total_phases=total_phases, verbose=self.reporter.verbose,
-                stream=self.reporter)
+            self.start_progress(total_phases)
         return self.progress
 
     def _node_size(self, md, node_type):
@@ -1519,10 +1533,7 @@ class Cluster:
             total_phases -= 1
         if not write_kubeconfig:
             total_phases -= 1
-        p = progress.Progress(
-            total_phases=total_phases, verbose=self.reporter.verbose,
-            stream=self.reporter)
-        self.progress = p
+        p = self.start_progress(total_phases)
 
         self.reporter.debug('Looking up k3s versions')
         target_release = primitives.get_k3s_release(
@@ -2266,9 +2277,7 @@ class Cluster:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
         self._require_usable(md, 'expand-workers')
 
-        p = progress.Progress(
-            total_phases=2, verbose=self.reporter.verbose, stream=self.reporter)
-        self.progress = p
+        p = self.start_progress(2)
         new_workers = self.create_and_await_instances(worker_count, 'worker')
         self.install_workers(new_workers)
         p.finish(f'Added {worker_count} workers to cluster {self.name}')
@@ -2365,10 +2374,7 @@ class Cluster:
         if not wanted:
             return
 
-        p = progress.Progress(
-            total_phases=len(wanted), verbose=self.reporter.verbose,
-            stream=self.reporter)
-        self.progress = p
+        p = self.start_progress(len(wanted))
 
         # Every node name is resolved before anything is drained or deleted,
         # for the reason the uuid check above runs first: this loop destroys
@@ -2595,9 +2601,7 @@ class Cluster:
             raise exceptions.ComponentNotInstalledError(
                 self.name, 'metallb', 'expand-addresses')
 
-        p = progress.Progress(
-            total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)
-        self.progress = p
+        p = self.start_progress(1)
         p.phase('Adding metallb addresses')
         self.allocate_metallb_addresses(address_count)
         self.configure_metallb_addresses()
@@ -2617,9 +2621,7 @@ class Cluster:
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
 
-        p = progress.Progress(
-            total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)
-        self.progress = p
+        p = self.start_progress(1)
         p.phase('Updating the OS on all cluster nodes')
         self.instance_os_update(md['control_plane_nodes'] + md['worker_nodes'])
         p.finish(f'Updated the OS on all nodes in cluster {self.name}')

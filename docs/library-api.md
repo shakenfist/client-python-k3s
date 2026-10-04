@@ -107,7 +107,8 @@ external callers. Everything else `Cluster` exposes --
 `install_extra_control_plane()`, `install_workers()`,
 `allocate_metallb_addresses()`, `configure_metallb_addresses()`,
 `setup_metallb()`, `setup_longhorn()`,
-`create_and_await_instances()`, `get_progress()`,
+`create_and_await_instances()`, `start_progress()`,
+`get_progress()`,
 `_interrupted_state()` and `_require_usable()` -- is internal
 orchestration the methods above are built from, not a supported
 entry point, so treat it as unstable even though nothing today
