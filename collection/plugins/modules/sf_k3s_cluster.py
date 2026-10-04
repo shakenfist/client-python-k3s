@@ -22,13 +22,40 @@
 # document is the race that would create.
 from __future__ import annotations
 
-from ansible.module_utils.basic import AnsibleModule
+import traceback
 
-from shakenfist_client import apiclient
-from shakenfist_client_k3s import client as sf_client
-from shakenfist_client_k3s import cluster as sf_cluster
-from shakenfist_client_k3s import exceptions as sf_exceptions
-from shakenfist_client_k3s import progress as sf_progress
+from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.basic import missing_required_lib
+
+# Guarded, because the likeliest first-run failure is a control node which
+# installed the collection and not the plugin. Galaxy cannot install a
+# Python package, so "ansible-galaxy collection install shakenfist.k3s"
+# leaves this import unsatisfiable until someone also runs the pip install
+# that collection/requirements.txt names -- and an unguarded import turns
+# that into a ModuleNotFoundError traceback inside MODULE FAILURE, which
+# says what Python could not find rather than what the operator should do.
+# missing_required_lib() says the latter. The traceback is kept and handed
+# back under "exception" so a genuinely broken install is still
+# diagnosable, which is the whole reason for capturing it here rather than
+# discarding it.
+#
+# requests is imported for the same reason it is caught below: it is
+# shakenfist_client's transport, so it is present whenever that is, and
+# naming it here keeps the failure for a half-installed environment in one
+# place.
+HAS_SF_K3S = True
+SF_K3S_IMPORT_ERROR = None
+try:
+    import requests
+
+    from shakenfist_client import apiclient
+    from shakenfist_client_k3s import client as sf_client
+    from shakenfist_client_k3s import cluster as sf_cluster
+    from shakenfist_client_k3s import exceptions as sf_exceptions
+    from shakenfist_client_k3s import progress as sf_progress
+except ImportError:
+    HAS_SF_K3S = False
+    SF_K3S_IMPORT_ERROR = traceback.format_exc()
 
 
 DOCUMENTATION = r"""
@@ -460,6 +487,20 @@ def run_module():
     module = AnsibleModule(
         argument_spec=argument_spec, supports_check_mode=True)
 
+    # Checked immediately after AnsibleModule exists and before anything
+    # else, because fail_json() is the only way to say this in a form
+    # Ansible renders as a message rather than a crash, and it needs the
+    # module object. Nothing above this point touches the guarded names.
+    if not HAS_SF_K3S:
+        module.fail_json(
+            msg=missing_required_lib(
+                'shakenfist_client_k3s',
+                reason=('on the Ansible control node. The collection cannot '
+                        'install it: Galaxy ships Ansible content and not '
+                        'Python packages, so the pip install in '
+                        'requirements.txt is a separate step')),
+            exception=SF_K3S_IMPORT_ERROR)
+
     # Where the orchestration's output goes. A Reporter is file like and
     # Progress writes to it as a stream, so this one object catches
     # everything the library would otherwise have printed, and stdout -- the
@@ -503,6 +544,26 @@ def run_module():
                  'sfrc/~/.shakenfist//etc/sf/shakenfist.json, and none were '
                  'found.' % e),
             health=None, log=reporter.lines)
+    except (apiclient.APIException,
+            requests.exceptions.RequestException) as e:
+        # Constructing a client is not a local operation, which is easy to
+        # miss and is why these two were not caught here at first: the
+        # review of #90 found the orchestration below unprotected, and
+        # sweeping for the same shape found this site as well.
+        # apiclient.Client.__init__ calls _collect_capabilities(), which
+        # does a GET against base_url before the constructor returns. So an
+        # api_url with a typo in it, a host which is down, DNS which does
+        # not resolve or a TLS failure all raise here -- before any
+        # orchestration, on what is very likely a first run with a
+        # misconfigured inventory. That makes this the more probable of the
+        # two sites, not the lesser one.
+        module.fail_json(
+            msg=('Could not reach the Shaken Fist API at %s: %s. The client '
+                 'checks the API is there while it is being built, so this '
+                 'failed before any cluster work started -- nothing has '
+                 'been created.'
+                 % (module.params['api_url'] or 'the discovered api_url', e)),
+            health=None, log=reporter.lines)
 
     cluster = sf_cluster.Cluster(
         client, module.params['name'], module.params['namespace'],
@@ -515,6 +576,19 @@ def run_module():
     # with the collected progress thrown away. exit_json() and fail_json()
     # raise SystemExit, which is not an Exception, so they pass through this
     # untouched.
+    #
+    # K3sClusterException alone is not enough, which the review of #90
+    # pointed out and cluster.py confirms: it catches
+    # apiclient.APIException at particular call sites (:761, :2203, :2250)
+    # precisely because the client raises it unwrapped, so every other call
+    # through the client can hand one straight out. An UnauthorizedException
+    # from the first get_namespace_metadata(), a namespace which does not
+    # exist, a connection dropped twenty minutes into a create, or a
+    # requests error from the GitHub release lookups in primitives.py were
+    # all reaching Ansible as a traceback -- and discarding the collected
+    # log, which is the one thing a half-finished create leaves behind
+    # worth reading. requests.exceptions.RequestException is the transport
+    # layer under apiclient; APIException does not derive from it.
     try:
         if module.params['state'] == 'present':
             _present(module, cluster, reporter)
@@ -522,6 +596,18 @@ def run_module():
             _absent(module, cluster, reporter)
     except sf_exceptions.K3sClusterException as e:
         module.fail_json(msg=str(e), health=None, log=reporter.lines)
+    except apiclient.APIException as e:
+        module.fail_json(
+            msg=('The Shaken Fist API refused a request: %s. The cluster may '
+                 'be partly built; "state: absent" removes whatever exists.'
+                 % e),
+            health=None, log=reporter.lines)
+    except requests.exceptions.RequestException as e:
+        module.fail_json(
+            msg=('Could not reach the Shaken Fist API: %s. The cluster may '
+                 'be partly built; "state: absent" removes whatever exists.'
+                 % e),
+            health=None, log=reporter.lines)
 
 
 def main():

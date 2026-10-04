@@ -246,11 +246,21 @@ jobs:
           publish-venv/bin/pip3 install --upgrade pip
           publish-venv/bin/pip3 install ansible-core
 
+      # The token arrives through env: rather than being interpolated
+      # into the script. Actions expands ${{ }} into the script text
+      # before bash sees it, so interpolating a secret writes it into the
+      # generated script file on the runner -- masked in the log, present
+      # on a persistent self-hosted disk, and the shape template
+      # injection linters flag. Every other secret in this repository's
+      # workflows already arrives this way; this step was the only one
+      # that did not.
       - name: Publish to Ansible Galaxy
+        env:
+          ANSIBLE_GALAXY_TOKEN: ${{ secrets.ANSIBLE_GALAXY_TOKEN }}
         run: |
           publish-venv/bin/ansible-galaxy collection publish \
-              ${{ runner.temp }}/dist-collection/*.tar.gz \
-              --api-key "${{ secrets.ANSIBLE_GALAXY_TOKEN }}"
+              "${RUNNER_TEMP}"/dist-collection/*.tar.gz \
+              --api-key "${ANSIBLE_GALAXY_TOKEN}"
 
   github-release:
     name: Create GitHub Release

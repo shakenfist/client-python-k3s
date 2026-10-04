@@ -166,6 +166,18 @@ def _build_spec(path):
                        That is where create() really reads the ssh key:
                        after the name and the network are settled, so
                        there is already output to lose.
+    client_raises      make constructing the client raise a transport
+                       error, which is what an api_url pointing at nothing
+                       does: apiclient.Client.__init__ GETs base_url
+                       before it returns.
+    metadata_raises    make the fake client's get_namespace_metadata()
+                       raise instead of answering: 'unauthorized' and
+                       'api' for apiclient exceptions, 'requests' for a
+                       transport error. None of these derive from
+                       K3sClusterException, which is the point -- they are
+                       what reaches the module unwrapped, because
+                       cluster.py catches apiclient.APIException only at
+                       particular call sites.
     """
     spec = json.load(io.open(path, encoding='utf-8'))
     spec.setdefault('cluster_exists', False)
@@ -175,6 +187,8 @@ def _build_spec(path):
     spec.setdefault('unconfigured', False)
     spec.setdefault('fake_create', False)
     spec.setdefault('create_raises', False)
+    spec.setdefault('metadata_raises', None)
+    spec.setdefault('client_raises', False)
     return spec
 
 
@@ -192,6 +206,29 @@ def build_fake_client(spec):
 
     client = mock.MagicMock()
     client.get_namespace_metadata.return_value = namespace_md
+
+    # The first thing the module asks the client for is this cluster's
+    # metadata, so it is the cheapest place to stand in for "the API said
+    # no" or "the API was not there". Raised from the client rather than
+    # from Cluster, because anything Cluster raised itself would be a
+    # K3sClusterException and would prove nothing about the handlers these
+    # scenarios exist for.
+    if spec['metadata_raises']:
+        import requests
+
+        from shakenfist_client import apiclient
+        raisers = {
+            'unauthorized': lambda: apiclient.UnauthorizedException(
+                'namespace ci is not yours', 'GET',
+                'http://sf-1:13000/auth/namespaces/ci', 401, 'denied'),
+            'api': lambda: apiclient.APIException(
+                'the server could not complete that', 'GET',
+                'http://sf-1:13000/auth/namespaces/ci', 500, 'boom'),
+            'requests': lambda: requests.exceptions.ConnectionError(
+                'connection refused by sf-1:13000'),
+        }
+        client.get_namespace_metadata.side_effect = \
+            raisers[spec['metadata_raises']]()
     client.get_instance.return_value = {
         'name': 'k3s-%s-node-001' % CLUSTER_NAME,
         'state': spec['instance_state'],
@@ -276,6 +313,13 @@ def main():
         if spec['unconfigured']:
             raise apiclient.UnconfiguredException(
                 'no Shaken Fist configuration could be found')
+        if spec['client_raises']:
+            # What apiclient.Client.__init__ really does before returning:
+            # _collect_capabilities() GETs base_url, so an unreachable or
+            # misnamed API fails here rather than on the first real call.
+            import requests
+            raise requests.exceptions.ConnectionError(
+                'failed to establish a connection to sf-1:13000')
         return client
 
     # How a controller hands a module its parameters. ansible-core reads

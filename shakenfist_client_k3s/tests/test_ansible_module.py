@@ -34,6 +34,7 @@ import tempfile
 
 import testtools
 
+from shakenfist_client_k3s import client as sf_client
 from shakenfist_client_k3s.tests import module_harness
 
 
@@ -221,13 +222,31 @@ class ConnectionTestCase(ModuleTestCase):
             expect_failure=True)
 
         self.assertTrue(run.failed)
-        # The behaviour, not the prose: a user who supplied two of three
-        # has to be told which two, because the failure is about what they
-        # did and not about what the rule is. make_client() names them and
-        # the module passes that through.
-        self.assertIn('api_url', run.msg)
-        self.assertIn('namespace', run.msg)
-        self.assertNotIn('key', run.msg.split('Got only')[-1])
+        # Asserted against what make_client() actually says, by asking it:
+        # the module's contract here is that it passes make_client()'s
+        # message through, so the test that proves it is one which has that
+        # message to compare with. The review of #90 found the previous
+        # version of this test matching on the literal phrase "Got only",
+        # and two of its assertions worse than brittle: assertIn('namespace')
+        # and assertIn('auth_namespace') were both satisfied by the
+        # parenthetical the module appends to every one of these failures,
+        # so they held whatever the message said about the parameters --
+        # which is the one thing they were there to check. Only the api_url
+        # assertion carried information.
+        try:
+            sf_client.make_client(api_url='http://sf-1:13000',
+                                  namespace='system', key=None)
+            self.fail('make_client() accepted a partial connection set')
+        except ValueError as e:
+            expected = str(e)
+        self.assertIn(expected, run.msg)
+        # And that the passed-through text is the informative part rather
+        # than something the module's own suffix could supply: the suffix
+        # names auth_namespace and namespace, so a message which named no
+        # parameters at all would still contain both words.
+        self.assertIn('api_url', expected)
+        self.assertIn('namespace', expected)
+        self.assertNotIn('key', expected.split('Got only')[-1])
         # And that the module owns the one translation it owes: its
         # parameter for make_client()'s namespace has a different name,
         # so a message naming "namespace" is ambiguous without this.
@@ -585,6 +604,168 @@ class ExceptionTestCase(ModuleTestCase):
         self.assertIn(
             'Creating node network', '\n'.join(run.log),
             'the progress emitted before the failure was thrown away')
+
+
+class ApiFailureTestCase(ModuleTestCase):
+    """What the client raises, which Cluster does not wrap.
+
+    The module used to catch only K3sClusterException, on the reasoning
+    that the library wraps what goes wrong with a cluster. It does, for
+    cluster-shaped problems -- but the API client raises its own
+    exceptions and Cluster passes most of them straight through:
+    cluster.py catches apiclient.APIException at :761, :2203 and :2250
+    and nowhere else, which is itself the evidence that it arrives
+    unwrapped. Found by the review of #90.
+
+    What made it worth fixing rather than noting is the second half: an
+    escaping exception is reported by Ansible as MODULE FAILURE with a
+    traceback, and the collected log goes with it. For a create which ran
+    for twenty minutes and then lost its connection, that log is the only
+    record of how far it got.
+    """
+
+    def test_an_unauthorized_api_is_a_message_not_a_traceback(self):
+        run = self.run_module(base_params(), metadata_raises='unauthorized',
+                              expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertNotIn('Traceback', run.stderr)
+        self.assertIn('refused a request', run.msg)
+        self.assertIn('namespace ci is not yours', run.msg)
+
+    def test_an_unreachable_api_fails_before_the_client_exists(self):
+        """The likeliest misconfiguration of all, at the earliest site.
+
+        apiclient.Client.__init__ calls _collect_capabilities(), which GETs
+        base_url, so a wrong api_url raises inside make_client() rather
+        than on the first real call. The review of #90 found the
+        orchestration handler missing these; sweeping for the same shape
+        found the construction handler missing them too, which is the site
+        a first run with a typo in the inventory actually reaches.
+        """
+        run = self.run_module(base_params(**FULL_CONNECTION),
+                              client_raises=True, expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertNotIn('Traceback', run.stderr)
+        self.assertIn('Could not reach the Shaken Fist API', run.msg)
+        # The api_url it could not reach, so the fix is in the message.
+        self.assertIn(FULL_CONNECTION['api_url'], run.msg)
+        # And that nothing was attempted, which is the reassurance the
+        # operator needs before they re-run it.
+        self.assertIn('nothing has been created', run.msg)
+        self.assertEqual([], run.diagnostics['cluster_calls'])
+
+    def test_an_api_error_keeps_the_log(self):
+        run = self.run_module(base_params(), metadata_raises='api',
+                              expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertNotIn('Traceback', run.stderr)
+        # The log is the point of catching these at all, so its presence is
+        # the assertion rather than its contents: this failure happens on
+        # the first client call, before anything has been reported, so an
+        # empty list is the correct answer and None is not.
+        self.assertEqual([], run.result['log'])
+        self.assertIn('log', run.result)
+
+    def test_an_unreachable_api_says_so_and_says_what_to_do(self):
+        run = self.run_module(base_params(), metadata_raises='requests',
+                              expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertNotIn('Traceback', run.stderr)
+        self.assertIn('Could not reach the Shaken Fist API', run.msg)
+        self.assertIn('connection refused', run.msg)
+        # A partly built cluster is the state this leaves behind, and the
+        # remedy belongs in the message rather than in the documentation.
+        self.assertIn('state: absent', run.msg)
+
+
+class MissingLibraryTestCase(ModuleTestCase):
+    """A control node with the collection and not the plugin.
+
+    This is the likeliest first-run failure there is, because Galaxy
+    installs Ansible content and cannot install a Python package: the
+    documented install is two commands and only one of them is
+    ansible-galaxy's. An unguarded import makes that a
+    ModuleNotFoundError traceback, which tells the operator what Python
+    could not find rather than what to do about it.
+
+    Driven without the harness, because the harness imports the same
+    package it would have to hide.
+    """
+
+    def _run_without_the_plugin(self, params):
+        """Run the module with shakenfist_client_k3s shadowed by a stub."""
+        stubdir = os.path.join(self.tempdir, 'stub')
+        os.makedirs(stubdir)
+        with open(os.path.join(stubdir, 'shakenfist_client_k3s.py'), 'w',
+                  encoding='utf-8') as f:
+            f.write("raise ImportError('stub: not installed')\n")
+
+        env = dict(os.environ)
+        # First on the path, so it wins over the real package. PYTHONPATH
+        # rather than a sys.path edit because the module runs in its own
+        # interpreter, which is also how Ansible runs it.
+        env['PYTHONPATH'] = stubdir + os.pathsep + env.get('PYTHONPATH', '')
+
+        # No _ANSIBLE_ARGS to set here, so the module reads its parameters
+        # from stdin the way a controller without that variable makes it.
+        process = subprocess.run(
+            [sys.executable, MODULE],
+            input=json.dumps({'ANSIBLE_MODULE_ARGS': params}),
+            capture_output=True, encoding='utf-8', env=env,
+            timeout=RUN_TIMEOUT)
+        return process
+
+    def test_a_missing_plugin_says_to_install_it(self):
+        process = self._run_without_the_plugin(base_params())
+
+        self.assertEqual(1, process.returncode)
+        result = json.loads(process.stdout)
+        self.assertTrue(result['failed'])
+        # missing_required_lib()'s wording, which is what makes this
+        # recognisable to anyone who has met it in another collection.
+        self.assertIn('Failed to import the required Python library',
+                      result['msg'])
+        self.assertIn('shakenfist_client_k3s', result['msg'])
+        # And the reason the usual advice is not enough here: the
+        # collection cannot install it for them.
+        self.assertIn('requirements.txt', result['msg'])
+
+    def test_a_missing_plugin_keeps_the_traceback_for_diagnosis(self):
+        # _ansible_tracebacks_for is asked for explicitly, for the same
+        # reason the no_log test asks for the invocation: ansible-core 2.21
+        # made traceback capture opt-in, so on that version fail_json()
+        # drops the exception key unless a controller enabled it, while
+        # every version from 2.15 -- the floor meta/runtime.yml declares --
+        # returns it unconditionally. Requesting it pins the behaviour the
+        # module is responsible for (handing the traceback to fail_json)
+        # rather than whichever ansible-core happens to be installed.
+        params = base_params()
+        params['_ansible_tracebacks_for'] = ['error']
+        process = self._run_without_the_plugin(params)
+
+        result = json.loads(process.stdout)
+        # Kept, because a genuinely broken install -- as opposed to an
+        # absent one -- is only diagnosable from the import error itself.
+        # It belongs in the result rather than on stderr, where Ansible
+        # would render it as a crash.
+        self.assertIn('ImportError', result['exception'])
+        self.assertIn('stub: not installed', result['exception'])
+        self.assertNotIn('Traceback', process.stderr)
+
+    def test_the_result_is_still_one_json_document(self):
+        """The stdout contract holds on the failure path too."""
+        process = self._run_without_the_plugin(base_params())
+
+        decoder = json.JSONDecoder()
+        _, end = decoder.raw_decode(process.stdout.strip())
+        self.assertEqual(
+            len(process.stdout.strip()), end,
+            'something follows the JSON document on stdout: %r'
+            % process.stdout)
 
 
 class StdoutTestCase(ModuleTestCase):

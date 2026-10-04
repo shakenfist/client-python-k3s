@@ -382,6 +382,62 @@ updated to describe phase 5 as it is actually scoped.
    adopting the script as-is in 5d, and revisitable before 5g makes any
    version public.
 
+## What the review of #90 changed
+
+One round, 3 `fix` / 1 `document` / 5 `consider` / 1 `none`. All four of
+the first two were taken, three `consider` items were taken because each
+was a defect in code this phase added, and two were declined with their
+reasoning recorded below.
+
+Two findings were worth more than their labels suggested.
+
+**The module only caught `K3sClusterException`.** `Cluster` wraps
+cluster-shaped problems, but the API client raises its own exceptions and
+`Cluster` passes most of them through -- `cluster.py` catches
+`apiclient.APIException` at `:761`, `:2203` and `:2250` and nowhere else,
+which is itself the evidence. So an unauthorised namespace, a dropped
+connection or a transport error reached Ansible as MODULE FAILURE with a
+traceback, discarding the collected log, which for a create that ran
+twenty minutes is the only record of how far it got.
+
+Sweeping for the same shape found a **second site the review did not
+report**, and the likelier of the two: `apiclient.Client.__init__` calls
+`_collect_capabilities()`, which GETs `base_url` before the constructor
+returns, so a typo in `api_url` raises inside `make_client()` where only
+`ValueError` and `UnconfiguredException` were caught. A first run against
+a misconfigured inventory hits that site, not the orchestration one.
+
+**Two test assertions could not fail.** `assertIn('namespace')` and
+`assertIn('auth_namespace')` were both satisfied by the parenthetical the
+module appends to every connection failure, so they held whatever the
+message said about the parameters -- the one thing they existed to check.
+The test now compares against what `make_client()` actually raises,
+obtained by calling it. Demonstrated rather than asserted: a mutation
+which names only `api_url` and silently drops `namespace` is **passed** by
+the old assertions and **failed** by the new ones.
+
+Declined, with reasons:
+
+- **Attaching the collection tarball to the GitHub release.** 5f
+  considered this and matched the shared template, which treats the two
+  publishing jobs as independent. The window in which it helps is the one
+  before Galaxy publishing works, which 5g closes, and `release.yml`
+  staying comparable to the server repository's is worth more than
+  closing a gap that is about to shut on its own.
+- **Pinning `ansible-core` in `tox.ini`.** Pinning a range makes the
+  untested floor less visible rather than less true, and testing the floor
+  properly needs an interpreter this environment does not have:
+  ansible-core 2.15 does not run on Python 3.13. Filed as
+  shakenfist/client-python-k3s#91, and noted at both the `tox.ini`
+  dependency and in `collection/meta/runtime.yml` so the gap is derivable
+  from the files that make the claim.
+
+The `none` item -- no end-to-end coverage against a real cluster -- was
+already #89, filed before the review raised it.
+
+Mutations stand at **29** (20 from 5c, 9 from this round), all killed,
+one incidentally. Tests stand at 415.
+
 ## Definition of done
 
 Each of these is checkable, and most are one command:

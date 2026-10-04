@@ -56,11 +56,6 @@ def main():
     raw, semver = collection_version()
     print('shakenfist_client_k3s version %s -> collection version %s' % (raw, semver))
 
-    galaxy = COLLECTION_DIR / 'galaxy.yml'
-    text = re.sub(
-        r'(?m)^version:.*$', 'version: %s' % semver, galaxy.read_text())
-    galaxy.write_text(text)
-
     # Use the ansible-galaxy that belongs to the interpreter running us (the
     # build venv), not whatever bare name happens to be on PATH -- running
     # venv/bin/python3 directly does not put the venv on PATH.
@@ -68,10 +63,31 @@ def main():
     if not galaxy_bin.exists():
         galaxy_bin = pathlib.Path('ansible-galaxy')
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    subprocess.check_call([
-        str(galaxy_bin), 'collection', 'build', str(COLLECTION_DIR),
-        '--output-path', str(OUTPUT_DIR), '--force'])
+    # galaxy.yml is tracked, and the version in it is a placeholder which
+    # this script rewrites so the built tarball carries the real one. The
+    # rewrite is reverted in the finally below, which matters for a local
+    # run rather than for CI: without it the tree is left dirty with a
+    # version nobody chose, where a git add -A commits it by accident --
+    # the way this branch already committed ansible-lint's working tree
+    # twice. A dirty tree also moves setuptools_scm's next computed
+    # version, so the next build would disagree with this one for a reason
+    # that is nowhere on screen.
+    #
+    # The revert restores the bytes that were there, rather than writing
+    # "0.0.0" back: the placeholder is whatever the file says, and this
+    # script has no business deciding what it should be.
+    galaxy = COLLECTION_DIR / 'galaxy.yml'
+    original = galaxy.read_text()
+    try:
+        galaxy.write_text(re.sub(
+            r'(?m)^version:.*$', 'version: %s' % semver, original))
+
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        subprocess.check_call([
+            str(galaxy_bin), 'collection', 'build', str(COLLECTION_DIR),
+            '--output-path', str(OUTPUT_DIR), '--force'])
+    finally:
+        galaxy.write_text(original)
 
 
 if __name__ == '__main__':
