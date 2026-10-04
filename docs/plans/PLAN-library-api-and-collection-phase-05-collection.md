@@ -438,6 +438,51 @@ already #89, filed before the review raised it.
 Mutations stand at **29** (20 from 5c, 9 from this round), all killed,
 one incidentally. Tests stand at 415.
 
+### Round two
+
+1 `fix` / 1 `document` / 5 `consider` / 2 `none`, down from 3 `fix`. Both
+`none` items were #89 and #91, already filed -- the reviewer agreeing they
+are tracked rather than raising them. All seven actionable items taken.
+
+The `fix` was mine from round one: `build-collection.py`'s
+`read_text()`/`write_text()` did not state `encoding='utf-8'`, which
+`AGENTS.md` requires. Latent rather than live, since `galaxy.yml` is
+ASCII -- and that is the kind that survives. The sharper half was the
+accompanying `consider`: `FileEncodingIsStatedTestCase` existed and could
+not have caught it, because it scanned the package directory with a
+non-recursive `listdir` and matched only `open()`. It now walks `tools/`
+and `collection/` as well, and has a second test for
+`Path.read_text`/`write_text`. Broadening it surfaced twenty pre-existing
+unencoded calls in `tests/`, which are #93 -- out of scope here because
+they predate this branch and are in files unrelated to the collection.
+
+The most serious item was labelled `consider`: a `health()` failure after
+a **successful** create was reported through the outer handler's "the
+cluster may be partly built; `state: absent` removes whatever exists"
+message, and without `changed=True`. An operator following that advice
+would have destroyed a healthy cluster they did not know they had built.
+Both `health()` call sites now go through `_probe()`, which downgrades a
+probe failure after a create to a warning with `changed=True`, and fails
+without the destructive advice when nothing was changed.
+
+Running `ansible-test sanity --test validate-modules` -- which the review
+suggested and which had apparently never been run against either
+collection in the fleet -- found three more. The `author` field is fixed.
+The other two are declined and filed as #94: `missing-gplv3-license` asks
+for a header that would misstate an Apache-2.0 project's licence, and
+`import-before-documentation` conflicts directly with flake8's E402, which
+*does* run in CI. Moving the imports was tried and reverted; it also
+cannot fully succeed, because `from __future__ import annotations` must be
+the first statement in the file.
+
+One mutation **survived** on the first pass: the post-release guard added
+this round was unreachable, because the conversion only ran via
+setuptools_scm. That is why `semver_from()` is now a pure function with
+its own test file -- the guard is covered, and so are the rc, dev+local
+and epoch shapes.
+
+Mutations stand at **35**, all killed. Tests stand at 425.
+
 ## Definition of done
 
 Each of these is checkable, and most are one command:

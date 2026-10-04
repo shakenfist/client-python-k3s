@@ -166,6 +166,9 @@ def _build_spec(path):
                        That is where create() really reads the ssh key:
                        after the name and the network are settled, so
                        there is already output to lose.
+    health_raises      make the per node get_instance() health() calls
+                       raise an APIException, which is a probe failing
+                       while the cluster is fine.
     client_raises      make constructing the client raise a transport
                        error, which is what an api_url pointing at nothing
                        does: apiclient.Client.__init__ GETs base_url
@@ -189,11 +192,13 @@ def _build_spec(path):
     spec.setdefault('create_raises', False)
     spec.setdefault('metadata_raises', None)
     spec.setdefault('client_raises', False)
+    spec.setdefault('health_raises', False)
     return spec
 
 
 def build_fake_client(spec):
     """A MagicMock which answers what health() and delete() ask it."""
+    from shakenfist_client import apiclient
     from shakenfist_client_k3s import cluster as cluster_module
 
     namespace_md = {}
@@ -215,8 +220,6 @@ def build_fake_client(spec):
     # scenarios exist for.
     if spec['metadata_raises']:
         import requests
-
-        from shakenfist_client import apiclient
         raisers = {
             'unauthorized': lambda: apiclient.UnauthorizedException(
                 'namespace ci is not yours', 'GET',
@@ -245,6 +248,15 @@ def build_fake_client(spec):
     }
     client.instance_execute.return_value = operation
     client.get_agent_operation.return_value = operation
+
+    # health() reads every node through get_instance(), so failing that is
+    # how a probe fails while the cluster itself is fine -- which is the
+    # case the review of #90 found reported as a possibly-partly-built
+    # create, advising an operator to delete a working cluster.
+    if spec['health_raises']:
+        client.get_instance.side_effect = apiclient.APIException(
+            'the server is too busy to answer', 'GET',
+            'http://sf-1:13000/instances/worker-uuid-0', 503, 'busy')
     return client
 
 

@@ -76,6 +76,24 @@ def base_params(**overrides):
     return params
 
 
+def _warning_text(warning):
+    """The text of a warning, whatever shape the running ansible-core uses.
+
+    Three shapes appear across the range meta/runtime.yml declares: a plain
+    string on older versions, and on 2.21 a structured WarningSummary dict
+    whose message is nested under "event". Asserting against whichever one
+    happens to be installed would make the test pass or fail by
+    environment, which is the third instance of this drift this suite has
+    had to absorb -- after invocation injection and traceback capture, both
+    recorded in shakenfist/client-python-k3s#91.
+    """
+    if isinstance(warning, str):
+        return warning
+    if 'msg' in warning:
+        return warning['msg']
+    return warning.get('event', {}).get('msg', '')
+
+
 class ModuleResult:
     """What one run of the module produced, as the controller would see it."""
 
@@ -680,6 +698,57 @@ class ApiFailureTestCase(ModuleTestCase):
         # A partly built cluster is the state this leaves behind, and the
         # remedy belongs in the message rather than in the documentation.
         self.assertIn('state: absent', run.msg)
+
+
+class ProbeFailureTestCase(ModuleTestCase):
+    """A health probe that fails is not a cluster that failed.
+
+    health() reads every node through get_instance() and runs an agent
+    operation for its kubectl check, so it can fail transiently while the
+    cluster is perfectly fine. The review of #90 found that such a failure
+    after a create which had already succeeded was reported with the outer
+    handler's "the cluster may be partly built; state: absent removes
+    whatever exists" message, and without changed=True -- so an operator
+    following the advice would destroy a healthy cluster they did not know
+    they had built.
+    """
+
+    def test_a_probe_failure_after_a_create_still_reports_the_change(self):
+        run = self.run_module(base_params(), fake_create=True,
+                              health_raises=True)
+
+        # The create happened, so the play has to be told, whatever the
+        # probe did afterwards.
+        self.assertTrue(run.result['changed'])
+        self.assertFalse(run.failed)
+        self.assertIsNone(run.result['health'])
+        # And it must not be the destructive advice.
+        self.assertNotIn('state: absent', json.dumps(run.result))
+        self.assertNotIn('partly built', json.dumps(run.result))
+
+    def test_a_probe_failure_after_a_create_warns(self):
+        run = self.run_module(base_params(), fake_create=True,
+                              health_raises=True)
+
+        warnings = ' '.join(
+            _warning_text(w) for w in run.result.get('warnings', []))
+        self.assertIn('cluster was created', warnings)
+        self.assertIn('health probe', warnings)
+        # The progress of the create it did do is still there.
+        self.assertTrue(run.result['log'])
+
+    def test_a_probe_failure_on_an_existing_cluster_changes_nothing(self):
+        run = self.run_module(base_params(), cluster_exists=True,
+                              health_raises=True, expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertFalse(run.result['changed'])
+        # It failed, but about the probe rather than about the cluster, and
+        # without telling anyone to delete anything.
+        self.assertIn('Could not read the health', run.msg)
+        self.assertNotIn('state: absent', run.msg)
+        self.assertNotIn('partly built', run.msg)
+        self.assertNotIn('Traceback', run.stderr)
 
 
 class MissingLibraryTestCase(ModuleTestCase):

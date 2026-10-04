@@ -231,9 +231,8 @@ options:
     description: The authentication key for O(auth_namespace). See O(api_url).
     required: false
     type: str
-    no_log: true
 author:
-  - Michael Still and contributors
+  - Michael Still (@mikalstill)
 """
 
 EXAMPLES = r"""
@@ -364,6 +363,47 @@ log:
 """
 
 
+def _probe(module, cluster, reporter, created):
+    """Run health(), without letting a probe failure read as a cluster failure.
+
+    health() does not wrap what the client raises: it calls get_instance()
+    for every node and runs an agent operation for the kubectl check, so a
+    transient APIException or a dropped connection comes out of it
+    unwrapped. Left to the outer handler, that is reported with the
+    "the cluster may be partly built; state: absent removes whatever
+    exists" message -- which after a create that took twenty minutes and
+    *succeeded* is advice to destroy a working cluster, and which arrives
+    without changed=True so the play does not even know one was built. The
+    review of #90 found this on the create path; the same shape applies to
+    the probe of a cluster which already existed, where the advice is
+    equally wrong for a different reason.
+
+    created says which of those two it is, and is the whole of the
+    difference. After a create the module has mutated the cloud, so the
+    result must say so and the probe is downgraded to a warning. Before any
+    create it has not, so this is a failure -- but one about the probe
+    rather than about the cluster, and it does not tell anyone to delete
+    anything.
+    """
+    try:
+        return cluster.health()
+    except (apiclient.APIException,
+            requests.exceptions.RequestException) as e:
+        if created:
+            module.warn(
+                'The cluster was created. The health probe afterwards failed '
+                '(%s), so no health report is included -- re-run this task to '
+                'collect one. Do not treat this as a failed create.' % e)
+            module.exit_json(changed=True, health=None, log=reporter.lines)
+        module.fail_json(
+            changed=False,
+            msg=('Could not read the health of cluster %s: %s. Nothing was '
+                 'changed, and this says nothing about whether the cluster '
+                 'is healthy -- only that it could not be asked. Re-run the '
+                 'task.' % (cluster.name, e)),
+            health=None, log=reporter.lines)
+
+
 def _present(module, cluster, reporter):
     """Ensure the cluster exists, and report whether that took a change."""
     # get_metadata() rather than health() for the existence decision: this
@@ -403,14 +443,18 @@ def _present(module, cluster, reporter):
             install_metallb=module.params['install_metallb'],
             install_longhorn=module.params['install_longhorn'],
             manifests=module.params['manifests'])
+        # Probed through _probe() rather than inline in exit_json(): a
+        # health() which raises there loses the fact that a create just
+        # succeeded.
         module.exit_json(
-            changed=True, health=cluster.health(), log=reporter.lines)
+            changed=True, health=_probe(module, cluster, reporter, True),
+            log=reporter.lines)
 
     # The cluster exists. health() is what says whether it is a cluster at
     # all: it returns structure rather than text precisely so that this
     # module can branch on it, and it is the only public way to learn that a
     # cluster never finished being built.
-    report = cluster.health()
+    report = _probe(module, cluster, reporter, False)
     if report['interrupted']:
         module.fail_json(
             msg=('Cluster %s is in state %s rather than created: an earlier '
@@ -540,8 +584,8 @@ def run_module():
         module.fail_json(
             msg=('Could not configure the Shaken Fist client: %s. No '
                  'connection parameters were given, so credentials were '
-                 'looked for in the environment and in '
-                 'sfrc/~/.shakenfist//etc/sf/shakenfist.json, and none were '
+                 'looked for in the environment and in sfrc, '
+                 '~/.shakenfist and /etc/sf/shakenfist.json, and none were '
                  'found.' % e),
             health=None, log=reporter.lines)
     except (apiclient.APIException,

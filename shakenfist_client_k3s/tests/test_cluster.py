@@ -3072,14 +3072,61 @@ class FileEncodingIsStatedTestCase(testtools.TestCase):
     here and names its own line number.
     """
 
-    def test_no_open_call_leaves_the_encoding_to_the_locale(self):
+    def _python_files(self):
+        """Every .py file this repository ships, not only the package's.
+
+        The scan used to be os.listdir() over the package directory alone,
+        which is how an unencoded pathlib call in tools/build-collection.py
+        reached the review of #90: the lint existed, and the file it needed
+        to read was outside the only directory it looked in. collection/
+        has the same exposure -- its module has no open() today and nothing
+        stops one being added.
+
+        Directories which are absent are skipped rather than failed, the
+        way ModuleTestCase skips: an installed copy of this package has the
+        tests but neither tools/ nor collection/.
+
+        tests/ is deliberately out of scope, and that is a boundary rather
+        than an oversight: the original scan was a non-recursive listdir of
+        the package directory, so it never covered this directory, and
+        twenty call sites in five test files have grown up unencoded behind
+        that. Fixing them is a mechanical change to files which have
+        nothing to do with the collection, so they are tracked in
+        shakenfist/client-python-k3s#93 rather than folded into a review
+        round. The hazard there is also
+        the milder one -- a fixture written in the locale encoding can make
+        a test pass or fail by machine, which is a bad day for whoever is
+        debugging it, but it is not bytes shipped to a cluster.
+        """
         package_dir = os.path.dirname(cluster_module.__file__)
+        roots = [package_dir]
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(
+            cluster_module.__file__)))
+        for extra in (os.path.join(repo_root, 'tools'),
+                      os.path.join(repo_root, 'collection')):
+            if os.path.isdir(extra):
+                roots.append(extra)
+
+        for root in roots:
+            for dirpath, dirnames, filenames in os.walk(root):
+                # ansible-lint's working tree is a copy of the collection,
+                # so scanning it would report every offender twice under a
+                # path nobody edits. tests/ is excluded for the reason in
+                # the docstring.
+                dirnames[:] = [d for d in sorted(dirnames)
+                               if d not in ('.ansible', '__pycache__',
+                                            'tests')]
+                for name in sorted(filenames):
+                    if name.endswith('.py'):
+                        yield os.path.join(dirpath, name)
+
+    def test_no_open_call_leaves_the_encoding_to_the_locale(self):
         offenders = []
 
-        for name in sorted(os.listdir(package_dir)):
-            if not name.endswith('.py'):
-                continue
-            path = os.path.join(package_dir, name)
+        for path in self._python_files():
+            name = os.path.relpath(path, os.path.dirname(os.path.dirname(
+                os.path.abspath(cluster_module.__file__))))
             with open(path, encoding='utf-8') as f:
                 tree = ast.parse(f.read(), filename=path)
 
@@ -3101,6 +3148,36 @@ class FileEncodingIsStatedTestCase(testtools.TestCase):
                 modes = [a.value for a in node.args[1:2]
                          if isinstance(a, ast.Constant)]
                 if modes and 'b' in modes[0]:
+                    continue
+                if not any(kw.arg == 'encoding' for kw in node.keywords):
+                    offenders.append('%s:%s' % (name, node.lineno))
+
+        self.assertEqual([], offenders)
+
+    def test_no_pathlib_text_call_leaves_the_encoding_to_the_locale(self):
+        """The same defect through Path.read_text() and Path.write_text().
+
+        Both default to locale.getpreferredencoding() exactly as open()
+        does, and neither is an open() call, so the check above cannot see
+        them. This is the spelling the review of #90 actually found, in
+        tools/build-collection.py's round trip of galaxy.yml -- which is
+        ASCII, so the bug was latent rather than live, which is precisely
+        the kind that survives a review nobody asks for.
+        """
+        offenders = []
+
+        for path in self._python_files():
+            name = os.path.relpath(path, os.path.dirname(os.path.dirname(
+                os.path.abspath(cluster_module.__file__))))
+            with open(path, encoding='utf-8') as f:
+                tree = ast.parse(f.read(), filename=path)
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr not in ('read_text', 'write_text'):
                     continue
                 if not any(kw.arg == 'encoding' for kw in node.keywords):
                     offenders.append('%s:%s' % (name, node.lineno))

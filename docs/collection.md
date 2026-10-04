@@ -26,9 +26,19 @@ has no `shakenfist.k3s` collection version to resolve.
 Until the first release, install from a locally built tarball instead:
 
 ```bash
-ansible-galaxy collection build collection/
-ansible-galaxy collection install shakenfist-k3s-*.tar.gz
+python3 tools/build-collection.py
+ansible-galaxy collection install dist-collection/shakenfist-k3s-*.tar.gz
+pip install shakenfist_client_k3s
 ```
+
+`tools/build-collection.py` rather than `ansible-galaxy collection build`
+directly: the version in `collection/galaxy.yml` is a `0.0.0`
+placeholder, and that script is what replaces it with the real version
+derived from the git tags before building. Building the directory
+yourself produces a tarball which installs, and reports its version as
+`0.0.0` -- which is confusing on its own and worse next to a published
+version later. The script restores the placeholder afterwards, so it
+leaves the checkout as it found it.
 
 That path works today, against any checkout of this repository, and
 is how to try the module before the first Galaxy release. Once a
