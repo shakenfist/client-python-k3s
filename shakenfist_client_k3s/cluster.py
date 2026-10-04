@@ -156,6 +156,15 @@ K3S_MANIFEST_SUFFIXES = ('.yaml', '.yml', '.json')
 # unreadable in the agent operation log and is not a filename anybody
 # meant to use. The leading character is restricted separately so that a
 # name cannot begin with a dot or a hyphen.
+#
+# This character class is also what keeps the remote destination inside
+# K3S_MANIFEST_DIR, which is a second job it does and the one a reader is
+# least likely to notice. install_control_plane() joins the directory and
+# the basename to build the path it writes on the node: no '/' can match,
+# so the basename cannot carry a path separator or be an absolute path,
+# and no leading dot can match, so it cannot be '..'. Relaxing the class
+# for readability -- to allow a space, say -- would need that join
+# reconsidered, not only the quoting at the write site.
 K3S_MANIFEST_BASENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 
 # The heredoc delimiter manifest content is handed to a node with.
@@ -2201,6 +2210,22 @@ class Cluster:
                 # API request with no validation anywhere on the path, so a
                 # name containing shell metacharacters would otherwise run
                 # as a command.
+                #
+                # That settles injection and not kubectl's own grammar,
+                # which is a separate question the paragraph above should
+                # not be read as answering. 'kubectl config unset' resolves
+                # its argument as a dot separated path into the config
+                # structure -- 'users' is a map, the next segment is the
+                # key, and a further segment is a field of the result -- so
+                # a cluster name containing a dot produces a path with an
+                # extra segment that kubectl cannot resolve, and the
+                # non-zero exit below becomes a KubeconfigError. By then
+                # the cluster really is gone and delete_metadata() has run,
+                # so re-running the delete raises ClusterNotFoundError and
+                # the stale entries stay in ~/.kube/config. 'my.cluster' is
+                # a name somebody will type. Validating the cluster name on
+                # the way in is what fixes it, and is
+                # shakenfist/client-python-k3s#96.
                 unset = subprocess.run(
                     ['kubectl', 'config', 'unset', config_elem],
                     capture_output=True)
