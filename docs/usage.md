@@ -37,14 +37,42 @@ Builds a cluster and, unless `--no-kubeconfig` is given, leaves it in
 | `--longhorn` / `--no-longhorn` | on | Install Longhorn for persistent storage. |
 | `--kubeconfig` / `--no-kubeconfig` | on | Merge the new cluster into `~/.kube/config`; see below. The cluster's own kubeconfig is recorded either way and is always available from `getconfig`. |
 | `--manifest PATH` | none | Stage a local manifest into the cluster on first start. Repeatable; see below. |
+| `--control-plane-cpus` | 2 | vCPUs for each control plane node. A positive integer. |
+| `--control-plane-memory` | 2048 | RAM, in MB, for each control plane node. A positive integer; see "Sizing", below. |
+| `--control-plane-disk` | 50 | Disk, in GB, for each control plane node. A positive integer. |
+| `--worker-cpus` | 2 | vCPUs for each worker node. A positive integer. |
+| `--worker-memory` | 2048 | RAM, in MB, for each worker node. A positive integer. |
+| `--worker-disk` | 50 | Disk, in GB, for each worker node. A positive integer. |
 
-Each node is a Shaken Fist instance with 2 vCPUs, 2GB of RAM and a
-50GB disk on a Debian 12 base image, with a floating address and the
-`sf-agent2` side channel enabled. A full create is 15-25 minutes, and
-reports numbered phases with per-phase elapsed times as it goes.
+Each node is a Shaken Fist instance on a Debian 12 base image, with a
+floating address and the `sf-agent2` side channel enabled. Nodes
+default to 2 vCPUs, 2048 MB of RAM and a 50 GB disk in both roles, and
+the six sizing options above change that per role. The sizes are
+recorded when the cluster is created, and `expand-workers` builds new
+workers at the size the cluster recorded. A full create is 15-25
+minutes, and reports numbered phases with per-phase elapsed times as
+it goes.
 Skipping MetalLB, Longhorn or the local kubeconfig update also skips
 that phase's number, so a create that leaves all three out counts
 fewer phases rather than reporting a phase it never runs.
+
+#### Sizing
+
+A realistic floor for a control plane node is 4096 MB of RAM. On a
+cluster built at exactly 2 vCPUs and 2048 MB, the k3s server process
+alone held about 709 MB resident. A burst of pod creations then drove
+the node into a global out-of-memory condition which killed Longhorn
+and Traefik and took the API server down for about 30 seconds. That
+is not reliably reproducible, because it depends on how recently k3s
+restarted, so 2048 MB runs a control plane rather than one that holds
+up under load.
+
+The plugin deliberately validates only that each size is a positive
+integer. A hard minimum would be a guess about workloads, and some
+clusters will carry very little. The default stays at 2048 MB so that
+existing invocations build what they built before; pass
+`--control-plane-memory 4096` (or more) for a control plane you intend
+to rely on.
 
 With `--kubeconfig` (the default), the local kubeconfig is written
 directly if `~/.kube/config` does not exist. If it does, the merge
@@ -151,7 +179,8 @@ on a shared pre-existing network takes that network with it.
 
 Adds `N` more workers (default 2) to a running cluster. Existing
 nodes are untouched. Refuses to run against a cluster that never
-finished being built; see `create`, above.
+finished being built; see `create`, above. New workers are built at
+the worker size the cluster recorded when it was created.
 
 ### `remove-worker NAME --worker UUID [--worker UUID ...]`
 
@@ -255,9 +284,13 @@ Prints the names of the clusters recorded in the namespace.
 
 Prints the cluster's namespace metadata: node UUIDs, the network, the
 API addresses, the join address, the plugin version that created it,
-and the release versions in use. A cluster that never finished being
-built is shown rather than refused, with a note pointing out that its
-`state` is not `created` and that `delete` is how to clear it.
+the release versions in use, and `node_sizes` (the vCPUs, memory in MB
+and disk in GB of each role). A cluster created before sizing existed
+reports the defaults it was built at, which is exact because it could
+only have been built at the default; nothing is written back to the
+cluster's metadata. A cluster that never finished being built is shown
+rather than refused, with a note pointing out that its `state` is not
+`created` and that `delete` is how to clear it.
 
 Note that the metadata includes the node token and the kubeconfig, so
 the output is cluster-admin credentials. Do not paste it into a bug

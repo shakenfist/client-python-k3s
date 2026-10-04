@@ -141,8 +141,11 @@ themselves -- they are exactly as unconditional as before -- it is
 `release_channel`, `sshkey`, `install_metallb`, `install_longhorn`,
 `manifests`) mirror the command's options of the same name --
 `manifests` takes a list of local paths, where `--manifest` is given
-once per file; see its docstring in `cluster.py` for the full
-signature. See `docs/usage.md` for what each command does; this page
+once per file. So do the six sizing arguments, `control_plane_cpus`,
+`control_plane_memory`, `control_plane_disk`, `worker_cpus`,
+`worker_memory` and `worker_disk`, which are vCPUs, MB and GB
+respectively and default to 2, 2048 and 50; see its docstring in
+`cluster.py` for the full signature. See `docs/usage.md` for what each command does; this page
 does not restate it.
 
 ### Kubeconfig side effects default off in the library
@@ -243,6 +246,7 @@ a correct caller never needs to catch it.
 | `WorkerUnnamedError` | `remove_worker()` finds a worker whose instance record has no name, so the k3s node it became cannot be identified |
 | `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable or not decodable as UTF-8, not valid YAML or JSON, or a line colliding with the staging marker |
 | `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
+| `NodeSizeError` | `create()` is given a node size that is not a positive integer (a bool counts as not), before anything is built or the name is registered |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
