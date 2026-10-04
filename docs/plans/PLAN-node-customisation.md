@@ -122,11 +122,11 @@ phase 1 is now on two critical paths rather than one.
 This plan is independent of the in-progress
 [library API plan](PLAN-library-api-and-collection.md), but touches the
 same code. Its phase 4 (first PyPI release) completed on 2026-10-03
-and `shakenfist_client_k3s` 0.1.0 is on PyPI, and its phase 5 (the
-`shakenfist.k3s` Ansible collection) will want to expose whatever
-options exist by then. Phase 5's plan decided not to wait for this
-one, on the grounds that every option here is a new *optional* module
-parameter and so an additive change to a published argument spec; it
+and `shakenfist_client_k3s` 0.1.0 is on PyPI. Its phase 5 (the
+`shakenfist.k3s` Ansible collection) merged as #90 before this plan's
+options existed: phase 5's plan decided not to wait for this one, on
+the grounds that every option here is a new *optional* module
+parameter and so an additive change to a published argument spec. It
 also records that 33fl cannot adopt the collection for CI runners
 until this plan lands. See open question 2, and phase 5's decision 8.
 
@@ -266,8 +266,11 @@ was written.
    permanent error noise that nothing noticed, and it goes away with
    traefik. Worth confirming it is traefik's Service and not
    something the plugin configures.
-2. **Should this plan land before or after the library API plan's
-   phase 4 (first PyPI release)?** This work is small and does not
+2. ~~Should this plan land before or after the library API plan's
+   phase 4 (first PyPI release)?~~ **Answered by events, 2026-10-04:
+   phase 4 landed first and `v0.1.0` is released; phase 5 merged as
+   #90 without these options, so they are a follow-on there.** The
+   original recommendation: this work is small and does not
    change existing behaviour, so it does not need to hold up the
    release. The collection in phase 5 exposes whatever `create()`
    parameters exist when it is written. Recommendation: do not block
@@ -312,8 +315,8 @@ than expected.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Per-role sizing | `create_instance(node_type)`; `node_sizes` in metadata with fallback defaults for existing clusters; six CLI flags and matching `create()` parameters; `show` displays sizes; drop the bare `apt-get install -y` at `cluster.py:1052`; unit tests for the metadata fallback and for the sizes reaching `client.create_instance`; regenerate the `tests/cli_contract/` snapshots; update `docs/usage.md` and `docs/library-api.md`. Unit tests can verify everything except the live build. | Not started | |
-| 2. k3s configuration pass-through | Resolve open questions 1 and 3 and the `config.yaml.d` version floor; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; write the default control plane `node-taint` per design 7 and `servicelb` into the plugin-owned server config whenever `install_metallb` is true, per open question 1; unit tests for validation, the file content, `expand-workers` reusing the recorded config, the default taint being present, and a caller's `node-taint: []` replacing it; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels) and the documented sizing floor from open question 3. The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | Not started | |
+| 1. Per-role sizing | [PLAN-node-customisation-phase-01-sizing.md](PLAN-node-customisation-phase-01-sizing.md) -- `create_instance(node_type)`; `node_sizes` in metadata with fallback defaults for existing clusters; six CLI flags and matching `create()` parameters; `show` displays sizes, including the 2 / 2048 / 50 fallback for clusters created before them (it already prints every recorded key); the documented sizing floor from open question 3; drop the bare `apt-get install -y` at `cluster.py:1052`; unit tests for the metadata fallback and for the sizes reaching `client.create_instance`; regenerate the `tests/cli_contract/` snapshots; update `docs/usage.md` and `docs/library-api.md`. Unit tests can verify everything except the live build. | In progress | |
+| 2. k3s configuration pass-through | Resolve open questions 1 and 3 and the `config.yaml.d` version floor; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; write the default control plane `node-taint` per design 7 and `servicelb` into the plugin-owned server config whenever `install_metallb` is true, per open question 1; unit tests for validation, the file content, `expand-workers` reusing the recorded config, the default taint being present, and a caller's `node-taint: []` replacing it; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels). (The sizing floor moved to phase 1, where open question 3 put it; this row used to repeat it.) The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | Not started | |
 | 3. Live validation | Extend `tools/ci_deploy_test.sh` to create with non-default sizes and both config files (disable Traefik, label control plane and workers differently), then assert with `kubectl`: no Traefik pods, no `svclb-*` pods, the expected labels on each node, the default `NoSchedule` taint on every control plane node, the recorded sizes in `show`, and a worker added by `expand-workers` carrying the agent labels. Also assert a second create passing `node-taint: []` leaves the control plane schedulable, since that is the documented opt-out. Run the merge-tier workflow. Then run the homelab OpenStack-Helm prototype's provision stage against the branch as a second, heavier consumer, and establish whether it wants the taint opt-out on a three node cluster (design 7). | Not started | |
 | 4. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-3 against `develop` | Not started | |
 
@@ -691,8 +694,10 @@ chosen to defer to here, so that we do not forget them.
   Ceph disk.
 * Per-invocation sizing and config overrides on `expand-workers`, for
   heterogeneous worker pools.
-* Surfacing the new options in the `shakenfist.k3s` collection, if
-  phase 5 of the library API plan is written before this plan lands.
+* Surfacing the new options in the `shakenfist.k3s` collection.
+  Phase 5 of the library API plan landed first (#90), so its
+  `sf_k3s_cluster` module needs the sizing and config options added
+  once both have landed.
 
 ### Bugs fixed during this work
 
