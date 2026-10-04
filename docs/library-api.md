@@ -207,6 +207,33 @@ reporter is passed as that stream.
 Both take `verbose=True` to also emit `debug()` lines; without it
 `debug()` is silent.
 
+### What the output looks like, and when
+
+`Progress` has two modes, and which one you get depends on the
+reporter's `isatty()` and on `verbose`.
+
+On a terminal, and not verbose, a wait block is rendered as one line per
+item and rewritten in place with ANSI cursor movement, truncated to the
+terminal width. Otherwise -- a pipe, a CI log, a `CollectingReporter`,
+or `verbose=True`, whose debug lines would interleave badly with cursor
+movement -- a status line is printed only when it changes, with a
+heartbeat reprint every 60 seconds so a log still shows liveness during
+a long wait.
+
+Either way each status carries how long the item has been in *that*
+status rather than how long the wait has run, so a stalled command shows
+up as a growing elapsed time next to one item while its neighbours
+advance. An idle wait names the agent command currently executing, not
+a bare operation count. If a single agent command runs for more than
+five minutes a one-off note says it may be stalled; the note does not
+reset the per-item timers it is drawing attention to, and on a terminal
+it is printed above the status block, which is then redrawn below it.
+
+Every elapsed time is measured on the monotonic clock, so an NTP
+correction part way through a twenty minute install cannot make a phase
+appear to take a negative amount of time, move a timeout, or fire a
+stall note.
+
 ## Exceptions
 
 Every failure this library detects and reports is a

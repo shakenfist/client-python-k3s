@@ -683,12 +683,11 @@ class AgentOperationError(K3sClusterException):
     ``progress.redact_command_line()``.
 
     ``state`` is the operation state which brought us here, and is
-    rendered only when it is not ``error``. That keeps the message
-    byte for byte what it was for the case which has always raised this,
-    while saying which ending it was for the one which did not:
-    ``expired`` means Shaken Fist took the operation's wall clock budget
-    away rather than the command failing, and "run it again with a longer
-    deadline" and "the command is broken" are different next steps.
+    rendered only when it is not ``error``. That keeps the message byte
+    for byte what it was for the case which has always raised this, while
+    saying which ending it was for the one which did not. Why the states
+    are distinguished at all, and why a wait enumerates them rather than
+    naming two endings, is on the constants at the top of ``cluster.py``.
     """
 
     def __init__(self, instance_name, instance_uuid, operation_uuid,
