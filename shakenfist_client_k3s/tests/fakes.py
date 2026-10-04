@@ -57,6 +57,15 @@ class FakeClusterClient:
         self.instances = {}
         self.instance_serial = 0
         self.instance_sshkeys = []
+
+        # (name, cpus, memory, disk size) for every instance the caller
+        # asked for, in the order it asked. Beside the instance rather than
+        # in it for the same reason as instance_sshkeys: the representation
+        # the fake hands back is the API's shape, and a size recorded there
+        # would be a field for a test to assert on that the orchestration
+        # never reads back.
+        self.instance_sizes = []
+
         self.aop_serial = 0
         self.routed_serial = 0
 
@@ -69,7 +78,10 @@ class FakeClusterClient:
         self.executed = []
 
         # What the caller asked us to destroy, so a test can assert on the
-        # teardown as well as the build.
+        # teardown as well as the build. Network allocation is recorded as
+        # well, because "nothing was built" has to be able to say networks
+        # too, and an allocation is not otherwise visible anywhere.
+        self.allocated_networks = []
         self.deleted_networks = []
         self.unrouted_addresses = []
 
@@ -90,6 +102,7 @@ class FakeClusterClient:
 
     def allocate_network(self, netblock, provide_dhcp, provide_nat, name,
                          namespace=None):
+        self.allocated_networks.append(name)
         return {'uuid': 'net-1', 'name': name, 'state': 'created'}
 
     def get_network(self, network_ref):
@@ -105,6 +118,7 @@ class FakeClusterClient:
         # fake which did would let a test assert on a field that does not
         # exist.
         self.instance_sshkeys.append(sshkey)
+        self.instance_sizes.append((name, cpus, memory, disks[0]['size']))
         self.instance_serial += 1
         instance_uuid = 'inst-%03d' % self.instance_serial
         self.instances[instance_uuid] = {

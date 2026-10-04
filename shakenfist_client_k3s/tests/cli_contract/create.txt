@@ -37,4 +37,20 @@ Options:
                                   templated, and the order manifests are applied
                                   in is k3s's business rather than this
                                   command's.
+  --control-plane-cpus INTEGER RANGE
+                                  The number of vCPUs for each control plane
+                                  node.  [x>=1]
+  --control-plane-memory INTEGER RANGE
+                                  The memory for each control plane node, in MB.
+                                  2048 runs a control plane but does not hold up
+                                  under load; 4096 or more is recommended.
+                                  [x>=1]
+  --control-plane-disk INTEGER RANGE
+                                  The disk for each control plane node, in GB.
+                                  [x>=1]
+  --worker-cpus INTEGER RANGE     The number of vCPUs for each worker node.
+                                  [x>=1]
+  --worker-memory INTEGER RANGE   The memory for each worker node, in MB.
+                                  [x>=1]
+  --worker-disk INTEGER RANGE     The disk for each worker node, in GB.  [x>=1]
   --help                          Show this message and exit.

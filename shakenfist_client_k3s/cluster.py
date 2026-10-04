@@ -50,6 +50,23 @@ METADATA_KEY = 'orchestrated_k3s_cluster_%s'
 
 BASE_OS_VERSION = 'debian:12'
 
+# The size every node is built at unless create() is told otherwise, per
+# role. Memory is in MB and disk in GB, because that is what the Shaken
+# Fist API takes and translating units here would only give the docs a
+# second set of numbers to disagree with. This is the one source of truth
+# for these numbers: create()'s keyword argument defaults read it, so do
+# the command line's option defaults, and so does the metadata fallback in
+# Cluster._node_size() and Cluster.show() for clusters created before
+# node_sizes was recorded. Three copies of 2048 is how the documentation
+# and the code come to disagree.
+#
+# These are the sizes every node was built at before they could be
+# chosen, and they stay the default so that an existing invocation builds
+# exactly what it built before. That is not the same as saying they are
+# enough: see create()'s docstring for what 2048 MB does to a control
+# plane under load.
+DEFAULT_NODE_SIZE = {'cpus': 2, 'memory': 2048, 'disk': 50}
+
 # How long, in seconds, a single agent command can run before the wait loop
 # notes that it might be stalled.
 STALL_WARNING_SECONDS = 300
@@ -260,6 +277,49 @@ def read_manifests(paths):
     return manifests
 
 
+def validate_node_sizes(sizes):
+    """Refuse a node size which is not a positive integer, before anything is built.
+
+    sizes is the mapping create() records in the metadata as
+    ``node_sizes``: ``{'control_plane': {'cpus', 'memory', 'disk'},
+    'worker': {...}}``. It returns nothing, and raises
+    exceptions.NodeSizeError naming the role, the field and the value for
+    the first value which is not usable, in the order the mapping holds
+    them.
+
+    Only positive integers are enforced, on purpose. A realistic floor --
+    2048 MB runs a control plane but does not hold up under load, and
+    4096 MB is the figure the documentation gives -- depends on workloads
+    this plugin cannot see, so a hard minimum here would be a guess
+    presented as a rule. A size of zero, a negative size or a size which
+    is not a whole number is not a judgement call, and neither is a type
+    the Shaken Fist API was never going to accept.
+
+    bool is refused explicitly, because True is an int in Python:
+    ``isinstance(True, int)`` holds and ``True >= 1`` is true, so without
+    the check ``cpus=True`` from a library caller -- or from a YAML
+    document where somebody wrote ``yes`` -- would build a one vCPU node
+    and say nothing. A float is refused rather than truncated for the same
+    reason: 2.5 GB of disk is a request this cannot honour, and rounding
+    it quietly in either direction is not what the caller asked for.
+
+    A pure function, like read_manifests(), so that it can be tested
+    without a client and so that create() can call it before it has talked
+    to the API at all.
+
+    It checks the values it is given and not the shape they come in: a
+    missing role or field is not reported. Its one caller, create(), always
+    builds the complete mapping, so there is nothing to catch today; a new
+    caller handing it something partial has to check the shape itself.
+    """
+    for role, size in sizes.items():
+        for field, value in size.items():
+            if (not isinstance(value, int) or isinstance(value, bool)
+                    or value < 1):
+                raise exceptions.NodeSizeError.not_positive_integer(
+                    role, field, value)
+
+
 class Cluster:
     """One k3s cluster, and everything the orchestration needs to reach it.
 
@@ -413,12 +473,51 @@ class Cluster:
                 stream=self.reporter)
         return self.progress
 
-    def create_instance(self):
+    def _node_size(self, md, node_type):
+        """Return the size this cluster builds node_type nodes at, as a new dict.
+
+        node_type is 'control_plane' or 'worker', which are the keys of
+        ``md['node_sizes']`` as create() records it and the values
+        create_and_await_instances() is handed.
+
+        A cluster created before node_sizes was recorded has no such key,
+        and falls back to DEFAULT_NODE_SIZE the way install_k3s_component()
+        falls back from ``join_address`` to ``api_address_inner``. The
+        fallback is exact rather than a guess: before node_sizes existed
+        every node was built at the default, and there was no way to build
+        one at any other size, so an expand-workers on such a cluster builds
+        exactly what its create did.
+
+        The fallback is per field rather than per role. The plugin only
+        ever records all three fields for both roles, but namespace
+        metadata is editable by anything holding the namespace's
+        credentials, and a role recorded without one of its fields would
+        otherwise be a bare KeyError from the middle of an expand-workers.
+        Filling the gap from the default is the same answer this method
+        gives for a cluster with no record at all.
+
+        A copy, so that a caller which adjusts what it is handed changes
+        neither the cached metadata nor the module's default.
+        """
+        return dict(DEFAULT_NODE_SIZE, **md.get('node_sizes', {}).get(node_type, {}))
+
+    def create_instance(self, node_type):
+        """Create one node of node_type, sized as this cluster records for that role.
+
+        node_type is required, with no default, on purpose. A default of
+        'worker' would be right for most callers and would silently build a
+        control plane node at worker size the day somebody adds a caller
+        and forgets the argument -- which on a cluster sized the way the
+        documentation recommends is a control plane with half the memory it
+        was meant to have, discovered under load. Its one caller,
+        create_and_await_instances(), already knows the role.
+        """
         md = self.get_metadata()
+        size = self._node_size(md, node_type)
 
         node_name = 'k3s-%s-node-%03d' % (md['name'], md['node_serial'])
         inst = self.client.create_instance(
-            node_name, 2, 2048,
+            node_name, size['cpus'], size['memory'],
             [
                 {
                     'network_uuid': md['node_network'],
@@ -429,7 +528,7 @@ class Cluster:
             ],
             [
                 {
-                    'size': 50,
+                    'size': size['disk'],
                     'base': BASE_OS_VERSION,
                     'bus': None,
                     'type': 'disk'
@@ -681,7 +780,7 @@ class Cluster:
 
         new_nodes = []
         for i in range(count):
-            inst = self.create_instance()
+            inst = self.create_instance(node_type)
             new_nodes.append(inst['uuid'])
             md['node_serial'] += 1
             md[f'{node_type}_nodes'].append(inst['uuid'])
@@ -1049,7 +1148,6 @@ class Cluster:
             instance_uuids,
             [
                 'sudo apt-get update',
-                'sudo apt-get install -y',
                 (
                     'curl -sfL https://get.k3s.io | '
                     'INSTALL_K3S_CHANNEL=%s '
@@ -1237,7 +1335,13 @@ class Cluster:
                network=None, refresh_version_cache=False,
                release_channel='stable', sshkey=None, install_metallb=True,
                install_longhorn=True, write_kubeconfig=False,
-               manifests=None):
+               manifests=None,
+               control_plane_cpus=DEFAULT_NODE_SIZE['cpus'],
+               control_plane_memory=DEFAULT_NODE_SIZE['memory'],
+               control_plane_disk=DEFAULT_NODE_SIZE['disk'],
+               worker_cpus=DEFAULT_NODE_SIZE['cpus'],
+               worker_memory=DEFAULT_NODE_SIZE['memory'],
+               worker_disk=DEFAULT_NODE_SIZE['disk']):
         """Build this cluster, from nothing to a working k3s.
 
         The namespace must already exist. The command line creates it when
@@ -1281,6 +1385,33 @@ class Cluster:
         the writes are extra commands inside the phase which installs k3s
         on that node, so total_phases below does not move with this
         argument.
+
+        control_plane_cpus, control_plane_memory and control_plane_disk
+        size every control plane node, and worker_cpus, worker_memory and
+        worker_disk every worker. cpus is a count of vCPUs, memory is in MB
+        and disk in GB, which are the units the Shaken Fist API takes. They
+        are six flat arguments rather than one mapping so that each mirrors
+        the command line option of the same name; the nested shape is
+        what the metadata records, as ``node_sizes``, and that record is
+        why expand_workers() builds new workers at the size this create
+        built the first ones rather than at whatever the default is by
+        then.
+
+        The defaults are DEFAULT_NODE_SIZE, 2 vCPUs, 2048 MB and 50 GB for
+        both roles, which is what every node was built at before these
+        arguments existed. 2048 MB is a size a control plane node runs at,
+        not one it holds up at: measured on a cluster built at exactly that
+        size, k3s's server process alone held 709 MB, and a burst of pod
+        creations drove the node into a global OOM which took the API
+        server down for around thirty seconds (open question 3 of
+        docs/plans/PLAN-node-customisation.md). It is still the default,
+        because changing it would change what an existing invocation
+        builds, and validation still accepts any positive integer, because
+        a hard minimum would be a guess about workloads this method cannot
+        see.
+        Nothing here stops a caller building something too small to be
+        useful; validate_node_sizes() only stops one which cannot be built
+        at all.
         """
         # Read the manifests before anything else happens, which is
         # earlier than this function checks any of its other arguments --
@@ -1294,7 +1425,32 @@ class Cluster:
         # rather than letting it read the paths again. There are ten to
         # twenty minutes between here and there, and a file which changed
         # in that window would make this check a check of something else.
+        #
+        # The node sizes are checked here for the same reason, and the
+        # placement matters more than it looks. The name is registered in
+        # the cluster list a few lines below, and the metadata document
+        # written in state 'initial' shortly after; a size which can never
+        # be valid (zero, a string, True) discovered once those exist
+        # leaves a claimed name and a document stuck in 'initial' that only
+        # a delete clears. Moving this one line later turns a typo into
+        # that, which is what test_an_invalid_size_registers_nothing pins.
+        # This is not a check of what Shaken Fist will accept: a valid size
+        # the API still refuses, for quota or because no hypervisor has the
+        # room, fails mid-create, as any other API refusal there does.
         staged_manifests = read_manifests(manifests)
+        node_sizes = {
+            'control_plane': {
+                'cpus': control_plane_cpus,
+                'memory': control_plane_memory,
+                'disk': control_plane_disk,
+            },
+            'worker': {
+                'cpus': worker_cpus,
+                'memory': worker_memory,
+                'disk': worker_disk,
+            },
+        }
+        validate_node_sizes(node_sizes)
 
         # Phases: create control plane nodes, create workers, install control
         # plane, install workers, fetch credentials, metallb, longhorn, and
@@ -1423,6 +1579,20 @@ class Cluster:
             # than left for somebody to rediscover.
             'metallb_installed': install_metallb,
             'longhorn_installed': install_longhorn,
+
+            # The size of each role's nodes, recorded here with the rest
+            # of the initial metadata for the same reason as the two flags
+            # above: before any instance exists, so that an interrupted
+            # create still describes what it was building. Its reader is
+            # create_instance(), through _node_size(), which is what makes
+            # expand-workers build new workers at the size this create
+            # chose rather than at the default. Readers must fall back to
+            # DEFAULT_NODE_SIZE when the key is missing, because every
+            # cluster built before it existed has none -- and that fallback
+            # is exact rather than a guess, because those clusters could
+            # only ever have been built at the default. show() reports the
+            # fallback for the same reason.
+            'node_sizes': node_sizes,
         }
         self.set_metadata(md)
 
@@ -1585,6 +1755,27 @@ class Cluster:
         the human running ``sf-client k3s show``, who would otherwise have
         to know that ``state = initial`` in a screenful of key/value pairs
         is the line that matters and that the answer to it is a delete.
+
+        ``node_sizes`` is the one key this reports which may not be stored.
+        A cluster created before node sizes were recorded has no such key,
+        and for one of those this returns a copy of the metadata with
+        ``node_sizes`` filled in from DEFAULT_NODE_SIZE for both roles.
+        That departs from "show reports what is stored", and it is right
+        here because the filled in values are a statement of fact rather
+        than a guess: before the key existed there was no way to build a
+        node at any size but the default, so every node such a cluster has
+        was built at exactly that. It is also what expand-workers will
+        build for it, through _node_size(), so show and the next expand
+        agree. Nothing is written back -- show stays read only, and the
+        stored document is neither changed nor rewritten -- which is why
+        the fill is on a deep copy rather than on the cached dictionary.
+
+        A record which is present but partial -- which the plugin never
+        writes, but anything holding the namespace's credentials could -- is
+        completed per field in the same way, for the same reason: it is
+        what expand-workers would build. When the record is complete it is
+        returned as stored, and the metadata is the cached dictionary
+        itself, exactly as it was before this key existed.
         """
         md = self.get_metadata()
         if not md:
@@ -1597,6 +1788,19 @@ class Cluster:
                 'interrupted while it was being built, and is not usable.\n'
                 "Remove what is left of it with 'sf-client k3s delete %s'.\n"
                 % (self.name, interrupted, self.name))
+
+        # Filled through _node_size() rather than from DEFAULT_NODE_SIZE
+        # directly, so that what show reports and what create_instance()
+        # builds come from the same line -- for an old cluster with no
+        # record, and for a record somebody else left partial, which
+        # _node_size() completes per field.
+        node_sizes = {
+            node_type: self._node_size(md, node_type)
+            for node_type in ('control_plane', 'worker')
+        }
+        if md.get('node_sizes') != node_sizes:
+            md = copy.deepcopy(md)
+            md['node_sizes'] = node_sizes
 
         return md
 

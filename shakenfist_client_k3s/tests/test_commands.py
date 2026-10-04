@@ -152,6 +152,60 @@ class ListOutputTestCase(testtools.TestCase):
         self.assertEqual('', result.output)
 
 
+class CreateNodeSizingOptionsTestCase(testtools.TestCase):
+    """create's sizing options must reach Cluster.create() as keywords."""
+
+    def setUp(self):
+        super(CreateNodeSizingOptionsTestCase, self).setUp()
+        self.client = mock.MagicMock()
+        self.client.namespace = 'clientns'
+        self.runner = CliRunner()
+
+        patcher = mock.patch.object(cluster_module.Cluster, 'create')
+        self.create = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _invoke(self, *args):
+        return self.runner.invoke(
+            shakenfist_client_k3s.k3s, ['create', 'banana'] + list(args),
+            obj={'VERBOSE': False, 'CLIENT': self.client})
+
+    def test_the_options_are_forwarded_as_keywords(self):
+        result = self._invoke(
+            '--control-plane-cpus', '4', '--control-plane-memory', '8192',
+            '--control-plane-disk', '100', '--worker-cpus', '6',
+            '--worker-memory', '16384', '--worker-disk', '200')
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.create.assert_called_once()
+        kwargs = self.create.call_args[1]
+        self.assertEqual(
+            {'control_plane_cpus': 4, 'control_plane_memory': 8192,
+             'control_plane_disk': 100, 'worker_cpus': 6,
+             'worker_memory': 16384, 'worker_disk': 200},
+            {k: v for k, v in kwargs.items() if k.startswith(('control_plane_', 'worker_'))})
+
+    def test_the_defaults_are_the_default_node_size(self):
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        kwargs = self.create.call_args[1]
+        size = cluster_module.DEFAULT_NODE_SIZE
+        self.assertEqual(size['cpus'], kwargs['control_plane_cpus'])
+        self.assertEqual(size['memory'], kwargs['control_plane_memory'])
+        self.assertEqual(size['disk'], kwargs['control_plane_disk'])
+        self.assertEqual(size['cpus'], kwargs['worker_cpus'])
+        self.assertEqual(size['memory'], kwargs['worker_memory'])
+        self.assertEqual(size['disk'], kwargs['worker_disk'])
+
+    def test_a_zero_size_is_refused_before_create_is_called(self):
+        result = self._invoke('--worker-memory', '0')
+
+        self.assertEqual(2, result.exit_code)
+        self.assertIn('--worker-memory', result.output)
+        self.create.assert_not_called()
+
+
 # A cluster which has finished being created, in the shape the three
 # expansion commands read it in: one control plane node, one worker, one
 # routed address, and the tokens and versions install_k3s_component wants.

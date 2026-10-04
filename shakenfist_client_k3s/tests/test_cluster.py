@@ -235,9 +235,15 @@ class ExpandWorkersTestCase(testtools.TestCase):
     workloads restarts the agent on a live node. An expand which hands
     install_workers() the whole of md['worker_nodes'] therefore damages
     every node it did not create, which is why the argument exists.
+
+    It also builds the new workers at the size the cluster recorded for
+    them, rather than at whatever the default is today, and at exactly the
+    default for a cluster created before sizes were recorded -- which is
+    the size every one of that cluster's nodes was built at.
     """
 
-    def _expand(self, existing_workers, worker_count, new_instances):
+    def _expand(self, existing_workers, worker_count, new_instances,
+                node_sizes=None):
         md = {
             'name': 'banana',
             'namespace': 'testns',
@@ -248,6 +254,8 @@ class ExpandWorkersTestCase(testtools.TestCase):
             'control_plane_nodes': ['uuid-cp-001'],
             'worker_nodes': list(existing_workers)
         }
+        if node_sizes is not None:
+            md['node_sizes'] = node_sizes
         client = mock.MagicMock()
         client.get_namespace_metadata.return_value = {MD_KEY: md}
         client.create_instance.side_effect = list(new_instances)
@@ -281,6 +289,55 @@ class ExpandWorkersTestCase(testtools.TestCase):
 
         ikc.assert_called_once_with(
             ['uuid-w-002', 'uuid-w-003'], 'node-token', 'agent')
+
+    def _built_sizes(self, cluster):
+        """(cpus, memory, disk) for every create_instance() call, in order."""
+        return [(c.args[1], c.args[2], c.args[4][0]['size'])
+                for c in cluster.client.create_instance.call_args_list]
+
+    def test_new_workers_are_built_at_the_recorded_worker_size(self):
+        # The control plane size is deliberately different, so that a
+        # lookup of the wrong role fails here rather than passing by
+        # coincidence.
+        cluster, _ = self._expand(
+            ['uuid-w-001'], 2,
+            [{'uuid': 'uuid-w-002', 'name': 'k3s-banana-node-002'},
+             {'uuid': 'uuid-w-003', 'name': 'k3s-banana-node-003'}],
+            node_sizes={
+                'control_plane': {'cpus': 8, 'memory': 16384, 'disk': 200},
+                'worker': {'cpus': 4, 'memory': 6144, 'disk': 80}})
+
+        self.assertEqual([(4, 6144, 80), (4, 6144, 80)],
+                         self._built_sizes(cluster))
+
+    def test_a_cluster_without_recorded_sizes_builds_at_the_default(self):
+        # Every cluster created before node_sizes existed. The fallback is
+        # what those clusters were built at, not a guess: there was no way
+        # to build a node at any other size. The literals are spelled out
+        # rather than read from DEFAULT_NODE_SIZE, so that changing the
+        # default is a decision this test makes somebody notice.
+        cluster, _ = self._expand(
+            ['uuid-w-001'], 1,
+            [{'uuid': 'uuid-w-002', 'name': 'k3s-banana-node-002'}])
+
+        self.assertNotIn('node_sizes', cluster.get_metadata())
+        self.assertEqual([(2, 2048, 50)], self._built_sizes(cluster))
+
+    def test_a_partial_record_falls_back_per_field(self):
+        # The plugin never writes this shape -- create() records every
+        # field for both roles -- but namespace metadata can be edited by
+        # anything with the namespace's credentials. A recorded field is
+        # used, a missing one comes from the default, and a missing role
+        # is the default whole, rather than a KeyError mid-expand.
+        cluster, _ = self._expand(
+            ['uuid-w-001'], 1,
+            [{'uuid': 'uuid-w-002', 'name': 'k3s-banana-node-002'}],
+            node_sizes={'worker': {'cpus': 4}})
+
+        self.assertEqual([(4, 2048, 50)], self._built_sizes(cluster))
+        self.assertEqual(
+            {'cpus': 2, 'memory': 2048, 'disk': 50},
+            cluster._node_size(cluster.get_metadata(), 'control_plane'))
 
 
 class CreateInstallsWorkersTestCase(testtools.TestCase):
@@ -863,6 +920,84 @@ class ShowReportsStateTestCase(testtools.TestCase):
         # Raising here would take away the only tool which can say why.
         md, _ = self._show(_interrupted_md(state='deleted'))
         self.assertEqual('banana', md['name'])
+
+
+class ShowReportsNodeSizesTestCase(testtools.TestCase):
+    """show() reports node sizes for every cluster, including ones which never recorded them.
+
+    A cluster created before node_sizes existed has no such key, and show()
+    fills it in from DEFAULT_NODE_SIZE. That is the one place show reports
+    something other than what is stored, and it is allowed to because the
+    filled in value is a fact: before the key existed, every node was built
+    at the default. What it must not do is make that fact true by writing
+    it: show is read only, and a show which rewrote the document would be a
+    metadata write racing conductor's on every look at a cluster.
+    """
+
+    def _show(self, md):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {MD_KEY: md}
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        return cluster.show(), client
+
+    def test_a_cluster_without_sizes_reports_the_defaults(self):
+        # Literals rather than DEFAULT_NODE_SIZE, as in ExpandWorkersTestCase:
+        # what an old cluster was built at does not change if the default
+        # does, and this is the test which should notice.
+        shown, _ = self._show(_interrupted_md(state='created'))
+        self.assertEqual(
+            {'control_plane': {'cpus': 2, 'memory': 2048, 'disk': 50},
+             'worker': {'cpus': 2, 'memory': 2048, 'disk': 50}},
+            shown['node_sizes'])
+
+    def test_the_fallback_is_not_written_back(self):
+        stored = _interrupted_md(state='created')
+        shown, client = self._show(stored)
+
+        self.assertIn('node_sizes', shown)
+        client.set_namespace_metadata_item.assert_not_called()
+
+        # Nor is the stored document changed in place: the fill is on a
+        # copy, so the dictionary get_metadata() cached -- and which a
+        # later set_metadata() would write -- still has no such key.
+        self.assertNotIn('node_sizes', stored)
+        self.assertEqual(_interrupted_md(state='created'), stored)
+
+    def test_the_fallback_is_not_shared_with_the_default(self):
+        # A caller which edits what show() handed it must not be editing
+        # the module's default, which every later create and expand reads.
+        shown, _ = self._show(_interrupted_md(state='created'))
+        shown['node_sizes']['worker']['memory'] = 1
+        self.assertEqual(2048, cluster_module.DEFAULT_NODE_SIZE['memory'])
+
+    def test_recorded_sizes_are_returned_as_stored(self):
+        stored = _interrupted_md(state='created')
+        stored['node_sizes'] = {
+            'control_plane': {'cpus': 4, 'memory': 8192, 'disk': 100},
+            'worker': {'cpus': 2, 'memory': 4096, 'disk': 60}}
+        expected = copy.deepcopy(stored)
+
+        shown, client = self._show(stored)
+
+        self.assertEqual(expected, shown)
+        client.set_namespace_metadata_item.assert_not_called()
+
+    def test_a_partial_record_is_reported_as_expand_would_build_it(self):
+        # Not a shape the plugin writes; see _node_size(). show() reports
+        # what expand-workers would build, and still writes nothing.
+        stored = _interrupted_md(state='created')
+        stored['node_sizes'] = {'worker': {'cpus': 4}}
+        expected_stored = copy.deepcopy(stored)
+
+        shown, client = self._show(stored)
+
+        self.assertEqual(
+            {'control_plane': {'cpus': 2, 'memory': 2048, 'disk': 50},
+             'worker': {'cpus': 4, 'memory': 2048, 'disk': 50}},
+            shown['node_sizes'])
+        self.assertEqual(expected_stored, stored)
+        client.set_namespace_metadata_item.assert_not_called()
 
 
 class InterruptedClusterVerbsTestCase(testtools.TestCase):
@@ -1530,6 +1665,82 @@ class ReadManifestsTestCase(testtools.TestCase):
             [bad, good])
 
         self.assertEqual(bad, e.path)
+
+
+class ValidateNodeSizesTestCase(testtools.TestCase):
+    """validate_node_sizes() accepts positive integers and nothing else.
+
+    It is read_manifests()'s sibling: a pure function create() calls before
+    it registers the name, so that a size which cannot be built costs the
+    caller an error rather than a claimed name and a metadata document
+    stuck in 'initial'. The command line's click.IntRange(min=1) refuses
+    most of these first, but a library caller -- an Ansible variable, a
+    YAML document -- has no click, so each refusal is pinned here against
+    the function itself.
+    """
+
+    def _sizes(self, role=None, field=None, value=None):
+        sizes = {
+            'control_plane': dict(cluster_module.DEFAULT_NODE_SIZE),
+            'worker': dict(cluster_module.DEFAULT_NODE_SIZE),
+        }
+        if role:
+            sizes[role][field] = value
+        return sizes
+
+    def test_the_defaults_are_accepted(self):
+        self.assertIsNone(cluster_module.validate_node_sizes(self._sizes()))
+
+    def test_distinct_positive_sizes_are_accepted(self):
+        # One is the smallest positive integer, and is accepted on purpose:
+        # a floor above it would be a guess about the workload.
+        sizes = {'control_plane': {'cpus': 4, 'memory': 8192, 'disk': 100},
+                 'worker': {'cpus': 1, 'memory': 1, 'disk': 1}}
+        self.assertIsNone(cluster_module.validate_node_sizes(sizes))
+
+    def _assert_refused(self, role, field, value):
+        e = self.assertRaises(
+            exceptions.NodeSizeError, cluster_module.validate_node_sizes,
+            self._sizes(role, field, value))
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual(role, e.role)
+        self.assertEqual(field, e.field)
+        self.assertIs(value, e.value)
+        self.assertEqual(
+            '%s %s must be a positive integer, not %r'
+            % (role.replace('_', ' '), field, value), str(e))
+        return e
+
+    def test_zero_is_refused(self):
+        e = self._assert_refused('worker', 'memory', 0)
+        self.assertEqual(
+            'worker memory must be a positive integer, not 0', str(e))
+
+    def test_a_negative_size_is_refused(self):
+        self._assert_refused('control_plane', 'disk', -1)
+
+    def test_true_is_refused(self):
+        # True is an int in Python and is >= 1, so without an explicit bool
+        # check this would build a one vCPU node and say nothing. YAML's
+        # 'yes' arrives as exactly this.
+        e = self._assert_refused('control_plane', 'cpus', True)
+        self.assertEqual(
+            'control plane cpus must be a positive integer, not True', str(e))
+
+    def test_a_float_is_refused(self):
+        # Refused rather than truncated: 2.0 happens to be whole, but the
+        # same check has to refuse 2.5, and accepting one float and not the
+        # other is a rule about values where the caller's mistake is a type.
+        self._assert_refused('worker', 'cpus', 2.0)
+
+    def test_a_string_is_refused(self):
+        # And told apart from the integer it looks like: the message uses
+        # repr(), so '2' is not rendered as 2.
+        e = self._assert_refused('worker', 'disk', '2')
+        self.assertIn("not '2'", str(e))
+
+    def test_none_is_refused(self):
+        self._assert_refused('control_plane', 'memory', None)
 
 
 class ManifestHeredocTestCase(testtools.TestCase):
