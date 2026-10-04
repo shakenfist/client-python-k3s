@@ -103,7 +103,7 @@ few minutes -- 184 occurrences over 25 days -- because a Service asked
 for dual-stack against an IPv4-only pool. Harmless, and invisible to
 every reading of current state.
 
-[p3]: library-api-and-collection-phase-03-missing-verbs.md
+[p3]: PLAN-library-api-and-collection-phase-03-missing-verbs.md
 
 ## Mission and problem statement
 

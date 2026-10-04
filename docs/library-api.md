@@ -97,9 +97,8 @@ Each command's body is a method taking that command's options, minus
 
 Only these nine methods, plus `get_metadata()`,
 `set_metadata(md)` and `delete_metadata()`, are this library's
-stable public surface. Phase 4 cuts `v0.1.0` to PyPI, so whatever
-is public at that point becomes a compatibility surface for
-external callers. Everything else `Cluster` exposes --
+stable public surface: this package is published to PyPI, so what
+is public here is a compatibility surface for external callers. Everything else `Cluster` exposes --
 `create_instance()`, `await_boot()`, `await_idle()`,
 `await_fetch()`, `await_execute()`, `reap_execute()`,
 `execute_and_await()`, `instance_os_update()`,
@@ -124,17 +123,16 @@ module in check mode, a form which wants to reject a file before the
 operator waits twenty minutes -- can do the same check the real call
 will do. It touches no cluster and no API client.
 
-Phase 3 reshaped two of these rather than leaving them for later, and
-the reshaping is worth naming because it corrects what this page used
-to say about them. `install_workers()` now takes the instance uuids to
+Two of these have shapes worth stating, because they are not what a
+reader would guess. `install_workers()` takes the instance uuids to
 install, with no default -- a caller which means "every worker" has to
-say so -- rather than gaining an incremental mode. That is deliberate:
+say so -- rather than offering an incremental mode:
 `create_and_await_instances()` already knows exactly which instances
-it just made, so passing that list along is the fix, and "incremental"
-was rejected as the framing for it. `install_control_plane()` gained
-an optional `manifests` argument, the same list of local paths
-`create()` reads and forwards to it. Skipping MetalLB or Longhorn, by
-contrast, is not a change to `setup_metallb()` or `setup_longhorn()`
+it just made, so passing that list along is the whole of what a caller
+needs. `install_control_plane()` takes an optional `manifests`
+argument, the same list of local paths `create()` reads and forwards to
+it. Skipping MetalLB or Longhorn, by contrast, is not a change to
+`setup_metallb()` or `setup_longhorn()`
 themselves -- they are exactly as unconditional as before -- it is
 `create()` deciding whether to call them at all.
 
@@ -168,13 +166,11 @@ library whose default is to rewrite the caller's `~/.kube/config` is
 surprising: an Ansible module or a conductor reconcile loop calling
 `create()` from inside a process that manages its own kubectl
 configuration should not find that file edited unless it said so.
-Reversing the default costs nothing today because nothing has ever been
-released -- there are no git tags and `shakenfist_client_k3s` is not on
-PyPI, so `sf-client k3s` is the only caller in the tree. Phase 4 is the
-first PyPI release, so this is the last point at which the default
-could change for free; taking the other default "for symmetry with the
-CLI" would have made the surprise permanent at the one moment avoiding
-it cost nothing.
+The default was chosen before the first PyPI release, while
+`sf-client k3s` was the only caller in the tree and reversing it cost
+nothing. Taking the other default "for symmetry with the CLI" would
+have made the surprise permanent at the one moment avoiding it was
+free.
 
 The cluster's kubeconfig is recorded in `md['kubeconfig']` regardless of
 `write_kubeconfig`, and `get_kubeconfig()` serves it either way -- only
@@ -263,9 +259,9 @@ constructors, because one class covers several call sites whose
 message text differs. `ClusterInterruptedError` carries the state the
 cluster was left in (`state`) and, for its `not_usable()` form, which
 verb refused to run (`verb`); both of its messages name `sf-client k3s
-delete <name>` as the way out, because phase 3 deliberately built
-detection and teardown rather than a way to resume a half built
-cluster -- see decision 5 of
+delete <name>` as the way out, because what is built is detection and
+teardown rather than a way to resume a half built cluster -- see
+decision 5 of
 `docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md`. One
 gap that decision does not close: a `create()` interrupted between
 claiming its name and writing that cluster's own metadata document
