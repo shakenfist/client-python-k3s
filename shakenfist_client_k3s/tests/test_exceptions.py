@@ -220,6 +220,30 @@ class TotalAttributesTestCase(testtools.TestCase):
     without knowing which constructor ran, so getattr has to be total.
     """
 
+    def test_every_reasoned_exception_initialises_all_of_its_fields(self):
+        """Driven by the subclass list, so a sixth one is covered the day it lands.
+
+        The two tests below check this by hand for the two classes which
+        had the defect. The shared base makes the property checkable for
+        every class that has it, which matters because the way it was lost
+        the first time was a new class written without FIELDS at all.
+        """
+        subclasses = exceptions._ReasonedK3sException.__subclasses__()
+        self.assertNotEqual([], subclasses)
+
+        for cls in subclasses:
+            self.assertIsInstance(cls.FIELDS, tuple)
+            self.assertNotEqual((), cls.FIELDS, cls.__name__)
+
+            # Built directly rather than through a classmethod: the point
+            # is the floor every classmethod inherits, not any one of them.
+            e = cls('a_reason', 'a message')
+            self.assertEqual('a_reason', e.reason)
+            self.assertEqual('a message', str(e))
+            for field in cls.FIELDS:
+                self.assertIsNone(getattr(e, field),
+                                  '%s.%s' % (cls.__name__, field))
+
     def test_release_lookup_fields_are_all_present(self):
         e = exceptions.ReleaseLookupError.unknown_channel('v1.26')
         self.assertEqual('v1.26', e.release_channel)

@@ -35,6 +35,53 @@ class K3sClusterException(Exception):
     """Base class for every exception this library raises."""
 
 
+class _ReasonedK3sException(K3sClusterException):
+    """Base for the exceptions built through classmethods rather than directly.
+
+    Five of the classes below describe several distinct failures that read
+    the same way to a caller: a manifest cannot be staged, a release
+    lookup failed. Each is built through a classmethod per failure, each
+    records which one ran in ``reason``, each renders a message its
+    classmethod composed, and each carries the failure's details as
+    attributes. That shape was written out five times, byte for byte, and
+    the duplication is a cross-phase one: two copies arrived with the
+    exception hierarchy, two more when later verbs needed their own
+    reasoned errors, and a fifth with the heredoc refusal.
+
+    ``reason`` does not decide which attributes exist. Every field any
+    classmethod of a subclass sets is declared in that subclass's
+    ``FIELDS``, and all of them are initialised to None here, so
+    ``getattr`` is total: a caller which does not know which constructor
+    ran -- ``docs/library-api.md`` describes these attributes as the
+    failure's details, and the Ansible module serialises them into
+    ``fail_json()`` -- reads any field off any instance and gets None
+    rather than ``AttributeError``. That is why ``FIELDS`` is declared
+    rather than left implicit in what each classmethod happens to pass.
+
+    Subclasses declare ``FIELDS`` and their classmethods, and nothing
+    else. A subclass whose failures do not share a message shape --
+    ``AgentOperationError``, ``CommandFailedError``, ``NodeSizeError`` --
+    is not one of these and takes its own named arguments.
+    """
+
+    #: The union of the fields this class's classmethods set. Declared by
+    #: each subclass; empty here so that the loop below is total for a
+    #: subclass which has no details to carry.
+    FIELDS = ()
+
+    def __init__(self, reason, message, **fields):
+        self.reason = reason
+        self.message = message
+        for key in self.FIELDS:
+            setattr(self, key, None)
+        for key, value in fields.items():
+            setattr(self, key, value)
+        super(_ReasonedK3sException, self).__init__(message)
+
+    def __str__(self):
+        return self.message
+
+
 class ClusterExistsError(K3sClusterException):
     """Raised when a cluster create is attempted with a name already in use.
 
@@ -151,7 +198,7 @@ class ClusterIncompleteError(K3sClusterException):
         return 'No kubeconfig for this cluster. Is it fully installed?'
 
 
-class ClusterInterruptedError(K3sClusterException):
+class ClusterInterruptedError(_ReasonedK3sException):
     """Raised when a cluster's own metadata says it never finished being built.
 
     ``md['state']`` is written by ``Cluster.create()`` and
@@ -192,20 +239,8 @@ class ClusterInterruptedError(K3sClusterException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('name', 'state', 'verb')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(ClusterInterruptedError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def mid_create(cls, name, state):
@@ -320,7 +355,7 @@ class ComponentNotInstalledError(K3sClusterException):
             % (self.name, self.component, self.verb, self.component))
 
 
-class ManifestError(K3sClusterException):
+class ManifestError(_ReasonedK3sException):
     """Raised when a manifest handed to ``Cluster.create()`` cannot be staged.
 
     ``--manifest`` (and the ``manifests`` argument behind it) names local
@@ -376,21 +411,9 @@ class ManifestError(K3sClusterException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('path', 'other_path', 'basename', 'suffixes', 'delimiter',
               'detail')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(ManifestError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def not_a_manifest(cls, path, suffixes):
@@ -452,7 +475,7 @@ class ManifestError(K3sClusterException):
                    delimiter=delimiter)
 
 
-class GuestFileError(K3sClusterException):
+class GuestFileError(_ReasonedK3sException):
     """Raised when a file this library writes onto a cluster node cannot be written.
 
     The in-guest agent runs a shell command line, so every file this
@@ -480,20 +503,8 @@ class GuestFileError(K3sClusterException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('path', 'delimiter')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(GuestFileError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def delimiter_collision(cls, path, delimiter):
@@ -580,7 +591,7 @@ class NodeSizeError(K3sClusterException):
             self.role.replace('_', ' '), self.field, self.value)
 
 
-class ReleaseLookupError(K3sClusterException):
+class ReleaseLookupError(_ReasonedK3sException):
     """Raised when looking up a k3s or Longhorn release fails.
 
     Covers five sites in ``primitives.py``, which reduce to four distinct
@@ -612,25 +623,10 @@ class ReleaseLookupError(K3sClusterException):
     None rather than raising ``AttributeError``.
     """
 
-    #: The union of the fields the classmethods below set. A caller which
-    #: does not know which constructor ran -- ``docs/library-api.md``
-    #: describes these as the failure's details, and phase 5's
-    #: ``fail_json()`` will serialise them -- must be able to read any of
-    #: them off any instance.
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('product', 'url', 'status_code', 'response_text',
               'response_snippet', 'release_channel')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(ReleaseLookupError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def http_status(cls, product, url, status_code, response_text):
@@ -761,7 +757,7 @@ class CommandFailedError(K3sClusterException):
         return '\n'.join(lines)
 
 
-class KubeconfigError(K3sClusterException):
+class KubeconfigError(_ReasonedK3sException):
     """Raised when a local kubeconfig merge or cleanup fails.
 
     Not writes: the three ``open(main_config_path, 'w')`` calls in
@@ -794,21 +790,9 @@ class KubeconfigError(K3sClusterException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('main_config_path', 'name', 'returncode', 'stderr',
               'config_elem')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(KubeconfigError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def missing_kubectl(cls, main_config_path, name):
