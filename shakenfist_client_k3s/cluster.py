@@ -23,6 +23,7 @@ standard library from Python 3.8, and this package supports 3.7).
 """
 
 import copy
+import ipaddress
 import json
 import os
 import re
@@ -47,6 +48,16 @@ from shakenfist_client_k3s import progress
 # The namespace metadata key a cluster's state is stored under, one
 # document per cluster.
 METADATA_KEY = 'orchestrated_k3s_cluster_%s'
+
+# The keys in that document whose values are credentials. node_token
+# registers an agent, which is scheduling rights on the cluster;
+# server_token joins a control plane node, which is cluster admin;
+# kubeconfig carries a cluster-admin client certificate and key; ssh_key
+# is whatever the cluster was built with. Named here rather than at each
+# site which must not print them, so that a site added later has
+# somewhere to ask rather than a list to rediscover.
+SECRET_METADATA_KEYS = ('node_token', 'server_token', 'kubeconfig',
+                        'ssh_key')
 
 BASE_OS_VERSION = 'debian:12'
 
@@ -146,6 +157,15 @@ K3S_MANIFEST_SUFFIXES = ('.yaml', '.yml', '.json')
 # unreadable in the agent operation log and is not a filename anybody
 # meant to use. The leading character is restricted separately so that a
 # name cannot begin with a dot or a hyphen.
+#
+# This character class is also what keeps the remote destination inside
+# K3S_MANIFEST_DIR, which is a second job it does and the one a reader is
+# least likely to notice. install_control_plane() joins the directory and
+# the basename to build the path it writes on the node: no '/' can match,
+# so the basename cannot carry a path separator or be an absolute path,
+# and no leading dot can match, so it cannot be '..'. Relaxing the class
+# for readability -- to allow a space, say -- would need that join
+# reconsidered, not only the quoting at the write site.
 K3S_MANIFEST_BASENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 
 # The heredoc delimiter manifest content is handed to a node with.
@@ -265,10 +285,70 @@ K3S_RELEASE_FLOOR = (1, 21, 1)
 # 2. Any heredoc carrying interpolated content uses a quoted delimiter, so
 #    the remote shell expands nothing inside the body. Python has already
 #    substituted the values by the time the shell sees them, so a quoted
-#    delimiter costs nothing and removes the whole question.
+#    delimiter costs nothing and removes the whole question. A quoted
+#    delimiter is necessary and not sufficient: it does not stop an
+#    interpolated value from *ending* the heredoc, which a value containing
+#    a newline followed by a line equal to the delimiter does, and then the
+#    rest of the body is read by the shell as commands. So every heredoc is
+#    built by heredoc() below, which refuses such a body.
 #
-# Cluster.delete()'s kubectl invocation is the third form of the same rule:
-# where a real argument list is available, it is used instead.
+# 3. Where a real argument list is available, it is used instead of a
+#    shell command line, so that no shell parses the value at all. Both
+#    local kubectl invocations -- create()'s merge and delete()'s unset
+#    calls -- are argument lists. The agent commands cannot be, because
+#    the agent takes a command line.
+
+
+def _is_address(value):
+    """True if value is a string holding an IP address.
+
+    The string check is not redundant with ip_address(). That accepts an
+    int as a packed address, so ip_address(1) is 0.0.0.1 and
+    ip_address(True) is too -- and these values are not used as addresses
+    but interpolated into YAML as text, where an int reaches
+    str.join() and raises TypeError from somewhere that cannot say which
+    metadata key was wrong. The metadata document is JSON, so an int in
+    an address list is a thing a writer can actually put there.
+
+    ip_address() rather than a regular expression so that this stays a
+    question about addresses rather than about the shapes seen so far:
+    IPv6 passes, and a cluster using it is not refused by its own
+    validator.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def heredoc(remote_path, body, delimiter='EOF'):
+    """Build the command which writes body to remote_path on a cluster node.
+
+    The in-guest agent runs a shell command line and nothing else, so a
+    file reaches a node as the body of a heredoc. Every such command in
+    this module is built here, for the reason rule 2 above gives: the
+    quoted delimiter is what stops the remote shell expanding the body,
+    and refusing a body which contains the delimiter on a line of its own
+    is what stops the body ending the heredoc and becoming commands. Both
+    halves have to hold for either to be worth anything, so they live
+    together rather than at each call site.
+
+    The path is quoted per rule 1, which is free for the literal paths and
+    is the point for the manifest destination, whose basename is the
+    caller's. Exactly one trailing newline, because the delimiter needs a
+    line of its own and a body which already ends in a newline must not
+    gain a blank line.
+    """
+    if body and not body.endswith('\n'):
+        body += '\n'
+    if delimiter in body.split('\n'):
+        raise exceptions.GuestFileError.delimiter_collision(
+            remote_path, delimiter)
+    return ("cat - > %s << '%s'\n%s%s\n"
+            % (shlex.quote(remote_path), delimiter, body, delimiter))
 
 
 def read_manifests(paths):
@@ -688,46 +768,90 @@ class Cluster:
             raise exceptions.ClusterInterruptedError.not_usable(
                 self.name, state, verb)
 
+    def _require_addresses(self, md, key):
+        """Refuse to run on metadata whose key does not hold IP addresses.
+
+        ``configure_metallb_addresses()`` interpolates these into a YAML
+        body written onto a node through ``heredoc()``, which refuses a
+        body carrying a line equal to its delimiter -- so a tampered
+        address cannot run commands on the node. What it can do is
+        arrive too late: ``expand_addresses()`` routes new floating
+        addresses, which are charged for, and commits them to the
+        metadata before that write happens, so the refusal lands after
+        the spending. The same function already refuses a cluster
+        without metallb up front for exactly that reason, and its
+        docstring gives the argument.
+
+        So the document is checked before anything is spent rather than
+        at the write site. ``heredoc()`` keeps its refusal, which covers
+        the sinks this check does not know about and any added later.
+        """
+        # An absent, empty or None key checks nothing and that is the
+        # right answer, not a skipped one: create() has always written
+        # this key as a list, and a cluster whose first expand-addresses
+        # has not run yet legitimately has none. A value which is not a
+        # list is not let through -- iterating a string yields characters
+        # and a mapping yields keys, neither of which is an address, so
+        # the refusal still fires.
+        for value in md.get(key) or []:
+            if not _is_address(value):
+                raise exceptions.ClusterMetadataError.not_an_address(
+                    self.name, key, value)
+
+    def start_progress(self, total_phases):
+        """Begin progress reporting for an operation of total_phases phases.
+
+        The one place a Progress is constructed. What is repetitive about
+        it is not the constructor but the wiring -- the reporter is both
+        the stream written to and the source of the verbose flag, which is
+        Cluster's knowledge rather than Progress's -- and every entry point
+        which knows its own phase count needs exactly that wiring. Five of
+        them wrote it out by hand, so the sixth was going to as well.
+
+        This replaces whatever Progress is already there, which is what an
+        entry point wants: it is starting an operation, and the count it
+        knows is the right one. get_progress() is the other half of the
+        arrangement and deliberately does not replace.
+        """
+        self.progress = progress.Progress(
+            total_phases=total_phases, verbose=self.reporter.verbose,
+            stream=self.reporter)
+        return self.progress
+
     def get_progress(self, total_phases=1):
         """Return the Progress reporter for this operation, making a default if needed.
 
-        Commands which know how many phases they have build their own and
-        assign it; everything else gets one lazily, so a method called
-        directly by a library caller still reports progress somewhere
-        sensible.
+        Commands which know how many phases they have call
+        start_progress(); everything else gets one lazily from here, so a
+        method called directly by a library caller still reports progress
+        somewhere sensible.
 
         total_phases is the count the lazy default is built with, and is
         ignored when there is already a Progress to return -- it says how
         many phases *this* method is about to open, not how many the
-        operation has. It defaults to 1 because all but one of the methods
-        which call get_progress() themselves -- rather than inheriting a
-        Progress an entry point like create() or expand_workers() already
-        built -- open exactly one phase and do their work inside it:
-        create_and_await_instances(), install_extra_control_plane(),
-        install_workers(), setup_metallb() and setup_longhorn(). 1 is
-        therefore not a placeholder guess but the true count for those
-        callers, giving a library caller who invokes one of them directly
-        an honest "[1/1]" instead of the un-numbered "[n]" this used to
-        print.
-
-        The exception is install_control_plane(), which opens a second
-        phase through install_extra_control_plane() when the cluster has
-        more than one control plane node, and so passes the count it works
-        out from the metadata rather than taking the default.
+        operation has. It defaults to 1 because the methods which call
+        get_progress() themselves, rather than inheriting a Progress an
+        entry point already started, open exactly one phase and do their
+        work inside it. 1 is therefore the true count for those callers
+        and not a placeholder guess, which is what gives a library caller
+        who invokes one of them directly an honest "[1/1]" instead of the
+        un-numbered "[n]" this used to print. install_control_plane() is
+        the exception: it opens a second phase through
+        install_extra_control_plane() when the cluster has more than one
+        control plane node, so it works its count out from the metadata
+        rather than taking the default.
 
         This is one Progress per Cluster instance, cached for its life
         (see __init__), so it is only accurate for a single such call. A
         library caller who invokes two of these methods in sequence on the
         same Cluster shares the one lazily built Progress between them --
         the second call's phase header becomes "[2/1]", which is worse
-        than un-numbered. A caller doing that should build its own
-        progress.Progress with the real total and assign it to
-        self.progress first, the way create() and expand_workers() do.
+        than un-numbered. A caller doing that should call start_progress()
+        with the real total first, the way create() and expand_workers()
+        do.
         """
         if not self.progress:
-            self.progress = progress.Progress(
-                total_phases=total_phases, verbose=self.reporter.verbose,
-                stream=self.reporter)
+            self.start_progress(total_phases)
         return self.progress
 
     def _node_size(self, md, node_type):
@@ -812,7 +936,7 @@ class Cluster:
         inst = self.client.get_instance(aop['instance_uuid'])
         return exceptions.AgentOperationError(
             inst['name'], aop['instance_uuid'], aop['uuid'],
-            primitives._describe_agent_op(aop, max_len=None),
+            progress.describe_agent_op(aop, max_len=None),
             aop.get('results', {}) or {},
             state=aop.get('state'))
 
@@ -915,7 +1039,7 @@ class Cluster:
                     waiting.remove(instance_uuid)
                 else:
                     aop = incomplete[0]
-                    desc = primitives._describe_agent_op(aop)
+                    desc = progress.describe_agent_op(aop)
                     remaining = progress.count_str(len(incomplete), 'operation')
                     if desc:
                         p.update(inst['name'], "running '%s' (%s remaining)" % (desc, remaining))
@@ -1147,7 +1271,7 @@ class Cluster:
         if aop['state'] in AGENT_OP_FAILED_STATES:
             probe['error'] = (
                 'the agent operation for %s entered the %s state'
-                % (primitives._describe_agent_op(aop, max_len=None) or command,
+                % (progress.describe_agent_op(aop, max_len=None) or command,
                    aop['state']))
             return probe
 
@@ -1350,12 +1474,13 @@ class Cluster:
                 "role must be 'server' or 'agent', not %r" % (role,))
 
         def write(path, body):
-            # Every body here already ends in exactly one newline, which
-            # puts the delimiter on a line of its own without a blank line
-            # in the file before it.
-            return ("cat - > %s << '%s'\n%s%s\n"
-                    % (path, K3S_CONFIG_DELIMITER, body,
-                       K3S_CONFIG_DELIMITER))
+            # Through heredoc() rather than built here, per rule 2 at the
+            # top of this module. The validation above already refuses a
+            # configuration whose YAML contains the delimiter and raises
+            # K3sConfigError for it; routing the write through the helper
+            # is what quotes the path, and what keeps the refusal beside
+            # the write for a body this method composed itself.
+            return heredoc(path, body, delimiter=K3S_CONFIG_DELIMITER)
 
         cmds = ['mkdir -p /etc/rancher/k3s/config.yaml.d',
                 write('/etc/rancher/k3s/config.yaml', main)]
@@ -1462,24 +1587,18 @@ class Cluster:
                 'mkdir -p -m 0700 /var/lib/rancher /var/lib/rancher/k3s '
                 '/var/lib/rancher/k3s/server %s' % K3S_MANIFEST_DIR)
             for basename, content in staged:
-                # Exactly one trailing newline, because the heredoc needs
-                # its delimiter on a line of its own and a file which
-                # already ends in a newline must not gain a blank line.
-                body = content if content.endswith('\n') else content + '\n'
-                # Quoted per rule 1 at the top of this module. The
-                # basename is the caller's, by way of os.path.basename()
-                # of a path nothing else has looked at;
-                # read_manifests() refuses the shapes which would be
-                # unreadable in the operation log, and this makes the
-                # ones it allows unable to mean anything to the shell.
-                # A basename of plain filename characters quotes to
-                # itself, so the common case is byte for byte what it
-                # was.
-                cmds.append(
-                    "cat - > %s << '%s'\n%s%s\n"
-                    % (shlex.quote('%s/%s' % (K3S_MANIFEST_DIR, basename)),
-                       K3S_MANIFEST_DELIMITER, body,
-                       K3S_MANIFEST_DELIMITER))
+                # heredoc() quotes the destination per rule 1 and
+                # normalises the trailing newline. The basename is the
+                # caller's, by way of os.path.basename() of a path nothing
+                # else has looked at; read_manifests() refuses the shapes
+                # which would be unreadable in the operation log, and the
+                # quoting makes the ones it allows unable to mean anything
+                # to the shell. A basename of plain filename characters
+                # quotes to itself, so the common case is byte for byte
+                # what it was.
+                cmds.append(heredoc(
+                    '%s/%s' % (K3S_MANIFEST_DIR, basename), content,
+                    delimiter=K3S_MANIFEST_DELIMITER))
 
         # Instruct the first control plane node to install k3s and helm
         cmds.append('curl -sfL https://get.k3s.io | '
@@ -1569,10 +1688,28 @@ class Cluster:
         md = self.get_metadata()
         node_network = self.client.get_network(md['node_network'])
 
+        # setdefault rather than [], because delete() and
+        # _require_addresses() both already read this key tolerantly and
+        # this was the one site which raised KeyError on a document
+        # missing it. create() has always written it, so no real cluster
+        # reaches that -- but "the document says what we expect" is the
+        # assumption rule 1 exists to refuse.
+        md.setdefault('routed_addresses', [])
+
         allocated = []
         for i in range(metal_address_count):
             addr = self.client.route_network_address(node_network['uuid'])
             if addr:
+                # Rule 1 at the top of this module puts the Shaken Fist
+                # API outside this package's trust boundary, so what it
+                # hands back is checked before it is recorded rather
+                # than after. Checked here and not only in
+                # _require_addresses() because this is the one point at
+                # which a bad value can be stopped from entering the
+                # document at all.
+                if not _is_address(addr):
+                    raise exceptions.ClusterMetadataError.not_an_address(
+                        self.name, 'routed_addresses', addr)
                 md['routed_addresses'].append(addr)
                 allocated.append(addr)
 
@@ -1593,24 +1730,25 @@ class Cluster:
         # Setup metallb for traffic ingress, guided by
         # https://itnext.io/kubernetes-loadbalancer-service-for-on-premises-6b7f75187be8
         #
-        # Quoted delimiter per rule 2 at the top of this module.
-        metal_lb_config = ("cat - > /etc/sf/metallb-range-allocation.yaml << 'EOF'\n"
-                           'apiVersion: metallb.io/v1beta1\n'
-                           'kind: IPAddressPool\n'
-                           'metadata:\n'
-                           '  name: empty\n'
-                           '  namespace: metallb-system\n'
-                           'spec:\n'
-                           '  addresses:\n'
-                           '  - %s/32\n'
-                           '---\n'
-                           'apiVersion: metallb.io/v1beta1\n'
-                           'kind: L2Advertisement\n'
-                           'metadata:\n'
-                           '  name: empty\n'
-                           '  namespace: metallb-system\n'
-                           'EOF\n'
-                           % '/32\n  - '.join(md['routed_addresses']))
+        # Through heredoc(), per rule 2 at the top of this module. The
+        # addresses are namespace metadata values.
+        metal_lb_config = heredoc(
+            '/etc/sf/metallb-range-allocation.yaml',
+            'apiVersion: metallb.io/v1beta1\n'
+            'kind: IPAddressPool\n'
+            'metadata:\n'
+            '  name: empty\n'
+            '  namespace: metallb-system\n'
+            'spec:\n'
+            '  addresses:\n'
+            '  - %s/32\n'
+            '---\n'
+            'apiVersion: metallb.io/v1beta1\n'
+            'kind: L2Advertisement\n'
+            'metadata:\n'
+            '  name: empty\n'
+            '  namespace: metallb-system\n'
+            % '/32\n  - '.join(md['routed_addresses']))
 
         # Wait on the two workloads rather than on the pods they own. A
         # pod wait resolves its label selector once and then spends a
@@ -1896,10 +2034,7 @@ class Cluster:
             total_phases -= 1
         if not write_kubeconfig:
             total_phases -= 1
-        p = progress.Progress(
-            total_phases=total_phases, verbose=self.reporter.verbose,
-            stream=self.reporter)
-        self.progress = p
+        p = self.start_progress(total_phases)
 
         self.reporter.debug('Looking up k3s versions')
         target_release = primitives.get_k3s_release(
@@ -2117,14 +2252,39 @@ class Cluster:
         # here. See create()'s docstring, and decision 6 of the phase 3 plan.
         if write_kubeconfig:
             p.phase('Updating local kubeconfig')
+            # Every component of these paths is chosen by this module -- the
+            # user's home directory, a fixed directory name, a fixed file
+            # name, and below a tempfile directory -- so the joins need no
+            # containment check and there is nothing for a realpath() guard
+            # to prove. An outside value appearing in one of them later
+            # would need both.
             kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
             main_config_path = os.path.join(kube_dir, 'config')
-            os.makedirs(kube_dir, exist_ok=True)
+
+            # 0700, rather than whatever the process umask makes of 0777. A
+            # k3s kubeconfig embeds client-certificate-data and
+            # client-key-data for a cluster-admin identity, so on a default
+            # umask 022 host this directory and the file below were readable
+            # by every local user -- which is the normal situation on a
+            # shared jump box or a CI runner. exist_ok leaves an existing
+            # directory's mode alone, so a user who has already tightened
+            # theirs keeps it, and one who has loosened it is not silently
+            # overridden.
+            os.makedirs(kube_dir, mode=0o700, exist_ok=True)
 
             if not os.path.exists(main_config_path):
                 # There is no existing configuration to preserve, so no merge is
                 # required and we don't need a local kubectl.
-                with open(main_config_path, 'w', encoding='utf-8') as f:
+                #
+                # os.open() with an explicit mode rather than open() and a
+                # chmod afterwards, so that the file is never briefly
+                # world readable between being created and being tightened.
+                # Only this branch creates the file: the merge branch below
+                # rewrites one which already exists, which keeps the mode
+                # the user's own kubeconfig had.
+                fd = os.open(main_config_path,
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with open(fd, 'w', encoding='utf-8') as f:
                     f.write(yaml.dump(kc))
             else:
                 if not shutil.which('kubectl'):
@@ -2135,8 +2295,18 @@ class Cluster:
                     new_config_path = os.path.join(tempdir, 'config')
                     with open(new_config_path, 'w', encoding='utf-8') as f:
                         f.write(yaml.dump(kc))
+                    # An argument list, per the third form of the rule
+                    # at the top of this module. Nothing here is
+                    # interpolated, so the shell had nothing to find and
+                    # this is consistency rather than a fix -- but a reader
+                    # comparing this with delete()'s unset calls should not
+                    # have to work out for themselves that the difference
+                    # does not matter, and spawning a shell to run a
+                    # constant buys nothing. The two paths travel as
+                    # environment values rather than as argv either way.
                     merged = subprocess.run(
-                        'kubectl config view --flatten', shell=True, capture_output=True,
+                        ['kubectl', 'config', 'view', '--flatten'],
+                        capture_output=True,
                         env={**os.environ,
                              'KUBECONFIG': '%s:%s' % (main_config_path, new_config_path)})
                     if merged.returncode != 0:
@@ -2468,9 +2638,18 @@ class Cluster:
                 'finished being built.\nRemoving whatever it did create.\n'
                 % (self.name, interrupted))
 
+        # Redacted here rather than relied on not being reached. The
+        # Ansible module leaves its reporter non-verbose and calls that a
+        # security property because of this loop, which makes a security
+        # property that holds only while one caller remembers a flag; and
+        # -v is exactly the flag somebody adds when a delete is failing,
+        # which is also when they paste the output into a bug report.
         self.reporter.debug('Cluster metadata:')
         for k in md:
-            self.reporter.debug('    %s = %s' % (k, md[k]))
+            if k in SECRET_METADATA_KEYS and md[k] is not None:
+                self.reporter.debug('    %s = %s' % (k, progress.REDACTED))
+            else:
+                self.reporter.debug('    %s = %s' % (k, md[k]))
 
         # Delete instances
         waiting = []
@@ -2500,8 +2679,14 @@ class Cluster:
 
         md['control_plane_nodes'] = []
         md['worker_nodes'] = []
-        md['api_floating_address'] = None
-        md['api_inner_address'] = None
+        # api_address_floating and api_address_inner, which is what create()
+        # writes and what install_control_plane() and install_k3s_component()
+        # read. This used to clear api_floating_address and
+        # api_inner_address -- the words transposed -- so it invented two
+        # keys nothing else in the package has ever used and left the two
+        # real ones in the document.
+        md['api_address_floating'] = None
+        md['api_address_inner'] = None
         md['k3s_version'] = None
         md['kubeconfig'] = None
         md['node_token'] = None
@@ -2526,7 +2711,9 @@ class Cluster:
             # preserved here deliberately: this step moves code without
             # changing what it does, and the fix belongs in its own change.
             self.client.delete_network(md['node_network'])
-            md['node_network'] = []
+            # None, not []: everywhere else this key holds a network uuid
+            # string, and create_instance() reads it as one.
+            md['node_network'] = None
 
         md['state'] = 'deleted'
         self.set_metadata(md)
@@ -2581,6 +2768,22 @@ class Cluster:
                 # API request with no validation anywhere on the path, so a
                 # name containing shell metacharacters would otherwise run
                 # as a command.
+                #
+                # That settles injection and not kubectl's own grammar,
+                # which is a separate question the paragraph above should
+                # not be read as answering. 'kubectl config unset' resolves
+                # its argument as a dot separated path into the config
+                # structure -- 'users' is a map, the next segment is the
+                # key, and a further segment is a field of the result -- so
+                # a cluster name containing a dot produces a path with an
+                # extra segment that kubectl cannot resolve, and the
+                # non-zero exit below becomes a KubeconfigError. By then
+                # the cluster really is gone and delete_metadata() has run,
+                # so re-running the delete raises ClusterNotFoundError and
+                # the stale entries stay in ~/.kube/config. 'my.cluster' is
+                # a name somebody will type. Validating the cluster name on
+                # the way in is what fixes it, and is
+                # shakenfist/client-python-k3s#96.
                 unset = subprocess.run(
                     ['kubectl', 'config', 'unset', config_elem],
                     capture_output=True)
@@ -2621,9 +2824,7 @@ class Cluster:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
         self._require_usable(md, 'expand-workers')
 
-        p = progress.Progress(
-            total_phases=2, verbose=self.reporter.verbose, stream=self.reporter)
-        self.progress = p
+        p = self.start_progress(2)
         new_workers = self.create_and_await_instances(worker_count, 'worker')
         self.install_workers(new_workers)
         p.finish(f'Added {worker_count} workers to cluster {self.name}')
@@ -2720,10 +2921,7 @@ class Cluster:
         if not wanted:
             return
 
-        p = progress.Progress(
-            total_phases=len(wanted), verbose=self.reporter.verbose,
-            stream=self.reporter)
-        self.progress = p
+        p = self.start_progress(len(wanted))
 
         # Every node name is resolved before anything is drained or deleted,
         # for the reason the uuid check above runs first: this loop destroys
@@ -2938,6 +3136,12 @@ class Cluster:
         fails, and it fails with the addresses already routed and charged
         for and nothing able to hand them out. Refusing up front costs the
         caller an error and nothing else.
+
+        The addresses already recorded are checked up front for the same
+        reason. They reach metallb's configuration only after the new
+        ones have been routed, and ``heredoc()`` refuses a body one of
+        them could end -- a refusal which is correct and which would
+        otherwise arrive after the allocation.
         """
         md = self.get_metadata()
         if not md:
@@ -2950,9 +3154,11 @@ class Cluster:
             raise exceptions.ComponentNotInstalledError(
                 self.name, 'metallb', 'expand-addresses')
 
-        p = progress.Progress(
-            total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)
-        self.progress = p
+        # And the document's contents for the same reason as its flags;
+        # _require_addresses() carries the argument.
+        self._require_addresses(md, 'routed_addresses')
+
+        p = self.start_progress(1)
         p.phase('Adding metallb addresses')
         self.allocate_metallb_addresses(address_count)
         self.configure_metallb_addresses()
@@ -2972,9 +3178,7 @@ class Cluster:
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
 
-        p = progress.Progress(
-            total_phases=1, verbose=self.reporter.verbose, stream=self.reporter)
-        self.progress = p
+        p = self.start_progress(1)
         p.phase('Updating the OS on all cluster nodes')
         self.instance_os_update(md['control_plane_nodes'] + md['worker_nodes'])
         p.finish(f'Updated the OS on all nodes in cluster {self.name}')

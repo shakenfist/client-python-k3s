@@ -35,6 +35,7 @@ import tempfile
 import testtools
 
 from shakenfist_client_k3s import client as sf_client
+from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.tests import module_harness
 
 
@@ -333,6 +334,38 @@ class SecretsTestCase(ModuleTestCase):
                        module_harness.SECRET_KUBECONFIG,
                        module_harness.SECRET_SSH_KEY):
             self.assertNotIn(secret, run.stdout)
+
+    def test_no_cluster_secret_reaches_a_failed_create(self):
+        """A worker install which exits non-zero reports no node token.
+
+        This is the path the audit found leaking. The k3s installer has to
+        be told which cluster to join, so install_k3s_component() puts
+        K3S_TOKEN= on the command line; the API echoes that command line
+        back; reap_execute() hands it to CommandFailedError on a non-zero
+        return code; and this module puts the exception into
+        fail_json(msg=...). The node token is not a module parameter, so it
+        is not in no_log_values and Ansible's own remove_values() does not
+        scrub it -- which made docs/collection.md's "Secrets never come
+        back in the module's output" false for this one path.
+
+        Triggering it needs no privilege: a transient apt failure during a
+        worker install is enough, and the CI job log which would then hold
+        the token is readable by anyone who can see the repository.
+        """
+        run = self.run_module(base_params(), expect_failure=True,
+                              fake_create=True, worker_install_fails=True)
+
+        self.assertTrue(run.failed)
+        # The premise: the failure really did come from the install, so a
+        # module which failed earlier for some other reason cannot pass
+        # this test by never reaching the leak.
+        self.assertIn('Command failed!', run.msg)
+        self.assertIn('exit code: 100', run.msg)
+
+        self.assertNotIn(module_harness.SECRET_NODE_TOKEN, run.stdout)
+        # And the message is still worth reading.
+        self.assertIn('K3S_TOKEN=%s' % progress.REDACTED, run.msg)
+        self.assertIn('E: Unable to fetch some archives', run.msg)
 
     def test_no_cluster_secret_reaches_the_result_of_a_health_report(self):
         run = self.run_module(base_params(), cluster_exists=True)

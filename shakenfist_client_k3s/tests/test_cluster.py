@@ -28,11 +28,6 @@ from shakenfist_client_k3s.tests import fakes
 MD_KEY = cluster_module.METADATA_KEY % 'banana'
 
 
-class FakeTty(io.StringIO):
-    def isatty(self):
-        return True
-
-
 def _make_cluster(client):
     return Cluster(client, 'banana', 'testns',
                    reporter=progress.CollectingReporter())
@@ -161,7 +156,7 @@ class ClusterProgressTestCase(testtools.TestCase):
         # mode when verbose. Driven from a terminal, the Cluster must pass
         # both the verbosity and the terminal through, because between
         # them they choose the CLI's entire output format.
-        with mock.patch('sys.stdout', FakeTty()):
+        with mock.patch('sys.stdout', fakes.FakeTty()):
             quiet = Cluster(mock.MagicMock(), 'banana', 'testns',
                             reporter=progress.Reporter(verbose=False))
             self.assertTrue(quiet.get_progress().interactive)
@@ -227,6 +222,39 @@ class AllocateMetallbAddressesTestCase(testtools.TestCase):
         out = self._allocate([None, None], 2)
         self.assertIn('no routed addresses were available (requested 2)', out)
         self.assertNotIn('allocated', out)
+
+    def test_a_non_address_from_the_api_is_refused_before_it_is_recorded(self):
+        """Rule 1 puts the API outside this package's trust boundary.
+
+        Not paranoia about our own server so much as the rule applied
+        where it happens to point at it: whatever reaches
+        ``routed_addresses`` is interpolated into a YAML body written on
+        a node, and the metadata document is the one place a bad value
+        would persist and be used again by a later run. Refusing it here
+        is the only point at which it can be stopped from entering the
+        document at all.
+        """
+        stream = io.StringIO()
+        client = mock.MagicMock()
+        client.get_network.return_value = {'uuid': 'net-1'}
+        client.route_network_address.side_effect = [
+            '192.168.10.2', '10.0.0.1\nEOF\ntouch /pwned']
+        client.get_namespace_metadata.return_value = {MD_KEY: {
+            'name': 'banana', 'node_network': 'net-1',
+            'routed_addresses': ['192.168.10.1']}}
+        cluster = Cluster(client, 'banana', 'testns')
+        cluster.progress = progress.Progress(stream=stream)
+
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              cluster.allocate_metallb_addresses, 2)
+
+        self.assertEqual('not_an_address', e.reason)
+        self.assertEqual('routed_addresses', e.key)
+        self.assertEqual('banana', e.name)
+        self.assertIn('is not an IP address', str(e))
+        # Nothing was written, so a later run does not find the value
+        # waiting for it.
+        self.assertEqual([], client.set_namespace_metadata_item.mock_calls)
 
 
 class ExpandWorkersTestCase(testtools.TestCase):
@@ -531,6 +559,70 @@ class ActionLogClient(fakes.FakeClusterClient):
     def delete_instance(self, instance_ref):
         self.actions.append(('delete_instance', instance_ref, None))
         return super(ActionLogClient, self).delete_instance(instance_ref)
+
+
+class DeleteClearsTheKeysCreateWroteTestCase(testtools.TestCase):
+    """delete() clears the address keys create() actually writes.
+
+    It cleared api_floating_address and api_inner_address, while create()
+    writes api_address_floating and api_address_inner and the two install
+    methods read those -- the words transposed. So the write in the middle
+    of delete() invented two keys nothing in the package has ever used and
+    carried the two real ones through unchanged.
+
+    The effect was cosmetic, because the document is deleted a few lines
+    later, and it stayed invisible for the same reason: nothing reads the
+    intermediate write, so nothing noticed. These assertions read it.
+    """
+
+    def _delete_and_capture(self):
+        """Run a delete, returning every metadata document it wrote."""
+        written = []
+
+        class CapturingClient(ActionLogClient):
+            def set_namespace_metadata_item(self, namespace, key, value):
+                if key == MD_KEY:
+                    written.append(copy.deepcopy(value))
+                return super(CapturingClient, self).\
+                    set_namespace_metadata_item(namespace, key, value)
+
+        client = CapturingClient()
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 2, 'node_network': 'net-1',
+            'node_token': 'node-token', 'k3s_version': 'v1.33',
+            'api_address_inner': '10.0.0.4',
+            'api_address_floating': '192.168.10.100',
+            'kubeconfig': 'apiVersion: v1\n',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': []}
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            _make_cluster(client).delete()
+
+        self.assertNotEqual([], written)
+        return written
+
+    def test_the_address_keys_are_the_ones_create_writes(self):
+        for md in self._delete_and_capture():
+            self.assertNotIn('api_floating_address', md)
+            self.assertNotIn('api_inner_address', md)
+
+        # And the real ones were actually cleared, which is the half the
+        # transposition was costing.
+        self.assertIsNone(self._delete_and_capture()[-1]['api_address_inner'])
+        self.assertIsNone(
+            self._delete_and_capture()[-1]['api_address_floating'])
+
+    def test_the_network_key_is_cleared_to_none_not_a_list(self):
+        """Everywhere else this key is a network uuid string."""
+        for md in self._delete_and_capture():
+            self.assertNotEqual([], md.get('node_network'))
+        self.assertIsNone(self._delete_and_capture()[-1]['node_network'])
 
 
 class RemoveWorkerTestCase(testtools.TestCase):
@@ -2529,16 +2621,180 @@ def _control_plane_and_metallb_commands():
     return [commandline for _, commandline in client.executed]
 
 
-class HeredocDelimiterTestCase(testtools.TestCase):
-    """Every heredoc this module generates has a quoted delimiter.
+class SecretRedactionTestCase(testtools.TestCase):
+    """The node token must not survive into an error message.
 
-    Rule 2 at the top of cluster.py. An unquoted delimiter lets the remote
-    shell expand $, backticks and $( ) inside the body, and every heredoc
-    here carries a value Python already substituted, so there is nothing
-    for the shell to be expanding. This asserts the rule over the
-    generated commands rather than per site, because the failure mode is a
-    new heredoc written the old way rather than one of these changing
-    back.
+    install_k3s_component() has to put K3S_TOKEN= on the command line,
+    because that is how the k3s installer is told which cluster to join.
+    The Shaken Fist API echoes the submitted command line back in
+    commands[0]['commandline'], so a worker install which exits non-zero
+    hands the cluster's node token to CommandFailedError -- and from there
+    to stderr, to an Ansible play's registered variables, and to a public
+    CI job log. A transient apt failure is enough to trigger it.
+
+    The command line these tests feed to reap_execute() is the real one,
+    built by the real install_k3s_component(), so that a future change to
+    the installer template which named the credential differently would
+    fail here rather than silently stop being redacted.
+    """
+
+    TOKEN = 'K10SECRETNODETOKEN::server:ffffffff'
+
+    def _install_commandline(self):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {MD_KEY: {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'k3s_version': 'v1.33', 'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1']}}
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        with mock.patch.object(Cluster, 'execute_and_await') as ea:
+            cluster.install_k3s_component(['inst-w1'], self.TOKEN, 'agent')
+        commands = list(ea.call_args[0][1])
+
+        installs = [c for c in commands if 'K3S_TOKEN=' in c]
+        self.assertEqual(1, len(installs), commands)
+        # The premise: the real command line does carry the token. Without
+        # this the rest of the test would pass against a template which
+        # had stopped including it, proving nothing.
+        self.assertIn(self.TOKEN, installs[0])
+        return installs[0]
+
+    def _failed_op(self, commandline, state='complete', return_code=1):
+        return {
+            'uuid': 'aop-100',
+            'instance_uuid': 'inst-w1',
+            'state': state,
+            'commands': [{'command': 'execute', 'commandline': commandline}],
+            'results': {'0': {'return-code': return_code,
+                              'stdout': 'running %s\n' % commandline,
+                              'stderr': 'E: Unable to fetch some archives'}}
+        }
+
+    def test_a_failed_install_does_not_report_the_node_token(self):
+        commandline = self._install_commandline()
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'k3s-banana-node-002'}
+        cluster = _make_cluster(client)
+
+        e = self.assertRaises(exceptions.CommandFailedError,
+                              cluster.reap_execute,
+                              self._failed_op(commandline))
+
+        self.assertNotIn(self.TOKEN, str(e))
+        self.assertIn('K3S_TOKEN=%s' % progress.REDACTED, str(e))
+        # The rest of the command line is what makes the message useful,
+        # so redaction must not have eaten it.
+        self.assertIn('INSTALL_K3S_CHANNEL=', str(e))
+        self.assertIn('E: Unable to fetch some archives', str(e))
+
+    def test_the_stored_attributes_carry_no_token_either(self):
+        """Not only __str__, because the attributes are the public surface."""
+        commandline = self._install_commandline()
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'k3s-banana-node-002'}
+        cluster = _make_cluster(client)
+
+        e = self.assertRaises(exceptions.CommandFailedError,
+                              cluster.reap_execute,
+                              self._failed_op(commandline))
+
+        self.assertNotIn(self.TOKEN, e.commandline)
+        self.assertNotIn(self.TOKEN, e.stdout)
+        self.assertNotIn(self.TOKEN, e.stderr)
+
+    def test_an_agent_operation_error_does_not_report_the_node_token(self):
+        """The other rendering site: a state which did not run the command."""
+        commandline = self._install_commandline()
+        client = mock.MagicMock()
+        client.get_instance.return_value = {'name': 'k3s-banana-node-002'}
+        cluster = _make_cluster(client)
+
+        e = self.assertRaises(
+            exceptions.AgentOperationError, cluster.reap_execute,
+            self._failed_op(commandline, state='expired', return_code=0))
+
+        self.assertNotIn(self.TOKEN, str(e))
+        self.assertNotIn(self.TOKEN, e.command_description)
+        self.assertNotIn(self.TOKEN, json.dumps(e.results))
+        self.assertIn('K3S_TOKEN=%s' % progress.REDACTED,
+                      e.command_description)
+
+    def test_delete_does_not_debug_log_the_cluster_secrets(self):
+        """delete() dumps the metadata document, so it has to redact it.
+
+        sf_k3s_cluster.py leaves its reporter non-verbose and calls that a
+        security property because of this loop, which makes the property
+        hold only for as long as one caller remembers a flag. -v is also
+        exactly the flag somebody adds when a delete is failing, which is
+        when the output gets pasted into a bug report.
+        """
+        md = _interrupted_md(state='created',
+                             control_plane_nodes=['inst-001'])
+        md['node_token'] = 'SECRET-NODE-TOKEN'
+        md['server_token'] = 'SECRET-SERVER-TOKEN'
+        md['kubeconfig'] = 'apiVersion: v1\nSECRET-KUBECONFIG\n'
+        md['ssh_key'] = 'ssh-rsa SECRET-SSH-KEY'
+
+        client = ActionLogClient()
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        client.metadata[MD_KEY] = md
+        client.instances['inst-001'] = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        reporter = progress.CollectingReporter(verbose=True)
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            Cluster(client, 'banana', 'testns', reporter=reporter).delete()
+
+        out = reporter.getvalue()
+        for secret in ('SECRET-NODE-TOKEN', 'SECRET-SERVER-TOKEN',
+                       'SECRET-KUBECONFIG', 'SECRET-SSH-KEY'):
+            self.assertNotIn(secret, out)
+        for key in cluster_module.SECRET_METADATA_KEYS:
+            self.assertIn('%s = %s' % (key, progress.REDACTED), out)
+
+        # The point of a debug dump is the rest of the document, which
+        # must still be there for it to be worth having.
+        self.assertIn('node_network = net-1', out)
+        self.assertIn('state = created', out)
+
+    def test_an_absent_secret_is_not_reported_as_redacted(self):
+        """A None token is not a secret being hidden, and saying so misleads."""
+        client = ActionLogClient()
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        client.metadata[MD_KEY] = _interrupted_md()
+        reporter = progress.CollectingReporter(verbose=True)
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            Cluster(client, 'banana', 'testns', reporter=reporter).delete()
+
+        self.assertIn('node_token = None', reporter.getvalue())
+
+    def test_progress_output_during_the_install_carries_no_token(self):
+        """await_idle() describes what it is waiting on, from the same text."""
+        commandline = self._install_commandline()
+        aop = self._failed_op(commandline, return_code=0)
+        aop['results'] = {}
+
+        self.assertNotIn(self.TOKEN,
+                         progress.describe_agent_op(aop, max_len=None))
+
+
+class HeredocDelimiterTestCase(testtools.TestCase):
+    """Every heredoc this module generates has a quoted delimiter, and no
+    body which ends it early.
+
+    Rule 2 at the top of cluster.py, both halves. An unquoted delimiter
+    lets the remote shell expand $, backticks and $( ) inside the body, and
+    every heredoc here carries a value Python already substituted, so there
+    is nothing for the shell to be expanding. A quoted delimiter is
+    necessary and not sufficient: it does not stop an interpolated value
+    from ending the heredoc, and whatever follows the delimiter line is
+    then read by the shell as commands, running as root on the node. Both
+    are asserted over the generated commands rather than per site, because
+    the failure mode is a new heredoc written the old way rather than one
+    of these changing back.
     """
 
     def test_no_generated_heredoc_is_unquoted(self):
@@ -2555,6 +2811,95 @@ class HeredocDelimiterTestCase(testtools.TestCase):
                 introducer.startswith("'") and introducer.endswith("'"),
                 'this heredoc delimiter is not quoted, so the remote shell '
                 'expands the body: %s' % line)
+
+    def test_a_metadata_address_cannot_end_the_heredoc(self):
+        """The namespace metadata document is third party writable.
+
+        Anything holding the namespace's credentials can write this
+        document, and conductor writes it too, so a value containing a
+        newline is not something the API's own validation rules out on
+        this package's behalf -- rule 1 says so in as many words. Without
+        a defence, these bodies would carry 'kubectl ...' or anything else
+        the writer chose, as root on the first control plane node.
+
+        The two sinks are defended differently, which is why both are
+        checked here rather than one standing in for the other.
+
+        The k3s configuration files are serialised by yaml.safe_dump(),
+        which emits a value containing newlines as a quoted scalar whose
+        continuation lines are indented. No line of the result can equal
+        the delimiter, so the body cannot end its own heredoc and
+        heredoc() has nothing to refuse -- the attack is answered by
+        construction rather than by a check. Asserted on the generated
+        command rather than trusting the serialiser, and the round trip is
+        asserted too, because escaping which corrupted the value would be
+        a different bug wearing this one's clothes.
+
+        MetalLB's address list is interpolated into its body as text, so
+        there the delimiter refusal in heredoc() is the whole defence and
+        the call raises.
+        """
+        hostile = '10.0.0.1"\nEOF\ntouch /pwned\ncat - > /dev/null << \'EOF\'\nx'
+
+        client = ActionLogClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'k3s_version': 'v1.33', 'api_address_floating': hostile,
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': [hostile]}
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        _make_cluster(client).install_control_plane()
+
+        wrote = [c for _, c in client.executed
+                 if cluster_module.K3S_CONFIG_DELIMITER in c]
+        self.assertNotEqual([], wrote)
+        for command in wrote:
+            body = command.split('\n', 1)[1]
+            lines = body.split('\n')
+            self.assertNotIn(cluster_module.K3S_CONFIG_DELIMITER,
+                             lines[:-2], command)
+            self.assertNotIn('EOF', lines, command)
+
+        main = [c for _, c in client.executed
+                if '/etc/rancher/k3s/config.yaml' in c
+                and 'config.yaml.d' not in c]
+        self.assertEqual(1, len(main), client.executed)
+        body = main[0].split('\n', 1)[1]
+        body = body[:body.rindex(cluster_module.K3S_CONFIG_DELIMITER)]
+        self.assertEqual([hostile], yaml.safe_load(body)['tls-san'])
+
+        e = self.assertRaises(
+            exceptions.GuestFileError,
+            _make_cluster(client).configure_metallb_addresses)
+        self.assertEqual('delimiter_collision', e.reason)
+        self.assertEqual('/etc/sf/metallb-range-allocation.yaml', e.path)
+
+    def test_heredoc_builds_what_it_used_to_build(self):
+        """The builder is a refactor of three identical string literals."""
+        self.assertEqual(
+            "cat - > /etc/sf/thing.yaml << 'EOF'\nkey: value\nEOF\n",
+            cluster_module.heredoc('/etc/sf/thing.yaml', 'key: value\n'))
+
+    def test_heredoc_adds_exactly_one_trailing_newline(self):
+        self.assertEqual(
+            "cat - > /etc/sf/thing.yaml << 'EOF'\nkey: value\nEOF\n",
+            cluster_module.heredoc('/etc/sf/thing.yaml', 'key: value'))
+
+    def test_heredoc_quotes_the_destination(self):
+        self.assertIn(
+            "cat - > '/etc/sf/a b.yaml'",
+            cluster_module.heredoc('/etc/sf/a b.yaml', 'x\n'))
+
+    def test_heredoc_honours_a_custom_delimiter(self):
+        e = self.assertRaises(
+            exceptions.GuestFileError, cluster_module.heredoc,
+            '/etc/sf/thing.yaml', 'SFK3SMANIFEST\n',
+            cluster_module.K3S_MANIFEST_DELIMITER)
+        self.assertEqual(cluster_module.K3S_MANIFEST_DELIMITER, e.delimiter)
 
     def test_the_k3s_configuration_heredocs_are_among_those_checked(self):
         # The check above is only as wide as the commands it is given.
@@ -3860,6 +4205,128 @@ class RemoveWorkerEdgeCaseTestCase(testtools.TestCase):
         self.assertIn('k3s-banana-node-003', drains[0][2])
 
 
+class ExpandAddressesChecksTheDocumentFirstTestCase(testtools.TestCase):
+    """A document which cannot produce a configuration is refused before spending.
+
+    ``heredoc()`` refuses a body an interpolated address could end, and
+    that refusal is correct and stays. What it cannot do is arrive in
+    time: ``expand_addresses()`` routes new floating addresses -- which
+    are charged for -- and commits them to the metadata, and only then
+    writes the configuration the old and new addresses share. So a value
+    which was already bad costs the caller an allocation before it is
+    told.
+
+    ``expand_addresses()`` makes exactly this argument in its own
+    docstring for a cluster without metallb, which it checks up front
+    for that reason. These tests are that argument applied to the
+    document's contents as well as its flags.
+    """
+
+    def _cluster(self, routed_addresses):
+        client = ActionLogClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'k3s_version': 'v1.33', 'node_network': 'net-1',
+            'node_token': 'a-token',
+            'api_address_floating': '10.0.0.1',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': routed_addresses}
+        return client, _make_cluster(client)
+
+    def test_a_hostile_recorded_address_is_refused_before_anything_is_routed(self):
+        client, cluster = self._cluster(
+            ['192.168.10.1', '10.0.0.1\nEOF\ntouch /pwned'])
+
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              cluster.expand_addresses, 2)
+
+        self.assertEqual('not_an_address', e.reason)
+        self.assertEqual('routed_addresses', e.key)
+        # The point of the whole change: nothing was allocated, so the
+        # refusal costs the caller an error and nothing else.
+        self.assertEqual(0, client.routed_serial)
+        self.assertEqual([], client.executed)
+
+    def test_a_merely_malformed_address_is_refused_too(self):
+        # The delimiter collision is the dramatic case; the check is for
+        # addresses, so a value which is harmless and still not an
+        # address is refused on the same ground rather than written into
+        # metallb's configuration for it to reject later.
+        client, cluster = self._cluster(['192.168.10.300'])
+
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              cluster.expand_addresses, 1)
+
+        self.assertEqual('192.168.10.300', e.value)
+        self.assertEqual(0, client.routed_serial)
+
+    def _expand_past_the_check(self, routed_addresses):
+        """Run expand_addresses as far as the configuration write, and no further.
+
+        What these cases assert is that the new check does not refuse a
+        document it should accept, which is the whole risk of adding a
+        validator. Writing metallb's configuration is a separate
+        concern with its own tests, and running it here would need the
+        agent's rollout commands scripted for no gain, so it is
+        replaced and asserted to have been reached.
+        """
+        client, cluster = self._cluster(routed_addresses)
+        with mock.patch.object(cluster, 'configure_metallb_addresses') as cfg:
+            cluster.expand_addresses(1)
+        cfg.assert_called_once_with()
+        return client
+
+    def test_an_ipv6_address_is_accepted(self):
+        # ip_address() rather than a regexp precisely so that this is not
+        # a new restriction: the check is "is this an address", not "does
+        # it look like the addresses we have seen so far".
+        client = self._expand_past_the_check(['fd00::1'])
+
+        self.assertEqual(1, client.routed_serial)
+
+    def test_an_empty_list_is_not_an_error(self):
+        # A cluster with metallb and no addresses yet is the ordinary
+        # case for the first expand-addresses.
+        client = self._expand_past_the_check([])
+
+        self.assertEqual(1, client.routed_serial)
+
+    def test_an_integer_is_not_an_address(self):
+        # ipaddress.ip_address(1) is 0.0.0.1, so a bare int passes the
+        # address parse and would then reach str.join() and raise
+        # TypeError from a place that cannot name the key. The metadata
+        # document is JSON, so an int in this list is a thing a writer can
+        # put there.
+        client, cluster = self._cluster(['192.168.10.1', 1])
+
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              cluster.expand_addresses, 1)
+
+        self.assertEqual(1, e.value)
+        self.assertEqual(0, client.routed_serial)
+
+    def test_a_boolean_is_not_an_address_either(self):
+        # Same reason: ip_address(True) is 0.0.0.1, and JSON has booleans.
+        client, cluster = self._cluster([True])
+
+        self.assertRaises(exceptions.ClusterMetadataError,
+                          cluster.expand_addresses, 1)
+
+        self.assertEqual(0, client.routed_serial)
+
+    def test_an_absent_key_is_not_an_error(self):
+        # Older clusters predate the key, and _require_addresses() is
+        # reached before anything reads it for real.
+        client, cluster = self._cluster([])
+        del client.metadata[MD_KEY]['routed_addresses']
+
+        with mock.patch.object(cluster, 'configure_metallb_addresses'):
+            cluster.expand_addresses(1)
+
+        self.assertEqual(1, client.routed_serial)
+
+
 class StagedManifestsAreWhatWasValidatedTestCase(testtools.TestCase):
     """create() stages the manifests it read, not the files as they are later.
 
@@ -4019,6 +4486,131 @@ class SshKeyIsReadThroughTheHierarchyTestCase(testtools.TestCase):
         self.assertEqual([content], sorted(set(self.client.instance_sshkeys)))
 
 
+def _repository_python_files():
+    """Every .py file this repository ships, not only the package's.
+
+    The scan used to be os.listdir() over the package directory alone,
+    which is how an unencoded pathlib call in tools/build-collection.py
+    reached the review of #90: the lint existed, and the file it needed
+    to read was outside the only directory it looked in. collection/
+    has the same exposure -- its module has no open() today and nothing
+    stops one being added.
+
+    Directories which are absent are skipped rather than failed, the
+    way ModuleTestCase skips: an installed copy of this package has the
+    tests but neither tools/ nor collection/.
+
+    tests/ is deliberately out of scope, and that is a boundary rather
+    than an oversight: the original scan was a non-recursive listdir of
+    the package directory, so it never covered this directory, and
+    twenty call sites in five test files have grown up unencoded behind
+    that. Fixing them is a mechanical change to files which have
+    nothing to do with the collection, so they are tracked in
+    shakenfist/client-python-k3s#93 rather than folded into a review
+    round. The hazard there is also
+    the milder one -- a fixture written in the locale encoding can make
+    a test pass or fail by machine, which is a bad day for whoever is
+    debugging it, but it is not bytes shipped to a cluster.
+    """
+    package_dir = os.path.dirname(cluster_module.__file__)
+    roots = [package_dir]
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(
+        cluster_module.__file__)))
+    for extra in (os.path.join(repo_root, 'tools'),
+                  os.path.join(repo_root, 'collection')):
+        if os.path.isdir(extra):
+            roots.append(extra)
+
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            # ansible-lint's working tree is a copy of the collection,
+            # so scanning it would report every offender twice under a
+            # path nobody edits. tests/ is excluded for the reason in
+            # the docstring.
+            dirnames[:] = [d for d in sorted(dirnames)
+                           if d not in ('.ansible', '__pycache__',
+                                        'tests')]
+            for name in sorted(filenames):
+                if name.endswith('.py'):
+                    yield os.path.join(dirpath, name)
+
+
+class NoShellInvocationTestCase(testtools.TestCase):
+    """Nothing in this package asks subprocess for a shell.
+
+    Rule 3 at the top of cluster.py, as a property of the tree rather
+    than of one call site. Every local command this package runs has an
+    argument list available, so none needs a shell to parse a string --
+    and the one site which asked for one passed a constant, which is how
+    a reader comparing it with the argument lists beside it was left to
+    work out for themselves that the difference did not matter. The
+    useful property is that there is no next one, written with an
+    interpolation in it.
+    """
+
+    def test_no_subprocess_call_asks_for_a_shell(self):
+        """Rule 3 at the top of cluster.py, as a property of the tree.
+
+        Every local command this package runs has an argument list
+        available, so none of them needs a shell to parse a string -- and
+        the one which asked for one was a constant, which is how a reader
+        comparing it with the unset calls beside it was left to work out
+        for themselves that the difference did not matter. The useful
+        property is that there is no next one, written with an
+        interpolation in it.
+        """
+        offenders = []
+
+        for path in _repository_python_files():
+            name = os.path.relpath(path, os.path.dirname(os.path.dirname(
+                os.path.abspath(cluster_module.__file__))))
+            with open(path, encoding='utf-8') as f:
+                tree = ast.parse(f.read(), filename=path)
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                for kw in node.keywords:
+                    if (kw.arg == 'shell'
+                            and isinstance(kw.value, ast.Constant)
+                            and kw.value.value):
+                        offenders.append('%s:%s' % (name, node.lineno))
+
+        self.assertEqual([], offenders)
+
+
+class ProgressIsStartedInOnePlaceTestCase(testtools.TestCase):
+    """progress.Progress is constructed in exactly one place.
+
+    What is repetitive about building one is the wiring -- the reporter
+    is both the stream written to and the source of the verbose flag --
+    and five entry points wrote it out by hand, three of them added by
+    later phases, so the sixth was going to as well.
+    Cluster.start_progress() is now that place. Asserted over the parsed
+    source rather than by counting phase headers, because the defect is
+    a new entry point written the old way, which no behavioural test
+    would notice.
+    """
+
+    def test_only_start_progress_constructs_a_progress(self):
+        path = cluster_module.__file__
+        with open(path, encoding='utf-8') as f:
+            tree = ast.parse(f.read(), filename=path)
+
+        constructing = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == 'Progress'):
+                    constructing.append(node.name)
+
+        self.assertEqual(['start_progress'], sorted(set(constructing)))
+
+
 class FileEncodingIsStatedTestCase(testtools.TestCase):
     """Every text file this package opens names the encoding it is in.
 
@@ -4035,59 +4627,10 @@ class FileEncodingIsStatedTestCase(testtools.TestCase):
     here and names its own line number.
     """
 
-    def _python_files(self):
-        """Every .py file this repository ships, not only the package's.
-
-        The scan used to be os.listdir() over the package directory alone,
-        which is how an unencoded pathlib call in tools/build-collection.py
-        reached the review of #90: the lint existed, and the file it needed
-        to read was outside the only directory it looked in. collection/
-        has the same exposure -- its module has no open() today and nothing
-        stops one being added.
-
-        Directories which are absent are skipped rather than failed, the
-        way ModuleTestCase skips: an installed copy of this package has the
-        tests but neither tools/ nor collection/.
-
-        tests/ is deliberately out of scope, and that is a boundary rather
-        than an oversight: the original scan was a non-recursive listdir of
-        the package directory, so it never covered this directory, and
-        twenty call sites in five test files have grown up unencoded behind
-        that. Fixing them is a mechanical change to files which have
-        nothing to do with the collection, so they are tracked in
-        shakenfist/client-python-k3s#93 rather than folded into a review
-        round. The hazard there is also
-        the milder one -- a fixture written in the locale encoding can make
-        a test pass or fail by machine, which is a bad day for whoever is
-        debugging it, but it is not bytes shipped to a cluster.
-        """
-        package_dir = os.path.dirname(cluster_module.__file__)
-        roots = [package_dir]
-
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(
-            cluster_module.__file__)))
-        for extra in (os.path.join(repo_root, 'tools'),
-                      os.path.join(repo_root, 'collection')):
-            if os.path.isdir(extra):
-                roots.append(extra)
-
-        for root in roots:
-            for dirpath, dirnames, filenames in os.walk(root):
-                # ansible-lint's working tree is a copy of the collection,
-                # so scanning it would report every offender twice under a
-                # path nobody edits. tests/ is excluded for the reason in
-                # the docstring.
-                dirnames[:] = [d for d in sorted(dirnames)
-                               if d not in ('.ansible', '__pycache__',
-                                            'tests')]
-                for name in sorted(filenames):
-                    if name.endswith('.py'):
-                        yield os.path.join(dirpath, name)
-
     def test_no_open_call_leaves_the_encoding_to_the_locale(self):
         offenders = []
 
-        for path in self._python_files():
+        for path in _repository_python_files():
             name = os.path.relpath(path, os.path.dirname(os.path.dirname(
                 os.path.abspath(cluster_module.__file__))))
             with open(path, encoding='utf-8') as f:
@@ -4104,6 +4647,16 @@ class FileEncodingIsStatedTestCase(testtools.TestCase):
                         continue
                 elif isinstance(node.func, ast.Attribute):
                     if node.func.attr != 'open':
+                        continue
+                    # os.open() is the file descriptor call, not the text
+                    # one: it returns an int, takes a mode rather than an
+                    # encoding, and raises TypeError if given one. It is
+                    # how a file is created with an explicit permission
+                    # mode, which the kubeconfig write needs; the open()
+                    # wrapped around the descriptor it returns is a
+                    # separate call and is still checked here.
+                    if (isinstance(node.func.value, ast.Name)
+                            and node.func.value.id == 'os'):
                         continue
                 else:
                     continue
@@ -4129,7 +4682,7 @@ class FileEncodingIsStatedTestCase(testtools.TestCase):
         """
         offenders = []
 
-        for path in self._python_files():
+        for path in _repository_python_files():
             name = os.path.relpath(path, os.path.dirname(os.path.dirname(
                 os.path.abspath(cluster_module.__file__))))
             with open(path, encoding='utf-8') as f:

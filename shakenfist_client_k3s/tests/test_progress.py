@@ -1,6 +1,8 @@
 import io
+import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 
@@ -15,7 +17,6 @@ import testtools
 import shakenfist_client_k3s
 from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import exceptions
-from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.cluster import Cluster
 from shakenfist_client_k3s.tests import fakes
@@ -41,11 +42,6 @@ class FakeClock:
 
     def advance(self, seconds):
         self.now += seconds
-
-
-class FakeTty(io.StringIO):
-    def isatty(self):
-        return True
 
 
 class FormatElapsedTestCase(testtools.TestCase):
@@ -79,7 +75,7 @@ class ReporterTestCase(testtools.TestCase):
         # answers without asking the real stream silently switches the CLI
         # between in place updates and line mode.
         r = progress.Reporter()
-        with mock.patch('sys.stdout', FakeTty()):
+        with mock.patch('sys.stdout', fakes.FakeTty()):
             self.assertTrue(r.isatty())
         with mock.patch('sys.stdout', io.StringIO()):
             self.assertFalse(r.isatty())
@@ -107,7 +103,7 @@ class CollectingReporterTestCase(testtools.TestCase):
         self.assertEqual(['one', 'two'], r.lines)
 
     def test_is_never_a_tty(self):
-        with mock.patch('sys.stdout', FakeTty()):
+        with mock.patch('sys.stdout', fakes.FakeTty()):
             self.assertFalse(progress.CollectingReporter().isatty())
 
     def test_lines_are_split_across_writes(self):
@@ -290,7 +286,7 @@ class ProgressLineModeTestCase(testtools.TestCase):
         self.assertEqual('Cluster banana is ready (2m05s total)\n', stream.getvalue())
 
     def test_verbose_forces_line_mode(self):
-        p = progress.Progress(stream=FakeTty(), verbose=True)
+        p = progress.Progress(stream=fakes.FakeTty(), verbose=True)
         self.assertFalse(p.interactive)
 
 
@@ -307,7 +303,7 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
             self.addCleanup(patcher.stop)
 
     def test_updates_rewrite_in_place(self):
-        stream = FakeTty()
+        stream = fakes.FakeTty()
         p = progress.Progress(stream=stream)
         p.phase('Booting')
 
@@ -325,7 +321,7 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
             stream.getvalue())
 
     def test_unchanged_status_age_grows(self):
-        stream = FakeTty()
+        stream = fakes.FakeTty()
         p = progress.Progress(stream=stream)
         p.phase('Booting')
 
@@ -340,7 +336,7 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
             stream.getvalue())
 
     def test_note_mid_wait_redraws_block_without_duplicates(self):
-        stream = FakeTty()
+        stream = fakes.FakeTty()
         p = progress.Progress(stream=stream)
         p.phase('Waiting')
         p.update('node-001', 'running')
@@ -361,12 +357,94 @@ class ProgressInteractiveModeTestCase(testtools.TestCase):
             stream.getvalue())
 
     def test_lines_truncated_to_terminal_width(self):
-        stream = FakeTty()
+        stream = fakes.FakeTty()
         p = progress.Progress(stream=stream)
         p.update('node-001', 'x' * 200)
 
         drawn = stream.getvalue().split('\x1b[K')[-1].rstrip('\n')
         self.assertEqual(79, len(drawn))
+
+
+class RedactCommandLineTestCase(testtools.TestCase):
+    """What redact_command_line() takes out, and what it must leave alone.
+
+    Both shapes shlex.quote() can produce are covered, because that is
+    what builds the values this sees: a bare word when the value needs no
+    quoting, which is what a k3s token normally is, and a single quoted
+    string when it does.
+    """
+
+    def test_a_bare_value_is_removed(self):
+        self.assertEqual(
+            'K3S_TOKEN=%s sh -s - agent' % progress.REDACTED,
+            progress.redact_command_line('K3S_TOKEN=K10abc::server:def '
+                                         'sh -s - agent'))
+
+    def test_a_quoted_value_is_removed_whole(self):
+        value = shlex.quote("a token with a space and a 'quote'")
+        self.assertIn("'", value)
+        redacted = progress.redact_command_line(
+            'K3S_TOKEN=%s sh -s - agent' % value)
+
+        self.assertEqual('K3S_TOKEN=%s sh -s - agent' % progress.REDACTED,
+                         redacted)
+
+    def test_the_rest_of_the_installer_line_survives(self):
+        line = ('curl -sfL https://get.k3s.io | '
+                "INSTALL_K3S_CHANNEL='v1.33' "
+                'K3S_URL=https://10.0.0.4:6443 '
+                'K3S_TOKEN=K10abc::server:def sh -s - agent')
+
+        redacted = progress.redact_command_line(line)
+
+        self.assertNotIn('K10abc', redacted)
+        self.assertIn("INSTALL_K3S_CHANNEL='v1.33'", redacted)
+        self.assertIn('K3S_URL=https://10.0.0.4:6443', redacted)
+        self.assertIn('sh -s - agent', redacted)
+
+    def test_a_longer_name_ending_in_a_secret_name_is_left_alone(self):
+        """The lookbehind: NOT_THE_K3S_TOKEN= is a different variable."""
+        self.assertEqual(
+            'NOT_THE_K3S_TOKEN=visible',
+            progress.redact_command_line('NOT_THE_K3S_TOKEN=visible'))
+
+    def test_text_with_no_assignment_is_unchanged(self):
+        self.assertEqual('kubectl get nodes',
+                         progress.redact_command_line('kubectl get nodes'))
+
+    def test_non_string_input_is_returned_unchanged(self):
+        self.assertIsNone(progress.redact_command_line(None))
+        self.assertEqual(7, progress.redact_command_line(7))
+
+    def test_every_declared_name_is_covered(self):
+        """So that adding a name to the tuple is the whole of the change."""
+        for name in progress.SECRET_ENVIRONMENT_NAMES:
+            self.assertEqual(
+                '%s=%s' % (name, progress.REDACTED),
+                progress.redact_command_line('%s=thevalue' % name))
+
+    def test_redact_structure_walks_results(self):
+        results = {'0': {'return-code': 1,
+                         'stdout': 'about to run K3S_TOKEN=secret sh',
+                         'stderr': ''},
+                   '1': {'notes': ['K3S_TOKEN=secret again']}}
+
+        redacted = progress.redact_structure(results)
+
+        self.assertNotIn('secret', json.dumps(redacted))
+        self.assertEqual(1, redacted['0']['return-code'])
+        self.assertEqual(['K3S_TOKEN=%s again' % progress.REDACTED],
+                         redacted['1']['notes'])
+
+    def test_describe_agent_op_redacts(self):
+        aop = {
+            'commands': [{'command': 'execute',
+                          'commandline': 'K3S_TOKEN=secret sh -s - agent'}],
+            'results': {}
+        }
+
+        self.assertEqual('K3S_TOKEN=%s sh -s - agent' % progress.REDACTED,
+                         progress.describe_agent_op(aop, max_len=None))
 
 
 class DescribeAgentOpTestCase(testtools.TestCase):
@@ -378,10 +456,10 @@ class DescribeAgentOpTestCase(testtools.TestCase):
             ],
             'results': {}
         }
-        self.assertEqual('apt-get update', primitives._describe_agent_op(aop))
+        self.assertEqual('apt-get update', progress.describe_agent_op(aop))
 
         aop['results'] = {'0': {'return-code': 0}}
-        self.assertEqual('apt-get dist-upgrade -y', primitives._describe_agent_op(aop))
+        self.assertEqual('apt-get dist-upgrade -y', progress.describe_agent_op(aop))
 
     def test_non_execute_command_uses_path(self):
         aop = {
@@ -389,14 +467,14 @@ class DescribeAgentOpTestCase(testtools.TestCase):
             'results': {}
         }
         self.assertEqual('get-file /etc/rancher/k3s/k3s.yaml',
-                         primitives._describe_agent_op(aop))
+                         progress.describe_agent_op(aop))
 
     def test_long_commands_truncated(self):
         aop = {
             'commands': [{'command': 'execute', 'commandline': 'x' * 100}],
             'results': {}
         }
-        desc = primitives._describe_agent_op(aop)
+        desc = progress.describe_agent_op(aop)
         self.assertEqual(60, len(desc))
         self.assertTrue(desc.endswith('...'))
 
@@ -409,10 +487,10 @@ class DescribeAgentOpTestCase(testtools.TestCase):
             'results': {}
         }
         self.assertEqual('cat - > /etc/sf/thing.yaml << EOF ...',
-                         primitives._describe_agent_op(aop))
+                         progress.describe_agent_op(aop))
 
     def test_no_commands(self):
-        self.assertIsNone(primitives._describe_agent_op({'commands': [], 'results': {}}))
+        self.assertIsNone(progress.describe_agent_op({'commands': [], 'results': {}}))
 
 
 class WaitLoopTestCase(testtools.TestCase):

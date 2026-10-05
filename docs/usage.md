@@ -172,8 +172,9 @@ sf-client k3s create mycluster \
 The servers end up with traefik and servicelb both disabled. Because
 the default taint applies, OpenStack services labelled for the control
 plane would be blocked from those nodes, so such a deployment may want
-`node-taint: []` on the servers or must add tolerations; phase 3 of
-the node customisation plan is checking which.
+`node-taint: []` on the servers or must add tolerations. Which of the
+two is right is still being settled against a live cluster; see
+`docs/plans/PLAN-node-customisation.md`.
 
 **Behaviour changes.** These apply to every new cluster, whether or not
 the options above are used, and existing clusters are untouched:

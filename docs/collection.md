@@ -13,37 +13,31 @@ source of truth for every parameter and return value below --
 directly, and this page agrees with that output rather than
 paraphrasing it independently.
 
-## Status: not yet published
+## Building the collection from a checkout
 
-`ansible-galaxy collection install shakenfist.k3s` **does not work
-today**. The collection has not been published to Ansible Galaxy --
-the credential and the first tagged release are both outstanding, and
-each needs a human to act (see the master plan's phase 5 row). Running
-that command now fails with "Could not satisfy the following
-requirements... shakenfist.k3s:\* (direct request)", because Galaxy
-has no `shakenfist.k3s` collection version to resolve.
-
-Until the first release, install from a locally built tarball instead:
+`shakenfist.k3s` is published to Ansible Galaxy, so the normal install
+is the one under "Installing" below and nothing here is needed to use
+the module. This section is for working against an unreleased checkout:
+a change to `collection/` which is not in a published version yet.
 
 ```bash
 python3 tools/build-collection.py
-ansible-galaxy collection install dist-collection/shakenfist-k3s-*.tar.gz
-pip install shakenfist_client_k3s
+ansible-galaxy collection install dist-collection/shakenfist-k3s-*.tar.gz --force
+pip install -e .
 ```
 
 `tools/build-collection.py` rather than `ansible-galaxy collection build`
 directly: the version in `collection/galaxy.yml` is a `0.0.0`
 placeholder, and that script is what replaces it with the real version
 derived from the git tags before building. Building the directory
-yourself produces a tarball which installs, and reports its version as
-`0.0.0` -- which is confusing on its own and worse next to a published
-version later. The script restores the placeholder afterwards, so it
-leaves the checkout as it found it.
+yourself produces a tarball which installs and reports its version as
+`0.0.0`, which is confusing on its own and worse next to a published
+version. The script restores the placeholder afterwards, so it leaves
+the checkout as it found it.
 
-That path works today, against any checkout of this repository, and
-is how to try the module before the first Galaxy release. Once a
-release is published, replace the two commands above with
-`ansible-galaxy collection install shakenfist.k3s`.
+`--force` because Galaxy's own copy is probably already installed, and
+`ansible-galaxy` will not replace a collection with the same or an
+older version unless told to.
 
 ## Installing
 
@@ -51,7 +45,7 @@ Two separate installs are needed, usually on the same machine but
 conceptually different things:
 
 ```bash
-ansible-galaxy collection install shakenfist.k3s   # not yet usable -- see above
+ansible-galaxy collection install shakenfist.k3s
 pip install shakenfist_client_k3s
 ```
 
@@ -289,9 +283,20 @@ pass through Ansible's own variable and logging machinery.
 progress output collected rather than printed -- useful for debugging
 a create that failed partway through -- and carries no more secret
 material than the cluster's own progress announcements already do
-(none; `verbose` is left off for exactly this reason, since a `create()`
-or `delete()` run at debug level does log the whole metadata document,
-secrets included).
+(none; `verbose` is left off as a second line of defence, since a
+`create()` or `delete()` run at debug level logs the whole metadata
+document with its secret values replaced by `<redacted>`).
+
+`msg` is covered too, which takes more than `no_log` to arrange. The
+`key` parameter is `no_log`, so Ansible's own scrubbing removes it from
+anything this module returns -- but the cluster's k3s node token is not
+a module parameter, and an agent command has to carry it on its command
+line for the k3s installer to join the right cluster. A worker install
+which exits non-zero therefore used to put that command line, token and
+all, into the failure message. The library now redacts secret
+environment assignments inside the two exceptions which report a failed
+agent command, so no raiser or caller has to remember; see
+`progress.redact_command_line()`.
 
 ## See also
 
@@ -302,6 +307,5 @@ secrets included).
   verbs run interactively rather than from a playbook.
 - `collection/README.md` -- the collection's own short-form install
   note, consistent with the fuller version above.
-- `RELEASE-SETUP.md` -- the Galaxy token and namespace permission this
-  collection's first release needs, which is the human gate blocking
-  publication.
+- `RELEASE-SETUP.md` -- the Galaxy token and the namespace permission
+  the release workflow publishes with, and how to verify both.

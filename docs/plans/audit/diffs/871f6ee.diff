@@ -1,0 +1,608 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index f383d94..6329cb5 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -35,6 +35,7 @@ Both tiers skip a change touching only `docs/`. See
+ | File | Purpose |
+ |------|---------|
+ | `shakenfist_client_k3s/__init__.py` | Click command group (`k3s ...`), plugin entry point |
++| `shakenfist_client_k3s/client.py` | `make_client()`: builds an API client for a caller with no Click context |
+ | `shakenfist_client_k3s/cluster.py` | `Cluster`: one cluster's state and orchestration, callable with no Click |
+ | `shakenfist_client_k3s/exceptions.py` | The `K3sClusterException` hierarchy this library raises |
+ | `shakenfist_client_k3s/primitives.py` | Namespace scoped lookups (release version caches) and stateless helpers |
+diff --git a/docs/library-api.md b/docs/library-api.md
+index 8930886..a3969fa 100644
+--- a/docs/library-api.md
++++ b/docs/library-api.md
+@@ -11,10 +11,10 @@ the map.
+ ## Constructing a `Cluster`
+ 
+ ```python
+-from shakenfist_client import apiclient
++from shakenfist_client_k3s.client import make_client
+ from shakenfist_client_k3s.cluster import Cluster
+ 
+-client = apiclient.Client()
++client = make_client()
+ cluster = Cluster(client, 'mycluster', client.namespace)
+ ```
+ 
+@@ -35,6 +35,44 @@ every extra read widens the window for losing someone else's update.
+ Build a fresh `Cluster` per operation rather than reusing one across
+ unrelated clusters or a long-lived process.
+ 
++### Constructing the client
++
++`make_client()` exists because `apiclient.Client` on its own is the
++wrong thing to reach for here. Its default strategy is `ASYNC_BLOCK`,
++under which the client waits for each operation internally and returns
++only once it has finished -- so the orchestration's own wait loops
++never run and the reporter has nothing to report. `make_client()` sets
++`ASYNC_CONTINUE` instead, which is what makes progress visible at all.
++
++```python
++from shakenfist_client_k3s.client import make_client
++
++# Discover configuration the way the CLI does.
++client = make_client()
++
++# Or supply it, and skip discovery entirely.
++client = make_client(api_url='https://api.example.com',
++                     namespace='mynamespace', key='mykey')
++```
++
++With no arguments it finds configuration exactly as `sf-client` does,
++from the environment, `~/.shakenfist` and `/etc/sf/shakenfist.json`.
++Supplying all three of `api_url`, `namespace` and `key` uses them
++verbatim and suppresses that discovery, which is the rule the Shaken
++Fist Ansible collection's own modules follow; supplying only some of
++them is treated as supplying none, so a client is never configured
++with holes. `apiclient.UnconfiguredException` propagates when
++discovery finds nothing, rather than being translated into a message
++or an exit code -- that choice belongs to the caller.
++
++A caller which brings its own client instead must set
++`async_strategy=apiclient.ASYNC_CONTINUE` on it, for the same reason.
++
++The `sf-client k3s` commands do not use this factory. `sf-client`
++builds a client from its own `--apiurl`, `--key` and `--namespace`
++options and the plugin uses that one, which is what keeps those
++options meaningful (see `docs/usage.md`).
++
+ Each command's body is now a method taking that command's options,
+ minus `name` and `namespace`, and returning a value instead of
+ printing one:
+@@ -149,11 +187,11 @@ This creates a one-node cluster, fetches its kubeconfig, and deletes
+ it again, with output collected rather than printed:
+ 
+ ```python
+-from shakenfist_client import apiclient
++from shakenfist_client_k3s.client import make_client
+ from shakenfist_client_k3s.cluster import Cluster
+ from shakenfist_client_k3s.progress import CollectingReporter
+ 
+-client = apiclient.Client()
++client = make_client()
+ reporter = CollectingReporter()
+ cluster = Cluster(client, 'mycluster', client.namespace, reporter=reporter)
+ 
+@@ -204,6 +242,6 @@ release lookups are called as plain functions in the test, so
+ patching them is what keeps the lookup from reaching the real k3s
+ update API and GitHub releases API; `requests.request` itself is
+ never touched. Running the sequence against a real Shaken Fist
+-namespace needs nothing more than the real `apiclient.Client()`
+-shown above; there is no other setup and no Click context to
+-fabricate.
++namespace needs nothing more than the real client `make_client()`
++returns, as shown above; there is no other setup and no Click
++context to fabricate.
+diff --git a/docs/plans/library-api-and-collection.md b/docs/plans/library-api-and-collection.md
+index 7282959..6041026 100644
+--- a/docs/plans/library-api-and-collection.md
++++ b/docs/plans/library-api-and-collection.md
+@@ -251,7 +251,7 @@ Constraints:
+ | Phase | Work | Status | Merged |
+ |-------|------|--------|--------|
+ | 1. Library API | [library-api-and-collection-phase-01-library-api.md](library-api-and-collection-phase-01-library-api.md) -- extract orchestration from the Click command bodies into a callable `Cluster` layer; replace `sys.exit(1)` with an exception hierarchy; route `print()` through a reporter; make the Click commands thin wrappers | Complete | `7fb29e5` (#55) |
+-| 2. Client construction | [library-api-and-collection-phase-02-client-construction.md](library-api-and-collection-phase-02-client-construction.md) -- take the client from `ctx.obj['CLIENT']` so the root `--apiurl`/`--key`/`--namespace` are honoured, and add the `api_url`/`namespace`/`key` plus `suppress_configuration_lookup=True` factory that `sf_namespace._make_client()` uses. Phase 1 collapsed the two overwrite sites this row used to cite into one, `_bind_namespace_context()` at `__init__.py:24`; the root builds its client at `client-python/shakenfist_client/main.py:229-237` and stores it at `:236`. The root's `--async` default is `pause` (`main.py:199`) and this code needs `ASYNC_CONTINUE`, which is why the root client cannot simply be used as it stands | In progress | `1c32d12` (#63, plan only) |
++| 2. Client construction | [library-api-and-collection-phase-02-client-construction.md](library-api-and-collection-phase-02-client-construction.md) -- take the client from `ctx.obj['CLIENT']` so the root `--apiurl`/`--key`/`--namespace` are honoured, and add the `api_url`/`namespace`/`key` plus `suppress_configuration_lookup=True` factory that `sf_namespace._make_client()` uses. Phase 1 collapsed the two overwrite sites this row used to cite into one, `_bind_namespace_context()` at `__init__.py:24`; the root builds its client at `client-python/shakenfist_client/main.py:229-237` and stores it at `:236`. The root's `--async` default is `pause` (`main.py:199`) and this code needs `ASYNC_CONTINUE`, which is why the root client cannot simply be used as it stands | In progress | `1c32d12` (#63, plan only), `4e76704` (#65, decision 2 settled) |
+ | 3. Missing verbs | `remove-worker`; make `install_workers()` incremental; reconcile/crash recovery for `state: initial`; a health verb; `--no-longhorn`/`--no-metallb`; kubeconfig side effects opt-out (including the `kubectl config unset` calls in `Cluster.delete()`, which run without `capture_output` and so write to the process's real stdout, bypassing the reporter -- found during phase 1 and recorded in its plan under "The kubectl unset leak"); route `GroupCatchClusterExceptions`'s `print(str(e))` to `sys.stderr` instead of `sys.stdout` (found during phase 1 -- pre-existing CLI behaviour, deferred because phase 1 changes no user-visible output); give `Cluster.get_progress()`'s lazy default a real `total_phases` so a library caller invoking a mid-level method directly gets `[n/total]` headers instead of un-numbered `[n]` ones (found during phase 1; no CLI path hits this today); manifest payload hook | Not started | |
+ | 4. First release | Cut `v0.1.0` so `shakenfist-client-k3s` exists on PyPI and `setuptools_scm` has a real version to stamp | Not started | |
+ | 5. The collection | `shakenfist.k3s` with `sf_k3s_cluster`; `tools/build-collection.py`; `build-collection` and `publish-collection` jobs in `release.yml`; ansible-lint in pre-commit and CI; docs | Not started | |
+diff --git a/docs/usage.md b/docs/usage.md
+index f609910..6bd1e6e 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -9,6 +9,14 @@ Every command takes `--namespace`. Without it the client's own
+ namespace is used; an administrator can name a different one to work
+ on a cluster they do not own.
+ 
++The root `sf-client` options are a separate thing, and two of them are
++worth knowing about here. `--apiurl`, `--key` and `--namespace`
++configure the client these commands use, so the cloud they talk to and
++the namespace referred to above both follow what you pass there. The
++root `--async` has no effect on `k3s` commands: each one runs its own
++wait loops and reports progress as it goes, so the client is always
++asked not to block on the command's behalf.
++
+ ## Cluster lifecycle
+ 
+ ### `create NAME`
+diff --git a/shakenfist_client_k3s/__init__.py b/shakenfist_client_k3s/__init__.py
+index 0038588..c9ffa2b 100644
+--- a/shakenfist_client_k3s/__init__.py
++++ b/shakenfist_client_k3s/__init__.py
+@@ -11,17 +11,40 @@ from shakenfist_client_k3s.cluster import Cluster
+ def _bind_namespace_context(ctx, namespace):
+     """Build what a namespace scoped command needs.
+ 
+-    Returns the client, the resolved namespace and a reporter. The
+-    --namespace option is None unless the caller passed it, and the
++    Returns the client, the resolved namespace and a reporter. The client
++    is the one sf-client's root callback already built from --apiurl,
++    --key and --namespace and left in the Click context. This plugin must
++    not build its own: doing so discarded those options silently, leaving
++    the configuration lookup to find credentials which may be for another
++    cloud entirely. A KeyError on 'CLIENT' therefore means the group was
++    invoked by something which is not sf-client, and naming the missing
++    key is a better failure than quietly constructing a second client.
++
++    The --namespace option is None unless the caller passed it, and the
+     namespace is passed directly to API calls, so it must be defaulted to
+-    the client's own namespace here.
++    the client's own namespace here. That default now follows the
++    operator's --namespace, because the client does.
+ 
+     list, query-k3s-version and query-longhorn-version are namespace
+     scoped rather than cluster scoped: they name no cluster, and the
+     release lookups they call cache in namespace metadata. They therefore
+     build no Cluster at all.
+     """
+-    client = apiclient.Client(async_strategy=apiclient.ASYNC_CONTINUE)
++    client = ctx.obj['CLIENT']
++
++    # The orchestration runs its own wait loops and reports progress as
++    # it goes, so this client must not block on our behalf.
++    # async_strategy is read per call rather than at construction --
++    # create_instance, delete_instance, allocate_network, _await_agentop
++    # and _request_url all consult it -- and under sf-client's "pause"
++    # default each of those would sit for up to a minute emitting
++    # nothing before our reporter ever ran. Setting it here, rather than
++    # building a second client, is what keeps the root's --apiurl, --key
++    # and --namespace. Replace this with the per call or copy returning
++    # API from shakenfist/client-python#404 once that ships, and raise
++    # the shakenfist_client floor in pyproject.toml.
++    client.async_strategy = apiclient.ASYNC_CONTINUE
++
+     if not namespace:
+         namespace = client.namespace
+     return client, namespace, progress.Reporter(verbose=ctx.obj.get('VERBOSE', False))
+diff --git a/shakenfist_client_k3s/client.py b/shakenfist_client_k3s/client.py
+new file mode 100644
+index 0000000..97bd1d6
+--- /dev/null
++++ b/shakenfist_client_k3s/client.py
+@@ -0,0 +1,56 @@
++"""Build an API client for a caller which does not have one already.
++
++The CLI never calls this. sf-client's root callback builds a client from
++--apiurl, --key and --namespace and leaves it in the Click context, and
++__init__.py takes it from there; a construction path of the CLI's own is
++how those options came to be ignored once already. This module is for
++the callers which have no Click context at all: the sf_k3s_cluster
++Ansible module, conductor, and anyone else importing Cluster as a
++library.
++
++It mirrors _make_client() in the Shaken Fist server repository at
++deploy/collection/plugins/modules/sf_namespace.py, so that a caller who
++supplies nothing gets the same environment, ~/.shakenfist and
++/etc/sf/shakenfist.json discovery the CLI gets, and one who supplies all
++three connection parameters gets them used verbatim.
++"""
++
++from shakenfist_client import apiclient
++
++
++def make_client(api_url=None, namespace=None, key=None):
++    """Return an API client suitable for driving this package's orchestration.
++
++    Supply all three of api_url, namespace and key to use them verbatim, or
++    none of them to auto-discover configuration the way the CLI does.
++    Supplying only some is treated as supplying none, which is the rule the
++    Shaken Fist Ansible collection's own modules follow.
++
++    apiclient.UnconfiguredException propagates when discovery finds nothing.
++    """
++    kwargs = {
++        'verbose': False,
++        # ASYNC_CONTINUE rather than the collection's ASYNC_BLOCK: this
++        # package's orchestration runs its own wait loops and reports
++        # progress as it goes, and a blocking client does that waiting
++        # internally, so the reporter sees nothing at all.
++        #
++        # sync_request_timeout is left at apiclient's own default rather
++        # than widened to 1800 as the collection widens it. The collection
++        # needs the headroom because it blocks; with ASYNC_CONTINUE no
++        # single HTTP call waits for orchestration to finish.
++        'async_strategy': apiclient.ASYNC_CONTINUE,
++    }
++    if api_url and namespace and key:
++        kwargs.update({
++            'base_url': api_url,
++            'namespace': namespace,
++            'key': key,
++            'suppress_configuration_lookup': True,
++        })
++
++    # UnconfiguredException is deliberately not caught. The collection
++    # translates it into fail_json() because it is an Ansible module;
++    # turning it into an exit code or a message here would take that
++    # choice away from a library caller who wants the exception.
++    return apiclient.Client(**kwargs)
+diff --git a/shakenfist_client_k3s/tests/test_cli_errors.py b/shakenfist_client_k3s/tests/test_cli_errors.py
+index 25abafe..4d83594 100644
+--- a/shakenfist_client_k3s/tests/test_cli_errors.py
++++ b/shakenfist_client_k3s/tests/test_cli_errors.py
+@@ -67,17 +67,13 @@ class ClientTestCase(testtools.TestCase):
+         super(ClientTestCase, self).setUp()
+         self.client = mock.MagicMock()
+         self.client.namespace = 'clientns'
+-        patcher = mock.patch(
+-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
+-        patcher.start()
+-        self.addCleanup(patcher.stop)
+         self.runner = CliRunner()
+ 
+     def _invoke(self, target, args, namespace_metadata=None):
+         if namespace_metadata is not None:
+             self.client.get_namespace_metadata.return_value = namespace_metadata
+         return self.runner.invoke(
+-            target, args, obj={'VERBOSE': False}, terminal_width=80)
++            target, args, obj={'VERBOSE': False, 'CLIENT': self.client}, terminal_width=80)
+ 
+ 
+ class CommandExceptionTestCase(ClientTestCase):
+diff --git a/shakenfist_client_k3s/tests/test_client.py b/shakenfist_client_k3s/tests/test_client.py
+new file mode 100644
+index 0000000..59f40c9
+--- /dev/null
++++ b/shakenfist_client_k3s/tests/test_client.py
+@@ -0,0 +1,86 @@
++"""make_client() builds the client a library caller needs.
++
++The CLI does not use this factory -- it is handed a client by sf-client --
++so nothing else in the suite covers it, and the behaviour it has to get
++right is the all-three-or-auto-discover rule the Shaken Fist Ansible
++collection's own modules follow. Getting that wrong half way, by passing
++two of the three connection parameters through with configuration lookup
++still suppressed, would produce a client pointed at nothing in particular.
++"""
++
++# The PyPI mock backport is used rather than unittest.mock for consistency
++# with the other tests here, as the project supports Python >= 3.7.
++import mock
++from shakenfist_client import apiclient
++import testtools
++
++from shakenfist_client_k3s import client as client_module
++
++
++SUPPLIED = ('base_url', 'namespace', 'key', 'suppress_configuration_lookup')
++
++
++class MakeClientTestCase(testtools.TestCase):
++    def setUp(self):
++        super(MakeClientTestCase, self).setUp()
++        patcher = mock.patch('shakenfist_client_k3s.client.apiclient.Client')
++        self.mock_client = patcher.start()
++        self.addCleanup(patcher.stop)
++
++    def _kwargs(self, **call):
++        result = client_module.make_client(**call)
++        self.assertIs(self.mock_client.return_value, result)
++        return self.mock_client.call_args[1]
++
++    def test_all_three_are_used_verbatim(self):
++        kwargs = self._kwargs(
++            api_url='https://api.example.com', namespace='ns', key='k')
++
++        self.assertEqual('https://api.example.com', kwargs['base_url'])
++        self.assertEqual('ns', kwargs['namespace'])
++        self.assertEqual('k', kwargs['key'])
++        self.assertTrue(kwargs['suppress_configuration_lookup'])
++
++    def test_nothing_supplied_auto_discovers(self):
++        kwargs = self._kwargs()
++
++        for name in SUPPLIED:
++            self.assertNotIn(name, kwargs)
++
++    def test_a_partial_set_auto_discovers_too(self):
++        # Each of the three omitted in turn. Passing the rest through with
++        # the lookup still suppressed is the failure this pins: the client
++        # would be configured with holes rather than falling back.
++        for call in [{'namespace': 'ns', 'key': 'k'},
++                     {'api_url': 'https://api.example.com', 'key': 'k'},
++                     {'api_url': 'https://api.example.com', 'namespace': 'ns'}]:
++            self.mock_client.reset_mock()
++            kwargs = self._kwargs(**call)
++
++            for name in SUPPLIED:
++                self.assertNotIn(name, kwargs, call)
++
++    def test_the_strategy_is_continue_either_way(self):
++        for call in [{}, {'api_url': 'https://api.example.com',
++                          'namespace': 'ns', 'key': 'k'}]:
++            self.mock_client.reset_mock()
++            kwargs = self._kwargs(**call)
++
++            self.assertEqual(
++                apiclient.ASYNC_CONTINUE, kwargs['async_strategy'], call)
++            self.assertFalse(kwargs['verbose'], call)
++
++    def test_sync_request_timeout_is_left_alone(self):
++        # The collection widens this to 1800 because it blocks. With
++        # ASYNC_CONTINUE no single call waits for orchestration, so the
++        # default stands and setting it would be cargo culting.
++        self.assertNotIn('sync_request_timeout', self._kwargs())
++
++    def test_unconfigured_propagates(self):
++        error = apiclient.UnconfiguredException('no configuration found')
++        self.mock_client.side_effect = error
++
++        raised = self.assertRaises(
++            apiclient.UnconfiguredException, client_module.make_client)
++
++        self.assertIs(error, raised)
+diff --git a/shakenfist_client_k3s/tests/test_commands.py b/shakenfist_client_k3s/tests/test_commands.py
+index f9f68a3..0932cbd 100644
+--- a/shakenfist_client_k3s/tests/test_commands.py
++++ b/shakenfist_client_k3s/tests/test_commands.py
+@@ -29,15 +29,11 @@ class NamespaceDefaultingTestCase(testtools.TestCase):
+         super(NamespaceDefaultingTestCase, self).setUp()
+         self.client = mock.MagicMock()
+         self.client.namespace = 'clientns'
+-        patcher = mock.patch(
+-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
+-        patcher.start()
+-        self.addCleanup(patcher.stop)
+         self.runner = CliRunner()
+ 
+     def _invoke(self, args):
+         return self.runner.invoke(
+-            shakenfist_client_k3s.k3s, args, obj={'VERBOSE': False})
++            shakenfist_client_k3s.k3s, args, obj={'VERBOSE': False, 'CLIENT': self.client})
+ 
+     def test_show_defaults_namespace_from_client(self):
+         md_key = cluster_module.METADATA_KEY % 'banana'
+@@ -104,17 +100,13 @@ class CreateNamespaceNoticeTestCase(testtools.TestCase):
+             # after the namespace-created notice, before touching instances.
+             primitives.CLUSTER_LIST: ['banana'],
+         }
+-        patcher = mock.patch(
+-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
+-        patcher.start()
+-        self.addCleanup(patcher.stop)
+         self.runner = CliRunner()
+ 
+     def test_namespace_created_notice_text_is_unchanged(self):
+         result = self.runner.invoke(
+             shakenfist_client_k3s.k3s,
+             ['create', 'banana', '--namespace', 'newns'],
+-            obj={'VERBOSE': False})
++            obj={'VERBOSE': False, 'CLIENT': self.client})
+ 
+         self.client.create_namespace.assert_called_once_with('newns')
+         self.assertIn('Created namespace newns\n', result.output)
+@@ -136,10 +128,6 @@ class ListOutputTestCase(testtools.TestCase):
+         super(ListOutputTestCase, self).setUp()
+         self.client = mock.MagicMock()
+         self.client.namespace = 'clientns'
+-        patcher = mock.patch(
+-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
+-        patcher.start()
+-        self.addCleanup(patcher.stop)
+         self.runner = CliRunner()
+ 
+     def test_list_prints_one_cluster_per_line(self):
+@@ -147,7 +135,7 @@ class ListOutputTestCase(testtools.TestCase):
+             primitives.CLUSTER_LIST: ['banana', 'apple']}
+ 
+         result = self.runner.invoke(
+-            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False})
++            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False, 'CLIENT': self.client})
+ 
+         self.assertEqual(0, result.exit_code, result.output)
+         self.assertEqual('banana\napple\n', result.output)
+@@ -156,7 +144,7 @@ class ListOutputTestCase(testtools.TestCase):
+         self.client.get_namespace_metadata.return_value = {}
+ 
+         result = self.runner.invoke(
+-            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False})
++            shakenfist_client_k3s.k3s, ['list'], obj={'VERBOSE': False, 'CLIENT': self.client})
+ 
+         self.assertEqual(0, result.exit_code, result.output)
+         self.assertEqual('', result.output)
+@@ -226,11 +214,6 @@ class CommandWiringTestCase(testtools.TestCase):
+                 'uuid': instance_uuid, 'name': name, 'state': 'created',
+                 'agent_state': 'ready'}
+ 
+-        patcher = mock.patch(
+-            'shakenfist_client_k3s.apiclient.Client', return_value=self.client)
+-        patcher.start()
+-        self.addCleanup(patcher.stop)
+-
+         patcher = mock.patch('time.sleep', lambda seconds: None)
+         patcher.start()
+         self.addCleanup(patcher.stop)
+@@ -266,7 +249,7 @@ class CommandWiringTestCase(testtools.TestCase):
+         result = self.runner.invoke(
+             shakenfist_client_k3s.k3s,
+             ['expand-workers', 'banana', '--worker-count', '3'],
+-            obj={'VERBOSE': False})
++            obj={'VERBOSE': False, 'CLIENT': self.client})
+ 
+         self.assertEqual(0, result.exit_code, result.output)
+         # Three new instances, and each recorded against the cluster
+@@ -280,7 +263,7 @@ class CommandWiringTestCase(testtools.TestCase):
+         result = self.runner.invoke(
+             shakenfist_client_k3s.k3s,
+             ['expand-addresses', 'banana', '--address-count', '3'],
+-            obj={'VERBOSE': False})
++            obj={'VERBOSE': False, 'CLIENT': self.client})
+ 
+         self.assertEqual(0, result.exit_code, result.output)
+         # Three addresses routed, on top of the one the cluster had, and
+@@ -295,7 +278,7 @@ class CommandWiringTestCase(testtools.TestCase):
+     def test_update_os_updates_every_node(self):
+         result = self.runner.invoke(
+             shakenfist_client_k3s.k3s, ['update-os', 'banana'],
+-            obj={'VERBOSE': False})
++            obj={'VERBOSE': False, 'CLIENT': self.client})
+ 
+         self.assertEqual(0, result.exit_code, result.output)
+         self.assertEqual(
+diff --git a/shakenfist_client_k3s/tests/test_progress.py b/shakenfist_client_k3s/tests/test_progress.py
+index f4b9aa8..a51375b 100644
+--- a/shakenfist_client_k3s/tests/test_progress.py
++++ b/shakenfist_client_k3s/tests/test_progress.py
+@@ -648,8 +648,6 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
+         self.home = home.name
+ 
+         for target, kwargs in [
+-                ('shakenfist_client_k3s.apiclient.Client',
+-                 {'return_value': self.client}),
+                 ('shakenfist_client_k3s.primitives.get_k3s_release',
+                  {'return_value': 'stable'}),
+                 ('shakenfist_client_k3s.primitives.get_longhorn_release',
+@@ -666,7 +664,7 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
+     def _create(self, args):
+         runner = CliRunner()
+         result = runner.invoke(
+-            shakenfist_client_k3s.k3s, ['create'] + args, obj={'VERBOSE': False})
++            shakenfist_client_k3s.k3s, ['create'] + args, obj={'VERBOSE': False, 'CLIENT': self.client})
+         self.assertEqual(
+             0, result.exit_code, '%s\n%s' % (result.output, result.exception))
+         return result.output
+diff --git a/shakenfist_client_k3s/tests/test_root_options.py b/shakenfist_client_k3s/tests/test_root_options.py
+new file mode 100644
+index 0000000..f048277
+--- /dev/null
++++ b/shakenfist_client_k3s/tests/test_root_options.py
+@@ -0,0 +1,116 @@
++"""The root sf-client options must reach the client k3s commands use.
++
++This plugin used to build its own apiclient.Client, which discarded the
++one sf-client's root callback had already built from --apiurl, --key and
++--namespace. Nothing failed when it did: apiclient's own configuration
++lookup reads SHAKENFIST_API_URL, SHAKENFIST_NAMESPACE and SHAKENFIST_KEY,
++so an operator who configures by environment variable got the right
++credentials by accident, and only one who passed the flags was silently
++pointed at another cloud. That is invisible to every test which invokes
++the k3s group directly, because the group never sees the root options at
++all, so the two tests here are deliberately the other shape: one asserts
++the construction is gone, and one drives the real root group end to end.
++
++The second test reaches the k3s group through the shakenfist_client.plugin
++entry point, which means it only works when this package is installed.
++"tox -epy3" installs it and CI runs tox, so that is the supported way to
++run these; a bare stestr run in a tree where the package is not installed
++fails on a missing subcommand rather than on the behaviour being pinned.
++"""
++
++from click.testing import CliRunner
++
++# The PyPI mock backport is used rather than unittest.mock for consistency
++# with the other tests here, as the project supports Python >= 3.7.
++import mock
++from shakenfist_client import apiclient
++from shakenfist_client import main
++import testtools
++
++import shakenfist_client_k3s
++
++
++class NoClientConstructionTestCase(testtools.TestCase):
++    """A k3s command must never construct an API client of its own.
++
++    The six command tests which used to patch apiclient.Client now hand
++    their fake in through the Click object instead, and a fake handed in
++    that way does not by itself prove no real client was built. This does,
++    and it is a stronger statement than those patches ever made: they
++    would have quietly returned a fake to a second construction rather
++    than objecting to it.
++    """
++
++    def test_client_is_never_constructed(self):
++        client = mock.MagicMock()
++        client.namespace = 'clientns'
++        client.get_namespace_metadata.return_value = {}
++
++        with mock.patch('shakenfist_client_k3s.apiclient.Client') as mock_client:
++            mock_client.side_effect = AssertionError(
++                'a k3s command constructed its own API client')
++            result = CliRunner().invoke(
++                shakenfist_client_k3s.k3s, ['list'],
++                obj={'VERBOSE': False, 'CLIENT': client})
++
++        # Asserted before the exit code so that a failure names the cause
++        # rather than the symptom: the side effect above makes a second
++        # construction fail the command, and "exit code 1" says nothing
++        # about why.
++        mock_client.assert_not_called()
++        self.assertEqual(0, result.exit_code, result.output)
++
++
++class RootOptionsTestCase(testtools.TestCase):
++    """The client built from --apiurl, --key and --namespace is the one used.
++
++    This drives shakenfist_client.main.cli, not the k3s group, because the
++    root callback is where those options are parsed and where the client is
++    built. Asserting on the identity of the object the command used is the
++    point: a plugin which built its own client would satisfy every other
++    assertion here while talking to a different cloud.
++    """
++
++    def test_root_options_reach_the_k3s_command(self):
++        constructed = []
++
++        def _client(*args, **kwargs):
++            # A distinct mock per construction, because a single
++            # return_value would hand the same object to a plugin which
++            # built its own and every assertion below would pass anyway.
++            client = mock.MagicMock()
++            client.namespace = kwargs.get('namespace') or 'ns'
++            client.get_namespace_metadata.return_value = {}
++            constructed.append((kwargs, client))
++            return client
++
++        with mock.patch('shakenfist_client.main.apiclient.Client',
++                        side_effect=_client):
++            result = CliRunner().invoke(
++                main.cli,
++                ['--apiurl', 'https://api.example.com', '--key', 'k',
++                 '--namespace', 'ns', 'k3s', 'list'])
++
++        self.assertEqual(0, result.exit_code, result.output)
++
++        # One client exists in the whole process. This is the assertion
++        # the old code failed: it built a second one, from the
++        # configuration lookup rather than from these options.
++        self.assertEqual(
++            1, len(constructed),
++            'expected one client, got %d' % len(constructed))
++
++        # The root built it from the options as passed. Index 1 is the
++        # kwargs dict rather than call_args.kwargs, which needs 3.8.
++        kwargs, client = constructed[0]
++        self.assertEqual('https://api.example.com', kwargs['base_url'])
++        self.assertEqual('k', kwargs['key'])
++        self.assertEqual('ns', kwargs['namespace'])
++
++        # And the k3s command used that client, not one of its own.
++        client.get_namespace_metadata.assert_called_once_with('ns')
++
++        # The strategy is forced on it, because the orchestration runs its
++        # own wait loops; the root's default is "pause", which would sit
++        # for up to a minute per call before the reporter ever ran.
++        self.assertEqual(apiclient.ASYNC_CONTINUE, client.async_strategy)

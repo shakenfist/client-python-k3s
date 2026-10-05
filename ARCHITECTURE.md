@@ -19,6 +19,7 @@ which deploys a real cluster from an ephemeral runner. See
 ```
 shakenfist_client_k3s/
 ├── __init__.py         # Click commands, the plugin entry point, and the group's error handling
+├── client.py           # make_client(): an API client for a caller with no Click context
 ├── cluster.py          # Cluster: one named cluster's state and orchestration
 ├── exceptions.py       # The K3sClusterException hierarchy this library raises
 ├── primitives.py       # Namespace scoped lookups and stateless helpers
@@ -57,8 +58,8 @@ that; this section is only the shape.
   subclasses instead of exiting.
 - **Namespace scoped lookups and stateless helpers (`primitives.py`)**
   -- work with no cluster identity: the two release lookups, whose
-  caches live in *namespace* metadata rather than any one cluster's,
-  and `_describe_agent_op()`. `list`, `query-k3s-version` and
+  caches live in *namespace* metadata rather than any one cluster's.
+  `list`, `query-k3s-version` and
   `query-longhorn-version` call these directly rather than building a
   `Cluster`. Imports run one way only -- `cluster.py` imports
   `primitives`, never the reverse.
@@ -136,65 +137,33 @@ site and attributes for each one.
 
 ### Progress reporting (`progress.py`)
 
-Every `Cluster` method that runs a long operation builds a `Progress`
-on demand via `Cluster.get_progress()`, writing to the `Cluster`'s own
-reporter (a `progress.Reporter` by default, or whatever a caller
-passed in -- see `docs/library-api.md`). Work is announced as numbered
-phases (`[3/9] Setting up metallb`), and the polling wait loops
-(`await_boot`, `await_idle`, `await_fetch`) report per-item statuses
-through `Progress.update()`. When stdout is a TTY the statuses are
-rendered as one line per item, rewritten in place with ANSI cursor
-movement and truncated to the terminal width. Otherwise (pipes, CI,
-or `--verbose`, whose debug lines would interleave badly with cursor
-movement) a status line is printed only when it changes, with a
-heartbeat reprint every 60 seconds so logs still show liveness. Each
-status shows how long the item has been in that status, so a stalled
-command is visible as a growing elapsed time, and idle waits describe
-the agent command currently executing rather than a bare operation
-count. The module is dependency free.
+Everything this library tells its caller goes through `progress.py`,
+which is dependency free. A `Cluster` method that knows how many phases
+its operation has starts a `Progress` with that count
+(`Cluster.start_progress()`); one called directly by a library caller
+gets one lazily (`Cluster.get_progress()`). Both write to the
+`Cluster`'s own reporter -- a `progress.Reporter` by default, or
+whatever a caller passed in -- so there is one output channel rather
+than two. Work is announced as numbered phases (`[3/9] Setting up
+metallb`), and the polling wait loops (`await_boot`, `await_idle`,
+`await_fetch`) report per-item statuses: in place on a terminal, one
+line per change otherwise.
 
-The wait loops also detect failure. They enumerate the agent operation
-states rather than naming the endings they expect: `initial`,
-`preflight`, `queued` and `executing` are still in progress, `error`
-and `expired` are failures, and `complete` and `deleted` are over. That
-matters because Shaken Fist gives every agent operation a wall clock
-budget and moves one that overruns it to `expired`, which is
-deliberately distinct from `error`, and because `deleted` is reachable
-from every state: a loop that waited for `complete` or `error` by name
-spun forever on either. An ending which is not `complete` aborts the
-command with the operation uuid, its state, the command it was on, and
-a pointer to `sf-client instance events` for the server side detail.
+The wait loops are also where failure is detected, and the way they do
+it is the part worth knowing. They enumerate the agent operation states
+rather than naming the two endings they expect, because Shaken Fist
+gives every operation a wall clock budget and moves one that overruns
+it to `expired` rather than `error`, and because `deleted` is reachable
+from any state -- so a loop waiting for `complete` or `error` by name
+spun forever on either. The states themselves, what each means, and why
+a wait for an instance to go idle treats an unrecognised state
+differently from a wait for a command's output are documented on the
+constants at the top of `cluster.py`, which is where they are used.
 
-A state none of those name is one Shaken Fist added later, and the two
-kinds of wait answer that differently on purpose. Waiting for an
-instance to go idle waits for it, because an unrecognised state is more
-likely a new way of being in flight than a new ending, and running the
-next install step over a command still executing corrupts the node; it
-says so once, naming the state. Waiting for a command's output raises,
-because that output only exists for `complete`. Neither can wedge the
-way `expired` did, because the server moves every operation out of
-whatever state it is in within its deadline.
-
-A wait for an instance to be idle waits for every agent operation on it,
-because the next command must not race one that is still executing, but
-it only fails on the operations it was handed -- `execute_and_await()`
-passes the ones it just submitted. Anyone else's operation is waited for
-while it can still progress and then ignored, whatever it ended as, so
-neither a historical failure nor a `health()` probe the server later
-expires can abort an unrelated `expand-workers`.
-
-The one bounded wait is `health()`'s read-only probe, which carries a
-thirty second timeout and is skipped
-entirely when the node it would run on is not up -- an operation queued
-against an unreachable agent never leaves the queue, and that is the
-cluster the verb exists to describe. If a single agent command runs for
-more than five minutes a one-off note flags that it may be stalled.
-Every elapsed time here is measured on the monotonic clock, so a wall
-clock step mid-install cannot move a timeout or fire a stall note.
-Notes emitted mid-wait leave the wait block's per-item timers intact
-(and, on a TTY, redraw the status block below the note), so a stall
-note does not reset the very elapsed counter it is drawing attention
-to.
+This section is only the shape. `docs/library-api.md` is the reference
+for what a caller sees: the reporter interface, the two output modes,
+the stall note, `health()`'s bounded probe, and which exception each
+ending raises.
 
 ## Python Version Compatibility
 
@@ -259,7 +228,6 @@ nothing to do with compatibility. `publish-collection` in
 `release.yml` publishes to Ansible Galaxy under the same release
 workflow and the same tag that triggers `publish-pypi`, with its own
 credential (`ANSIBLE_GALAXY_TOKEN`); see `RELEASE-SETUP.md` for both.
-As of this writing the collection has not yet had a first release --
-the credential and the first tag are both outstanding -- so
-`ansible-galaxy collection install shakenfist.k3s` does not resolve;
-`docs/collection.md` covers the tarball install that works today.
+`ansible-galaxy collection install shakenfist.k3s` resolves against
+Galaxy, and `docs/collection.md` covers both that and the tarball build
+needed to work against an unreleased checkout.

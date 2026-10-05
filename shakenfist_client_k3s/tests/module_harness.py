@@ -66,6 +66,19 @@ SECRET_NODE_TOKEN = 'SECRET-K3S-NODE-TOKEN'
 SECRET_KUBECONFIG = 'SECRET-KUBECONFIG-CONTENTS'
 SECRET_SSH_KEY = 'SECRET-SSH-PUBLIC-KEY'
 
+# The shape of the command line install_k3s_component() builds for a
+# worker, which the Shaken Fist API echoes back in the agent operation's
+# commands[0]['commandline']. Written out here rather than built by
+# calling the real installer, because what this harness is for is what
+# lands on fd 1; that the real template still names the credential this
+# way is pinned by test_cluster.SecretRedactionTestCase, which drives the
+# real install_k3s_component().
+WORKER_INSTALL_COMMANDLINE = (
+    'curl -sfL https://get.k3s.io | '
+    "INSTALL_K3S_CHANNEL='v1.33' "
+    'K3S_URL=https://10.0.0.4:6443 '
+    'K3S_TOKEN=%s sh -s - agent' % SECRET_NODE_TOKEN)
+
 # Every Cluster method which changes something -- on the cloud, in the
 # namespace metadata, or on the calling machine. A check mode run must
 # call none of them. Listed by name rather than detected, because
@@ -166,6 +179,15 @@ def _build_spec(path):
                        That is where create() really reads the ssh key:
                        after the name and the network are settled, so
                        there is already output to lose.
+    worker_install_fails
+                       with fake_create, fail the worker install the way
+                       the real one fails: hand reap_execute() an agent
+                       operation whose command line is the installer's,
+                       carrying the node token, with a non-zero return
+                       code. The exception is raised by the real
+                       reap_execute() from the real CommandFailedError, so
+                       what reaches fd 1 is what a real failed install
+                       would put there.
     delete_raises      make delete_instance() raise an APIException part
                        way through a delete, which is a delete stopping
                        after it has already removed something.
@@ -194,6 +216,7 @@ def _build_spec(path):
     spec.setdefault('unconfigured', False)
     spec.setdefault('fake_create', False)
     spec.setdefault('create_raises', False)
+    spec.setdefault('worker_install_fails', False)
     spec.setdefault('metadata_raises', None)
     spec.setdefault('client_raises', False)
     spec.setdefault('health_raises', False)
@@ -289,6 +312,20 @@ def install_fake_create(spec, created_kwargs):
             # been told about two phases they are about to lose.
             raise exceptions.SshKeyError.unreadable(
                 '/no/such/id_rsa.pub', 'No such file or directory')
+        if spec['worker_install_fails']:
+            # Through the real reap_execute(), so that the real
+            # CommandFailedError is built from the command line the API
+            # echoed back -- which is the whole path under test.
+            self.reap_execute({
+                'uuid': 'aop-install-worker',
+                'instance_uuid': 'worker-uuid-0',
+                'state': 'complete',
+                'commands': [{'command': 'execute',
+                              'commandline': WORKER_INSTALL_COMMANDLINE}],
+                'results': {'0': {
+                    'return-code': 100,
+                    'stdout': 'running %s\n' % WORKER_INSTALL_COMMANDLINE,
+                    'stderr': 'E: Unable to fetch some archives'}}})
         progress.finish('Cluster %s is ready' % self.name)
         self._metadata[self._metadata_key()] = healthy_metadata()
 

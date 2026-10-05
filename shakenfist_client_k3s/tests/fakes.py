@@ -11,7 +11,22 @@ goes for HealthClient below, which the library and command line tests for
 the health verb both drive.
 """
 
+import io
+
 from shakenfist_client import apiclient
+
+
+class FakeTty(io.StringIO):
+    """A stream which claims to be a terminal.
+
+    Progress chooses between in place ANSI updates and line mode by
+    asking its stream, so this is how a test exercises the interactive
+    format without a pty. Here rather than in one test module because
+    both the progress tests and the cluster tests need it.
+    """
+
+    def isatty(self):
+        return True
 
 
 def not_found(instance_uuid):

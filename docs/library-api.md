@@ -97,9 +97,8 @@ Each command's body is a method taking that command's options, minus
 
 Only these nine methods, plus `get_metadata()`,
 `set_metadata(md)` and `delete_metadata()`, are this library's
-stable public surface. Phase 4 cuts `v0.1.0` to PyPI, so whatever
-is public at that point becomes a compatibility surface for
-external callers. Everything else `Cluster` exposes --
+stable public surface: this package is published to PyPI, so what
+is public here is a compatibility surface for external callers. Everything else `Cluster` exposes --
 `create_instance()`, `await_boot()`, `await_idle()`,
 `await_fetch()`, `await_execute()`, `reap_execute()`,
 `execute_and_await()`, `instance_os_update()`,
@@ -107,7 +106,8 @@ external callers. Everything else `Cluster` exposes --
 `install_extra_control_plane()`, `install_workers()`,
 `allocate_metallb_addresses()`, `configure_metallb_addresses()`,
 `setup_metallb()`, `setup_longhorn()`,
-`create_and_await_instances()`, `get_progress()`,
+`create_and_await_instances()`, `start_progress()`,
+`get_progress()`,
 `_interrupted_state()` and `_require_usable()` -- is internal
 orchestration the methods above are built from, not a supported
 entry point, so treat it as unstable even though nothing today
@@ -130,17 +130,16 @@ returns the mapping the file holds, ready to pass as `server_config` or
 parse, or whose keys `create()` would refuse. It touches no cluster and
 no API client.
 
-Phase 3 reshaped two of these rather than leaving them for later, and
-the reshaping is worth naming because it corrects what this page used
-to say about them. `install_workers()` now takes the instance uuids to
+Two of these have shapes worth stating, because they are not what a
+reader would guess. `install_workers()` takes the instance uuids to
 install, with no default -- a caller which means "every worker" has to
-say so -- rather than gaining an incremental mode. That is deliberate:
+say so -- rather than offering an incremental mode:
 `create_and_await_instances()` already knows exactly which instances
-it just made, so passing that list along is the fix, and "incremental"
-was rejected as the framing for it. `install_control_plane()` gained
-an optional `manifests` argument, the same list of local paths
-`create()` reads and forwards to it. Skipping MetalLB or Longhorn, by
-contrast, is not a change to `setup_metallb()` or `setup_longhorn()`
+it just made, so passing that list along is the whole of what a caller
+needs. `install_control_plane()` takes an optional `manifests`
+argument, the same list of local paths `create()` reads and forwards to
+it. Skipping MetalLB or Longhorn, by contrast, is not a change to
+`setup_metallb()` or `setup_longhorn()`
 themselves -- they are exactly as unconditional as before -- it is
 `create()` deciding whether to call them at all.
 
@@ -179,13 +178,11 @@ library whose default is to rewrite the caller's `~/.kube/config` is
 surprising: an Ansible module or a conductor reconcile loop calling
 `create()` from inside a process that manages its own kubectl
 configuration should not find that file edited unless it said so.
-Reversing the default costs nothing today because nothing has ever been
-released -- there are no git tags and `shakenfist_client_k3s` is not on
-PyPI, so `sf-client k3s` is the only caller in the tree. Phase 4 is the
-first PyPI release, so this is the last point at which the default
-could change for free; taking the other default "for symmetry with the
-CLI" would have made the surprise permanent at the one moment avoiding
-it cost nothing.
+The default was chosen before the first PyPI release, while
+`sf-client k3s` was the only caller in the tree and reversing it cost
+nothing. Taking the other default "for symmetry with the CLI" would
+have made the surprise permanent at the one moment avoiding it was
+free.
 
 The cluster's kubeconfig is recorded in `md['kubeconfig']` regardless of
 `write_kubeconfig`, and `get_kubeconfig()` serves it either way -- only
@@ -222,6 +219,33 @@ reporter is passed as that stream.
 Both take `verbose=True` to also emit `debug()` lines; without it
 `debug()` is silent.
 
+### What the output looks like, and when
+
+`Progress` has two modes, and which one you get depends on the
+reporter's `isatty()` and on `verbose`.
+
+On a terminal, and not verbose, a wait block is rendered as one line per
+item and rewritten in place with ANSI cursor movement, truncated to the
+terminal width. Otherwise -- a pipe, a CI log, a `CollectingReporter`,
+or `verbose=True`, whose debug lines would interleave badly with cursor
+movement -- a status line is printed only when it changes, with a
+heartbeat reprint every 60 seconds so a log still shows liveness during
+a long wait.
+
+Either way each status carries how long the item has been in *that*
+status rather than how long the wait has run, so a stalled command shows
+up as a growing elapsed time next to one item while its neighbours
+advance. An idle wait names the agent command currently executing, not
+a bare operation count. If a single agent command runs for more than
+five minutes a one-off note says it may be stalled; the note does not
+reset the per-item timers it is drawing attention to, and on a terminal
+it is printed above the status block, which is then redrawn below it.
+
+Every elapsed time is measured on the monotonic clock, so an NTP
+correction part way through a twenty minute install cannot make a phase
+appear to take a negative amount of time, move a timeout, or fire a
+stall note.
+
 ## Exceptions
 
 Every failure this library detects and reports is a
@@ -257,11 +281,13 @@ a correct caller never needs to catch it.
 | `WorkerNotFoundError` | `remove_worker()` is given a uuid that is not one of the cluster's workers |
 | `WorkerUnnamedError` | `remove_worker()` finds a worker whose instance record has no name, so the k3s node it became cannot be identified |
 | `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable or not decodable as UTF-8, not valid YAML or JSON, or a line colliding with the staging marker |
+| `GuestFileError` | a file this library writes onto a cluster node carries a line equal to the heredoc marker used to write it, so writing it would run the rest as commands on the node. The values that reach these bodies come from the namespace metadata document, which is third-party writable |
 | `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
 | `NodeSizeError` | `create()` is given a node size that is not a positive integer (a bool counts as not), before anything is built or the name is registered |
 | `K3sConfigError` | `create(server_config=..., agent_config=...)` is given a mapping that cannot be used -- not a mapping, a non-string key, a value that does not survive a JSON round trip, a key the plugin owns, or text that collides with the heredoc marker -- or `read_k3s_config()` cannot read or parse its file, before anything is built or the name is registered |
 | `UnsupportedReleaseError` | `create()` resolves a k3s release older than `v1.21.1+k3s1`, or one it cannot parse, right after the channel lookup and before anything is built or the name is registered |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
+| `ClusterMetadataError` | a value read back out of the namespace metadata cannot be used -- `expand_addresses()` finds something in `routed_addresses` that is not an IP address, or the API hands back one that is not. Raised before any address is routed, because the addresses are charged for and the configuration they go into is written afterwards |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
@@ -272,12 +298,21 @@ names the exact call site and the attributes it carries; several are
 built through classmethods (`ClusterNotFoundError.not_found(name)`,
 `KubeconfigError.merge_failed(...)`, and so on) rather than their
 constructors, because one class covers several call sites whose
-message text differs. `ClusterInterruptedError` carries the state the
+message text differs.
+
+Where a class has classmethods, **they are the interface and the
+constructor is not**. The seven classes that carry a `reason` share a
+base whose `__init__` takes `(reason, message, **fields)`, so every
+attribute past `message` is keyword-only, and the set of attributes a
+class carries is its `FIELDS` tuple rather than a parameter list.
+Catching these and reading their attributes is supported; constructing
+one positionally is not, and the shared base is free to move a field
+between classes without that being a breaking change. `ClusterInterruptedError` carries the state the
 cluster was left in (`state`) and, for its `not_usable()` form, which
 verb refused to run (`verb`); both of its messages name `sf-client k3s
-delete <name>` as the way out, because phase 3 deliberately built
-detection and teardown rather than a way to resume a half built
-cluster -- see decision 5 of
+delete <name>` as the way out, because what is built is detection and
+teardown rather than a way to resume a half built cluster -- see
+decision 5 of
 `docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md`. One
 gap that decision does not close: a `create()` interrupted between
 claiming its name and writing that cluster's own metadata document

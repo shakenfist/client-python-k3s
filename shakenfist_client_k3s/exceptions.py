@@ -15,8 +15,9 @@ rather than stdout because ``get-kubeconfig`` and the ``--json`` outputs
 put machine readable text on stdout, and an error printed there is text a
 pipeline would parse. Because
 ``shakenfist_client_k3s`` is imported unconditionally by the ``sf-client``
-plugin loader, this module must import nothing beyond the standard
-library.
+plugin loader, this module must import nothing beyond the standard library
+and siblings which do the same -- ``progress``, for the redaction two of
+these classes apply to the command text they are handed.
 
 ``K3sClusterException`` deliberately does not subclass anything from
 ``shakenfist_client.apiclient``: the parent CLI's ``GroupCatchExceptions``
@@ -27,9 +28,64 @@ hierarchy must not be caught by that machinery.
 
 import json
 
+from shakenfist_client_k3s import progress
+
 
 class K3sClusterException(Exception):
     """Base class for every exception this library raises."""
+
+
+class _ReasonedK3sException(K3sClusterException):
+    """Base for the exceptions built through classmethods rather than directly.
+
+    Seven of the classes below describe several distinct failures that read
+    the same way to a caller: a manifest cannot be staged, a release
+    lookup failed. Each is built through a classmethod per failure, each
+    records which one ran in ``reason``, each renders a message its
+    classmethod composed, and each carries the failure's details as
+    attributes. That shape was written out seven times, byte for byte, and
+    the duplication is a cross-phase one: two copies arrived with the
+    exception hierarchy, two more when later verbs needed their own
+    reasoned errors, a fifth with the heredoc refusal, and the last two
+    with k3s configuration pass-through -- which landed on the default
+    branch while this base class was being written, and is why the count
+    in this docstring is worth keeping accurate rather than approximate.
+    ``UnsupportedReleaseError`` named its three fields in its own
+    ``__init__`` rather than taking ``**fields``; it declares them in
+    ``FIELDS`` like the others now.
+
+    ``reason`` does not decide which attributes exist. Every field any
+    classmethod of a subclass sets is declared in that subclass's
+    ``FIELDS``, and all of them are initialised to None here, so
+    ``getattr`` is total: a caller which does not know which constructor
+    ran -- ``docs/library-api.md`` describes these attributes as the
+    failure's details, and the Ansible module serialises them into
+    ``fail_json()`` -- reads any field off any instance and gets None
+    rather than ``AttributeError``. That is why ``FIELDS`` is declared
+    rather than left implicit in what each classmethod happens to pass.
+
+    Subclasses declare ``FIELDS`` and their classmethods, and nothing
+    else. A subclass whose failures do not share a message shape --
+    ``AgentOperationError``, ``CommandFailedError``, ``NodeSizeError`` --
+    is not one of these and takes its own named arguments.
+    """
+
+    #: The union of the fields this class's classmethods set. Declared by
+    #: each subclass; empty here so that the loop below is total for a
+    #: subclass which has no details to carry.
+    FIELDS = ()
+
+    def __init__(self, reason, message, **fields):
+        self.reason = reason
+        self.message = message
+        for key in self.FIELDS:
+            setattr(self, key, None)
+        for key, value in fields.items():
+            setattr(self, key, value)
+        super(_ReasonedK3sException, self).__init__(message)
+
+    def __str__(self):
+        return self.message
 
 
 class ClusterExistsError(K3sClusterException):
@@ -148,7 +204,7 @@ class ClusterIncompleteError(K3sClusterException):
         return 'No kubeconfig for this cluster. Is it fully installed?'
 
 
-class ClusterInterruptedError(K3sClusterException):
+class ClusterInterruptedError(_ReasonedK3sException):
     """Raised when a cluster's own metadata says it never finished being built.
 
     ``md['state']`` is written by ``Cluster.create()`` and
@@ -189,20 +245,8 @@ class ClusterInterruptedError(K3sClusterException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('name', 'state', 'verb')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(ClusterInterruptedError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def mid_create(cls, name, state):
@@ -317,7 +361,7 @@ class ComponentNotInstalledError(K3sClusterException):
             % (self.name, self.component, self.verb, self.component))
 
 
-class ManifestError(K3sClusterException):
+class ManifestError(_ReasonedK3sException):
     """Raised when a manifest handed to ``Cluster.create()`` cannot be staged.
 
     ``--manifest`` (and the ``manifests`` argument behind it) names local
@@ -373,21 +417,9 @@ class ManifestError(K3sClusterException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('path', 'other_path', 'basename', 'suffixes', 'delimiter',
               'detail')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(ManifestError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def not_a_manifest(cls, path, suffixes):
@@ -447,6 +479,97 @@ class ManifestError(K3sClusterException):
         ) % (path, delimiter)
         return cls('delimiter_collision', message, path=path,
                    delimiter=delimiter)
+
+
+class GuestFileError(_ReasonedK3sException):
+    """Raised when a file this library writes onto a cluster node cannot be written.
+
+    The in-guest agent runs a shell command line, so every file this
+    library puts on a node is written by a ``cat - > path << DELIMITER``
+    heredoc. Rule 2 at the top of ``cluster.py`` keeps the delimiter
+    quoted, which stops the remote shell expanding anything inside the
+    body -- and that is not the whole of what a body can do. A body
+    containing a line which is exactly the delimiter ends the heredoc
+    early, and everything after it is read by the shell as commands,
+    running as root on the node.
+
+    So an interpolated value is refused rather than written:
+
+    - ``delimiter_collision(path, delimiter)``: the body contains a line
+      equal to the delimiter. The values which reach these bodies are
+      addresses out of the namespace metadata document, which anything
+      holding the namespace's credentials can write and which conductor
+      also writes, so "the API would not return that" is not an argument
+      this package makes -- rule 1 says so in as many words.
+
+    ``ManifestError.delimiter_collision`` is the same refusal for a
+    caller's own manifest file, checked earlier so that the message can
+    name the local path the operator passed; this is the backstop which
+    covers every heredoc, including ones added later.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
+    FIELDS = ('path', 'delimiter')
+
+    @classmethod
+    def delimiter_collision(cls, path, delimiter):
+        message = (
+            'Refusing to write %s on the cluster node: the content contains a\n'
+            'line which is exactly %s, which is the marker used to write it,\n'
+            'so the rest of the content would be run as commands instead.'
+        ) % (path, delimiter)
+        return cls('delimiter_collision', message, path=path,
+                   delimiter=delimiter)
+
+
+class ClusterMetadataError(_ReasonedK3sException):
+    """Raised when a value read back out of the namespace metadata is not usable.
+
+    Rule 1 at the top of ``cluster.py`` says the metadata document is
+    outside controlled: anything holding the namespace's credentials can
+    write it, and conductor also does. Everything this package reads
+    from it is therefore either quoted, validated, or refused.
+
+    ``GuestFileError.delimiter_collision`` is the refusal of last resort
+    for a metadata value on its way into a heredoc, and it fires at the
+    point of writing. That is the wrong place for a verb which spends
+    something first. ``expand_addresses()`` routes floating addresses --
+    which are charged for -- and commits them to the metadata before the
+    configuration they are for is written, so a value which was already
+    bad fails after the spending rather than before it. Its docstring
+    makes the same argument for refusing a cluster without metallb up
+    front, and this is that argument applied to the document's contents
+    as well as its flags.
+
+    - ``not_an_address(name, key, value)``: a key which must hold IP
+      addresses holds something that is not one. Raised from two points:
+      ``expand_addresses()`` checks what is already recorded before it
+      allocates anything, and ``allocate_metallb_addresses()`` checks
+      each address the API hands back before recording it. Rule 1 says
+      the Shaken Fist API "is not this package's trust boundary" in as
+      many words, so the second check is required by the same rule as
+      the first rather than being paranoia about our own server. The
+      message deliberately does not say whether anything was changed,
+      because that differs between the two sites; the first has spent
+      nothing and the second may have routed an address it then refused
+      to record.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
+    FIELDS = ('name', 'key', 'value')
+
+    @classmethod
+    def not_an_address(cls, name, key, value):
+        message = (
+            'Cluster %s has an unusable value in its metadata: %s contains\n'
+            '%r, which is not an IP address, so it is refused rather than\n'
+            'written into the cluster configuration. That document can be\n'
+            "written by anything holding this namespace's credentials, so a\n"
+            'value in it is checked rather than trusted.'
+        ) % (name, key, value)
+        return cls('not_an_address', message, name=name, key=key, value=value)
 
 
 class SshKeyError(K3sClusterException):
@@ -523,7 +646,7 @@ class NodeSizeError(K3sClusterException):
             self.role.replace('_', ' '), self.field, self.value)
 
 
-class K3sConfigError(K3sClusterException):
+class K3sConfigError(_ReasonedK3sException):
     """Raised when k3s configuration handed to ``Cluster.create()`` cannot be used.
 
     ``create()`` takes a ``server_config`` and an ``agent_config``: mappings
@@ -587,20 +710,8 @@ class K3sConfigError(K3sClusterException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('role', 'key', 'value', 'delimiter', 'path', 'detail')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(K3sConfigError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def not_a_mapping(cls, role, value):
@@ -660,7 +771,7 @@ class K3sConfigError(K3sClusterException):
         return cls('unreadable', message, path=path, detail=reason)
 
 
-class UnsupportedReleaseError(K3sClusterException):
+class UnsupportedReleaseError(_ReasonedK3sException):
     """Raised when ``Cluster.create()`` resolves a k3s release older than the plugin supports.
 
     The plugin writes configuration onto every node as files in
@@ -689,16 +800,9 @@ class UnsupportedReleaseError(K3sClusterException):
     ``reason``.
     """
 
-    def __init__(self, reason, message, release, channel, floor=None):
-        self.reason = reason
-        self.message = message
-        self.release = release
-        self.channel = channel
-        self.floor = floor
-        super(UnsupportedReleaseError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
+    FIELDS = ('release', 'channel', 'floor')
 
     @classmethod
     def too_old(cls, release, channel, floor):
@@ -708,7 +812,8 @@ class UnsupportedReleaseError(K3sClusterException):
             'releases silently ignore the configuration files the plugin\n'
             'writes onto every node. Choose a newer release channel.'
         ) % (channel, release, '.'.join(str(part) for part in floor))
-        return cls('too_old', message, release, channel, floor=tuple(floor))
+        return cls('too_old', message, release=release, channel=channel,
+                   floor=tuple(floor))
 
     @classmethod
     def unparseable(cls, release, channel):
@@ -717,10 +822,11 @@ class UnsupportedReleaseError(K3sClusterException):
             'shakenfist_client_k3s can read, so it cannot tell whether that\n'
             'release supports the configuration files the plugin writes.'
         ) % (channel, release)
-        return cls('unparseable', message, release, channel)
+        return cls('unparseable', message, release=release,
+                   channel=channel)
 
 
-class ReleaseLookupError(K3sClusterException):
+class ReleaseLookupError(_ReasonedK3sException):
     """Raised when looking up a k3s or Longhorn release fails.
 
     Covers five sites in ``primitives.py``, which reduce to four distinct
@@ -731,11 +837,15 @@ class ReleaseLookupError(K3sClusterException):
       by ``primitives.get_k3s_release()`` on its channel fetch (with
       ``product='k3s'``) and by ``primitives.get_longhorn_release()`` on
       its release fetch (with ``product='Longhorn'``); both render
-      identically apart from the product name.
+      identically apart from the product name. ``response_text`` is
+      bounded by the caller to ``primitives.RESPONSE_SNIPPET_BYTES``,
+      because it is third-party text and whoever serves it would
+      otherwise choose the length of this message.
     - ``no_usable_k3s_channels(url, response_snippet)``: raised by
       ``primitives.get_k3s_release()`` when the channel response parsed
       but yielded no channels at all. ``response_snippet`` is the
-      caller's already-truncated ``json.dumps(d)[:512]``.
+      caller's already-truncated ``json.dumps(d)``, bounded by
+      ``primitives.RESPONSE_SNIPPET_BYTES``.
     - ``unknown_channel(release_channel)``: raised by
       ``primitives.get_k3s_release()`` when the requested channel is not
       in the (possibly cached) release map.
@@ -749,25 +859,10 @@ class ReleaseLookupError(K3sClusterException):
     None rather than raising ``AttributeError``.
     """
 
-    #: The union of the fields the classmethods below set. A caller which
-    #: does not know which constructor ran -- ``docs/library-api.md``
-    #: describes these as the failure's details, and phase 5's
-    #: ``fail_json()`` will serialise them -- must be able to read any of
-    #: them off any instance.
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('product', 'url', 'status_code', 'response_text',
               'response_snippet', 'release_channel')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(ReleaseLookupError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def http_status(cls, product, url, status_code, response_text):
@@ -807,19 +902,27 @@ class AgentOperationError(K3sClusterException):
     Built by ``Cluster._agent_op_error()`` and raised by its three
     callers: ``Cluster.await_idle()``, ``Cluster.await_fetch()`` and
     ``Cluster.reap_execute()``.
-    ``command_description`` is the value ``_describe_agent_op(aop,
-    max_len=None)`` returns, and is only rendered when truthy. ``results``
+    ``command_description`` is the value
+    ``progress.describe_agent_op(aop, max_len=None)`` returns, and is
+    only rendered when truthy. ``results``
     is the agent operation's results dict; when it is empty (or falsy) a
     fixed "no results were recorded" line is rendered instead of a JSON
     dump.
 
+    ``command_description`` and ``results`` are redacted on the way in,
+    not on the way out: an agent command carries a credential when the
+    command needs one, the API echoes the command line back, and the
+    agent's own stdout may repeat it. Redacting in the constructor means
+    no raiser has to remember and nothing dangerous is ever stored, so a
+    rendering site added later is covered by construction. See
+    ``progress.redact_command_line()``.
+
     ``state`` is the operation state which brought us here, and is
-    rendered only when it is not ``error``. That keeps the message
-    byte for byte what it was for the case which has always raised this,
-    while saying which ending it was for the one which did not:
-    ``expired`` means Shaken Fist took the operation's wall clock budget
-    away rather than the command failing, and "run it again with a longer
-    deadline" and "the command is broken" are different next steps.
+    rendered only when it is not ``error``. That keeps the message byte
+    for byte what it was for the case which has always raised this, while
+    saying which ending it was for the one which did not. Why the states
+    are distinguished at all, and why a wait enumerates them rather than
+    naming two endings, is on the constants at the top of ``cluster.py``.
     """
 
     def __init__(self, instance_name, instance_uuid, operation_uuid,
@@ -827,8 +930,9 @@ class AgentOperationError(K3sClusterException):
         self.instance_name = instance_name
         self.instance_uuid = instance_uuid
         self.operation_uuid = operation_uuid
-        self.command_description = command_description
-        self.results = results
+        self.command_description = progress.redact_command_line(
+            command_description)
+        self.results = progress.redact_structure(results)
         self.state = state
         super(AgentOperationError, self).__init__(instance_name)
 
@@ -857,18 +961,23 @@ class CommandFailedError(K3sClusterException):
 
     Raised by ``Cluster.reap_execute()`` from its return-code check, as
     distinct from its agent operation state check, which raises
-    ``AgentOperationError``. ``stdout`` and ``stderr`` are the raw
-    strings from the agent operation's results; ``__str__`` re-joins each
+    ``AgentOperationError``. ``stdout`` and ``stderr`` are the strings
+    from the agent operation's results; ``__str__`` re-joins each
     on its own prefixed line exactly as the original ``print()`` calls did.
+
+    ``commandline``, ``stdout`` and ``stderr`` are redacted on the way in,
+    for the reason ``AgentOperationError`` gives: this is the exception a
+    failed k3s install raises, and the command line the API echoes back
+    carries the cluster's node or server token.
     """
 
     def __init__(self, instance_name, instance_uuid, commandline, return_code, stdout, stderr):
         self.instance_name = instance_name
         self.instance_uuid = instance_uuid
-        self.commandline = commandline
+        self.commandline = progress.redact_command_line(commandline)
         self.return_code = return_code
-        self.stdout = stdout
-        self.stderr = stderr
+        self.stdout = progress.redact_command_line(stdout)
+        self.stderr = progress.redact_command_line(stderr)
         super(CommandFailedError, self).__init__(instance_name)
 
     def __str__(self):
@@ -883,7 +992,7 @@ class CommandFailedError(K3sClusterException):
         return '\n'.join(lines)
 
 
-class KubeconfigError(K3sClusterException):
+class KubeconfigError(_ReasonedK3sException):
     """Raised when a local kubeconfig merge or cleanup fails.
 
     Not writes: the three ``open(main_config_path, 'w')`` calls in
@@ -916,21 +1025,9 @@ class KubeconfigError(K3sClusterException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('main_config_path', 'name', 'returncode', 'stderr',
               'config_elem')
-
-    def __init__(self, reason, message, **fields):
-        self.reason = reason
-        self.message = message
-        for key in self.FIELDS:
-            setattr(self, key, None)
-        for key, value in fields.items():
-            setattr(self, key, value)
-        super(KubeconfigError, self).__init__(message)
-
-    def __str__(self):
-        return self.message
 
     @classmethod
     def missing_kubectl(cls, main_config_path, name):
