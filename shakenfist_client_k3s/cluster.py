@@ -2704,9 +2704,15 @@ class Cluster:
         # property that holds only while one caller remembers a flag; and
         # -v is exactly the flag somebody adds when a delete is failing,
         # which is also when they paste the output into a bug report.
+        #
+        # The caller's k3s configuration is redacted whole whenever there is
+        # any. k3s takes credentials inline as configuration keys
+        # (etcd-s3-secret-key, agent-token, a datastore-endpoint carrying a
+        # password), and a list of those here would go stale with k3s.
         self.reporter.debug('Cluster metadata:')
         for k in md:
-            if k in SECRET_METADATA_KEYS and md[k] is not None:
+            if ((k in SECRET_METADATA_KEYS and md[k] is not None)
+                    or (k in ('server_config', 'agent_config') and md[k])):
                 self.reporter.debug('    %s = %s' % (k, progress.REDACTED))
             else:
                 self.reporter.debug('    %s = %s' % (k, md[k]))

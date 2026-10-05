@@ -156,6 +156,19 @@ Other things to know:
   check.
 - A bad file, a refused key, or a release that is too old is reported
   before anything is built or the cluster's name is registered.
+- Both mappings are stored in the cluster's metadata, printed by
+  `show`, and written to each node as a file whose mode follows the
+  node's umask. k3s accepts credentials inline as keys
+  (`etcd-s3-secret-key`, `agent-token`, a `datastore-endpoint` with a
+  password in it), so keep them out of these files; `delete -v`
+  redacts both mappings, but nothing else does.
+- The refused keys protect the plugin's own operations. They are not a
+  security boundary: whoever writes either file controls the security
+  of every node in that role (`kube-apiserver-arg` alone can turn off
+  the API server's authentication), which is no more than the
+  cluster's owner can already do. A tool which accepts configuration
+  from someone it trusts less than that must apply its own allowlist
+  of keys.
 
 An example for an OpenStack-Helm deployment. `servers.yaml` keeps
 Traefik out of the way, labels the control plane nodes, and removes the

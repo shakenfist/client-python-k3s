@@ -2842,6 +2842,31 @@ class SecretRedactionTestCase(testtools.TestCase):
         self.assertIn('node_network = net-1', out)
         self.assertIn('state = created', out)
 
+    def test_delete_does_not_debug_log_the_callers_k3s_configuration(self):
+        # k3s takes credentials inline as configuration keys, and nothing
+        # stops a caller putting one in either file.
+        md = _interrupted_md(state='created',
+                             control_plane_nodes=['inst-001'])
+        md['server_config'] = {'etcd-s3-secret-key': 'SECRET-S3-KEY'}
+        md['agent_config'] = {}
+
+        client = ActionLogClient()
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        client.metadata[MD_KEY] = md
+        client.instances['inst-001'] = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        reporter = progress.CollectingReporter(verbose=True)
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            Cluster(client, 'banana', 'testns', reporter=reporter).delete()
+
+        out = reporter.getvalue()
+        self.assertNotIn('SECRET-S3-KEY', out)
+        self.assertIn('server_config = %s' % progress.REDACTED, out)
+        # An empty configuration is not a secret being hidden.
+        self.assertIn('agent_config = {}', out)
+
     def test_an_absent_secret_is_not_reported_as_redacted(self):
         """A None token is not a secret being hidden, and saying so misleads."""
         client = ActionLogClient()
