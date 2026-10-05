@@ -2300,7 +2300,8 @@ class CheckK3sReleaseTestCase(testtools.TestCase):
         self.assertEqual((1, 21, 1), cluster_module.K3S_RELEASE_FLOOR)
 
     def test_supported_releases_are_accepted(self):
-        for release in ('v1.21.1+k3s1', 'v1.36.5+k3s1', 'v2.0.0+k3s1'):
+        for release in ('v1.21.1+k3s1', 'v1.36.5+k3s1', 'v2.0.0+k3s1',
+                        'v1.33.4', 'v1.34.0-rc1+k3s1'):
             self.assertIsNone(
                 cluster_module.check_k3s_release(release, 'stable'))
 
@@ -2342,6 +2343,28 @@ class CheckK3sReleaseTestCase(testtools.TestCase):
             exceptions.UnsupportedReleaseError,
             cluster_module.check_k3s_release, None, 'stable')
         self.assertEqual('unparseable', e.reason)
+
+    def test_a_release_which_only_starts_well_is_unparseable(self):
+        # The release is third-party text. A good prefix followed by a
+        # terminal escape or a newline would reach too_old()'s message as
+        # it stands; unparseable() renders it with repr().
+        for release in ('v1.20.0\x1b[2J+k3s1', 'v1.33.4\nINJECT',
+                        'v1.33.4 +k3s1', 'v1.33.4k3s1'):
+            e = self.assertRaises(
+                exceptions.UnsupportedReleaseError,
+                cluster_module.check_k3s_release, release, 'stable')
+            self.assertEqual('unparseable', e.reason)
+            self.assertIn(repr(release), str(e))
+
+    def test_a_component_must_be_a_few_ascii_digits(self):
+        # \d would take digits from other scripts, which int() reads, and
+        # thousands of digits make int() itself raise on newer Pythons.
+        for release in ('v\uff11.\uff12\uff11.\uff11', 'v1.21.' + '1' * 5000,
+                        'v1.21.1234567890'):
+            e = self.assertRaises(
+                exceptions.UnsupportedReleaseError,
+                cluster_module.check_k3s_release, release, 'stable')
+            self.assertEqual('unparseable', e.reason)
 
 
 class ManifestHeredocTestCase(testtools.TestCase):

@@ -699,6 +699,16 @@ def check_k3s_release(release, channel):
     That needs a channel which resolves to exactly one, and the v1.21
     channel resolves to v1.21.14+k3s1.
 
+    What follows the version does have to look like a suffix, though: a
+    '-' or '+' and then only ASCII letters, digits, '.', '-' and '+'. The
+    release comes from the k3s update API, or from the namespace's cache
+    of it, which is third-party writable. A string with a control
+    character or a newline after a good prefix would otherwise be accepted
+    and land in too_old()'s message as it stands, and a component of
+    thousands of digits makes int() raise on newer Pythons. Each component
+    is ASCII digits for the same reason: the regular expression digit class
+    also matches digits from other scripts, which int() reads.
+
     A release this cannot parse raises
     exceptions.UnsupportedReleaseError.unparseable rather than being let
     through, because a version which cannot be read is not one the plugin
@@ -707,7 +717,9 @@ def check_k3s_release(release, channel):
     """
     match = None
     if isinstance(release, str):
-        match = re.match(r'^v(\d+)\.(\d+)\.(\d+)', release)
+        match = re.match(
+            r'v([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(?:[-+][0-9A-Za-z.+-]*)?\Z',
+            release)
     if not match:
         raise exceptions.UnsupportedReleaseError.unparseable(release, channel)
 
