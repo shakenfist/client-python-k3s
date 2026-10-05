@@ -229,6 +229,35 @@ curl -sfL -o "${tmpdir}/kubectl.sha256" \
 sudo install -m 0755 "${tmpdir}/kubectl" /usr/local/bin/kubectl
 rm -rf "${tmpdir}"
 
+status 'Verify a k3s release older than the floor is refused'
+# Every create refuses a release older than v1.21.1+k3s1, straight after
+# the channel lookup and before the name is registered or anything is
+# built, so this costs seconds. The v1.20 channel still resolves to such a
+# release, and this is the only check that the live update API's release
+# strings still parse: the unit tests hand the check literals. If upstream
+# ever drops the v1.20 channel the create fails as an unknown channel
+# instead, and the message check below fails saying so rather than
+# passing. --worker-count 0 keeps a create which wrongly succeeds small.
+too_old_output=/tmp/k3s-ci-floor-refusal
+if sf-client k3s create ciTooOld --release-channel v1.20 \
+        --worker-count 0 > "${too_old_output}" 2>&1; then
+    echo 'create on the v1.20 channel succeeded; it should have been refused'
+    exit 1
+fi
+if ! grep -qF 'older than' "${too_old_output}" \
+        || ! grep -qF 'v1.21.1' "${too_old_output}"; then
+    echo 'create on the v1.20 channel failed, but not with the release floor refusal:'
+    cat "${too_old_output}"
+    exit 1
+fi
+# A here-string rather than a pipe: under pipefail, grep -q exiting early
+# can fail the pipe's writer and so the condition.
+clusters=$(sf-client k3s list)
+if grep -qxF ciTooOld <<< "${clusters}"; then
+    echo 'The refused create registered ciTooOld anyway'
+    exit 1
+fi
+
 status 'Create the cluster'
 # A manifest staged at create time, which k3s applies itself the first
 # time the server starts. This is the only tier which can answer whether
