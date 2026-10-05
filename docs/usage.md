@@ -44,7 +44,7 @@ Builds a cluster and, unless `--no-kubeconfig` is given, leaves it in
 | `--worker-memory` | 2048 | RAM, in MB, for each worker node. A positive integer. |
 | `--worker-disk` | 50 | Disk, in GB, for each worker node. A positive integer. |
 | `--server-config PATH` | none | A YAML mapping of k3s configuration keys, applied to every control plane node. A few keys the plugin depends on are refused; see "k3s configuration", below. |
-| `--agent-config PATH` | none | A YAML mapping of k3s configuration keys, applied to every worker, including workers added later by `expand-workers`. The same keys are refused for the agent role as listed below. |
+| `--agent-config PATH` | none | A YAML mapping of k3s configuration keys, applied to every worker, including workers added later by `expand-workers`. A smaller set of keys is refused for the agent role; see "k3s configuration", below. |
 
 Each node is a Shaken Fist instance on a Debian 12 base image, with a
 floating address and the `sf-agent2` side channel enabled. Nodes
@@ -151,11 +151,13 @@ Other things to know:
   before anything is built or the cluster's name is registered.
 
 An example for an OpenStack-Helm deployment. `servers.yaml` keeps
-Traefik out of the way and labels the control plane nodes:
+Traefik out of the way, labels the control plane nodes, and removes the
+default taint:
 
 ```yaml
 disable: [traefik]
 node-label: [openstack-control-plane=enabled]
+node-taint: []
 ```
 
 and `agents.yaml` labels the workers as compute nodes:
@@ -169,12 +171,12 @@ sf-client k3s create mycluster \
     --server-config servers.yaml --agent-config agents.yaml
 ```
 
-The servers end up with traefik and servicelb both disabled. Because
-the default taint applies, OpenStack services labelled for the control
-plane would be blocked from those nodes, so such a deployment may want
-`node-taint: []` on the servers or must add tolerations. Which of the
-two is right is still being settled against a live cluster; see
-`docs/plans/PLAN-node-customisation.md`.
+The servers end up with traefik and servicelb both disabled, and
+untainted. Without `node-taint: []` they would keep the default taint,
+and OpenStack-Helm's charts ship their control plane toleration
+disabled, so every OpenStack service labelled for the control plane
+would stay Pending. Enabling that toleration in each chart is the
+alternative.
 
 **Behaviour changes.** These apply to every new cluster, whether or not
 the options above are used, and existing clusters are untouched:
