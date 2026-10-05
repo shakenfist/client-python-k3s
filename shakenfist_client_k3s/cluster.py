@@ -2277,10 +2277,16 @@ class Cluster:
         p.phase('Fetching cluster credentials')
         aop = self.client.instance_get(
             md['control_plane_nodes'][0], '/etc/rancher/k3s/k3s.yaml')
-        kubeconfig = self.await_fetch(aop).replace(
-            '127.0.0.1', md['api_address_floating'])
+        kc = yaml.safe_load(self.await_fetch(aop))
 
-        kc = yaml.safe_load(kubeconfig)
+        # Set rather than rewritten. k3s writes https://127.0.0.1:6443 here
+        # only when no bind-address is configured, and the bind address when
+        # one is, which a caller's server_config can do; substituting for
+        # 127.0.0.1 would then leave the kubeconfig pointing at the bind
+        # address, with nothing failing. 6443 is the port K3S_URL assumes,
+        # and https-listen-port is an owned key.
+        kc['clusters'][0]['cluster']['server'] = (
+            'https://%s:6443' % md['api_address_floating'])
         fqcn = '%s.%s' % (self.name, self.namespace)
         kc['clusters'][0]['name'] = fqcn
         kc['contexts'][0]['name'] = fqcn

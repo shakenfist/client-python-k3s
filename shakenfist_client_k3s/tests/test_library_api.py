@@ -656,6 +656,39 @@ class K3sConfigTestCase(LibraryTestCase):
         self.assertEqual(self.AGENT, self._stored()['agent_config'])
 
 
+class BindAddressClient(RecordingClient):
+    """A client whose node wrote its kubeconfig for a configured bind-address.
+
+    k3s puts https://127.0.0.1:6443 in /etc/rancher/k3s/k3s.yaml only when
+    no bind-address is set. With one, the server URL names that address.
+    """
+
+    def get_blob_data(self, blob_uuid):
+        if blob_uuid.endswith('k3s.yaml'):
+            yield fakes.KUBECONFIG.replace(
+                '127.0.0.1', '10.0.0.4').encode('utf-8')
+        else:
+            yield from super(BindAddressClient, self).get_blob_data(blob_uuid)
+
+
+class KubeconfigServerTestCase(LibraryTestCase):
+    """The recorded kubeconfig names the floating API address, however k3s wrote it."""
+
+    def _server(self):
+        kc = yaml.safe_load(self.client.metadata[MD_KEY]['kubeconfig'])
+        return kc['clusters'][0]['cluster']['server']
+
+    def test_the_loopback_address_is_replaced(self):
+        self._cluster().create(1, 1, 1)
+        self.assertEqual('https://192.168.10.100:6443', self._server())
+
+    def test_a_bind_address_is_replaced_too(self):
+        self.client = BindAddressClient()
+        self._cluster().create(
+            1, 1, 1, server_config={'bind-address': '10.0.0.4'})
+        self.assertEqual('https://192.168.10.100:6443', self._server())
+
+
 class ClusterAccessorTestCase(testtools.TestCase):
     """show() and get_kubeconfig(), which return rather than print."""
 
