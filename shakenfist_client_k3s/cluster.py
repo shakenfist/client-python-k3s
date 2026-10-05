@@ -572,8 +572,12 @@ def validate_k3s_config(config, role):
     if not config:
         return ''
 
+    # Sorted, so the file on a node reads the same whatever order the
+    # mapping was in. safe_dump() sorts by default; sort_keys is not passed
+    # because the keyword only exists from PyYAML 5.1, which pyproject.toml
+    # does not require, and older releases sort unconditionally anyway.
     text = yaml.safe_dump(json.loads(json.dumps(config)),
-                          default_flow_style=False, sort_keys=True)
+                          default_flow_style=False)
 
     # The same check read_manifests() makes, on the text that will be
     # written rather than on the values it came from. PyYAML indents every
@@ -1466,8 +1470,7 @@ class Cluster:
             if md.get('worker_nodes'):
                 plugin_config['node-taint'] = [
                     'node-role.kubernetes.io/control-plane:NoSchedule']
-            main = yaml.safe_dump(plugin_config, default_flow_style=False,
-                                  sort_keys=True)
+            main = yaml.safe_dump(plugin_config, default_flow_style=False)
         elif role == 'agent':
             main = ('# Written by shakenfist_client_k3s; caller '
                     'configuration is in config.yaml.d/.\n')
@@ -1497,7 +1500,7 @@ class Cluster:
                 '/etc/rancher/k3s/config.yaml.d/'
                 '90-sf-client-k3s-enforced.yaml',
                 yaml.safe_dump({'disable+': ['servicelb']},
-                               default_flow_style=False, sort_keys=True)))
+                               default_flow_style=False)))
 
         return cmds
 

@@ -2021,8 +2021,7 @@ class ValidateK3sConfigTestCase(testtools.TestCase):
 
         self.assertEqual(self.REALISTIC, yaml.safe_load(text))
         self.assertEqual(
-            yaml.safe_dump(self.REALISTIC, default_flow_style=False,
-                           sort_keys=True),
+            yaml.safe_dump(self.REALISTIC, default_flow_style=False),
             text)
         # Block style and sorted, so the file on the node reads the same
         # whatever order the caller's mapping happened to be in.
