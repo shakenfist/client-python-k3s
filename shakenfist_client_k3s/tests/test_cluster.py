@@ -2097,6 +2097,17 @@ class ValidateK3sConfigTestCase(testtools.TestCase):
         self.assertEqual({'tls-san+': ['k3s.example.com']},
                          yaml.safe_load(text))
 
+    def test_a_callers_own_plus_key_is_accepted(self):
+        # docs/usage.md tells a caller to write node-taint+ to add a taint
+        # to the plugin's. The '+' is stripped only to find an owned key
+        # behind it; a '+' on any other key is the caller's to use.
+        config = {'node-taint+': ['dedicated=infra:NoSchedule'],
+                  'node-label+': ['a=b'],
+                  'disable+': ['local-storage']}
+        for role in ('server', 'agent'):
+            text = cluster_module.validate_k3s_config(config, role)
+            self.assertEqual(config, yaml.safe_load(text))
+
     def test_a_doubled_plus_is_still_an_owned_key(self):
         # Only exactly tls-san+ is excused; anything else which strips to
         # an owned key is that key.
