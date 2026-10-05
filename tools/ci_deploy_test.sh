@@ -18,13 +18,32 @@ set -o pipefail
 # is the only tier which can tell whether the name it computes is the one
 # k3s actually registered.
 CLUSTER=ciMixed
-# The second, deliberately minimal cluster: one control plane node and
-# none of the optional components. It exists because --no-metallb,
-# --no-longhorn and --no-kubeconfig change what create() does on a real
-# cluster and nowhere else can tell whether skipping those steps leaves a
-# working cluster behind. It is cheaper than the cluster above rather
-# than more expensive: no worker nodes, and neither component install.
+# The second, deliberately minimal cluster: one control plane node, one
+# worker and none of the optional components. It exists because
+# --no-metallb, --no-longhorn and --no-kubeconfig change what create() does
+# on a real cluster and nowhere else can tell whether skipping those steps
+# leaves a working cluster behind. It is cheaper than the cluster above
+# rather than more expensive: one worker, and neither component install.
+#
+# The worker is there for the node-taint: [] opt-out this cluster carries.
+# A cluster with no workers is never tainted, so on one the opt-out
+# assertion would pass with the opt-out broken; only a cluster which would
+# otherwise be tainted can show the caller's empty list replacing the
+# default. It also disables and labels nothing, which makes it the positive
+# control for the main cluster's absence checks: Traefik and its svclb pods
+# have to appear here, or those checks are looking for the wrong names.
 MINIMAL_CLUSTER=ciMinimal
+# Node sizes for the main cluster, shared by its create and the assertions
+# which read them back. Every value differs from the 2 / 2048 / 50 default
+# and from the other role's, so a dropped flag or a swapped role shows up
+# as a wrong number rather than passing. The minimal cluster keeps the
+# defaults.
+CONTROL_PLANE_CPUS=4
+CONTROL_PLANE_MEMORY=4096
+CONTROL_PLANE_DISK=30
+WORKER_CPUS=3
+WORKER_MEMORY=3072
+WORKER_DISK=40
 # This tracks the cluster's k3s channel only loosely, which is fine for
 # the simple kubectl operations used here.
 # renovate: datasource=github-releases depName=kubernetes/kubernetes
@@ -45,6 +64,11 @@ dump_state() {
     status 'Failure diagnostics'
     sf-client instance list || true
     kubectl get nodes -o wide || true
+    # Labels and taints are what several of the node customisation
+    # assertions fail on, and the namespace is gone by the time anyone
+    # reads this log. Neither carries a secret.
+    kubectl get nodes --show-labels || true
+    kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints || true
     kubectl get pods -A || true
 }
 on_exit() {
@@ -82,8 +106,17 @@ worker_uuids() {
     # k3s show prints: worker_nodes = ['uuid-one', 'uuid-two']. Captured
     # first for the reason count_routed_addresses() gives below.
     local show_output
-    show_output=$(sf-client k3s show "${CLUSTER}")
+    show_output=$(sf-client k3s show "${CLUSTER}") || return 1
     echo "${show_output}" | grep 'worker_nodes' | grep -o "'[^']*'" | tr -d "'"
+}
+
+control_plane_uuids() {
+    # k3s show prints: control_plane_nodes = ['uuid-one']. Captured first
+    # for the reason count_routed_addresses() gives below, and never
+    # echoed whole for the reason dump_state() gives.
+    local show_output
+    show_output=$(sf-client k3s show "${CLUSTER}") || return 1
+    echo "${show_output}" | grep '^    control_plane_nodes = ' | grep -o "'[^']*'" | tr -d "'"
 }
 
 count_routed_addresses() {
@@ -91,9 +124,89 @@ count_routed_addresses() {
     # show output is captured first so a failure of sf-client itself
     # aborts the script rather than being masked as a zero count; the
     # || true only covers grep finding no matches.
+    #
+    # The explicit || return 1 is what makes that true. These helpers are
+    # called inside $(...), and bash clears set -e in a command
+    # substitution, so without it a failed sf-client would carry on to
+    # the pipeline below and the function would succeed with no output.
     local show_output
-    show_output=$(sf-client k3s show "${CLUSTER}")
+    show_output=$(sf-client k3s show "${CLUSTER}") || return 1
     echo "${show_output}" | grep 'routed_addresses' | grep -o "'[0-9.]*'" | wc -l || true
+}
+
+pod_names() {
+    # NAMESPACE/NAME for every pod in the cluster. Captured first so a
+    # kubectl failure is a failure, not an empty list which every absence
+    # check below would read as a pass.
+    local pods
+    pods=$(kubectl get pods -A --no-headers) || return 1
+    echo "${pods}" | awk '{print $1 "/" $2}'
+}
+
+assert_node_sizes() {
+    # k3s show prints node_sizes = {...} as a Python repr, which
+    # ast.literal_eval reads back; the comparison is between dicts, so key
+    # order does not matter. Only that one line is ever printed: the rest
+    # of the output carries the node token and the admin kubeconfig, for
+    # the reason dump_state() gives. This proves what the plugin recorded,
+    # not what Shaken Fist built; assert_instance_size() is that half.
+    local show_output found expected
+    show_output=$(sf-client k3s show "${CLUSTER}")
+    found=$(echo "${show_output}" | sed -n 's/^    node_sizes = //p')
+    expected="{'control_plane': {'cpus': ${CONTROL_PLANE_CPUS}, "
+    expected+="'memory': ${CONTROL_PLANE_MEMORY}, 'disk': ${CONTROL_PLANE_DISK}}, "
+    expected+="'worker': {'cpus': ${WORKER_CPUS}, 'memory': ${WORKER_MEMORY}, "
+    expected+="'disk': ${WORKER_DISK}}}"
+    if [ -z "${found}" ]; then
+        echo "Expected k3s show to report node_sizes = ${expected}"
+        echo 'Found no node_sizes line at all'
+        exit 1
+    fi
+    if ! python3 -c 'import ast, sys; sys.exit(ast.literal_eval(sys.argv[1]) != ast.literal_eval(sys.argv[2]))' \
+            "${found}" "${expected}"; then
+        echo "Expected k3s show to report node_sizes = ${expected}"
+        echo "Found node_sizes = ${found}"
+        exit 1
+    fi
+}
+
+assert_instance_size() {
+    # Shaken Fist's own view of an instance, rather than the plugin's
+    # record of what it asked for: a create_instance() which ignored the
+    # node's role would leave node_sizes correct and this wrong.
+    # sf-client --simple instance show prints cpus:N, memory:N (in MB) and,
+    # after a disk_spec,type,bus,size,base header, a
+    # disk_spec,TYPE,BUS,SIZE,BASE line per disk; nodes have one disk.
+    # Only those three values are ever printed, because the full output
+    # carries the instance's user data.
+    local role=$1
+    local uuid=$2
+    local cpus=$3
+    local memory=$4
+    local disk=$5
+    local show_output found_cpus found_memory found_disk
+    if [ -z "${uuid}" ]; then
+        echo "Expected a ${role} instance UUID to check the size of, found none"
+        exit 1
+    fi
+    show_output=$(sf-client --simple instance show "${uuid}")
+    found_cpus=$(echo "${show_output}" | awk -F: '$1 == "cpus" {print $2}')
+    found_memory=$(echo "${show_output}" | awk -F: '$1 == "memory" {print $2}')
+    found_disk=$(echo "${show_output}" | awk -F, '$1 == "disk_spec" && $4 != "size" {print $4}')
+    if [ "${found_cpus}" != "${cpus}" ] || [ "${found_memory}" != "${memory}" ] \
+            || [ "${found_disk}" != "${disk}" ]; then
+        echo "Expected ${role} ${uuid} to have cpus ${cpus}, memory ${memory} MB, disk ${disk} GB"
+        echo "Shaken Fist reports cpus ${found_cpus:-none}, memory ${found_memory:-none} MB," \
+            "disk ${found_disk:-none} GB"
+        exit 1
+    fi
+}
+
+count_labelled_nodes() {
+    # kubectl prints "No resources found" to stderr and exits 0 when the
+    # selector matches nothing, so wc -l is the count either way; a kubectl
+    # failure still fails the pipeline under pipefail.
+    kubectl get nodes -l "$1" -o name | wc -l
 }
 
 status 'Install sf-client and the plugin under test'
@@ -135,11 +248,35 @@ data:
   hazards: "$HOME `id` $(whoami) \"double\""
 MANIFEST
 
+# k3s configuration for each role, asserted once the cluster is up. The
+# bare disable is deliberate: it is the case where the plugin's enforced
+# disable+: [servicelb] drop-in has to append to the caller's list rather
+# than be replaced by it, and the only place that k3s merge rule can be
+# seen working. The labels are how the assertions find out that each
+# role's file reached that role's nodes, agents included, without knowing
+# any node's name.
+cat - > "${manifest_dir}/ci-server.yaml" <<'SERVERCONFIG'
+disable: [traefik]
+node-label: [ci-role=server]
+SERVERCONFIG
+cat - > "${manifest_dir}/ci-agent.yaml" <<'AGENTCONFIG'
+node-label: [ci-role=agent]
+AGENTCONFIG
+
 sf-client k3s create "${CLUSTER}" \
     --control-plane-count 1 --worker-count 2 --metal-address-count 2 \
-    --manifest "${manifest_dir}/ci-staged.yaml"
+    --manifest "${manifest_dir}/ci-staged.yaml" \
+    --server-config "${manifest_dir}/ci-server.yaml" \
+    --agent-config "${manifest_dir}/ci-agent.yaml" \
+    --control-plane-cpus "${CONTROL_PLANE_CPUS}" \
+    --control-plane-memory "${CONTROL_PLANE_MEMORY}" \
+    --control-plane-disk "${CONTROL_PLANE_DISK}" \
+    --worker-cpus "${WORKER_CPUS}" \
+    --worker-memory "${WORKER_MEMORY}" \
+    --worker-disk "${WORKER_DISK}"
 
-# The manifest is on the cluster now, so the local copy has done its job.
+# The manifest and both configurations are on the cluster now (and the
+# configurations in its metadata), so the local copies have done their job.
 # Cleaned up here the way the kubectl download's temp directory is, rather
 # than left for the ephemeral runner to take with it.
 rm -rf "${manifest_dir}"
@@ -210,18 +347,117 @@ echo "LoadBalancer address is ${lb_address}"
 curl -sf --retry 10 --retry-delay 10 --retry-all-errors --max-time 10 \
     "http://${lb_address}/" > /dev/null
 
+status 'Verify the k3s configuration took effect on every node'
+# These run after the LoadBalancer test on purpose. That took minutes, so
+# Traefik's install job has long since run if it was going to, and ci-web
+# is itself a LoadBalancer Service, so a live servicelb would have made
+# svclb-ci-web-* pods by now. Run straight after the create, the absence
+# checks could pass because nothing had been scheduled yet. The minimal
+# cluster below is their positive control: it disables nothing, and the
+# same names have to appear there.
+#
+# The HelmChart is absent only if kubectl says NotFound: any other failure
+# (an API server which is not answering, say) is not evidence of absence.
+if traefik_chart=$(kubectl get helmchart -n kube-system traefik -o name 2>&1); then
+    echo 'Expected no kube-system/traefik HelmChart, given disable: [traefik] in --server-config'
+    echo "Found ${traefik_chart}"
+    exit 1
+fi
+if ! echo "${traefik_chart}" | grep -q 'NotFound'; then
+    echo 'Expected kubectl to report the kube-system/traefik HelmChart NotFound'
+    echo "It said: ${traefik_chart}"
+    exit 1
+fi
+pods=$(pod_names)
+# || true because no match is the expected answer here.
+traefik_pods=$(echo "${pods}" | grep 'traefik' || true)
+if [ -n "${traefik_pods}" ]; then
+    echo 'Expected no Traefik pods, given disable: [traefik] in --server-config'
+    echo "Found: ${traefik_pods}"
+    exit 1
+fi
+# servicelb surviving here means the caller's bare disable replaced the
+# plugin's enforced disable+: [servicelb] instead of being appended to.
+svclb_pods=$(echo "${pods}" | grep '/svclb-' || true)
+if [ -n "${svclb_pods}" ]; then
+    echo 'Expected no svclb- pods: servicelb is disabled whenever MetalLB is installed'
+    echo "Found: ${svclb_pods}"
+    exit 1
+fi
+
+# Counted by label rather than by node name, which on this mixed case
+# cluster the script would have to compute. Exact counts rather than "at
+# least one", so the server file landing on agents (or the other way
+# round) fails as well as either file going missing.
+server_nodes=$(count_labelled_nodes ci-role=server)
+if [ "${server_nodes}" -ne 1 ]; then
+    echo "Expected 1 node labelled ci-role=server, found ${server_nodes}"
+    exit 1
+fi
+agent_nodes=$(count_labelled_nodes ci-role=agent)
+if [ "${agent_nodes}" -ne 2 ]; then
+    echo "Expected 2 nodes labelled ci-role=agent, found ${agent_nodes}"
+    exit 1
+fi
+
+# The default taint, which the caller's --server-config here does not
+# touch: it is the positive control for the node-taint: [] opt-out the
+# minimal cluster asserts. The empty check matters, because a loop over no
+# control plane nodes would pass whatever their taints were.
+control_plane_nodes=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o name)
+if [ -z "${control_plane_nodes}" ]; then
+    echo 'Expected at least one node labelled node-role.kubernetes.io/control-plane, found none'
+    exit 1
+fi
+for node in ${control_plane_nodes}; do
+    taints=$(kubectl get "${node}" \
+        -o jsonpath='{range .spec.taints[*]}{.key}:{.effect}{"\n"}{end}')
+    if ! echo "${taints}" | grep -qx 'node-role.kubernetes.io/control-plane:NoSchedule'; then
+        echo "Expected ${node} to be tainted node-role.kubernetes.io/control-plane:NoSchedule"
+        echo "Its taints are: ${taints:-none}"
+        exit 1
+    fi
+done
+
+status 'Verify the nodes were built at the requested sizes'
+assert_node_sizes
+if ! control_plane_uuid=$(control_plane_uuids | sed -n 1p); then
+    echo 'Expected k3s show to list control_plane_nodes, found none'
+    exit 1
+fi
+assert_instance_size 'control plane node' "${control_plane_uuid}" \
+    "${CONTROL_PLANE_CPUS}" "${CONTROL_PLANE_MEMORY}" "${CONTROL_PLANE_DISK}"
+if ! first_worker=$(worker_uuids | sed -n 1p); then
+    echo 'Expected k3s show to list worker_nodes, found none'
+    exit 1
+fi
+assert_instance_size 'worker' "${first_worker}" \
+    "${WORKER_CPUS}" "${WORKER_MEMORY}" "${WORKER_DISK}"
+
 status 'Expand the cluster with an extra worker'
 before_workers=$(worker_uuids | sort)
 sf-client k3s expand-workers "${CLUSTER}" --worker-count 1
 wait_for_nodes 4
 after_workers=$(worker_uuids | sort)
-
-status 'Remove the worker which was just added'
 new_worker=$(comm -13 <(echo "${before_workers}") <(echo "${after_workers}"))
 if [ "$(echo "${new_worker}" | wc -l)" -ne 1 ] || [ -z "${new_worker}" ]; then
     echo "Expected exactly one new worker, found: ${new_worker}"
     exit 1
 fi
+
+status 'Verify the new worker was built from the recorded configuration'
+# expand-workers takes no sizing or configuration flags, so the only way
+# the new worker gets the agent label and the worker sizes is from what
+# create recorded in the cluster metadata.
+agent_nodes=$(count_labelled_nodes ci-role=agent)
+if [ "${agent_nodes}" -ne 3 ]; then
+    echo "Expected 3 nodes labelled ci-role=agent after expand-workers, found ${agent_nodes}"
+    exit 1
+fi
+assert_instance_size 'new worker' "${new_worker}" \
+    "${WORKER_CPUS}" "${WORKER_MEMORY}" "${WORKER_DISK}"
+
+status 'Remove the worker which was just added'
 echo "Removing worker ${new_worker}"
 sf-client k3s remove-worker "${CLUSTER}" --worker "${new_worker}"
 
@@ -271,9 +507,22 @@ status 'Create a cluster with none of the optional components'
 # which could never pass.
 kubeconfig_before=$(sha256sum "${HOME}/.kube/config")
 
+# The opt-out from the default control plane taint. Its replacing the
+# taint in config.yaml, rather than being merged with it, is a k3s rule
+# only a live node can show; see MINIMAL_CLUSTER above for why this
+# cluster has a worker.
+minimal_config_dir=$(mktemp -d)
+cat - > "${minimal_config_dir}/ci-server.yaml" <<'SERVERCONFIG'
+node-taint: []
+SERVERCONFIG
+
 sf-client k3s create "${MINIMAL_CLUSTER}" \
-    --control-plane-count 1 --worker-count 0 --metal-address-count 0 \
-    --no-metallb --no-longhorn --no-kubeconfig
+    --control-plane-count 1 --worker-count 1 --metal-address-count 0 \
+    --no-metallb --no-longhorn --no-kubeconfig \
+    --server-config "${minimal_config_dir}/ci-server.yaml"
+
+# On the cluster and in its metadata now, as for the main cluster above.
+rm -rf "${minimal_config_dir}"
 
 status 'Verify --no-kubeconfig left the local kubeconfig alone'
 kubeconfig_after=$(sha256sum "${HOME}/.kube/config")
@@ -294,7 +543,63 @@ sf-client k3s health "${MINIMAL_CLUSTER}" --strict
 KUBECONFIG=/tmp/k3s-ci-kubeconfig-minimal
 sf-client k3s getconfig "${MINIMAL_CLUSTER}" > "${KUBECONFIG}"
 export KUBECONFIG
-wait_for_nodes 1
+wait_for_nodes 2
+
+status 'Verify node-taint: [] removed the control plane taint'
+# The main cluster's taint assertion is the positive control: without
+# this file, a control plane with a worker beside it is tainted. Checked
+# after wait_for_nodes, so the transient not-ready taint has gone and
+# anything left came from the k3s configuration.
+control_plane_nodes=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o name)
+if [ "$(echo "${control_plane_nodes}" | wc -l)" -ne 1 ] || [ -z "${control_plane_nodes}" ]; then
+    echo "Expected exactly one node labelled node-role.kubernetes.io/control-plane, found: ${control_plane_nodes}"
+    exit 1
+fi
+taints=$(kubectl get "${control_plane_nodes}" -o jsonpath='{.spec.taints}')
+if [ -n "${taints}" ]; then
+    echo "Expected ${control_plane_nodes} to have no taints, given node-taint: [] in --server-config"
+    echo "Its taints are: ${taints}"
+    exit 1
+fi
+
+status 'Verify Traefik and servicelb run where nothing disabled them'
+# The positive control for the main cluster's absence checks. This cluster
+# disables nothing and was built without MetalLB, so k3s installs Traefik
+# from the kube-system/traefik HelmChart and servicelb gives its
+# LoadBalancer Service svclb-traefik-* pods. If these never appear, the
+# main cluster's checks for the same names prove nothing. Polled because
+# Traefik's install pulls its image from the internet; a failure here is
+# that poll timing out, not a node customisation fault.
+traefik_chart=''
+svclb_traefik_pods=''
+for _ in $(seq 30); do
+    if kubectl get helmchart -n kube-system traefik > /dev/null 2>&1; then
+        traefik_chart='present'
+    fi
+    pods=$(pod_names)
+    # || true because the pods may not have been scheduled yet.
+    svclb_traefik_pods=$(echo "${pods}" | grep '^kube-system/svclb-traefik-' || true)
+    if [ -n "${traefik_chart}" ] && [ -n "${svclb_traefik_pods}" ]; then
+        break
+    fi
+    sleep 10
+done
+if [ -z "${traefik_chart}" ] || [ -z "${svclb_traefik_pods}" ]; then
+    echo 'Positive control failed: after five minutes the minimal cluster, which disables nothing,'
+    echo 'still lacks the kube-system/traefik HelmChart or a kube-system/svclb-traefik- pod.'
+    echo "HelmChart: ${traefik_chart:-absent}; svclb-traefik pods: ${svclb_traefik_pods:-none}"
+    echo "Without them the main cluster's Traefik and svclb absence checks prove nothing."
+    exit 1
+fi
+
+status 'Verify the minimal cluster carries no ci-role labels'
+# The main cluster's labels came from its configuration files, not from
+# anything the plugin applies to every cluster.
+labelled_nodes=$(count_labelled_nodes ci-role)
+if [ "${labelled_nodes}" -ne 0 ]; then
+    echo "Expected no nodes with a ci-role label on ${MINIMAL_CLUSTER}, found ${labelled_nodes}"
+    exit 1
+fi
 
 status 'Verify expand-addresses refuses a cluster built without metallb'
 # Routing more addresses into a cluster with nothing to hand them out is

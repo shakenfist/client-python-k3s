@@ -195,7 +195,9 @@ was written.
    `with-node-id`, `token-file`), and puts the servicelb disable in a
    later drop-in, because a caller's `disable` would otherwise replace
    it. See [the phase 2 plan](PLAN-node-customisation-phase-02-k3s-config.md), survey findings 3-5 and decisions
-   3, 5 and 6.
+   3, 5 and 6. The enforced `disable+` appending to a caller's bare
+   `disable`, and drop-ins loading on agents, were observed on a live
+   cluster in phase 3 ([merge tier run](https://github.com/shakenfist/client-python-k3s/actions/runs/37246848512)).
 4. **Server configuration applies to every control plane node, and
    agent configuration to every worker.** That includes additional
    control plane nodes (which currently get no config file) and
@@ -242,7 +244,14 @@ was written.
    the honest cost is that it is not free on small clusters: a
    three-node cluster gives up a third of its schedulable capacity.
    The OpenStack-Helm prototype may well want the opt-out, and phase 3
-   should check whether it does rather than assume. The default is
+   should check whether it does rather than assume. **Answered in phase
+   3 planning, from the chart source: it does, as written.** It labels
+   only the control plane `openstack-control-plane=enabled`, and every
+   chart it deploys ships its control-plane toleration with
+   `enabled: false`, so every OpenStack control service would sit
+   Pending. See the
+   [phase 3 plan](PLAN-node-customisation-phase-03-live-validation.md),
+   survey finding 3. The default is
    still the right way round -- a control plane that competes with
    workloads for memory is a correctness problem, and the opt-out is
    one line for the caller who has measured and decided otherwise.
@@ -252,6 +261,9 @@ was written.
    the taint, so tainting the only node would fail every zero-worker
    create with MetalLB at its `rollout status` wait. See the phase 2
    plan's survey finding 7 and decision 7.
+
+   The default taint, and its `node-taint: []` opt-out, were observed
+   on a live cluster in phase 3 ([merge tier run](https://github.com/shakenfist/client-python-k3s/actions/runs/37246848512)).
 
 ## Open questions
 
@@ -331,8 +343,8 @@ than expected.
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
 | 1. Per-role sizing | [PLAN-node-customisation-phase-01-sizing.md](PLAN-node-customisation-phase-01-sizing.md) -- `create_instance(node_type)`; `node_sizes` in metadata with fallback defaults for existing clusters; six CLI flags and matching `create()` parameters; `show` displays sizes, including the 2 / 2048 / 50 fallback for clusters created before them (it already prints every recorded key); the documented sizing floor from open question 3; drop the bare `apt-get install -y` at `cluster.py:1052`; unit tests for the metadata fallback and for the sizes reaching `client.create_instance`; regenerate the `tests/cli_contract/` snapshots; update `docs/usage.md` and `docs/library-api.md`. Unit tests can verify everything except the live build. | Complete | `ddb1f3b` (#92) |
-| 2. k3s configuration pass-through | [PLAN-node-customisation-phase-02-k3s-config.md](PLAN-node-customisation-phase-02-k3s-config.md) -- Open question 1 and the `config.yaml.d` version floor are resolved in the phase plan; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; write the default control plane `node-taint` per design 7 (only when the cluster has workers) and disable `servicelb` through a later, plugin-enforced drop-in whenever `install_metallb` is true, per open question 1; refuse k3s releases older than v1.21.1+k3s1; unit tests for validation, the file content, `expand-workers` reusing the recorded config, the default taint being present, and a caller's `node-taint: []` replacing it; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels). (The sizing floor moved to phase 1, where open question 3 put it; this row used to repeat it.) The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | In progress | |
-| 3. Live validation | Extend `tools/ci_deploy_test.sh` to create with non-default sizes and both config files (disable Traefik, label control plane and workers differently), then assert with `kubectl`: no Traefik pods, no `svclb-*` pods, the expected labels on each node, the default `NoSchedule` taint on every control plane node, the recorded sizes in `show`, and a worker added by `expand-workers` carrying the agent labels. Also assert a second create passing `node-taint: []` leaves the control plane schedulable, since that is the documented opt-out. Run the merge-tier workflow. Then run the homelab OpenStack-Helm prototype's provision stage against the branch as a second, heavier consumer, and establish whether it wants the taint opt-out on a three node cluster (design 7). | Not started | |
+| 2. k3s configuration pass-through | [PLAN-node-customisation-phase-02-k3s-config.md](PLAN-node-customisation-phase-02-k3s-config.md) -- Open question 1 and the `config.yaml.d` version floor are resolved in the phase plan; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; write the default control plane `node-taint` per design 7 (only when the cluster has workers) and disable `servicelb` through a later, plugin-enforced drop-in whenever `install_metallb` is true, per open question 1; refuse k3s releases older than v1.21.1+k3s1; unit tests for validation, the file content, `expand-workers` reusing the recorded config, the default taint being present, and a caller's `node-taint: []` replacing it; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels). (The sizing floor moved to phase 1, where open question 3 put it; this row used to repeat it.) The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | Complete | `b791364` (#98) |
+| 3. Live validation | [PLAN-node-customisation-phase-03-live-validation.md](PLAN-node-customisation-phase-03-live-validation.md) -- Extend `tools/ci_deploy_test.sh` to create the main cluster with non-default sizes on both roles and both config files (disable Traefik, label control plane and workers differently), then assert with `kubectl`: no Traefik, no `svclb-*` pods, the expected labels on each node, the default `NoSchedule` taint on every control plane node, the recorded sizes in `show` and in Shaken Fist's own `instance show`, and a worker added by `expand-workers` carrying the agent label and worker sizes. The minimal cluster gains one worker and carries the `node-taint: []` opt-out, because a zero-worker cluster is never tainted and could not show it; it is also the positive control for the absence checks. Run the merge tier against the branch through `workflow_dispatch`. (This row used to ask for a run of the homelab OpenStack-Helm prototype's provision stage; that stage has not been built, and design 7's question to it was answered from the chart source instead.) | In progress | |
 | 4. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-3 against `develop` | Not started | |
 
 <!-- shared-block: plan-push-audit-phase v3 -->
