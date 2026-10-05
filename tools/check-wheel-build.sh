@@ -82,3 +82,59 @@ if [ -n "${artefacts}" ]; then
     exit 1
 fi
 echo "check-wheel-build: $(basename "${sdist}") OK (no build artefacts)"
+
+# And the same check for the case the one above cannot see. The artefact
+# grep asks whether a known kind of junk directory is present, which only
+# works for junk somebody has already met -- its own comment says the next
+# one will have a different name, and the next one did. The push audit
+# committed ten per-merge diffs under docs/plans/audit/diffs, deliberately
+# and for a good reason, and they rode into the sdist as 1.2MB across
+# eleven files. No name matched, the wheel stayed at twelve entries, and
+# the gate stayed green. MANIFEST.in prunes them now.
+#
+# The bound is on the whole rather than per file. Of the eleven diffs
+# only three were bigger than test_cluster.py, so a per-file cap would
+# have had to sit just above the largest legitimate source file to catch
+# them, and would still have let the other eight through. Total size and
+# entry count are what actually moved: 136 entries and 2.9MB, against
+# 126 and 1.7MB once they were pruned. These two are what the sdist
+# measures today plus room to grow, not a target -- a legitimate increase is normal and raising them is the
+# right response. What is not normal is a jump, which is what this asks
+# about.
+#
+# If this trips, read the listing it prints before changing the numbers.
+# The question is always whether the biggest new entries belong in a
+# source distribution, not whether the number is too small.
+MAX_SDIST_ENTRIES=160
+MAX_SDIST_BYTES=2200000
+
+sdist_entries=$(tar tzf "${sdist}" | wc -l)
+sdist_bytes=$(tar tzvf "${sdist}" | awk '{s+=$3} END {print s+0}')
+echo "check-wheel-build: sdist has ${sdist_entries} entries," \
+    "${sdist_bytes} bytes uncompressed"
+
+# A zero here is not a small sdist, it is a measurement that did not
+# happen -- the byte count is the third field of tar's verbose listing,
+# and a tar whose output is shaped differently would sum to nothing and
+# sail under both bounds without a word. Checked explicitly, because a
+# guard which passes when it cannot measure is worse than no guard.
+if [ "${sdist_entries}" -lt 1 ] || [ "${sdist_bytes}" -lt 1 ]; then
+    echo "check-wheel-build: could not measure the sdist" \
+        "(${sdist_entries} entries, ${sdist_bytes} bytes)."
+    echo "check-wheel-build: tar's listing is not the shape this expects."
+    exit 1
+fi
+
+if [ "${sdist_entries}" -gt "${MAX_SDIST_ENTRIES}" ] \
+        || [ "${sdist_bytes}" -gt "${MAX_SDIST_BYTES}" ]; then
+    echo "check-wheel-build: the sdist has grown past its bounds" \
+        "(${MAX_SDIST_ENTRIES} entries, ${MAX_SDIST_BYTES} bytes)."
+    echo "check-wheel-build: the largest entries are:"
+    tar tzvf "${sdist}" | sort -k3 -n -r | head -15 \
+        | awk '{printf "  %10d  %s\n", $3, $NF}'
+    echo "check-wheel-build: if they belong in a source release, raise the"
+    echo "check-wheel-build: bounds in this script. If they do not, prune"
+    echo "check-wheel-build: them in MANIFEST.in."
+    exit 1
+fi
+echo "check-wheel-build: sdist size OK"

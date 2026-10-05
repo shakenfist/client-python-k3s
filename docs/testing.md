@@ -14,6 +14,41 @@ reach the orchestration path -- whether a cluster actually assembles is
 only answerable against a live Shaken Fist cloud, which is what the
 merge tier of CI is for.
 
+## Checking that the tests would fail
+
+A green suite says the tests pass. It does not say that any of them
+would have failed, and for the properties nobody exercises by hand --
+a secret that must not reach stderr, a heredoc body that must not be
+able to end itself, a file that must be created `0600` -- that is the
+only question worth asking. Reading a test cannot distinguish "this
+holds" from "this cannot fail".
+
+```bash
+python3 tools/mutation-check.py          # all of them
+python3 tools/mutation-check.py --only kubeconfig
+python3 tools/mutation-check.py -v       # show each test run
+```
+
+Each entry in that script makes one stated property false with a
+minimal edit, runs the test that is supposed to notice, and requires a
+failure. The file is restored from a copy taken immediately before the
+edit, so uncommitted work survives -- but do not interrupt a run. It is
+not in CI: it rewrites the working tree and costs a test run per
+mutation. Run it when the defended properties change, and when
+answering a review, so the set visibly grows instead of being
+reinvented each round.
+
+**A mutation that survives is the interesting outcome.** It means
+either that the property has no test or that the test cannot see the
+code you changed. The second really happens: the Ansible module harness
+runs the module as a script, so `sys.path[0]` is the tests directory,
+the repository root is never on the path, and those tests import the
+*installed* package. A bare `stestr run` therefore checks whatever was
+last installed, which is why those entries go through `tox -epy3`
+instead. That is
+[#106](https://github.com/shakenfist/client-python-k3s/issues/106), and
+it was found by exactly this script reporting a survivor.
+
 ## The two CI tiers
 
 `.github/workflows/functional-tests.yml` runs two tiers.

@@ -36,13 +36,22 @@ The counts below are the decided ones.
 | Numbered findings in | **62** (code quality 18, style 8, tests 15, documentation 8, security 13) |
 | Duplicate groups merged | **9**, collapsing 24 findings into 9 triage rows |
 | Findings dropped as out of scope (post-`eb248bd`) | **0 whole**; one finding halved, two cited line references dropped |
-| Taken as `fix` | **9** |
-| Taken as `document` | **5** |
+| Taken as `fix` | **9 rows** |
+| Taken as `document` | **4 rows** |
 | Taken as `consider` | **13 rows**, covering 16 findings |
-| Taken although rated `none` | **2** (one row) |
-| Declined | **31** |
-| Issues to file | **6** |
+| Taken although rated `none` | **2 findings**, one of which has its own row |
+| **Rows in "What I will take"** | **27** (9 + 4 + 13 + 1) |
+| **Findings taken** | **31** |
+| **Findings declined** | **31**, one row each |
+| **Accounted for** | **62** = 31 + 31 |
+| Issues to file | **6** (#100-#105; **#106** was filed outside this table) |
 | Issue comments to add | **4** (#96, #82, #89, #91) |
+
+The row and finding totals are spelled out because the phase's
+definition of done is that this table accounts for every finding, and
+that is only checkable if the sums are stated. The `document` count
+above read 5 until the pull request review did the arithmetic; the
+table has always had four such rows (CQ F6, CQ F7, sec F9, sec F10).
 
 Two bookkeeping corrections to the findings files themselves, because
 the phase's definition of done is that this table accounts for every

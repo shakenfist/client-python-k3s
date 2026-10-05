@@ -287,6 +287,7 @@ a correct caller never needs to catch it.
 | `K3sConfigError` | `create(server_config=..., agent_config=...)` is given a mapping that cannot be used -- not a mapping, a non-string key, a value that does not survive a JSON round trip, a key the plugin owns, or text that collides with the heredoc marker -- or `read_k3s_config()` cannot read or parse its file, before anything is built or the name is registered |
 | `UnsupportedReleaseError` | `create()` resolves a k3s release older than `v1.21.1+k3s1`, or one it cannot parse, right after the channel lookup and before anything is built or the name is registered |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
+| `ClusterMetadataError` | a value read back out of the namespace metadata cannot be used -- `expand_addresses()` finds something in `routed_addresses` that is not an IP address, or the API hands back one that is not. Raised before any address is routed, because the addresses are charged for and the configuration they go into is written afterwards |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
@@ -297,7 +298,16 @@ names the exact call site and the attributes it carries; several are
 built through classmethods (`ClusterNotFoundError.not_found(name)`,
 `KubeconfigError.merge_failed(...)`, and so on) rather than their
 constructors, because one class covers several call sites whose
-message text differs. `ClusterInterruptedError` carries the state the
+message text differs.
+
+Where a class has classmethods, **they are the interface and the
+constructor is not**. The seven classes that carry a `reason` share a
+base whose `__init__` takes `(reason, message, **fields)`, so every
+attribute past `message` is keyword-only, and the set of attributes a
+class carries is its `FIELDS` tuple rather than a parameter list.
+Catching these and reading their attributes is supported; constructing
+one positionally is not, and the shared base is free to move a field
+between classes without that being a breaking change. `ClusterInterruptedError` carries the state the
 cluster was left in (`state`) and, for its `not_usable()` form, which
 verb refused to run (`verb`); both of its messages name `sf-client k3s
 delete <name>` as the way out, because what is built is detection and

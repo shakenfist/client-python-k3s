@@ -27,3 +27,22 @@ done | sort -u > docs/plans/audit/scope-files.txt
 Read `scope-files.txt`; do not derive your own range. 16 of the 74
 files are under `docs/plans/`; only the documentation lens (6e) reads
 those.
+
+The SHAs in the loop above are the authoritative list, and so are the
+`diffs/` filenames, which were written by it. The phase plan's scope
+table is a hand transcription of the same ten and had two of them
+wrong; `ls diffs/` answers the question without trusting any prose.
+
+## Why the diffs are in git but not in a release
+
+`diffs/` is 1.2MB, which `MANIFEST.in` prunes from the sdist.
+setuptools_scm offers every tracked file to the sdist, so without that
+these would ship to everyone installing from source, forever, for a
+record of this project's history rather than a part of it. They stay in
+git because a reader checking a finding needs the code as it was, and
+they are regenerable from the loop above if they are ever dropped
+entirely. The findings and triage files cannot be regenerated -- they
+are judgements -- so those are small and do ship.
+`tools/check-wheel-build.sh` bounds the sdist's size and entry count so
+the next large tracked directory fails the gate instead of riding
+along.

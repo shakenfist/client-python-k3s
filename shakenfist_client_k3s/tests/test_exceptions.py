@@ -63,6 +63,29 @@ class NodeSizeErrorTestCase(testtools.TestCase):
             "worker cpus must be a positive integer, not '2'", str(e))
 
 
+class ClusterMetadataErrorTestCase(testtools.TestCase):
+    def test_not_an_address(self):
+        e = exceptions.ClusterMetadataError.not_an_address(
+            'banana', 'routed_addresses', '10.0.0.1\nEOF')
+
+        self.assertEqual('not_an_address', e.reason)
+        self.assertEqual('banana', e.name)
+        self.assertEqual('routed_addresses', e.key)
+        self.assertEqual('10.0.0.1\nEOF', e.value)
+
+    def test_the_value_is_rendered_with_repr(self):
+        # A value worth refusing usually contains a newline, and %s would
+        # print it as a newline -- so the message would show the attack
+        # laid out as the shell would have run it, with no indication of
+        # where the value started and stopped. NodeSizeError makes the
+        # same choice for the same reason.
+        e = exceptions.ClusterMetadataError.not_an_address(
+            'banana', 'routed_addresses', '10.0.0.1\nEOF\ntouch /pwned')
+
+        self.assertIn("'10.0.0.1\\nEOF\\ntouch /pwned'", str(e))
+        self.assertIn('routed_addresses', str(e))
+
+
 class ReleaseLookupErrorTestCase(testtools.TestCase):
     def test_http_status_k3s(self):
         e = exceptions.ReleaseLookupError.http_status(

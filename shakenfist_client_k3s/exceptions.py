@@ -523,6 +523,55 @@ class GuestFileError(_ReasonedK3sException):
                    delimiter=delimiter)
 
 
+class ClusterMetadataError(_ReasonedK3sException):
+    """Raised when a value read back out of the namespace metadata is not usable.
+
+    Rule 1 at the top of ``cluster.py`` says the metadata document is
+    outside controlled: anything holding the namespace's credentials can
+    write it, and conductor also does. Everything this package reads
+    from it is therefore either quoted, validated, or refused.
+
+    ``GuestFileError.delimiter_collision`` is the refusal of last resort
+    for a metadata value on its way into a heredoc, and it fires at the
+    point of writing. That is the wrong place for a verb which spends
+    something first. ``expand_addresses()`` routes floating addresses --
+    which are charged for -- and commits them to the metadata before the
+    configuration they are for is written, so a value which was already
+    bad fails after the spending rather than before it. Its docstring
+    makes the same argument for refusing a cluster without metallb up
+    front, and this is that argument applied to the document's contents
+    as well as its flags.
+
+    - ``not_an_address(name, key, value)``: a key which must hold IP
+      addresses holds something that is not one. Raised from two points:
+      ``expand_addresses()`` checks what is already recorded before it
+      allocates anything, and ``allocate_metallb_addresses()`` checks
+      each address the API hands back before recording it. Rule 1 says
+      the Shaken Fist API "is not this package's trust boundary" in as
+      many words, so the second check is required by the same rule as
+      the first rather than being paranoia about our own server. The
+      message deliberately does not say whether anything was changed,
+      because that differs between the two sites; the first has spent
+      nothing and the second may have routed an address it then refused
+      to record.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
+    FIELDS = ('name', 'key', 'value')
+
+    @classmethod
+    def not_an_address(cls, name, key, value):
+        message = (
+            'Cluster %s has an unusable value in its metadata: %s contains\n'
+            '%r, which is not an IP address, so it is refused rather than\n'
+            'written into the cluster configuration. That document can be\n'
+            "written by anything holding this namespace's credentials, so a\n"
+            'value in it is checked rather than trusted.'
+        ) % (name, key, value)
+        return cls('not_an_address', message, name=name, key=key, value=value)
+
+
 class SshKeyError(K3sClusterException):
     """Raised when the ssh key handed to ``Cluster.create()`` cannot be read.
 
@@ -661,7 +710,7 @@ class K3sConfigError(_ReasonedK3sException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('role', 'key', 'value', 'delimiter', 'path', 'detail')
 
     @classmethod
@@ -752,7 +801,7 @@ class UnsupportedReleaseError(_ReasonedK3sException):
     """
 
     #: The union of the fields the classmethods below set. See
-    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('release', 'channel', 'floor')
 
     @classmethod

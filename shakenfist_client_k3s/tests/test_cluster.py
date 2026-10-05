@@ -223,6 +223,39 @@ class AllocateMetallbAddressesTestCase(testtools.TestCase):
         self.assertIn('no routed addresses were available (requested 2)', out)
         self.assertNotIn('allocated', out)
 
+    def test_a_non_address_from_the_api_is_refused_before_it_is_recorded(self):
+        """Rule 1 puts the API outside this package's trust boundary.
+
+        Not paranoia about our own server so much as the rule applied
+        where it happens to point at it: whatever reaches
+        ``routed_addresses`` is interpolated into a YAML body written on
+        a node, and the metadata document is the one place a bad value
+        would persist and be used again by a later run. Refusing it here
+        is the only point at which it can be stopped from entering the
+        document at all.
+        """
+        stream = io.StringIO()
+        client = mock.MagicMock()
+        client.get_network.return_value = {'uuid': 'net-1'}
+        client.route_network_address.side_effect = [
+            '192.168.10.2', '10.0.0.1\nEOF\ntouch /pwned']
+        client.get_namespace_metadata.return_value = {MD_KEY: {
+            'name': 'banana', 'node_network': 'net-1',
+            'routed_addresses': ['192.168.10.1']}}
+        cluster = Cluster(client, 'banana', 'testns')
+        cluster.progress = progress.Progress(stream=stream)
+
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              cluster.allocate_metallb_addresses, 2)
+
+        self.assertEqual('not_an_address', e.reason)
+        self.assertEqual('routed_addresses', e.key)
+        self.assertEqual('banana', e.name)
+        self.assertIn('is not an IP address', str(e))
+        # Nothing was written, so a later run does not find the value
+        # waiting for it.
+        self.assertEqual([], client.set_namespace_metadata_item.mock_calls)
+
 
 class ExpandWorkersTestCase(testtools.TestCase):
     """Expanding a cluster installs k3s on the new workers and no others.
@@ -4170,6 +4203,128 @@ class RemoveWorkerEdgeCaseTestCase(testtools.TestCase):
                   if a[2] and a[2].startswith('kubectl drain')]
         self.assertEqual(1, len(drains), client.actions)
         self.assertIn('k3s-banana-node-003', drains[0][2])
+
+
+class ExpandAddressesChecksTheDocumentFirstTestCase(testtools.TestCase):
+    """A document which cannot produce a configuration is refused before spending.
+
+    ``heredoc()`` refuses a body an interpolated address could end, and
+    that refusal is correct and stays. What it cannot do is arrive in
+    time: ``expand_addresses()`` routes new floating addresses -- which
+    are charged for -- and commits them to the metadata, and only then
+    writes the configuration the old and new addresses share. So a value
+    which was already bad costs the caller an allocation before it is
+    told.
+
+    ``expand_addresses()`` makes exactly this argument in its own
+    docstring for a cluster without metallb, which it checks up front
+    for that reason. These tests are that argument applied to the
+    document's contents as well as its flags.
+    """
+
+    def _cluster(self, routed_addresses):
+        client = ActionLogClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'k3s_version': 'v1.33', 'node_network': 'net-1',
+            'node_token': 'a-token',
+            'api_address_floating': '10.0.0.1',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': routed_addresses}
+        return client, _make_cluster(client)
+
+    def test_a_hostile_recorded_address_is_refused_before_anything_is_routed(self):
+        client, cluster = self._cluster(
+            ['192.168.10.1', '10.0.0.1\nEOF\ntouch /pwned'])
+
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              cluster.expand_addresses, 2)
+
+        self.assertEqual('not_an_address', e.reason)
+        self.assertEqual('routed_addresses', e.key)
+        # The point of the whole change: nothing was allocated, so the
+        # refusal costs the caller an error and nothing else.
+        self.assertEqual(0, client.routed_serial)
+        self.assertEqual([], client.executed)
+
+    def test_a_merely_malformed_address_is_refused_too(self):
+        # The delimiter collision is the dramatic case; the check is for
+        # addresses, so a value which is harmless and still not an
+        # address is refused on the same ground rather than written into
+        # metallb's configuration for it to reject later.
+        client, cluster = self._cluster(['192.168.10.300'])
+
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              cluster.expand_addresses, 1)
+
+        self.assertEqual('192.168.10.300', e.value)
+        self.assertEqual(0, client.routed_serial)
+
+    def _expand_past_the_check(self, routed_addresses):
+        """Run expand_addresses as far as the configuration write, and no further.
+
+        What these cases assert is that the new check does not refuse a
+        document it should accept, which is the whole risk of adding a
+        validator. Writing metallb's configuration is a separate
+        concern with its own tests, and running it here would need the
+        agent's rollout commands scripted for no gain, so it is
+        replaced and asserted to have been reached.
+        """
+        client, cluster = self._cluster(routed_addresses)
+        with mock.patch.object(cluster, 'configure_metallb_addresses') as cfg:
+            cluster.expand_addresses(1)
+        cfg.assert_called_once_with()
+        return client
+
+    def test_an_ipv6_address_is_accepted(self):
+        # ip_address() rather than a regexp precisely so that this is not
+        # a new restriction: the check is "is this an address", not "does
+        # it look like the addresses we have seen so far".
+        client = self._expand_past_the_check(['fd00::1'])
+
+        self.assertEqual(1, client.routed_serial)
+
+    def test_an_empty_list_is_not_an_error(self):
+        # A cluster with metallb and no addresses yet is the ordinary
+        # case for the first expand-addresses.
+        client = self._expand_past_the_check([])
+
+        self.assertEqual(1, client.routed_serial)
+
+    def test_an_integer_is_not_an_address(self):
+        # ipaddress.ip_address(1) is 0.0.0.1, so a bare int passes the
+        # address parse and would then reach str.join() and raise
+        # TypeError from a place that cannot name the key. The metadata
+        # document is JSON, so an int in this list is a thing a writer can
+        # put there.
+        client, cluster = self._cluster(['192.168.10.1', 1])
+
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              cluster.expand_addresses, 1)
+
+        self.assertEqual(1, e.value)
+        self.assertEqual(0, client.routed_serial)
+
+    def test_a_boolean_is_not_an_address_either(self):
+        # Same reason: ip_address(True) is 0.0.0.1, and JSON has booleans.
+        client, cluster = self._cluster([True])
+
+        self.assertRaises(exceptions.ClusterMetadataError,
+                          cluster.expand_addresses, 1)
+
+        self.assertEqual(0, client.routed_serial)
+
+    def test_an_absent_key_is_not_an_error(self):
+        # Older clusters predate the key, and _require_addresses() is
+        # reached before anything reads it for real.
+        client, cluster = self._cluster([])
+        del client.metadata[MD_KEY]['routed_addresses']
+
+        with mock.patch.object(cluster, 'configure_metallb_addresses'):
+            cluster.expand_addresses(1)
+
+        self.assertEqual(1, client.routed_serial)
 
 
 class StagedManifestsAreWhatWasValidatedTestCase(testtools.TestCase):

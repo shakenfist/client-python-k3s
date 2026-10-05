@@ -328,6 +328,21 @@ contents depend on what `get.k3s.io`'s installer prints; I did not
 confirm that it ever echoes the token, so the finding rests on the
 command line.
 
+**Confirmed later, during the pull request review of this phase**, so
+the sentence above stands as what the lens knew and this is the answer
+to it. The installer fetched from `https://get.k3s.io` on 2026-10-05
+does not print the token in any form. It reads `K3S_TOKEN` once, to
+test it for emptiness when `K3S_URL` is set (`:181`), and otherwise
+only passes it through: `create_env_file()` writes the `K3S_*`
+environment to `/etc/systemd/system/k3s.service.env` through
+`tee ... >/dev/null`, after `chmod 0600`. Its four `set -x` calls are
+all inside the killall and uninstall scripts it *generates*, not in its
+own execution, and none of those scripts reads the token. So the
+secondary channel is empty for this installer, and `K3S_TOKEN=` on the
+command line was the whole of the leak. A future installer version
+could change that, which is the argument for the redaction living in
+the exception constructors rather than at any one raise site.
+
 Everything else in the file is clean. The `__init__` methods of
 `ManifestError`, `ReleaseLookupError` and `KubeconfigError` declare
 their field unions explicitly (`exceptions.py:376-378`, `557-561`,

@@ -69,24 +69,35 @@ Out of scope, explicitly:
 
 The master plan's phase 6 row says "the accumulated diff of phases 1-5
 against `develop`". Read literally as a range that is
-`73bd499..develop`, which is **78 files, 20,115 insertions, 115
-commits** -- and includes two other master plans plus sixteen unrelated
-merges. The `plan-push-audit-phase v3` shared block anticipates exactly
+`73bd499..develop`, which at this phase's base (`0c856fd`) is **78
+files, 20,115 insertions, 115 commits** -- and includes two other
+master plans plus sixteen unrelated merges. The base is named because
+`develop` moves: the same range is 79 files and 22,315 insertions by
+the time this phase opens its pull request, so a figure quoted against
+the bare branch name stops reproducing almost immediately. The `plan-push-audit-phase v3` shared block anticipates exactly
 this mistake: "unrelated work lands on the default branch between
 phases, so anything anchored on 'since the plan file appeared' is far
 too wide. It has to be recorded."
 
 The record is the `Merged` column. The scope is therefore the union of
 `git diff <merge>^1 <merge>` over the ten merge commits the column
-names -- **74 files, 18,122 insertions**:
+names -- **74 files, 18,123 insertions**:
 
 | Phase | Merges | Insertions |
 |-------|--------|-----------|
 | 1 | `7fb29e5` (#55) | 4,742 |
-| 2 | `1c32d12` (#63), `4e76704` (#65), `871f6de` (#68), `539b50d` (#69), `205e4c3` (#70) | 1,009 |
+| 2 | `1c32d12` (#63), `4e76704` (#65), `871f6ee` (#68), `539b50d` (#69), `205e4c3` (#70) | 1,010 |
 | 3 | `d51cf59` (#75) | 7,388 |
-| 4 | `2506b19` (#81), `d2e43d1` (#86) | 1,078 |
+| 4 | `2506c19` (#81), `d2e43d1` (#86) | 1,078 |
 | 5 | `eb248bd` (#90) | 3,905 |
+
+Two of those ten SHAs were mistyped when this table was first
+transcribed from the `Merged` column, and the audit's own review caught
+one of them. The authority is not this table: it is the filenames under
+`docs/plans/audit/diffs/`, which 6a generated from the merges it
+actually read, so `ls` answers "which commits were audited" without
+trusting any prose. Both typos were in the prose only -- the diffs were
+taken from the right commits, so no finding was affected.
 
 Of the 74 files, 16 are under `docs/plans/` and 58 are not. The
 non-test Python the audit's code-quality and security lenses actually
@@ -122,7 +133,7 @@ were written and are now done:
 
 - `ANSIBLE_GALAXY_TOKEN` exists as a `release` **environment** secret,
   created 2026-10-04T19:17:01Z.
-- `v0.2.0` was tagged at `0c856ed`, signed into tag object `da6a11f`
+- `v0.2.0` was tagged at `0c856fd`, signed into tag object `da6a11f`
   by `github-actions[bot]`, and published to PyPI and to Galaxy
   (`shakenfist.k3s` 0.2.0, 2026-10-04T20:32:05Z).
 - `ansible-galaxy collection install shakenfist.k3s` resolves, and
@@ -307,9 +318,22 @@ so no later step redoes them:
 ## What running the phase found
 
 Five lenses produced 62 numbered findings. Nine duplicate groups
-collapsed 24 of them into 9 rows; 23 rows were taken, 33 declined, 7
-issues filed and 6 comments added to existing ones. The suite went from
-461 tests to 492. Full detail is in `docs/plans/audit/`.
+collapsed 24 of them into 9 rows. Of the 62, **31 were taken** across
+27 triage rows -- 9 `fix`, 4 `document`, 13 `consider` and 1 rated
+`none` -- and **31 were declined**. Six issues were filed from the
+triage table (**#100**-**#105**) and a seventh, **#106**, outside it,
+because the test-harness defect it records was found while re-running
+the suites rather than by a lens. Four existing issues gained an
+occurrence (**#96**, **#82**, **#89**, **#91**), and **#58** and
+**#99** are closed by trailer rather than commented on. The suite went
+from 461 tests to 492; it reads 555 on this branch, the extra 63 being
+`node-customisation` phase 2's, which merged in while the audit ran.
+Full detail is in `docs/plans/audit/`.
+
+Every figure in that paragraph is derivable from `triage.md`, which is
+the point of keeping it: the first version of this paragraph said 23
+taken, 33 declined, 7 filed and 6 commented, and all four were wrong.
+The audit's review caught it by doing the arithmetic.
 
 ### The Isolation column was not followed, deliberately
 
@@ -415,6 +439,82 @@ Each of these is checkable, and most are one command:
   recorded merge commits diffed against their first parents, so a
   reader who never opens this file cannot mistake it for a range
   ending at `develop` (finding 1).
+
+## What the pull request review found
+
+The automated reviewer raised three `fix` items and three `consider`
+items on #107. Two of the three `fix` items were wrong numbers in this
+file -- a tag commit that does not resolve, and an outcome paragraph
+disagreeing with `triage.md` on all four of its figures -- and the
+third was two comments left pointing at a subclass after their
+rationale moved to the base class. The lesson is narrower than "check
+your arithmetic": this phase exists to make a five-phase plan's output
+checkable, and the two things a reader would check first were the
+figures and the commit SHAs, which were the two things wrong.
+
+Sweeping each class rather than fixing the reported instance found
+more of both. The reported SHA was one of three that do not resolve:
+the scope table's `871f6de` and `2506b19` are `871f6ee` and `2506c19`.
+The audit read the right commits -- `README.md`'s generation loop and
+the `diffs/` filenames both carry the correct ten -- so no finding was
+affected, but the plan's statement of what it read was wrong in two of
+ten rows and nothing noticed for the length of the phase. Likewise the
+`73bd499..develop` comparison was quoted against a branch name that
+moves, and had already drifted from 78 files to 79 by the time the
+pull request opened; it is anchored to this phase's base now.
+
+Three `consider` items, two taken:
+
+- **The sdist shipped the audit's diffs.** 1.2MB across eleven files,
+  in every source release from now on, because setuptools_scm offers
+  every tracked file and nothing bounded the result.
+  `tools/check-wheel-build.sh` already checked the sdist, for committed
+  build artefacts, by grepping names it knew -- and its own comment says
+  the next one will have a different name. It did. `MANIFEST.in` prunes
+  the diffs and the script now bounds the sdist's size and entry count,
+  which is a check that does not need to know the name. The decision to
+  keep the diffs in git is unchanged; shipping them to installers was
+  never part of it.
+- **`expand_addresses()` refused a tampered address after spending.**
+  The heredoc refusal this phase added is correct and arrives after
+  `allocate_metallb_addresses()` has routed and recorded addresses that
+  are charged for. The function's own docstring makes exactly that
+  argument for checking `metallb_installed` up front, so the document's
+  contents are now checked there too, and each address the API hands
+  back is checked before it is recorded -- rule 1 puts the API outside
+  this package's trust boundary in as many words. `heredoc()` keeps its
+  refusal as the backstop for the sinks this check does not know about.
+
+Verifying the round turned up two things worth more than either item.
+The mutation set that earlier rounds re-improvised is now
+`tools/mutation-check.py`, twelve properties with the test that must
+notice each, and the first run reported a survivor: emptying
+`SECRET_ENVIRONMENT_NAMES` did not fail `SecretsTestCase`. The test is
+fine. The Ansible module harness runs the module as a script, so the
+repository root is never on `sys.path` and those tests import the
+installed package -- #106, which this phase filed, showing up as a
+false pass in this phase's own verification. Those entries go through
+`tox -epy3` now, which reinstalls.
+
+And the address check added for the item above was itself wrong on an
+input the tree does not contain. `ipaddress.ip_address(1)` is
+`0.0.0.1`, and the metadata document is JSON, so an integer in the
+address list would have passed the new validator and then raised
+`TypeError` out of `str.join()` from a place that cannot say which key
+was bad -- a worse error than the one being fixed. The check requires a
+string as well now. Writing a validator and not enumerating what its
+parser accepts is the same mistake in miniature as the ordering problem
+it was added to fix.
+
+The third was declined on a false premise, which is worth recording
+because the premise read as decisive: moving `UnsupportedReleaseError`
+onto the shared base makes its fields keyword-only, and the review
+called that a compatibility concern for a package published as 0.2.0.
+`UnsupportedReleaseError` is in no release. It arrived with
+`node-customisation` phase 2, which merged after `v0.2.0` was tagged,
+so no external caller can exist. The documentation half was taken
+anyway, because "the classmethods are the interface" is worth stating
+whether or not anything has broken.
 
 ## Back brief
 

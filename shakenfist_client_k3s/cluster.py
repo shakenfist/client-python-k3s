@@ -23,6 +23,7 @@ standard library from Python 3.8, and this package supports 3.7).
 """
 
 import copy
+import ipaddress
 import json
 import os
 import re
@@ -296,6 +297,31 @@ K3S_RELEASE_FLOOR = (1, 21, 1)
 #    local kubectl invocations -- create()'s merge and delete()'s unset
 #    calls -- are argument lists. The agent commands cannot be, because
 #    the agent takes a command line.
+
+
+def _is_address(value):
+    """True if value is a string holding an IP address.
+
+    The string check is not redundant with ip_address(). That accepts an
+    int as a packed address, so ip_address(1) is 0.0.0.1 and
+    ip_address(True) is too -- and these values are not used as addresses
+    but interpolated into YAML as text, where an int reaches
+    str.join() and raises TypeError from somewhere that cannot say which
+    metadata key was wrong. The metadata document is JSON, so an int in
+    an address list is a thing a writer can actually put there.
+
+    ip_address() rather than a regular expression so that this stays a
+    question about addresses rather than about the shapes seen so far:
+    IPv6 passes, and a cluster using it is not refused by its own
+    validator.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
 
 
 def heredoc(remote_path, body, delimiter='EOF'):
@@ -741,6 +767,36 @@ class Cluster:
         if state:
             raise exceptions.ClusterInterruptedError.not_usable(
                 self.name, state, verb)
+
+    def _require_addresses(self, md, key):
+        """Refuse to run on metadata whose key does not hold IP addresses.
+
+        ``configure_metallb_addresses()`` interpolates these into a YAML
+        body written onto a node through ``heredoc()``, which refuses a
+        body carrying a line equal to its delimiter -- so a tampered
+        address cannot run commands on the node. What it can do is
+        arrive too late: ``expand_addresses()`` routes new floating
+        addresses, which are charged for, and commits them to the
+        metadata before that write happens, so the refusal lands after
+        the spending. The same function already refuses a cluster
+        without metallb up front for exactly that reason, and its
+        docstring gives the argument.
+
+        So the document is checked before anything is spent rather than
+        at the write site. ``heredoc()`` keeps its refusal, which covers
+        the sinks this check does not know about and any added later.
+        """
+        # An absent, empty or None key checks nothing and that is the
+        # right answer, not a skipped one: create() has always written
+        # this key as a list, and a cluster whose first expand-addresses
+        # has not run yet legitimately has none. A value which is not a
+        # list is not let through -- iterating a string yields characters
+        # and a mapping yields keys, neither of which is an address, so
+        # the refusal still fires.
+        for value in md.get(key) or []:
+            if not _is_address(value):
+                raise exceptions.ClusterMetadataError.not_an_address(
+                    self.name, key, value)
 
     def start_progress(self, total_phases):
         """Begin progress reporting for an operation of total_phases phases.
@@ -1632,10 +1688,28 @@ class Cluster:
         md = self.get_metadata()
         node_network = self.client.get_network(md['node_network'])
 
+        # setdefault rather than [], because delete() and
+        # _require_addresses() both already read this key tolerantly and
+        # this was the one site which raised KeyError on a document
+        # missing it. create() has always written it, so no real cluster
+        # reaches that -- but "the document says what we expect" is the
+        # assumption rule 1 exists to refuse.
+        md.setdefault('routed_addresses', [])
+
         allocated = []
         for i in range(metal_address_count):
             addr = self.client.route_network_address(node_network['uuid'])
             if addr:
+                # Rule 1 at the top of this module puts the Shaken Fist
+                # API outside this package's trust boundary, so what it
+                # hands back is checked before it is recorded rather
+                # than after. Checked here and not only in
+                # _require_addresses() because this is the one point at
+                # which a bad value can be stopped from entering the
+                # document at all.
+                if not _is_address(addr):
+                    raise exceptions.ClusterMetadataError.not_an_address(
+                        self.name, 'routed_addresses', addr)
                 md['routed_addresses'].append(addr)
                 allocated.append(addr)
 
@@ -3062,6 +3136,12 @@ class Cluster:
         fails, and it fails with the addresses already routed and charged
         for and nothing able to hand them out. Refusing up front costs the
         caller an error and nothing else.
+
+        The addresses already recorded are checked up front for the same
+        reason. They reach metallb's configuration only after the new
+        ones have been routed, and ``heredoc()`` refuses a body one of
+        them could end -- a refusal which is correct and which would
+        otherwise arrive after the allocation.
         """
         md = self.get_metadata()
         if not md:
@@ -3073,6 +3153,10 @@ class Cluster:
         if not md.get('metallb_installed', True):
             raise exceptions.ComponentNotInstalledError(
                 self.name, 'metallb', 'expand-addresses')
+
+        # And the document's contents for the same reason as its flags;
+        # _require_addresses() carries the argument.
+        self._require_addresses(md, 'routed_addresses')
 
         p = self.start_progress(1)
         p.phase('Adding metallb addresses')

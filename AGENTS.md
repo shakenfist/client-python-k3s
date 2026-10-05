@@ -80,6 +80,12 @@ Both tiers skip a change touching only `docs/`. See
 - Run the unit tests with `tox -epy3` and add coverage for new
   parsing or error-handling behavior, especially around external API
   responses which can change shape over time
+- When a change defends a property rather than adding behaviour --
+  a secret that must not be printed, a file that must be created
+  private -- add it to `tools/mutation-check.py` and run that, because
+  a passing test is not evidence the test would have failed. Note that
+  the Ansible module tests import the *installed* package, so a bare
+  `stestr run` does not see your edits (#106)
 - Ensure changes work with Python >= 3.7
 - Verify the plugin still imports cleanly (`python -c 'import
   shakenfist_client_k3s'`) -- a broken import takes the whole
