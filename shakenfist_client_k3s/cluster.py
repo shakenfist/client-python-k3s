@@ -558,11 +558,15 @@ def validate_k3s_config(config, role):
 
         # json.dumps() raises TypeError for a type it cannot serialise at
         # all (datetime.date, bytes, set) and ValueError for a circular
-        # reference. A type it can serialise but not give back -- a tuple,
-        # a non-string key inside a value, a NaN -- comes back different
-        # and fails the comparison instead.
+        # reference, and with allow_nan=False for NaN and both infinities
+        # too, which YAML reads from .nan and .inf: by default it would
+        # write them as NaN and Infinity, which are not JSON, and an
+        # infinity would even survive the comparison below. A type it can
+        # serialise but not give back -- a tuple, a non-string key inside a
+        # value -- comes back different and fails the comparison instead.
         try:
-            representable = json.loads(json.dumps(value)) == value
+            representable = json.loads(
+                json.dumps(value, allow_nan=False)) == value
         except (TypeError, ValueError):
             representable = False
         if not representable:

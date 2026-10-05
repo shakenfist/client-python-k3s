@@ -2069,6 +2069,17 @@ class ValidateK3sConfigTestCase(testtools.TestCase):
             'not_representable', {'node-label': {1: 'a'}}, 'agent')
         self.assertEqual('node-label', e.key)
 
+    def test_nan_and_infinities_are_refused(self):
+        # YAML reads .nan, .inf and -.inf as floats, and json.dumps() writes
+        # them as NaN, Infinity and -Infinity, which are not JSON. An
+        # infinity compares equal after that round trip, so only refusing
+        # them outright keeps them out of the metadata.
+        for text in ('.nan', '.inf', '-.inf'):
+            value = yaml.safe_load('x: %s\n' % text)['x']
+            e = self._assert_refused(
+                'not_representable', {'kubelet-arg': [value]}, 'agent')
+            self.assertEqual('kubelet-arg', e.key)
+
     def test_every_server_owned_key_is_refused_with_and_without_plus(self):
         for key in SERVER_OWNED_KEYS:
             for spelling in (key, key + '+'):
