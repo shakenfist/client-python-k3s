@@ -195,7 +195,9 @@ was written.
    `with-node-id`, `token-file`), and puts the servicelb disable in a
    later drop-in, because a caller's `disable` would otherwise replace
    it. See [the phase 2 plan](PLAN-node-customisation-phase-02-k3s-config.md), survey findings 3-5 and decisions
-   3, 5 and 6.
+   3, 5 and 6. The enforced `disable+` appending to a caller's bare
+   `disable`, and drop-ins loading on agents, were observed on a live
+   cluster in phase 3 ([merge tier run](https://github.com/shakenfist/client-python-k3s/actions/runs/37246848512)).
 4. **Server configuration applies to every control plane node, and
    agent configuration to every worker.** That includes additional
    control plane nodes (which currently get no config file) and
@@ -259,6 +261,9 @@ was written.
    the taint, so tainting the only node would fail every zero-worker
    create with MetalLB at its `rollout status` wait. See the phase 2
    plan's survey finding 7 and decision 7.
+
+   The default taint, and its `node-taint: []` opt-out, were observed
+   on a live cluster in phase 3 ([merge tier run](https://github.com/shakenfist/client-python-k3s/actions/runs/37246848512)).
 
 ## Open questions
 
