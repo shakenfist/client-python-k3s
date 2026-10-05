@@ -185,11 +185,17 @@ was written.
    not a single mapping. The whole check is a pure function, so it
    can be unit tested without mocks.
 
-   **Needs verifying in phase planning:** the k3s release that
-   introduced `config.yaml.d` and the `+` suffix (believed to be
-   around v1.21 to v1.22). If `--release-channel` can resolve to
-   anything older, either refuse the combination or document the
-   floor.
+   ~~**Needs verifying in phase planning:** the k3s release that
+   introduced `config.yaml.d` and the `+` suffix.~~ **Verified in
+   phase 2 planning:** drop-ins arrived in v1.21.0+k3s1 and `+` in
+   v1.21.1+k3s1. `--release-channel` can resolve to older releases,
+   so phase 2 refuses them at create. The phase also extends the
+   rejected keys to six more the plugin depends on (`data-dir`,
+   `write-kubeconfig`, `https-listen-port`, `node-name`,
+   `with-node-id`, `token-file`), and puts the servicelb disable in a
+   later drop-in, because a caller's `disable` would otherwise replace
+   it. See [the phase 2 plan](PLAN-node-customisation-phase-02-k3s-config.md), survey findings 3-5 and decisions
+   3, 5 and 6.
 4. **Server configuration applies to every control plane node, and
    agent configuration to every worker.** That includes additional
    control plane nodes (which currently get no config file) and
@@ -241,6 +247,12 @@ was written.
    workloads for memory is a correctness problem, and the opt-out is
    one line for the caller who has measured and decided otherwise.
 
+   **One exception, found in phase 2 planning:** a cluster with no
+   workers is not tainted. MetalLB's controller has no toleration for
+   the taint, so tainting the only node would fail every zero-worker
+   create with MetalLB at its `rollout status` wait. See the phase 2
+   plan's survey finding 7 and decision 7.
+
 ## Open questions
 
 1. ~~Should the plugin disable servicelb whenever it installs
@@ -265,7 +277,10 @@ was written.
    only. Harmless, since the IPv4 address is assigned, but it is
    permanent error noise that nothing noticed, and it goes away with
    traefik. Worth confirming it is traefik's Service and not
-   something the plugin configures.
+   something the plugin configures. **Confirmed in phase 2 planning:**
+   k3s's bundled `manifests/traefik.yaml` sets
+   `ipFamilyPolicy: "PreferDualStack"`, and the plugin sets no IP
+   family anywhere.
 2. ~~Should this plan land before or after the library API plan's
    phase 4 (first PyPI release)?~~ **Answered by events, 2026-10-04:
    phase 4 landed first and `v0.1.0` is released; phase 5 merged as
@@ -315,8 +330,8 @@ than expected.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Per-role sizing | [PLAN-node-customisation-phase-01-sizing.md](PLAN-node-customisation-phase-01-sizing.md) -- `create_instance(node_type)`; `node_sizes` in metadata with fallback defaults for existing clusters; six CLI flags and matching `create()` parameters; `show` displays sizes, including the 2 / 2048 / 50 fallback for clusters created before them (it already prints every recorded key); the documented sizing floor from open question 3; drop the bare `apt-get install -y` at `cluster.py:1052`; unit tests for the metadata fallback and for the sizes reaching `client.create_instance`; regenerate the `tests/cli_contract/` snapshots; update `docs/usage.md` and `docs/library-api.md`. Unit tests can verify everything except the live build. | In progress | |
-| 2. k3s configuration pass-through | Resolve open questions 1 and 3 and the `config.yaml.d` version floor; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; write the default control plane `node-taint` per design 7 and `servicelb` into the plugin-owned server config whenever `install_metallb` is true, per open question 1; unit tests for validation, the file content, `expand-workers` reusing the recorded config, the default taint being present, and a caller's `node-taint: []` replacing it; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels). (The sizing floor moved to phase 1, where open question 3 put it; this row used to repeat it.) The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | Not started | |
+| 1. Per-role sizing | [PLAN-node-customisation-phase-01-sizing.md](PLAN-node-customisation-phase-01-sizing.md) -- `create_instance(node_type)`; `node_sizes` in metadata with fallback defaults for existing clusters; six CLI flags and matching `create()` parameters; `show` displays sizes, including the 2 / 2048 / 50 fallback for clusters created before them (it already prints every recorded key); the documented sizing floor from open question 3; drop the bare `apt-get install -y` at `cluster.py:1052`; unit tests for the metadata fallback and for the sizes reaching `client.create_instance`; regenerate the `tests/cli_contract/` snapshots; update `docs/usage.md` and `docs/library-api.md`. Unit tests can verify everything except the live build. | Complete | `ddb1f3b` (#92) |
+| 2. k3s configuration pass-through | [PLAN-node-customisation-phase-02-k3s-config.md](PLAN-node-customisation-phase-02-k3s-config.md) -- Open question 1 and the `config.yaml.d` version floor are resolved in the phase plan; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; write the default control plane `node-taint` per design 7 (only when the cluster has workers) and disable `servicelb` through a later, plugin-enforced drop-in whenever `install_metallb` is true, per open question 1; refuse k3s releases older than v1.21.1+k3s1; unit tests for validation, the file content, `expand-workers` reusing the recorded config, the default taint being present, and a caller's `node-taint: []` replacing it; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels). (The sizing floor moved to phase 1, where open question 3 put it; this row used to repeat it.) The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | In progress | |
 | 3. Live validation | Extend `tools/ci_deploy_test.sh` to create with non-default sizes and both config files (disable Traefik, label control plane and workers differently), then assert with `kubectl`: no Traefik pods, no `svclb-*` pods, the expected labels on each node, the default `NoSchedule` taint on every control plane node, the recorded sizes in `show`, and a worker added by `expand-workers` carrying the agent labels. Also assert a second create passing `node-taint: []` leaves the control plane schedulable, since that is the documented opt-out. Run the merge-tier workflow. Then run the homelab OpenStack-Helm prototype's provision stage against the branch as a second, heavier consumer, and establish whether it wants the taint opt-out on a three node cluster (design 7). | Not started | |
 | 4. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-3 against `develop` | Not started | |
 
@@ -694,6 +709,11 @@ chosen to defer to here, so that we do not forget them.
   Ceph disk.
 * Per-invocation sizing and config overrides on `expand-workers`, for
   heterogeneous worker pools.
+* Matching Longhorn's `defaultReplicaCount` to the number of
+  schedulable nodes. Once phase 2 taints the control plane, the default
+  one control plane plus two workers has two Longhorn storage nodes
+  against a default of three replicas, so new volumes run degraded.
+  They work, but it is the wrong default. See the phase 2 plan, risk 3.
 * Surfacing the new options in the `shakenfist.k3s` collection.
   Phase 5 of the library API plan landed first (#90), so its
   `sf_k3s_cluster` module needs the sizing and config options added

@@ -5,7 +5,7 @@ import sys
 from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
-from shakenfist_client_k3s.cluster import Cluster, DEFAULT_NODE_SIZE
+from shakenfist_client_k3s.cluster import Cluster, DEFAULT_NODE_SIZE, read_k3s_config
 
 
 def _bind_namespace_context(ctx, namespace):
@@ -209,6 +209,15 @@ def k3s_list(ctx, namespace=None, ):
 @click.option('--worker-disk', type=click.IntRange(min=1),
               default=DEFAULT_NODE_SIZE['disk'],
               help='The disk for each worker node, in GB.')
+@click.option('--server-config', type=click.Path(exists=True, dir_okay=False),
+              help=('A YAML mapping of k3s configuration keys, applied to every '
+                    'control plane node. A few keys the plugin depends on are '
+                    'refused. See docs/usage.md.'))
+@click.option('--agent-config', type=click.Path(exists=True, dir_okay=False),
+              help=('A YAML mapping of k3s configuration keys, applied to every '
+                    'worker, including workers added later by expand-workers. '
+                    'A few keys the plugin depends on are refused. See '
+                    'docs/usage.md.'))
 @click.pass_context
 def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                metal_address_count=None,  namespace=None, network=None,
@@ -216,7 +225,17 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                sshkey=None, metallb=True, longhorn=True, kubeconfig=True,
                manifests=None, control_plane_cpus=None, control_plane_memory=None,
                control_plane_disk=None, worker_cpus=None, worker_memory=None,
-               worker_disk=None):
+               worker_disk=None, server_config=None, agent_config=None):
+    # The configuration files are read before the cluster context is bound
+    # because binding creates the namespace when --namespace names one that
+    # does not exist yet, and a bad file should not leave a namespace behind.
+    parsed_server_config = None
+    if server_config:
+        parsed_server_config = read_k3s_config(server_config, 'server')
+    parsed_agent_config = None
+    if agent_config:
+        parsed_agent_config = read_k3s_config(agent_config, 'agent')
+
     c = _bind_new_cluster_context(ctx, name, namespace)
     # write_kubeconfig defaults to False in the library and True here: the
     # command line's behaviour is unchanged, and a library caller does not
@@ -234,7 +253,8 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
              control_plane_memory=control_plane_memory,
              control_plane_disk=control_plane_disk,
              worker_cpus=worker_cpus, worker_memory=worker_memory,
-             worker_disk=worker_disk)
+             worker_disk=worker_disk, server_config=parsed_server_config,
+             agent_config=parsed_agent_config)
 
 
 @k3s.command(name='query-k3s-version',

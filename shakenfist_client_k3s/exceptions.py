@@ -38,15 +38,21 @@ class K3sClusterException(Exception):
 class _ReasonedK3sException(K3sClusterException):
     """Base for the exceptions built through classmethods rather than directly.
 
-    Five of the classes below describe several distinct failures that read
+    Seven of the classes below describe several distinct failures that read
     the same way to a caller: a manifest cannot be staged, a release
     lookup failed. Each is built through a classmethod per failure, each
     records which one ran in ``reason``, each renders a message its
     classmethod composed, and each carries the failure's details as
-    attributes. That shape was written out five times, byte for byte, and
+    attributes. That shape was written out seven times, byte for byte, and
     the duplication is a cross-phase one: two copies arrived with the
     exception hierarchy, two more when later verbs needed their own
-    reasoned errors, and a fifth with the heredoc refusal.
+    reasoned errors, a fifth with the heredoc refusal, and the last two
+    with k3s configuration pass-through -- which landed on the default
+    branch while this base class was being written, and is why the count
+    in this docstring is worth keeping accurate rather than approximate.
+    ``UnsupportedReleaseError`` named its three fields in its own
+    ``__init__`` rather than taking ``**fields``; it declares them in
+    ``FIELDS`` like the others now.
 
     ``reason`` does not decide which attributes exist. Every field any
     classmethod of a subclass sets is declared in that subclass's
@@ -589,6 +595,186 @@ class NodeSizeError(K3sClusterException):
     def __str__(self):
         return '%s %s must be a positive integer, not %r' % (
             self.role.replace('_', ' '), self.field, self.value)
+
+
+class K3sConfigError(_ReasonedK3sException):
+    """Raised when k3s configuration handed to ``Cluster.create()`` cannot be used.
+
+    ``create()`` takes a ``server_config`` and an ``agent_config``: mappings
+    of k3s configuration keys, written onto every control plane node and
+    every worker respectively as a drop-in file in
+    ``/etc/rancher/k3s/config.yaml.d/``, which k3s reads after the plugin's
+    own ``config.yaml``. ``validate_k3s_config()`` in ``cluster.py`` checks
+    both before the cluster's name is registered, for the reason
+    ``NodeSizeError`` gives, and ``read_k3s_config()`` reads a file into
+    one for the command line. Construct via the classmethods below, one
+    per refusal:
+
+    - ``not_a_mapping(role, value)``: the configuration is not a mapping
+      -- a list, or a scalar. k3s's configuration file is a mapping of
+      flag names to values, and nothing else means anything to it.
+    - ``non_string_key(role, key)``: a key is not a string. YAML reads
+      ``1: x`` as an integer key, which names no k3s flag, and which the
+      JSON the metadata is stored as cannot hold unchanged either.
+    - ``not_representable(role, key, value)``: a value does not survive a
+      round trip through JSON unchanged. The mapping is recorded in the
+      cluster's namespace metadata, which is a JSON document, so that
+      ``expand-workers`` can write the same file onto workers it adds
+      later. ``yaml.safe_load`` happily produces ``datetime.date``,
+      ``bytes`` and integer keys inside a value, and without this refusal
+      the first sign of one would be ``set_metadata()`` failing after the
+      name had been registered -- or worse, succeeding with something
+      other than what was written onto the nodes.
+    - ``owned_key(role, key)``: the key is one the plugin sets itself, or
+      depends on k3s leaving at its default. A trailing ``+`` does not
+      change that, because on a string key k3s's ``+`` appends to the
+      plugin's value rather than leaving it alone. The one exception is
+      ``tls-san+``, which is how a caller adds SANs to the plugin's; the
+      message for a bare ``tls-san`` says so. The keys and why each is
+      owned are listed beside ``K3S_SERVER_OWNED_KEYS`` and
+      ``K3S_AGENT_OWNED_KEYS`` in ``cluster.py``.
+    - ``delimiter_collision(role, delimiter)``: a line of the YAML the
+      configuration is written as is exactly the heredoc delimiter the
+      write uses, which would end the heredoc early and truncate the
+      file. This is ``ManifestError.delimiter_collision()`` for
+      configuration rather than manifests.
+    - ``unreadable(path, reason)``: the file ``read_k3s_config()`` was
+      given could not be opened, decoded as UTF-8, or parsed as a single
+      YAML document. As with ``ManifestError.unreadable()``, this keeps
+      ``OSError``, ``UnicodeDecodeError`` and ``yaml.YAMLError`` inside
+      this hierarchy, so a caller which catches ``K3sClusterException``
+      does not have to catch builtins and PyYAML's errors as well.
+
+    Keys are not checked against k3s's own flag list, deliberately: that
+    would be a copy of k3s's flags which goes stale with every release,
+    and k3s already logs and ignores a flag it does not recognise for the
+    role (decision 2 of
+    ``docs/plans/PLAN-node-customisation-phase-02-k3s-config.md``).
+
+    ``role`` is ``'server'`` or ``'agent'``, as k3s spells the two roles,
+    and is None for ``unreadable()``, which is about a file before it is
+    about a role. Which classmethod built an instance is recorded in
+    ``reason``; every field any of them sets is declared in ``FIELDS``, as
+    ``ManifestError`` does, so an unset field answers None. ``unreadable()``
+    stores its reason as ``detail``, the name ``ManifestError`` uses, since
+    ``reason`` is already which refusal this is.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    FIELDS = ('role', 'key', 'value', 'delimiter', 'path', 'detail')
+
+    @classmethod
+    def not_a_mapping(cls, role, value):
+        message = (
+            'k3s %s configuration must be a mapping of configuration keys\n'
+            'to values, not %s.'
+        ) % (role, type(value).__name__)
+        return cls('not_a_mapping', message, role=role, value=value)
+
+    @classmethod
+    def non_string_key(cls, role, key):
+        message = (
+            'k3s %s configuration key %r is not a string. k3s configuration\n'
+            'keys are flag names, such as node-label.'
+        ) % (role, key)
+        return cls('non_string_key', message, role=role, key=key)
+
+    @classmethod
+    def not_representable(cls, role, key, value):
+        message = (
+            'k3s %s configuration key %s has a value which cannot be stored\n'
+            'unchanged as JSON: %r. The configuration is recorded in the\n'
+            'cluster metadata, which is JSON, so that workers added later are\n'
+            'configured the same way. Quote dates, and use only strings,\n'
+            'numbers, booleans, lists and mappings with string keys.'
+        ) % (role, key, value)
+        return cls('not_representable', message, role=role, key=key,
+                   value=value)
+
+    @classmethod
+    def owned_key(cls, role, key):
+        message = (
+            'k3s %s configuration key %s is set by shakenfist_client_k3s\n'
+            'itself, or must be left at its default for the cluster to work,\n'
+            'so it cannot be supplied.'
+        ) % (role, key)
+        if key.rstrip('+') == 'tls-san':
+            message += (
+                ' To add subject alternative names to the API server\n'
+                'certificate alongside the ones the plugin sets, write\n'
+                'tls-san+ instead.')
+        return cls('owned_key', message, role=role, key=key)
+
+    @classmethod
+    def delimiter_collision(cls, role, delimiter):
+        message = (
+            'k3s %s configuration, written as YAML, contains a line which is\n'
+            'exactly %s, which is the marker used to write it to the\n'
+            'cluster, so it cannot be written without being truncated there.'
+        ) % (role, delimiter)
+        return cls('delimiter_collision', message, role=role,
+                   delimiter=delimiter)
+
+    @classmethod
+    def unreadable(cls, path, reason):
+        message = 'Could not read k3s configuration %s: %s' % (path, reason)
+        return cls('unreadable', message, path=path, detail=reason)
+
+
+class UnsupportedReleaseError(_ReasonedK3sException):
+    """Raised when ``Cluster.create()`` resolves a k3s release older than the plugin supports.
+
+    The plugin writes configuration onto every node as files in
+    ``/etc/rancher/k3s/config.yaml.d/``, and depends on k3s's ``+`` key
+    suffix to append to a list rather than replace it. k3s gained the
+    drop-in directory in v1.21.0+k3s1 and the ``+`` suffix in
+    v1.21.1+k3s1, and an older k3s ignores both silently: a drop-in is
+    never read, and ``disable+`` is a key with a different name. So
+    ``check_k3s_release()`` in ``cluster.py`` refuses anything older than
+    ``K3S_RELEASE_FLOOR`` straight after the release channel is resolved,
+    which is before the cluster's name is registered. The channels which
+    still resolve to such a release are ones whose Kubernetes went end of
+    life in 2022, and Longhorn's chart already refuses them.
+
+    - ``too_old(release, channel, floor)``: the release parsed, and is
+      older than ``floor``.
+    - ``unparseable(release, channel)``: the release does not start with
+      ``vMAJOR.MINOR.PATCH``. That is refused rather than guessed at,
+      because a version which cannot be read is not one the plugin can
+      promise drop-ins on.
+
+    ``release`` is the version string the channel resolved to, ``channel``
+    the release channel which was asked for, and ``floor`` the oldest
+    supported version as a ``(major, minor, patch)`` tuple, or None for
+    ``unparseable()``. Which classmethod built an instance is recorded in
+    ``reason``.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``ReleaseLookupError.FIELDS`` for why this is not left implicit.
+    FIELDS = ('release', 'channel', 'floor')
+
+    @classmethod
+    def too_old(cls, release, channel, floor):
+        message = (
+            'k3s release channel %s resolves to %s, which is older than\n'
+            'v%s, the oldest release shakenfist_client_k3s supports: older\n'
+            'releases silently ignore the configuration files the plugin\n'
+            'writes onto every node. Choose a newer release channel.'
+        ) % (channel, release, '.'.join(str(part) for part in floor))
+        return cls('too_old', message, release=release, channel=channel,
+                   floor=tuple(floor))
+
+    @classmethod
+    def unparseable(cls, release, channel):
+        message = (
+            'k3s release channel %s resolves to %r, which is not a version\n'
+            'shakenfist_client_k3s can read, so it cannot tell whether that\n'
+            'release supports the configuration files the plugin writes.'
+        ) % (channel, release)
+        return cls('unparseable', message, release=release,
+                   channel=channel)
 
 
 class ReleaseLookupError(_ReasonedK3sException):

@@ -43,6 +43,8 @@ Builds a cluster and, unless `--no-kubeconfig` is given, leaves it in
 | `--worker-cpus` | 2 | vCPUs for each worker node. A positive integer. |
 | `--worker-memory` | 2048 | RAM, in MB, for each worker node. A positive integer. |
 | `--worker-disk` | 50 | Disk, in GB, for each worker node. A positive integer. |
+| `--server-config PATH` | none | A YAML mapping of k3s configuration keys, applied to every control plane node. A few keys the plugin depends on are refused; see "k3s configuration", below. |
+| `--agent-config PATH` | none | A YAML mapping of k3s configuration keys, applied to every worker, including workers added later by `expand-workers`. The same keys are refused for the agent role as listed below. |
 
 Each node is a Shaken Fist instance on a Debian 12 base image, with a
 floating address and the `sf-agent2` side channel enabled. Nodes
@@ -73,6 +75,121 @@ clusters will carry very little. The default stays at 2048 MB so that
 existing invocations build what they built before; pass
 `--control-plane-memory 4096` (or more) for a control plane you intend
 to rely on.
+
+#### k3s configuration
+
+`--server-config` and `--agent-config` each take the path of a YAML
+file holding a single mapping of k3s configuration keys, spelled as
+k3s's own `config.yaml` spells them. The server file is applied to
+every control plane node and the agent file to every worker. Neither
+is interpreted: keys are not checked against k3s's flags, and k3s logs
+and ignores a key it does not recognise for the role. An empty file
+means no configuration. Both mappings are recorded in the cluster's
+metadata, which is how `expand-workers` gives a new worker the agent
+configuration the cluster was created with.
+
+Each node gets up to three files in `/etc/rancher/k3s/`, all written
+before the k3s installer first runs, and k3s reads them in this order:
+
+1. `config.yaml` holds what the plugin sets or defaults for the node.
+   On a server that is the kubeconfig mode, the floating API address as
+   a SAN, `cluster-init` on the first server only, and the control
+   plane taint (below). On a worker it is a single comment line.
+2. `config.yaml.d/50-sf-client-k3s.yaml` holds your file, re-dumped as
+   YAML. It is written only when the mapping is not empty.
+3. `config.yaml.d/90-sf-client-k3s-enforced.yaml` holds what must
+   survive your file. Today that is `disable+: [servicelb]`, on servers
+   only, and only when MetalLB is installed.
+
+k3s's merge rule is that a key in a later file replaces the same key
+in an earlier one, unless the later key ends in `+`, in which case it
+appends. So your file can replace any default the plugin wrote in
+`config.yaml`, and a list key written with `+` adds to it. This is why
+the servicelb disable lives in the last file: `disable: [traefik]` in
+your file yields traefik and servicelb both disabled. The servicelb
+disable is the one plugin default a caller cannot override; a caller
+who wants servicelb wants `--no-metallb`. Disabling Traefik also
+removes the `AdditionalAssignFailed ... PreferDualStack` log noise
+from `metallb-controller`, which comes from Traefik's Service.
+
+Keys the plugin sets, or depends on k3s leaving at its default, are
+refused before anything is built. A trailing `+` does not get round
+this, because on a string key `+` appends to the plugin's value.
+
+| Role | Refused keys | Why |
+|------|--------------|-----|
+| server | `cluster-init` | The plugin sets it on the first server, which makes that node the embedded etcd cluster the others join. |
+| server | `data-dir` | The plugin reads the join tokens and stages manifests under `/var/lib/rancher/k3s`. |
+| server | `https-listen-port` | Extra servers and workers join through port 6443. |
+| server | `node-name`, `with-node-id` | `remove-worker` finds a k3s node by its lowercased instance name, and a fixed name would be shared by every node. |
+| server | `server`, `token`, `token-file` | The plugin joins extra servers to the first one itself. |
+| server | `tls-san` (bare) | It would replace the floating API address the plugin put there. Write `tls-san+` to add SANs. |
+| server | `write-kubeconfig`, `write-kubeconfig-mode` | Every `kubectl` and `helm` command, and the credential fetch, read `/etc/rancher/k3s/k3s.yaml`, and the plugin sets its mode. |
+| agent | `data-dir`, `node-name`, `with-node-id`, `server`, `token`, `token-file` | As for servers: every node keeps the same layout, and the plugin joins and names workers itself. |
+
+Other things to know:
+
+- Control plane nodes are tainted
+  `node-role.kubernetes.io/control-plane:NoSchedule` by default, in
+  `config.yaml`, when the cluster has at least one worker. Put
+  `node-taint: []` in `--server-config` to remove the taint, or
+  `node-taint+: [key=value:NoSchedule]` to add another taint to it.
+- A cluster created with `--worker-count 0` is not tainted. MetalLB's
+  controller and Longhorn do not tolerate the taint, so tainting the
+  only node would make MetalLB's rollout wait fail. That cluster stays
+  untainted after `expand-workers` adds workers.
+- The files are written only when a node is installed. Changing a
+  cluster's recorded configuration afterwards is not supported, and
+  nothing rewrites a running node.
+- Every `create` refuses a k3s release older than `v1.21.1+k3s1`,
+  whether or not a configuration was given, because older releases
+  silently ignore the drop-in directory or the `+` suffix. The channels
+  that still resolve to such a release (`v1.16` to `v1.20`, `testing`)
+  are ones Longhorn's chart already refuses. `expand-workers` does not
+  check.
+- A bad file, a refused key, or a release that is too old is reported
+  before anything is built or the cluster's name is registered.
+
+An example for an OpenStack-Helm deployment. `servers.yaml` keeps
+Traefik out of the way and labels the control plane nodes:
+
+```yaml
+disable: [traefik]
+node-label: [openstack-control-plane=enabled]
+```
+
+and `agents.yaml` labels the workers as compute nodes:
+
+```yaml
+node-label: [openstack-compute-node=enabled, openvswitch=enabled]
+```
+
+```
+sf-client k3s create mycluster \
+    --server-config servers.yaml --agent-config agents.yaml
+```
+
+The servers end up with traefik and servicelb both disabled. Because
+the default taint applies, OpenStack services labelled for the control
+plane would be blocked from those nodes, so such a deployment may want
+`node-taint: []` on the servers or must add tolerations. Which of the
+two is right is still being settled against a live cluster; see
+`docs/plans/PLAN-node-customisation.md`.
+
+**Behaviour changes.** These apply to every new cluster, whether or not
+the options above are used, and existing clusters are untouched:
+
+- servicelb is disabled whenever MetalLB is installed.
+- Control plane nodes are tainted when the cluster has workers, so
+  ordinary workloads schedule only on workers.
+- With the default one control plane node and two workers, Longhorn now
+  has two storage nodes rather than three. Its default replica count
+  is 3, so a new volume runs degraded with two replicas until a third
+  node is added.
+- k3s releases older than `v1.21.1+k3s1` are refused, as described
+  above.
+
+#### Local kubeconfig and manifests
 
 With `--kubeconfig` (the default), the local kubeconfig is written
 directly if `~/.kube/config` does not exist. If it does, the merge
@@ -180,7 +297,11 @@ on a shared pre-existing network takes that network with it.
 Adds `N` more workers (default 2) to a running cluster. Existing
 nodes are untouched. Refuses to run against a cluster that never
 finished being built; see `create`, above. New workers are built at
-the worker size the cluster recorded when it was created.
+the worker size the cluster recorded when it was created, and are
+given the `--agent-config` the cluster recorded, as a drop-in written
+before k3s is installed on them. A cluster created before this
+existed recorded none, so its new workers get no drop-in. The release
+floor is not checked here.
 
 ### `remove-worker NAME --worker UUID [--worker UUID ...]`
 
@@ -284,13 +405,17 @@ Prints the names of the clusters recorded in the namespace.
 
 Prints the cluster's namespace metadata: node UUIDs, the network, the
 API addresses, the join address, the plugin version that created it,
-the release versions in use, and `node_sizes` (the vCPUs, memory in MB
-and disk in GB of each role). A cluster created before sizing existed
+the release versions in use, `node_sizes` (the vCPUs, memory in MB
+and disk in GB of each role), and `server_config` and `agent_config`
+(the mappings given to `--server-config` and `--agent-config`, as
+structure rather than text). A cluster created before sizing existed
 reports the defaults it was built at, which is exact because it could
-only have been built at the default; nothing is written back to the
-cluster's metadata. A cluster that never finished being built is shown
-rather than refused, with a note pointing out that its `state` is not
-`created` and that `delete` is how to clear it.
+only have been built at the default, and one created before the k3s
+configuration options reports both mappings as empty, for the same
+reason; nothing is written back to the cluster's metadata. A cluster
+that never finished being built is shown rather than refused, with a
+note pointing out that its `state` is not `created` and that `delete`
+is how to clear it.
 
 Note that the metadata includes the node token and the kubeconfig, so
 the output is cluster-admin credentials. Do not paste it into a bug

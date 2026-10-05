@@ -741,7 +741,7 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
 
         for target, kwargs in [
                 ('shakenfist_client_k3s.primitives.get_k3s_release',
-                 {'return_value': 'stable'}),
+                 {'return_value': 'v1.33.4+k3s1'}),
                 ('shakenfist_client_k3s.primitives.get_longhorn_release',
                  {'return_value': '1.6.0'}),
                 ('time.sleep', {'new': lambda seconds: None})]:

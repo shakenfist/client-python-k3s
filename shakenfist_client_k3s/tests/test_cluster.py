@@ -1,5 +1,7 @@
 import ast
+import collections
 import copy
+import datetime
 import io
 import json
 import os
@@ -234,7 +236,9 @@ class ExpandWorkersTestCase(testtools.TestCase):
     It also builds the new workers at the size the cluster recorded for
     them, rather than at whatever the default is today, and at exactly the
     default for a cluster created before sizes were recorded -- which is
-    the size every one of that cluster's nodes was built at.
+    the size every one of that cluster's nodes was built at. And it writes
+    the cluster's recorded agent_config onto them, or no drop-in at all for
+    a cluster which has none.
     """
 
     def _expand(self, existing_workers, worker_count, new_instances,
@@ -334,6 +338,60 @@ class ExpandWorkersTestCase(testtools.TestCase):
             {'cpus': 2, 'memory': 2048, 'disk': 50},
             cluster._node_size(cluster.get_metadata(), 'control_plane'))
 
+    def _expand_for_real(self, md_extra):
+        """Expand by one worker with install_k3s_component() left in; return the new worker's commands.
+
+        The tests above patch install_k3s_component() out, because their
+        question is which instances it is handed. These ask what those
+        instances are sent, so they keep it and drive a scripted fake.
+        """
+        client = fakes.FakeClusterClient()
+        client.instance_serial = 2
+        md = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 3, 'node_network': 'net-1',
+            'node_token': 'node-token', 'server_token': 'server-token',
+            'k3s_version': 'v1.33', 'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4', 'join_address': '10.0.0.4',
+            'control_plane_nodes': ['inst-001'], 'worker_nodes': ['inst-002'],
+            'routed_addresses': []
+        }
+        md.update(md_extra)
+        client.metadata[MD_KEY] = md
+        for instance_uuid in md['control_plane_nodes'] + md['worker_nodes']:
+            client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': 'k3s-banana-' + instance_uuid,
+                'state': 'created', 'agent_state': 'ready'}
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            _make_cluster(client).expand_workers(1)
+
+        self.assertEqual(['inst-001', 'inst-002', 'inst-003'],
+                         sorted(client.instances))
+        return [commandline for instance_uuid, commandline in client.executed
+                if instance_uuid == 'inst-003']
+
+    def test_new_workers_are_given_the_recorded_agent_config(self):
+        # expand_workers() is not changed to make this happen: it reaches
+        # install_k3s_component() through install_workers(), which reads
+        # the recorded agent_config by role. The server_config is recorded
+        # too, and must not reach a worker.
+        agent_config = {'node-label': ['openvswitch=enabled']}
+        files = _k3s_config_files(self._expand_for_real({
+            'agent_config': agent_config,
+            'server_config': {'disable': ['traefik']}}))
+        self.assertEqual(agent_config,
+                         yaml.safe_load(files[K3S_CALLER_DROP_IN]))
+        self.assertEqual(K3S_AGENT_CONFIG_BODY, files[K3S_CONFIG])
+        self.assertNotIn(K3S_ENFORCED_DROP_IN, files)
+
+    def test_a_cluster_without_an_agent_config_gives_new_workers_no_drop_in(self):
+        # Every cluster created before agent_config was recorded. Such a
+        # cluster could not have been given one, so no drop-in is exact,
+        # and the new worker still gets the plugin's config.yaml.
+        files = _k3s_config_files(self._expand_for_real({}))
+        self.assertEqual([K3S_CONFIG], list(files))
+
 
 class CreateInstallsWorkersTestCase(testtools.TestCase):
     """Creating a cluster installs k3s on every worker it just created.
@@ -383,7 +441,9 @@ class CreateInstallsWorkersTestCase(testtools.TestCase):
         self.addCleanup(patcher.stop)
 
         # The release lookups reach the internet, and have their own tests.
-        for target, release in [('get_k3s_release', 'stable'),
+        # A real release rather than a channel name, because create()
+        # refuses one it cannot parse (check_k3s_release()).
+        for target, release in [('get_k3s_release', 'v1.33.4+k3s1'),
                                 ('get_longhorn_release', '1.6.0')]:
             patcher = mock.patch(
                 'shakenfist_client_k3s.primitives.%s' % target,
@@ -789,10 +849,12 @@ class CreateOverInterruptedClusterTestCase(testtools.TestCase):
         # order of create()'s two guards matter.
         self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
 
-        # create() looks up the k3s release before it looks at the name.
+        # create() looks up the k3s release before it looks at the name,
+        # and checks it against K3S_RELEASE_FLOOR, so this is a release
+        # rather than a channel name.
         patcher = mock.patch(
             'shakenfist_client_k3s.primitives.get_k3s_release',
-            return_value='stable')
+            return_value='v1.33.4+k3s1')
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1031,10 +1093,15 @@ class ShowReportsNodeSizesTestCase(testtools.TestCase):
         self.assertEqual(2048, cluster_module.DEFAULT_NODE_SIZE['memory'])
 
     def test_recorded_sizes_are_returned_as_stored(self):
+        # The two k3s configuration keys are stored too, as every cluster
+        # created since they existed has them, because show() fills those
+        # as well and this test is about a document with nothing to fill.
         stored = _interrupted_md(state='created')
         stored['node_sizes'] = {
             'control_plane': {'cpus': 4, 'memory': 8192, 'disk': 100},
             'worker': {'cpus': 2, 'memory': 4096, 'disk': 60}}
+        stored['server_config'] = {}
+        stored['agent_config'] = {}
         expected = copy.deepcopy(stored)
 
         shown, client = self._show(stored)
@@ -1057,6 +1124,63 @@ class ShowReportsNodeSizesTestCase(testtools.TestCase):
             shown['node_sizes'])
         self.assertEqual(expected_stored, stored)
         client.set_namespace_metadata_item.assert_not_called()
+
+
+class ShowReportsK3sConfigTestCase(testtools.TestCase):
+    """show() reports both k3s configurations, as {} for clusters which never recorded them.
+
+    The same exact fill as node_sizes: a cluster created before the keys
+    existed had no way to be given a configuration, so an empty one is a
+    fact about it rather than a guess. And the same rule: nothing is
+    written back, and the cached document is not changed in place.
+    """
+
+    def _show(self, md):
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {MD_KEY: md}
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        return cluster.show(), client
+
+    def test_a_cluster_without_configs_reports_empty_ones(self):
+        stored = _interrupted_md(state='created')
+        shown, client = self._show(stored)
+
+        self.assertEqual({}, shown['server_config'])
+        self.assertEqual({}, shown['agent_config'])
+        # node_sizes is filled on the same copy.
+        self.assertIn('node_sizes', shown)
+
+        client.set_namespace_metadata_item.assert_not_called()
+        self.assertNotIn('server_config', stored)
+        self.assertNotIn('agent_config', stored)
+        self.assertEqual(_interrupted_md(state='created'), stored)
+
+    def test_recorded_configs_are_returned_as_stored(self):
+        stored = _interrupted_md(state='created')
+        stored['node_sizes'] = {
+            'control_plane': {'cpus': 2, 'memory': 2048, 'disk': 50},
+            'worker': {'cpus': 2, 'memory': 2048, 'disk': 50}}
+        stored['server_config'] = {'disable': ['traefik']}
+        stored['agent_config'] = {'node-label': ['a=b']}
+        expected = copy.deepcopy(stored)
+
+        shown, client = self._show(stored)
+
+        self.assertEqual(expected, shown)
+        # Nothing to fill, so no copy either: the cached dictionary itself.
+        self.assertIs(stored, shown)
+        client.set_namespace_metadata_item.assert_not_called()
+
+    def test_one_missing_config_is_filled_alone(self):
+        stored = _interrupted_md(state='created')
+        stored['server_config'] = {'disable': ['traefik']}
+
+        shown, _ = self._show(stored)
+
+        self.assertEqual({'disable': ['traefik']}, shown['server_config'])
+        self.assertEqual({}, shown['agent_config'])
+        self.assertNotIn('agent_config', stored)
 
 
 class InterruptedClusterVerbsTestCase(testtools.TestCase):
@@ -1802,6 +1926,308 @@ class ValidateNodeSizesTestCase(testtools.TestCase):
         self._assert_refused('control_plane', 'memory', None)
 
 
+# The keys each role refuses, written out rather than read from the
+# frozensets, so that a key leaving or joining a set is a change this file
+# has to make on purpose.
+SERVER_OWNED_KEYS = (
+    'cluster-init', 'data-dir', 'https-listen-port', 'node-name', 'server',
+    'tls-san', 'token', 'token-file', 'with-node-id', 'write-kubeconfig',
+    'write-kubeconfig-mode')
+AGENT_OWNED_KEYS = (
+    'data-dir', 'node-name', 'server', 'token', 'token-file', 'with-node-id')
+
+
+class ValidateK3sConfigTestCase(testtools.TestCase):
+    """validate_k3s_config() accepts configuration it can write, and refuses the rest.
+
+    Another of create()'s checks before the name is registered, so each
+    refusal here is one a caller hears about before anything exists to
+    clean up. What it refuses is what the plugin cannot live with -- a key
+    it owns, a value the JSON metadata cannot record, text that would end
+    its own heredoc -- and nothing about whether k3s knows the key.
+    """
+
+    REALISTIC = {
+        'disable': ['traefik'],
+        'node-label': ['openstack-control-plane=enabled'],
+        'tls-san+': ['k3s.example.com'],
+        'node-taint': [],
+        'kubelet-arg': ['max-pods=250'],
+    }
+
+    def _assert_refused(self, reason, config, role='server'):
+        e = self.assertRaises(
+            exceptions.K3sConfigError, cluster_module.validate_k3s_config,
+            config, role)
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual(reason, e.reason)
+        self.assertEqual(role, e.role)
+        return e
+
+    def test_the_owned_key_sets_are_exactly_the_plans(self):
+        self.assertEqual(frozenset(SERVER_OWNED_KEYS),
+                         cluster_module.K3S_SERVER_OWNED_KEYS)
+        self.assertEqual(frozenset(AGENT_OWNED_KEYS),
+                         cluster_module.K3S_AGENT_OWNED_KEYS)
+
+    def test_an_empty_mapping_is_no_text(self):
+        for role in ('server', 'agent'):
+            self.assertEqual(
+                '', cluster_module.validate_k3s_config({}, role))
+
+    def test_none_is_an_empty_mapping(self):
+        # What an empty file and a library caller's default both produce.
+        for role in ('server', 'agent'):
+            self.assertEqual(
+                '', cluster_module.validate_k3s_config(None, role))
+
+    def test_a_realistic_mapping_is_returned_as_sorted_block_yaml(self):
+        text = cluster_module.validate_k3s_config(self.REALISTIC, 'server')
+
+        self.assertEqual(self.REALISTIC, yaml.safe_load(text))
+        self.assertEqual(
+            yaml.safe_dump(self.REALISTIC, default_flow_style=False,
+                           sort_keys=True),
+            text)
+        # Block style and sorted, so the file on the node reads the same
+        # whatever order the caller's mapping happened to be in.
+        top_level = [line.split(':')[0] for line in text.split('\n')
+                     if line and not line.startswith(('-', ' '))]
+        self.assertEqual(sorted(self.REALISTIC), top_level)
+
+    def test_a_dict_subclass_is_written_as_plain_yaml(self):
+        # yaml.safe_dump() refuses to represent an OrderedDict. The text is
+        # dumped from the JSON round trip, which is plain dicts, so a
+        # library caller's mapping type does not decide whether this works.
+        config = collections.OrderedDict([('node-label', ['a=b'])])
+        self.assertEqual(
+            'node-label:\n- a=b\n',
+            cluster_module.validate_k3s_config(config, 'agent'))
+
+    def test_a_list_is_refused(self):
+        e = self._assert_refused('not_a_mapping', ['disable', 'traefik'])
+        self.assertIn('not list', str(e))
+
+    def test_a_string_is_refused(self):
+        # What a file holding one bare line of text parses to.
+        e = self._assert_refused('not_a_mapping', 'disable traefik', 'agent')
+        self.assertIn('not str', str(e))
+
+    def test_an_integer_key_is_refused(self):
+        e = self._assert_refused('non_string_key', {1: 'x'})
+        self.assertEqual(1, e.key)
+
+    def test_a_date_value_is_refused(self):
+        # yaml.safe_load reads an unquoted 2026-10-05 as a datetime.date,
+        # which json.dumps() cannot serialise at all, so set_metadata()
+        # would fail with the name already registered.
+        value = datetime.date(2026, 10, 5)
+        e = self._assert_refused(
+            'not_representable', {'node-label': ['ok=yes'], 'kubelet-arg': value})
+        self.assertEqual('kubelet-arg', e.key)
+        self.assertIs(value, e.value)
+        self.assertIn('JSON', str(e))
+
+    def test_a_value_json_changes_is_refused(self):
+        # Serialisable, but not unchanged: JSON turns the integer key into
+        # '1', so what the metadata recorded would not be what was written.
+        e = self._assert_refused(
+            'not_representable', {'node-label': {1: 'a'}}, 'agent')
+        self.assertEqual('node-label', e.key)
+
+    def test_every_server_owned_key_is_refused_with_and_without_plus(self):
+        for key in SERVER_OWNED_KEYS:
+            for spelling in (key, key + '+'):
+                if spelling == 'tls-san+':
+                    continue
+                e = self._assert_refused('owned_key', {spelling: 'x'})
+                self.assertEqual(spelling, e.key)
+                self.assertIn(spelling, str(e))
+
+    def test_every_agent_owned_key_is_refused_with_and_without_plus(self):
+        for key in AGENT_OWNED_KEYS:
+            for spelling in (key, key + '+'):
+                e = self._assert_refused(
+                    'owned_key', {spelling: 'x'}, 'agent')
+                self.assertEqual(spelling, e.key)
+
+    def test_bare_tls_san_is_refused_and_the_message_says_what_to_write(self):
+        e = self._assert_refused('owned_key', {'tls-san': ['k3s.example.com']})
+        self.assertIn('tls-san+', str(e))
+
+    def test_tls_san_plus_is_allowed_on_a_server(self):
+        # The one '+' spelling of an owned key which is allowed: it is how
+        # a caller adds SANs to the floating address the plugin sets.
+        text = cluster_module.validate_k3s_config(
+            {'tls-san+': ['k3s.example.com']}, 'server')
+        self.assertEqual({'tls-san+': ['k3s.example.com']},
+                         yaml.safe_load(text))
+
+    def test_a_doubled_plus_is_still_an_owned_key(self):
+        # Only exactly tls-san+ is excused; anything else which strips to
+        # an owned key is that key.
+        self._assert_refused('owned_key', {'tls-san++': ['x']})
+        self._assert_refused('owned_key', {'token++': 'x'}, 'agent')
+
+    def test_ownership_is_per_role(self):
+        # write-kubeconfig-mode is a server's concern only: an agent writes
+        # no kubeconfig, and k3s ignores the key there itself.
+        self.assertNotEqual(
+            '', cluster_module.validate_k3s_config(
+                {'write-kubeconfig-mode': '0600'}, 'agent'))
+
+    def test_a_value_holding_the_delimiter_is_written_indented(self):
+        # The check is on the text that will be written, not on the input.
+        # PyYAML indents every continuation line of a value in a mapping,
+        # so the delimiter on a line of its own inside a value never
+        # reaches column zero, and refusing it would refuse configuration
+        # which can be written perfectly well.
+        config = {'node-label': 'a\n%s\nb' % cluster_module.K3S_CONFIG_DELIMITER,
+                  cluster_module.K3S_CONFIG_DELIMITER: ['x']}
+        text = cluster_module.validate_k3s_config(config, 'server')
+        self.assertNotIn(cluster_module.K3S_CONFIG_DELIMITER, text.split('\n'))
+        self.assertEqual(config, yaml.safe_load(text))
+
+    def test_text_with_a_delimiter_line_is_refused(self):
+        # No mapping makes today's PyYAML emit a line which is exactly
+        # SFK3SCONFIG (see the test above), so the check is exercised by
+        # pointing it at a line this dump does emit. That still runs the
+        # real dumper and the real comparison; only the marker differs.
+        with mock.patch.object(cluster_module, 'K3S_CONFIG_DELIMITER',
+                               '- traefik'):
+            e = self._assert_refused('delimiter_collision',
+                                     {'disable': ['traefik']})
+        self.assertEqual('- traefik', e.delimiter)
+
+    def test_an_unknown_role_is_a_programming_error(self):
+        self.assertRaises(ValueError, cluster_module.validate_k3s_config,
+                          {}, 'worker')
+
+
+class ReadK3sConfigTestCase(testtools.TestCase):
+    """read_k3s_config() reads one YAML mapping, and keeps every failure in the hierarchy."""
+
+    def setUp(self):
+        super(ReadK3sConfigTestCase, self).setUp()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        self.tempdir = tempdir.name
+
+    def _write_bytes(self, content, name='config.yaml'):
+        path = os.path.join(self.tempdir, name)
+        with open(path, 'wb') as f:
+            f.write(content)
+        return path
+
+    def _assert_unreadable(self, path):
+        e = self.assertRaises(
+            exceptions.K3sConfigError, cluster_module.read_k3s_config,
+            path, 'server')
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('unreadable', e.reason)
+        self.assertEqual(path, e.path)
+        self.assertIn(path, str(e))
+        return e
+
+    def test_the_mapping_is_returned_not_the_text(self):
+        path = self._write_bytes(
+            b'disable:\n- traefik\nnode-label:\n- a=b\n')
+        self.assertEqual({'disable': ['traefik'], 'node-label': ['a=b']},
+                         cluster_module.read_k3s_config(path, 'server'))
+
+    def test_an_empty_file_is_an_empty_mapping(self):
+        path = self._write_bytes(b'')
+        self.assertEqual({}, cluster_module.read_k3s_config(path, 'agent'))
+
+    def test_a_missing_file_is_refused(self):
+        self._assert_unreadable(os.path.join(self.tempdir, 'missing.yaml'))
+
+    def test_a_file_which_is_not_utf8_is_refused(self):
+        # A UnicodeDecodeError is a ValueError, not an OSError, and has to
+        # be named to stay inside the hierarchy.
+        self._assert_unreadable(self._write_bytes(b'node-label:\n- \xff\xfe\n'))
+
+    def test_invalid_yaml_is_refused(self):
+        self._assert_unreadable(self._write_bytes(b'disable: [traefik\n'))
+
+    def test_two_documents_are_refused(self):
+        # yaml.safe_load raises for a stream holding more than one
+        # document, which is a YAMLError like any other parse failure.
+        self._assert_unreadable(
+            self._write_bytes(b'disable:\n- traefik\n---\ntoken: x\n'))
+
+    def test_what_is_read_is_validated(self):
+        path = self._write_bytes(b'token: x\n')
+        e = self.assertRaises(
+            exceptions.K3sConfigError, cluster_module.read_k3s_config,
+            path, 'agent')
+        self.assertEqual('owned_key', e.reason)
+        self.assertEqual('agent', e.role)
+
+    def test_a_file_holding_a_list_is_refused_as_not_a_mapping(self):
+        path = self._write_bytes(b'- disable\n- traefik\n')
+        e = self.assertRaises(
+            exceptions.K3sConfigError, cluster_module.read_k3s_config,
+            path, 'server')
+        self.assertEqual('not_a_mapping', e.reason)
+
+
+class CheckK3sReleaseTestCase(testtools.TestCase):
+    """check_k3s_release() refuses anything older than v1.21.1, and anything it cannot read.
+
+    v1.21.0 is the boundary worth pinning: it reads drop-in files but not
+    the '+' suffix, so a cluster built on it would take tls-san+ and
+    disable+ as keys with other names and say nothing.
+    """
+
+    def test_the_floor_is_v1_21_1(self):
+        self.assertEqual((1, 21, 1), cluster_module.K3S_RELEASE_FLOOR)
+
+    def test_supported_releases_are_accepted(self):
+        for release in ('v1.21.1+k3s1', 'v1.36.5+k3s1', 'v2.0.0+k3s1'):
+            self.assertIsNone(
+                cluster_module.check_k3s_release(release, 'stable'))
+
+    def _assert_too_old(self, release, channel):
+        e = self.assertRaises(
+            exceptions.UnsupportedReleaseError,
+            cluster_module.check_k3s_release, release, channel)
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('too_old', e.reason)
+        self.assertEqual(release, e.release)
+        self.assertEqual(channel, e.channel)
+        self.assertEqual((1, 21, 1), e.floor)
+        self.assertIn(release, str(e))
+        self.assertIn(channel, str(e))
+        self.assertIn('v1.21.1', str(e))
+        return e
+
+    def test_v1_21_0_is_refused(self):
+        self._assert_too_old('v1.21.0+k3s1', 'v1.21')
+
+    def test_the_last_v1_20_is_refused(self):
+        self._assert_too_old('v1.20.15+k3s1', 'v1.20')
+
+    def test_a_release_candidate_is_compared_by_its_numbers(self):
+        # What the testing channel has resolved to.
+        self._assert_too_old('v1.18.2-rc3+k3s1', 'testing')
+
+    def test_a_channel_name_is_unparseable(self):
+        e = self.assertRaises(
+            exceptions.UnsupportedReleaseError,
+            cluster_module.check_k3s_release, 'stable', 'stable')
+        self.assertEqual('unparseable', e.reason)
+        self.assertEqual('stable', e.release)
+        self.assertIsNone(e.floor)
+        self.assertIn("'stable'", str(e))
+
+    def test_none_is_unparseable(self):
+        e = self.assertRaises(
+            exceptions.UnsupportedReleaseError,
+            cluster_module.check_k3s_release, None, 'stable')
+        self.assertEqual('unparseable', e.reason)
+
+
 class ManifestHeredocTestCase(testtools.TestCase):
     """The command a manifest is staged with, run through a real shell.
 
@@ -2115,12 +2541,17 @@ class ShellQuotingTestCase(testtools.TestCase):
 
 
 def _control_plane_and_metallb_commands():
-    """Every commandline a control plane install and a metallb reconfigure send.
+    """Every commandline a control plane install, a k3s join and a metallb reconfigure send.
 
-    Shared by the two test cases below which assert a property over the
-    generated commands rather than at each call site. Both want the same
-    two paths driven, and a second copy of this setup is a second thing to
+    Shared by the test cases below which assert a property over the
+    generated commands rather than at each call site. They want the same
+    paths driven, and a second copy of this setup is a second thing to
     forget to update.
+
+    install_k3s_component() is driven for both roles, with a non-empty
+    configuration recorded for each, because it writes k3s configuration
+    files through heredocs of its own, and a property asserted over every
+    heredoc is only as good as the set of commands it is asserted over.
     """
     client = fakes.FakeClusterClient()
     client.metadata[MD_KEY] = {
@@ -2130,11 +2561,16 @@ def _control_plane_and_metallb_commands():
         'api_address_floating': '192.168.10.100',
         'api_address_inner': '10.0.0.4',
         'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
-        'routed_addresses': ['192.168.10.101', '192.168.10.102']
+        'routed_addresses': ['192.168.10.101', '192.168.10.102'],
+        'server_config': {'disable': ['traefik']},
+        'agent_config': {'node-label': ['openvswitch=enabled']}
     }
-    client.instances['inst-cp1'] = {
-        'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
-        'state': 'created', 'agent_state': 'ready'}
+    for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                ('inst-cp2', 'k3s-banana-node-002'),
+                                ('inst-w1', 'k3s-banana-node-003')]:
+        client.instances[instance_uuid] = {
+            'uuid': instance_uuid, 'name': name,
+            'state': 'created', 'agent_state': 'ready'}
 
     with tempfile.TemporaryDirectory() as tempdir:
         manifest = os.path.join(tempdir, 'staged.yaml')
@@ -2143,6 +2579,10 @@ def _control_plane_and_metallb_commands():
 
         cluster = _make_cluster(client)
         cluster.install_control_plane(manifests=[manifest])
+        _make_cluster(client).install_k3s_component(
+            ['inst-cp2'], 'server-token', 'server')
+        _make_cluster(client).install_k3s_component(
+            ['inst-w1'], 'node-token', 'agent')
         _make_cluster(client).configure_metallb_addresses()
 
     return [commandline for _, commandline in client.executed]
@@ -2346,8 +2786,25 @@ class HeredocDelimiterTestCase(testtools.TestCase):
         document, and conductor writes it too, so a value containing a
         newline is not something the API's own validation rules out on
         this package's behalf -- rule 1 says so in as many words. Without
-        the refusal, these two bodies would carry 'kubectl ...' or anything
-        else the writer chose, as root on the first control plane node.
+        a defence, these bodies would carry 'kubectl ...' or anything else
+        the writer chose, as root on the first control plane node.
+
+        The two sinks are defended differently, which is why both are
+        checked here rather than one standing in for the other.
+
+        The k3s configuration files are serialised by yaml.safe_dump(),
+        which emits a value containing newlines as a quoted scalar whose
+        continuation lines are indented. No line of the result can equal
+        the delimiter, so the body cannot end its own heredoc and
+        heredoc() has nothing to refuse -- the attack is answered by
+        construction rather than by a check. Asserted on the generated
+        command rather than trusting the serialiser, and the round trip is
+        asserted too, because escaping which corrupted the value would be
+        a different bug wearing this one's clothes.
+
+        MetalLB's address list is interpolated into its body as text, so
+        there the delimiter refusal in heredoc() is the whole defence and
+        the call raises.
         """
         hostile = '10.0.0.1"\nEOF\ntouch /pwned\ncat - > /dev/null << \'EOF\'\nx'
 
@@ -2362,18 +2819,31 @@ class HeredocDelimiterTestCase(testtools.TestCase):
             'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
             'state': 'created', 'agent_state': 'ready'}
 
-        e = self.assertRaises(exceptions.GuestFileError,
-                              _make_cluster(client).install_control_plane)
-        self.assertEqual('delimiter_collision', e.reason)
-        self.assertEqual('/etc/rancher/k3s/config.yaml', e.path)
+        _make_cluster(client).install_control_plane()
+
+        wrote = [c for _, c in client.executed
+                 if cluster_module.K3S_CONFIG_DELIMITER in c]
+        self.assertNotEqual([], wrote)
+        for command in wrote:
+            body = command.split('\n', 1)[1]
+            lines = body.split('\n')
+            self.assertNotIn(cluster_module.K3S_CONFIG_DELIMITER,
+                             lines[:-2], command)
+            self.assertNotIn('EOF', lines, command)
+
+        main = [c for _, c in client.executed
+                if '/etc/rancher/k3s/config.yaml' in c
+                and 'config.yaml.d' not in c]
+        self.assertEqual(1, len(main), client.executed)
+        body = main[0].split('\n', 1)[1]
+        body = body[:body.rindex(cluster_module.K3S_CONFIG_DELIMITER)]
+        self.assertEqual([hostile], yaml.safe_load(body)['tls-san'])
 
         e = self.assertRaises(
             exceptions.GuestFileError,
             _make_cluster(client).configure_metallb_addresses)
+        self.assertEqual('delimiter_collision', e.reason)
         self.assertEqual('/etc/sf/metallb-range-allocation.yaml', e.path)
-
-        # Nothing was executed on the node before the refusal.
-        self.assertEqual([], [a for a in client.actions if a[0] == 'execute'])
 
     def test_heredoc_builds_what_it_used_to_build(self):
         """The builder is a refactor of three identical string literals."""
@@ -2397,6 +2867,318 @@ class HeredocDelimiterTestCase(testtools.TestCase):
             '/etc/sf/thing.yaml', 'SFK3SMANIFEST\n',
             cluster_module.K3S_MANIFEST_DELIMITER)
         self.assertEqual(cluster_module.K3S_MANIFEST_DELIMITER, e.delimiter)
+
+    def test_the_k3s_configuration_heredocs_are_among_those_checked(self):
+        # The check above is only as wide as the commands it is given.
+        # install_k3s_component() generated no heredoc until it started
+        # writing k3s configuration, and nothing failed when the shared
+        # helper did not drive it; this is what fails if it stops doing so.
+        # One config.yaml for each of the three nodes the helper installs,
+        # and each drop-in at least once.
+        destinations = [line.split(' << ', 1)[0][len('cat - > '):]
+                        for commandline in _control_plane_and_metallb_commands()
+                        for line in commandline.split('\n')
+                        if line.startswith('cat - > /etc/rancher/k3s/')]
+        self.assertEqual(3, destinations.count('/etc/rancher/k3s/config.yaml'),
+                         destinations)
+        for drop_in in ('50-sf-client-k3s.yaml',
+                        '90-sf-client-k3s-enforced.yaml'):
+            self.assertIn('/etc/rancher/k3s/config.yaml.d/' + drop_in,
+                          destinations)
+
+
+# The framing every k3s configuration file is written with: a quoted
+# heredoc, its body, and the delimiter on a line of its own. A body which
+# did not end in a newline would put the delimiter on the body's last line
+# and fail this match, which is the point of matching the whole command.
+K3S_CONFIG_WRITE_RE = re.compile(
+    r"\Acat - > (/etc/rancher/k3s/\S+) << '%s'\n(.*\n)%s\n\Z"
+    % (re.escape(cluster_module.K3S_CONFIG_DELIMITER),
+       re.escape(cluster_module.K3S_CONFIG_DELIMITER)),
+    re.DOTALL)
+
+K3S_CONFIG = '/etc/rancher/k3s/config.yaml'
+K3S_CALLER_DROP_IN = '/etc/rancher/k3s/config.yaml.d/50-sf-client-k3s.yaml'
+K3S_ENFORCED_DROP_IN = (
+    '/etc/rancher/k3s/config.yaml.d/90-sf-client-k3s-enforced.yaml')
+K3S_CONTROL_PLANE_TAINT = 'node-role.kubernetes.io/control-plane:NoSchedule'
+K3S_AGENT_CONFIG_BODY = (
+    '# Written by shakenfist_client_k3s; caller configuration is in '
+    'config.yaml.d/.\n')
+
+
+def _k3s_config_files(commands):
+    """{path: body} for every k3s configuration file commands write, in order.
+
+    Fails rather than skipping a write whose framing it does not recognise,
+    so that a malformed heredoc is a failure here and not a missing file.
+    """
+    files = collections.OrderedDict()
+    for command in commands:
+        if not command.startswith('cat - > /etc/rancher/k3s/'):
+            continue
+        match = K3S_CONFIG_WRITE_RE.match(command)
+        if not match:
+            raise AssertionError(
+                'a k3s configuration write is not framed as a quoted '
+                'heredoc ending in its delimiter: %r' % command)
+        files[match.group(1)] = match.group(2)
+    return files
+
+
+class K3sConfigCommandsTestCase(testtools.TestCase):
+    """The k3s configuration files every node is given before its installer runs.
+
+    Decisions 4, 5 and 7 of
+    docs/plans/PLAN-node-customisation-phase-02-k3s-config.md. Each node
+    gets config.yaml with the plugin's own settings, the caller's
+    configuration for its role as a drop-in read after it, and on servers
+    of a cluster with MetalLB an enforced drop-in read last which appends
+    servicelb to disable.
+
+    Driven through install_control_plane(), install_extra_control_plane()
+    and install_workers() rather than by calling the helper, so that what
+    is pinned is what each kind of node is sent, first_server and role
+    included. These assert on the commands. Whether k3s merges the files
+    the way the comment above _k3s_config_commands() says is phase 3's
+    live check, not something a unit test can answer.
+    """
+
+    SERVER_CONFIG = {'disable': ['traefik'],
+                     'node-label': ['openstack-control-plane=enabled']}
+    AGENT_CONFIG = {'node-label': ['openstack-compute-node=enabled',
+                                   'openvswitch=enabled']}
+
+    def setUp(self):
+        super(K3sConfigCommandsTestCase, self).setUp()
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _install(self, workers=True, **md_extra):
+        """Install a two server cluster, and its worker if any; return each node's commands."""
+        client = fakes.FakeClusterClient()
+        worker_nodes = ['inst-w1'] if workers else []
+        md = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 4, 'node_network': 'net-1',
+            'node_token': None, 'server_token': None, 'k3s_version': 'v1.33',
+            'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4', 'join_address': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1', 'inst-cp2'],
+            'worker_nodes': worker_nodes, 'routed_addresses': []
+        }
+        md.update(md_extra)
+        client.metadata[MD_KEY] = md
+        for i, instance_uuid in enumerate(['inst-cp1', 'inst-cp2']
+                                          + worker_nodes):
+            client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': 'k3s-banana-node-%03d' % (i + 1),
+                'state': 'created', 'agent_state': 'ready'}
+
+        cluster = _make_cluster(client)
+        cluster.install_control_plane()
+        if workers:
+            cluster.install_workers(worker_nodes)
+
+        commands = collections.defaultdict(list)
+        for instance_uuid, commandline in client.executed:
+            commands[instance_uuid].append(commandline)
+        return commands
+
+    def _files(self, commands):
+        return _k3s_config_files(commands)
+
+    def _expected_server_config(self, workers, first_server):
+        expected = {'write-kubeconfig-mode': '0644',
+                    'tls-san': ['192.168.10.100']}
+        if first_server:
+            expected['cluster-init'] = True
+        if workers:
+            expected['node-taint'] = [K3S_CONTROL_PLANE_TAINT]
+        return expected
+
+    def test_the_first_server_config_with_workers(self):
+        files = self._files(self._install(workers=True)['inst-cp1'])
+        self.assertEqual(
+            self._expected_server_config(workers=True, first_server=True),
+            yaml.safe_load(files[K3S_CONFIG]))
+
+    def test_the_first_server_config_without_workers_has_no_taint(self):
+        # MetalLB's controller does not tolerate the taint, and create()
+        # waits for it to roll out, so a zero-worker cluster tainting its
+        # only node would fail every create (survey finding 7).
+        files = self._files(self._install(workers=False)['inst-cp1'])
+        self.assertEqual(
+            self._expected_server_config(workers=False, first_server=True),
+            yaml.safe_load(files[K3S_CONFIG]))
+
+    def test_the_kubeconfig_mode_is_a_string(self):
+        # Unquoted, YAML reads 0644 as the integer 644 (or 420, as an
+        # octal), and k3s would be given a mode it did not mean.
+        files = self._files(self._install()['inst-cp1'])
+        self.assertIn("write-kubeconfig-mode: '0644'\n", files[K3S_CONFIG])
+
+    def test_an_extra_server_config_has_no_cluster_init(self):
+        for workers in (True, False):
+            files = self._files(self._install(workers=workers)['inst-cp2'])
+            self.assertEqual(
+                self._expected_server_config(workers=workers,
+                                             first_server=False),
+                yaml.safe_load(files[K3S_CONFIG]),
+                'with%s workers' % ('' if workers else 'out'))
+
+    def test_an_agent_config_is_the_comment_line_only(self):
+        files = self._files(self._install()['inst-w1'])
+        self.assertEqual(K3S_AGENT_CONFIG_BODY, files[K3S_CONFIG])
+        self.assertIsNone(yaml.safe_load(files[K3S_CONFIG]))
+
+    def test_the_caller_drop_in_round_trips_for_each_role(self):
+        commands = self._install(server_config=self.SERVER_CONFIG,
+                                 agent_config=self.AGENT_CONFIG)
+        for instance_uuid, expected in [('inst-cp1', self.SERVER_CONFIG),
+                                        ('inst-cp2', self.SERVER_CONFIG),
+                                        ('inst-w1', self.AGENT_CONFIG)]:
+            files = self._files(commands[instance_uuid])
+            self.assertEqual(expected,
+                             yaml.safe_load(files[K3S_CALLER_DROP_IN]),
+                             instance_uuid)
+
+    def test_the_caller_drop_in_is_written_only_for_a_non_empty_config(self):
+        # Each role's file is decided by that role's configuration alone:
+        # a server_config does not give the workers a drop-in, nor an
+        # agent_config the servers. Missing and empty both mean none.
+        cases = [
+            ({}, {'inst-cp1': False, 'inst-cp2': False, 'inst-w1': False}),
+            ({'server_config': {}, 'agent_config': {}},
+             {'inst-cp1': False, 'inst-cp2': False, 'inst-w1': False}),
+            ({'server_config': self.SERVER_CONFIG},
+             {'inst-cp1': True, 'inst-cp2': True, 'inst-w1': False}),
+            ({'agent_config': self.AGENT_CONFIG},
+             {'inst-cp1': False, 'inst-cp2': False, 'inst-w1': True}),
+        ]
+        for md_extra, expected in cases:
+            commands = self._install(**md_extra)
+            written = {instance_uuid: K3S_CALLER_DROP_IN in self._files(
+                           commands[instance_uuid])
+                       for instance_uuid in expected}
+            self.assertEqual(expected, written, md_extra)
+
+    def test_the_enforced_drop_in_is_on_servers_with_metallb_only(self):
+        # Missing means True: a cluster built before metallb_installed was
+        # recorded has MetalLB.
+        for md_extra, on_servers in [({}, True),
+                                     ({'metallb_installed': True}, True),
+                                     ({'metallb_installed': False}, False)]:
+            commands = self._install(**md_extra)
+            for instance_uuid in ('inst-cp1', 'inst-cp2'):
+                files = self._files(commands[instance_uuid])
+                if on_servers:
+                    self.assertEqual(
+                        {'disable+': ['servicelb']},
+                        yaml.safe_load(files[K3S_ENFORCED_DROP_IN]),
+                        (instance_uuid, md_extra))
+                else:
+                    self.assertNotIn(K3S_ENFORCED_DROP_IN, files,
+                                     (instance_uuid, md_extra))
+            self.assertNotIn(K3S_ENFORCED_DROP_IN,
+                             self._files(commands['inst-w1']), md_extra)
+
+    def test_servicelb_is_not_in_config_yaml(self):
+        # A caller's disable in the 50 file would replace a disable in
+        # config.yaml and bring servicelb back (survey finding 4).
+        files = self._files(self._install(
+            server_config={'disable': ['traefik']})['inst-cp1'])
+        self.assertNotIn('disable', yaml.safe_load(files[K3S_CONFIG]))
+
+    def test_the_drop_ins_are_written_in_the_order_k3s_reads_them(self):
+        files = self._files(self._install(
+            server_config=self.SERVER_CONFIG)['inst-cp1'])
+        self.assertEqual(
+            [K3S_CONFIG, K3S_CALLER_DROP_IN, K3S_ENFORCED_DROP_IN],
+            list(files))
+
+    def test_node_taint_opt_out_replaces_the_default(self):
+        # The default stays in config.yaml; the opt-out is the caller's
+        # file, read after it, replacing the list with an empty one.
+        files = self._files(self._install(
+            server_config={'node-taint': []})['inst-cp1'])
+        self.assertEqual([K3S_CONTROL_PLANE_TAINT],
+                         yaml.safe_load(files[K3S_CONFIG])['node-taint'])
+        self.assertEqual([], yaml.safe_load(
+            files[K3S_CALLER_DROP_IN])['node-taint'])
+
+    def test_every_config_command_precedes_the_installer(self):
+        commands = self._install(server_config=self.SERVER_CONFIG,
+                                 agent_config=self.AGENT_CONFIG)
+        # The directory, config.yaml and the caller's drop-in on every
+        # node, and the enforced drop-in on the servers.
+        for instance_uuid, expected_count in [('inst-cp1', 4), ('inst-cp2', 4),
+                                              ('inst-w1', 3)]:
+            node_commands = commands[instance_uuid]
+            # startswith() rather than a hostname substring test, for the
+            # CodeQL reason test_library_api.py's _server_install_index()
+            # gives.
+            installs = [i for i, c in enumerate(node_commands)
+                        if c.startswith('curl -sfL https://get.k3s.io | ')]
+            self.assertEqual(1, len(installs), node_commands)
+            config = [i for i, c in enumerate(node_commands)
+                      if '/etc/rancher/k3s/config.yaml' in c]
+            self.assertEqual(expected_count, len(config), node_commands)
+            for i in config:
+                self.assertLess(
+                    i, installs[0],
+                    '%s: %r runs after the k3s installer, which has already '
+                    'started the service by then' % (instance_uuid,
+                                                     node_commands[i]))
+            self.assertTrue(node_commands[config[0]].startswith('mkdir -p '),
+                            node_commands)
+
+    def test_the_files_which_land_are_the_files_which_were_sent(self):
+        # Through a real shell, as ManifestHeredocTestCase does for
+        # manifests: whether the heredoc framing delivers the body intact
+        # is a fact about /bin/sh rather than about string formatting.
+        if not os.path.exists('/bin/sh'):
+            self.skipTest('this test runs the write commands through /bin/sh')
+        config = {'node-label': ['shell=$HOME `hostname` $(id)'],
+                  'kubelet-arg': ["eviction-hard=memory.available<'5%'"]}
+        commands = self._install(server_config=config)['inst-cp1']
+        sent = self._files(commands)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            for command in commands:
+                if '/etc/rancher/k3s' not in command:
+                    continue
+                command = command.replace('/etc/rancher/k3s', tempdir)
+                run = subprocess.run(command, shell=True, cwd=tempdir,
+                                     capture_output=True)
+                self.assertEqual(0, run.returncode, run.stderr)
+            for path, body in sent.items():
+                with open(path.replace('/etc/rancher/k3s', tempdir),
+                          encoding='utf-8') as f:
+                    self.assertEqual(body, f.read(), path)
+        self.assertEqual(config, yaml.safe_load(sent[K3S_CALLER_DROP_IN]))
+
+    def test_metadata_configuration_is_validated_again_at_write_time(self):
+        # A library caller can reach the install methods without create(),
+        # with metadata nothing has checked. A plugin-owned key there is
+        # refused before anything is run on the node.
+        client = fakes.FakeClusterClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 2, 'node_network': 'net-1', 'k3s_version': 'v1.33',
+            'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': [],
+            'routed_addresses': [], 'server_config': {'token': 'x'}
+        }
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+
+        self.assertRaises(exceptions.K3sConfigError,
+                          _make_cluster(client).install_control_plane)
+        self.assertEqual([], client.executed)
 
 
 class ReadinessWaitsOnWorkloadsTestCase(testtools.TestCase):

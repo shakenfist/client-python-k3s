@@ -123,6 +123,13 @@ module in check mode, a form which wants to reject a file before the
 operator waits twenty minutes -- can do the same check the real call
 will do. It touches no cluster and no API client.
 
+`read_k3s_config(path, role)` is public on the same terms. It takes the
+path of a k3s configuration file and `'server'` or `'agent'`, and
+returns the mapping the file holds, ready to pass as `server_config` or
+`agent_config`. It raises `K3sConfigError` for a file it cannot read or
+parse, or whose keys `create()` would refuse. It touches no cluster and
+no API client.
+
 Two of these have shapes worth stating, because they are not what a
 reader would guess. `install_workers()` takes the instance uuids to
 install, with no default -- a caller which means "every worker" has to
@@ -143,9 +150,14 @@ themselves -- they are exactly as unconditional as before -- it is
 once per file. So do the six sizing arguments, `control_plane_cpus`,
 `control_plane_memory`, `control_plane_disk`, `worker_cpus`,
 `worker_memory` and `worker_disk`, which are vCPUs, MB and GB
-respectively and default to 2, 2048 and 50; see its docstring in
-`cluster.py` for the full signature. See `docs/usage.md` for what each
-command does; this page does not restate it.
+respectively and default to 2, 2048 and 50. `server_config` and
+`agent_config` take a mapping of k3s configuration keys, applied to
+every control plane node and every worker respectively and recorded so
+that `expand_workers()` reuses the agent one; they default to None,
+which means none, and `docs/usage.md` says which keys are refused. See
+its docstring in `cluster.py` for the full signature, and
+`docs/usage.md` for what each command does; this page does not restate
+it.
 
 ### Kubeconfig side effects default off in the library
 
@@ -272,6 +284,8 @@ a correct caller never needs to catch it.
 | `GuestFileError` | a file this library writes onto a cluster node carries a line equal to the heredoc marker used to write it, so writing it would run the rest as commands on the node. The values that reach these bodies come from the namespace metadata document, which is third-party writable |
 | `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
 | `NodeSizeError` | `create()` is given a node size that is not a positive integer (a bool counts as not), before anything is built or the name is registered |
+| `K3sConfigError` | `create(server_config=..., agent_config=...)` is given a mapping that cannot be used -- not a mapping, a non-string key, a value that does not survive a JSON round trip, a key the plugin owns, or text that collides with the heredoc marker -- or `read_k3s_config()` cannot read or parse its file, before anything is built or the name is registered |
+| `UnsupportedReleaseError` | `create()` resolves a k3s release older than `v1.21.1+k3s1`, or one it cannot parse, right after the channel lookup and before anything is built or the name is registered |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
