@@ -1080,12 +1080,14 @@ class ShowReportsNodeSizesTestCase(testtools.TestCase):
     """show() reports node sizes for every cluster, including ones which never recorded them.
 
     A cluster created before node_sizes existed has no such key, and show()
-    fills it in from DEFAULT_NODE_SIZE. That is the one place show reports
-    something other than what is stored, and it is allowed to because the
-    filled in value is a fact: before the key existed, every node was built
-    at the default. What it must not do is make that fact true by writing
-    it: show is read only, and a show which rewrote the document would be a
-    metadata write racing conductor's on every look at a cluster.
+    fills it in from DEFAULT_NODE_SIZE. That, and the matching fill for
+    server_config and agent_config (ShowReportsK3sConfigTestCase), are the
+    only places show reports something other than what is stored, and they
+    are allowed to because the filled in value is a fact: before the key
+    existed, every node was built at the default. What it must not do is
+    make that fact true by writing it: show is read only, and a show which
+    rewrote the document would be a metadata write racing conductor's on
+    every look at a cluster.
     """
 
     def _show(self, md):

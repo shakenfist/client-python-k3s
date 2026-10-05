@@ -643,7 +643,8 @@ def check_k3s_release(release, channel):
     A release this cannot parse raises
     exceptions.UnsupportedReleaseError.unparseable rather than being let
     through, because a version which cannot be read is not one the plugin
-    can promise drop-in configuration on (decision 6 of the phase 2 plan).
+    can promise drop-in configuration on (decision 6 of
+    docs/plans/PLAN-node-customisation-phase-02-k3s-config.md).
     """
     match = None
     if isinstance(release, str):
@@ -1422,11 +1423,14 @@ class Cluster:
     # cluster created without workers stays untainted once expand-workers
     # adds some; nothing rewrites a running server's configuration.
     #
-    # Every body goes through a heredoc with a quoted delimiter, per rule 2
-    # above read_manifests(). The paths are literals of this method, so
-    # rule 1 has nothing to quote; the floating address is substituted into
-    # a YAML document rather than into a command line, and yaml.safe_dump()
-    # quotes it as YAML needs.
+    # Every file is written through heredoc(), per rule 2 above
+    # read_manifests(). It quotes the path, although the paths are literals
+    # of this method, and refuses a body which would end its own heredoc:
+    # validate_k3s_config() has already refused that for a caller's
+    # configuration, as a K3sConfigError, so the helper's refusal is what
+    # covers the two bodies this method composes itself. The floating
+    # address is substituted into a YAML document rather than into a
+    # command line, and yaml.safe_dump() quotes it as YAML needs.
     def _k3s_config_commands(self, md, role, first_server=False):
         """The shell commands which write a node's k3s configuration files.
 
@@ -1474,12 +1478,6 @@ class Cluster:
                 "role must be 'server' or 'agent', not %r" % (role,))
 
         def write(path, body):
-            # Through heredoc() rather than built here, per rule 2 at the
-            # top of this module. The validation above already refuses a
-            # configuration whose YAML contains the delimiter and raises
-            # K3sConfigError for it; routing the write through the helper
-            # is what quotes the path, and what keeps the refusal beside
-            # the write for a body this method composed itself.
             return heredoc(path, body, delimiter=K3S_CONFIG_DELIMITER)
 
         cmds = ['mkdir -p /etc/rancher/k3s/config.yaml.d',
@@ -1920,11 +1918,8 @@ class Cluster:
         The defaults are DEFAULT_NODE_SIZE, 2 vCPUs, 2048 MB and 50 GB for
         both roles, which is what every node was built at before these
         arguments existed. 2048 MB is a size a control plane node runs at,
-        not one it holds up at: measured on a cluster built at exactly that
-        size, k3s's server process alone held 709 MB, and a burst of pod
-        creations drove the node into a global OOM which took the API
-        server down for around thirty seconds (open question 3 of
-        docs/plans/PLAN-node-customisation.md). It is still the default,
+        not one it holds up at; the "Sizing" section of docs/usage.md gives
+        the measurement and recommends 4096 MB. It is still the default,
         because changing it would change what an existing invocation
         builds, and validation still accepts any positive integer, because
         a hard minimum would be a guess about workloads this method cannot
@@ -2370,10 +2365,11 @@ class Cluster:
         to know that ``state = initial`` in a screenful of key/value pairs
         is the line that matters and that the answer to it is a delete.
 
-        ``node_sizes`` is the one key this reports which may not be stored.
-        A cluster created before node sizes were recorded has no such key,
-        and for one of those this returns a copy of the metadata with
-        ``node_sizes`` filled in from DEFAULT_NODE_SIZE for both roles.
+        ``node_sizes``, ``server_config`` and ``agent_config`` are the three
+        keys this reports which may not be stored. A cluster created before
+        node sizes were recorded has no ``node_sizes``, and for one of those
+        this returns a copy of the metadata with ``node_sizes`` filled in
+        from DEFAULT_NODE_SIZE for both roles.
         That departs from "show reports what is stored", and it is right
         here because the filled in values are a statement of fact rather
         than a guess: before the key existed there was no way to build a
