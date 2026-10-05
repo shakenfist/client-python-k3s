@@ -208,7 +208,7 @@ class CreateNodeSizingOptionsTestCase(testtools.TestCase):
         self.create.assert_not_called()
 
     def _write_config(self, text):
-        f = tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False)
+        f = tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.yaml', delete=False)
         self.addCleanup(os.unlink, f.name)
         f.write(text)
         f.close()
@@ -234,9 +234,14 @@ class CreateNodeSizingOptionsTestCase(testtools.TestCase):
         self.assertIsNone(kwargs['agent_config'])
 
     def test_a_refused_key_exits_before_create_is_called(self):
+        # --namespace naming one which does not exist yet, because that is
+        # the only case in which binding the context creates a namespace,
+        # and so the only case in which binding before the file is read
+        # would leave one behind.
+        self.client.get_namespace.return_value = None
         server = self._write_config('token: x\n')
 
-        result = self._invoke('--server-config', server)
+        result = self._invoke('--server-config', server, '--namespace', 'newns')
 
         self.assertNotEqual(0, result.exit_code)
         self.assertIn('token', result.output)
