@@ -127,7 +127,7 @@ will do. It touches no cluster and no API client.
 path of a k3s configuration file and `'server'` or `'agent'`, and
 returns the mapping the file holds, ready to pass as `server_config` or
 `agent_config`. It raises `K3sConfigError` for a file it cannot read or
-parse, or whose keys `create()` would refuse. It touches no cluster and
+parse, which uses a YAML alias, or whose keys `create()` would refuse. It touches no cluster and
 no API client.
 
 Two of these have shapes worth stating, because they are not what a

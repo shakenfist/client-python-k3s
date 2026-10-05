@@ -623,6 +623,29 @@ def validate_k3s_config(config, role):
     return text
 
 
+class _NoAliasSafeLoader(yaml.SafeLoader):
+    """yaml.SafeLoader, except that a YAML alias is a parse error.
+
+    safe_load() builds an alias as a second reference to the node it names,
+    which is cheap. validate_k3s_config()'s JSON round trip and its dump
+    then write out every reference in full, so each level of nested
+    aliases multiplies the text: a 350 byte file of them took 80 seconds
+    and 175 MB to validate, and would have been stored in the metadata and
+    written to every node. k3s configuration has no use for aliases, so
+    read_k3s_config() refuses them rather than bounding what they cost. An
+    anchor which nothing refers to is harmless and still parses.
+    """
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            event = self.peek_event()
+            raise yaml.composer.ComposerError(
+                None, None,
+                'found an alias, which k3s configuration may not use',
+                event.start_mark)
+        return super(_NoAliasSafeLoader, self).compose_node(parent, index)
+
+
 def read_k3s_config(path, role):
     """Read a k3s configuration file for role, and return the mapping it holds.
 
@@ -637,7 +660,10 @@ def read_k3s_config(path, role):
     validate_k3s_config(). A file holding more than one YAML document is
     refused as unreadable rather than read for its first document, because
     k3s reads a configuration file as a single mapping and a second
-    document is more likely a mistake than a request to ignore it.
+    document is more likely a mistake than a request to ignore it. So is a
+    file which uses a YAML alias, for the reason _NoAliasSafeLoader gives.
+    A library caller which passes create() a mapping it built itself is
+    not parsing YAML, and is not affected.
 
     The file is read as UTF-8, and OSError, UnicodeDecodeError and
     yaml.YAMLError are all turned into exceptions.K3sConfigError.unreadable,
@@ -648,7 +674,7 @@ def read_k3s_config(path, role):
     """
     try:
         with open(path, encoding='utf-8') as f:
-            config = yaml.safe_load(f.read())
+            config = yaml.load(f.read(), Loader=_NoAliasSafeLoader)
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
         raise exceptions.K3sConfigError.unreadable(path, str(e))
 

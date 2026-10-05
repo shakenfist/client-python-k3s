@@ -84,9 +84,11 @@ k3s's own `config.yaml` spells them. The server file is applied to
 every control plane node and the agent file to every worker. Neither
 is interpreted: keys are not checked against k3s's flags, and k3s logs
 and ignores a key it does not recognise for the role. An empty file
-means no configuration. Both mappings are recorded in the cluster's
-metadata, which is how `expand-workers` gives a new worker the agent
-configuration the cluster was created with.
+means no configuration. A file which uses a YAML alias (`*name`, which
+`<<:` merge keys need too) is refused, because a few hundred bytes of
+nested aliases expand to gigabytes. Both mappings are recorded in the
+cluster's metadata, which is how `expand-workers` gives a new worker
+the agent configuration the cluster was created with.
 
 Each node gets up to three files in `/etc/rancher/k3s/`, all written
 before the k3s installer first runs, and k3s reads them in this order:

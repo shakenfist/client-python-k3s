@@ -696,7 +696,7 @@ class K3sConfigError(_ReasonedK3sException):
       configuration rather than manifests.
     - ``unreadable(path, reason)``: the file ``read_k3s_config()`` was
       given could not be opened, decoded as UTF-8, or parsed as a single
-      YAML document. As with ``ManifestError.unreadable()``, this keeps
+      YAML document without aliases. As with ``ManifestError.unreadable()``, this keeps
       ``OSError``, ``UnicodeDecodeError`` and ``yaml.YAMLError`` inside
       this hierarchy, so a caller which catches ``K3sClusterException``
       does not have to catch builtins and PyYAML's errors as well.

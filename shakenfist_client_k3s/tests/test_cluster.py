@@ -2237,6 +2237,41 @@ class ReadK3sConfigTestCase(testtools.TestCase):
         self._assert_unreadable(
             self._write_bytes(b'disable:\n- traefik\n---\ntoken: x\n'))
 
+    def test_an_alias_is_refused(self):
+        e = self._assert_unreadable(self._write_bytes(
+            b'node-label: &labels [a=b]\nnode-label+: *labels\n'))
+        self.assertIn('alias', str(e))
+
+    def test_a_merge_key_is_refused(self):
+        # <<: needs an alias to name what it merges.
+        self._assert_unreadable(self._write_bytes(
+            b'base: &base {a: b}\nkubelet-arg:\n  <<: *base\n'))
+
+    def test_nested_aliases_are_refused_before_they_are_expanded(self):
+        # Ten references per level, so each level multiplies the expanded
+        # text by ten; nine levels in about 350 bytes would be gigabytes.
+        # Two levels here, so that if the refusal were lost this would
+        # fail by returning a mapping rather than hang expanding one.
+        lines = [b'l0: &l0 [x]']
+        for level in range(1, 3):
+            lines.append(b'l%d: &l%d [%s]' % (
+                level, level, b', '.join([b'*l%d' % (level - 1)] * 10)))
+        self._assert_unreadable(self._write_bytes(b'\n'.join(lines) + b'\n'))
+
+    def test_an_anchor_with_no_alias_is_accepted(self):
+        path = self._write_bytes(b'node-label: &labels [a=b]\n')
+        self.assertEqual({'node-label': ['a=b']},
+                         cluster_module.read_k3s_config(path, 'agent'))
+
+    def test_a_mapping_passed_directly_may_share_a_value(self):
+        # Only parsing refuses aliases. A library caller's own mapping, in
+        # which two keys refer to one list, is validated as it always was.
+        labels = ['a=b']
+        config = {'node-label': labels, 'node-label+': labels}
+        self.assertEqual(
+            {'node-label': ['a=b'], 'node-label+': ['a=b']},
+            yaml.safe_load(cluster_module.validate_k3s_config(config, 'agent')))
+
     def test_what_is_read_is_validated(self):
         path = self._write_bytes(b'token: x\n')
         e = self.assertRaises(
