@@ -127,8 +127,11 @@ will do. It touches no cluster and no API client.
 path of a k3s configuration file and `'server'` or `'agent'`, and
 returns the mapping the file holds, ready to pass as `server_config` or
 `agent_config`. It raises `K3sConfigError` for a file it cannot read or
-parse, or whose keys `create()` would refuse. It touches no cluster and
-no API client.
+parse, which uses a YAML alias, or whose keys `create()` would refuse.
+It touches no cluster and no API client. Those refusals protect the
+plugin's own operations rather than the cluster, so a form taking
+configuration from someone less trusted than the cluster's owner needs
+an allowlist of its own; `docs/usage.md` explains why.
 
 Two of these have shapes worth stating, because they are not what a
 reader would guess. `install_workers()` takes the instance uuids to
@@ -250,9 +253,9 @@ stall note.
 
 Every failure this library detects and reports is a
 `K3sClusterException` subclass; `apiclient` exceptions, and
-`OSError`/`yaml.YAMLError` from local file and subprocess work (an
-unreadable `sshkey` path, a `~/.kube/config` write, a malformed
-kubeconfig), propagate unchanged rather than being wrapped. Every
+`OSError`/`yaml.YAMLError` from local file and subprocess work (a
+`~/.kube/config` write, a malformed kubeconfig), propagate unchanged
+rather than being wrapped. Every
 `K3sClusterException` subclass's `__str__` renders exactly the text
 `sf-client k3s ...` printed before this line existed as an exception
 at all -- catching the base class and printing `str(e)` reproduces
@@ -284,14 +287,14 @@ a correct caller never needs to catch it.
 | `GuestFileError` | a file this library writes onto a cluster node carries a line equal to the heredoc marker used to write it, so writing it would run the rest as commands on the node. The values that reach these bodies come from the namespace metadata document, which is third-party writable |
 | `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
 | `NodeSizeError` | `create()` is given a node size that is not a positive integer (a bool counts as not), before anything is built or the name is registered |
-| `K3sConfigError` | `create(server_config=..., agent_config=...)` is given a mapping that cannot be used -- not a mapping, a non-string key, a value that does not survive a JSON round trip, a key the plugin owns, or text that collides with the heredoc marker -- or `read_k3s_config()` cannot read or parse its file, before anything is built or the name is registered |
+| `K3sConfigError` | `create(server_config=..., agent_config=...)` is given a mapping that cannot be used -- not a mapping, a non-string key, a key containing `=`, a value that does not survive a JSON round trip, a key the plugin owns (or k3s's alias for one), or text that collides with the heredoc marker -- or `read_k3s_config()` cannot read or parse its file, before anything is built or the name is registered |
 | `UnsupportedReleaseError` | `create()` resolves a k3s release older than `v1.21.1+k3s1`, or one it cannot parse, right after the channel lookup and before anything is built or the name is registered |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
 | `ClusterMetadataError` | a value read back out of the namespace metadata cannot be used -- `expand_addresses()` finds something in `routed_addresses` that is not an IP address, or the API hands back one that is not. Raised before any address is routed, because the addresses are charged for and the configuration they go into is written afterwards |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
-| `KubeconfigError` | a local `~/.kube/config` write, merge or `kubectl config unset` fails |
+| `KubeconfigError` | a local `~/.kube/config` merge or `kubectl config unset` fails, or a merge is needed and there is no local `kubectl`. A failed write of the file itself is an `OSError` |
 
 Each exception's docstring in `shakenfist_client_k3s/exceptions.py`
 names the exact call site and the attributes it carries; several are
@@ -301,7 +304,7 @@ constructors, because one class covers several call sites whose
 message text differs.
 
 Where a class has classmethods, **they are the interface and the
-constructor is not**. The seven classes that carry a `reason` share a
+constructor is not**. The eight classes that carry a `reason` share a
 base whose `__init__` takes `(reason, message, **fields)`, so every
 attribute past `message` is keyword-only, and the set of attributes a
 class carries is its `FIELDS` tuple rather than a parameter list.

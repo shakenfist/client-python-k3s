@@ -94,6 +94,15 @@ from memory of the version floor.
         fail_msg: "{{ cluster.health }}"
 ```
 
+A cluster created with no workers, as this one is and as
+`initial_workers` defaults to, is never given the control plane
+`NoSchedule` taint, and stays untainted after workers are added, so
+pods can schedule onto its control plane node (see "k3s configuration"
+in `docs/usage.md`). The module cannot yet pass the k3s configuration
+or node sizes the command line can. Until it does, a control plane
+that must stay clear of workloads needs `initial_workers` of at least
+one.
+
 This and the module's own `EXAMPLES` string are the same playbook
 shapes; `EXAMPLES` additionally shows an administrator connecting with
 explicit credentials, a manifest applied at first boot, a check-mode

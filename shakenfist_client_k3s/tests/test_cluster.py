@@ -1080,12 +1080,14 @@ class ShowReportsNodeSizesTestCase(testtools.TestCase):
     """show() reports node sizes for every cluster, including ones which never recorded them.
 
     A cluster created before node_sizes existed has no such key, and show()
-    fills it in from DEFAULT_NODE_SIZE. That is the one place show reports
-    something other than what is stored, and it is allowed to because the
-    filled in value is a fact: before the key existed, every node was built
-    at the default. What it must not do is make that fact true by writing
-    it: show is read only, and a show which rewrote the document would be a
-    metadata write racing conductor's on every look at a cluster.
+    fills it in from DEFAULT_NODE_SIZE. That, and the matching fill for
+    server_config and agent_config (ShowReportsK3sConfigTestCase), are the
+    only places show reports something other than what is stored, and they
+    are allowed to because the filled in value is a fact: before the key
+    existed, every node was built at the default. What it must not do is
+    make that fact true by writing it: show is read only, and a show which
+    rewrote the document would be a metadata write racing conductor's on
+    every look at a cluster.
     """
 
     def _show(self, md):
@@ -1965,9 +1967,13 @@ class ValidateNodeSizesTestCase(testtools.TestCase):
 SERVER_OWNED_KEYS = (
     'cluster-init', 'data-dir', 'https-listen-port', 'node-name', 'server',
     'tls-san', 'token', 'token-file', 'with-node-id', 'write-kubeconfig',
-    'write-kubeconfig-mode')
+    'write-kubeconfig-mode',
+    # k3s's aliases for data-dir, server, token and write-kubeconfig.
+    'd', 's', 't', 'o')
 AGENT_OWNED_KEYS = (
-    'data-dir', 'node-name', 'server', 'token', 'token-file', 'with-node-id')
+    'data-dir', 'node-name', 'server', 'token', 'token-file', 'with-node-id',
+    # k3s's aliases for data-dir, server and token.
+    'd', 's', 't')
 
 
 class ValidateK3sConfigTestCase(testtools.TestCase):
@@ -2019,8 +2025,7 @@ class ValidateK3sConfigTestCase(testtools.TestCase):
 
         self.assertEqual(self.REALISTIC, yaml.safe_load(text))
         self.assertEqual(
-            yaml.safe_dump(self.REALISTIC, default_flow_style=False,
-                           sort_keys=True),
+            yaml.safe_dump(self.REALISTIC, default_flow_style=False),
             text)
         # Block style and sorted, so the file on the node reads the same
         # whatever order the caller's mapping happened to be in.
@@ -2068,6 +2073,17 @@ class ValidateK3sConfigTestCase(testtools.TestCase):
             'not_representable', {'node-label': {1: 'a'}}, 'agent')
         self.assertEqual('node-label', e.key)
 
+    def test_nan_and_infinities_are_refused(self):
+        # YAML reads .nan, .inf and -.inf as floats, and json.dumps() writes
+        # them as NaN, Infinity and -Infinity, which are not JSON. An
+        # infinity compares equal after that round trip, so only refusing
+        # them outright keeps them out of the metadata.
+        for text in ('.nan', '.inf', '-.inf'):
+            value = yaml.safe_load('x: %s\n' % text)['x']
+            e = self._assert_refused(
+                'not_representable', {'kubelet-arg': [value]}, 'agent')
+            self.assertEqual('kubelet-arg', e.key)
+
     def test_every_server_owned_key_is_refused_with_and_without_plus(self):
         for key in SERVER_OWNED_KEYS:
             for spelling in (key, key + '+'):
@@ -2095,6 +2111,38 @@ class ValidateK3sConfigTestCase(testtools.TestCase):
             {'tls-san+': ['k3s.example.com']}, 'server')
         self.assertEqual({'tls-san+': ['k3s.example.com']},
                          yaml.safe_load(text))
+
+    def test_k3s_aliases_of_owned_keys_are_refused(self):
+        # k3s accepts a flag's one-letter alias in a configuration file as
+        # readily as its long name, so t: is token by another spelling.
+        for key, role in (('t', 'agent'), ('s', 'agent'), ('d', 'server'),
+                          ('o', 'server'), ('t+', 'server')):
+            e = self._assert_refused('owned_key', {key: 'x'}, role)
+            self.assertEqual(key, e.key)
+
+        # o is write-kubeconfig on a server only; an agent has no such flag.
+        self.assertNotEqual(
+            '', cluster_module.validate_k3s_config({'o': 'x'}, 'agent'))
+
+    def test_a_key_containing_equals_is_refused(self):
+        # k3s would pass token=abc: def on as --token=abc=def, which sets
+        # token. Refused whatever precedes the '=', since no flag has one.
+        for key in ('token=abc', 'node-label=a', '=x'):
+            for role in ('server', 'agent'):
+                e = self._assert_refused('key_contains_equals', {key: 'x'}, role)
+                self.assertEqual(key, e.key)
+                self.assertIn(repr(key), str(e))
+
+    def test_a_callers_own_plus_key_is_accepted(self):
+        # docs/usage.md tells a caller to write node-taint+ to add a taint
+        # to the plugin's. The '+' is stripped only to find an owned key
+        # behind it; a '+' on any other key is the caller's to use.
+        config = {'node-taint+': ['dedicated=infra:NoSchedule'],
+                  'node-label+': ['a=b'],
+                  'disable+': ['local-storage']}
+        for role in ('server', 'agent'):
+            text = cluster_module.validate_k3s_config(config, role)
+            self.assertEqual(config, yaml.safe_load(text))
 
     def test_a_doubled_plus_is_still_an_owned_key(self):
         # Only exactly tls-san+ is excused; anything else which strips to
@@ -2189,6 +2237,41 @@ class ReadK3sConfigTestCase(testtools.TestCase):
         self._assert_unreadable(
             self._write_bytes(b'disable:\n- traefik\n---\ntoken: x\n'))
 
+    def test_an_alias_is_refused(self):
+        e = self._assert_unreadable(self._write_bytes(
+            b'node-label: &labels [a=b]\nnode-label+: *labels\n'))
+        self.assertIn('alias', str(e))
+
+    def test_a_merge_key_is_refused(self):
+        # <<: needs an alias to name what it merges.
+        self._assert_unreadable(self._write_bytes(
+            b'base: &base {a: b}\nkubelet-arg:\n  <<: *base\n'))
+
+    def test_nested_aliases_are_refused_before_they_are_expanded(self):
+        # Ten references per level, so each level multiplies the expanded
+        # text by ten; nine levels in about 350 bytes would be gigabytes.
+        # Two levels here, so that if the refusal were lost this would
+        # fail by returning a mapping rather than hang expanding one.
+        lines = [b'l0: &l0 [x]']
+        for level in range(1, 3):
+            lines.append(b'l%d: &l%d [%s]' % (
+                level, level, b', '.join([b'*l%d' % (level - 1)] * 10)))
+        self._assert_unreadable(self._write_bytes(b'\n'.join(lines) + b'\n'))
+
+    def test_an_anchor_with_no_alias_is_accepted(self):
+        path = self._write_bytes(b'node-label: &labels [a=b]\n')
+        self.assertEqual({'node-label': ['a=b']},
+                         cluster_module.read_k3s_config(path, 'agent'))
+
+    def test_a_mapping_passed_directly_may_share_a_value(self):
+        # Only parsing refuses aliases. A library caller's own mapping, in
+        # which two keys refer to one list, is validated as it always was.
+        labels = ['a=b']
+        config = {'node-label': labels, 'node-label+': labels}
+        self.assertEqual(
+            {'node-label': ['a=b'], 'node-label+': ['a=b']},
+            yaml.safe_load(cluster_module.validate_k3s_config(config, 'agent')))
+
     def test_what_is_read_is_validated(self):
         path = self._write_bytes(b'token: x\n')
         e = self.assertRaises(
@@ -2217,7 +2300,8 @@ class CheckK3sReleaseTestCase(testtools.TestCase):
         self.assertEqual((1, 21, 1), cluster_module.K3S_RELEASE_FLOOR)
 
     def test_supported_releases_are_accepted(self):
-        for release in ('v1.21.1+k3s1', 'v1.36.5+k3s1', 'v2.0.0+k3s1'):
+        for release in ('v1.21.1+k3s1', 'v1.36.5+k3s1', 'v2.0.0+k3s1',
+                        'v1.33.4', 'v1.34.0-rc1+k3s1'):
             self.assertIsNone(
                 cluster_module.check_k3s_release(release, 'stable'))
 
@@ -2259,6 +2343,28 @@ class CheckK3sReleaseTestCase(testtools.TestCase):
             exceptions.UnsupportedReleaseError,
             cluster_module.check_k3s_release, None, 'stable')
         self.assertEqual('unparseable', e.reason)
+
+    def test_a_release_which_only_starts_well_is_unparseable(self):
+        # The release is third-party text. A good prefix followed by a
+        # terminal escape or a newline would reach too_old()'s message as
+        # it stands; unparseable() renders it with repr().
+        for release in ('v1.20.0\x1b[2J+k3s1', 'v1.33.4\nINJECT',
+                        'v1.33.4 +k3s1', 'v1.33.4k3s1'):
+            e = self.assertRaises(
+                exceptions.UnsupportedReleaseError,
+                cluster_module.check_k3s_release, release, 'stable')
+            self.assertEqual('unparseable', e.reason)
+            self.assertIn(repr(release), str(e))
+
+    def test_a_component_must_be_a_few_ascii_digits(self):
+        # \d would take digits from other scripts, which int() reads, and
+        # thousands of digits make int() itself raise on newer Pythons.
+        for release in ('v\uff11.\uff12\uff11.\uff11', 'v1.21.' + '1' * 5000,
+                        'v1.21.1234567890'):
+            e = self.assertRaises(
+                exceptions.UnsupportedReleaseError,
+                cluster_module.check_k3s_release, release, 'stable')
+            self.assertEqual('unparseable', e.reason)
 
 
 class ManifestHeredocTestCase(testtools.TestCase):
@@ -2758,6 +2864,31 @@ class SecretRedactionTestCase(testtools.TestCase):
         # must still be there for it to be worth having.
         self.assertIn('node_network = net-1', out)
         self.assertIn('state = created', out)
+
+    def test_delete_does_not_debug_log_the_callers_k3s_configuration(self):
+        # k3s takes credentials inline as configuration keys, and nothing
+        # stops a caller putting one in either file.
+        md = _interrupted_md(state='created',
+                             control_plane_nodes=['inst-001'])
+        md['server_config'] = {'etcd-s3-secret-key': 'SECRET-S3-KEY'}
+        md['agent_config'] = {}
+
+        client = ActionLogClient()
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        client.metadata[MD_KEY] = md
+        client.instances['inst-001'] = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        reporter = progress.CollectingReporter(verbose=True)
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            Cluster(client, 'banana', 'testns', reporter=reporter).delete()
+
+        out = reporter.getvalue()
+        self.assertNotIn('SECRET-S3-KEY', out)
+        self.assertIn('server_config = %s' % progress.REDACTED, out)
+        # An empty configuration is not a secret being hidden.
+        self.assertIn('agent_config = {}', out)
 
     def test_an_absent_secret_is_not_reported_as_redacted(self):
         """A None token is not a secret being hidden, and saying so misleads."""

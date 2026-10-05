@@ -200,7 +200,11 @@ K3S_CONFIG_DELIMITER = 'SFK3SCONFIG'
 # docs/plans/PLAN-node-customisation-phase-02-k3s-config.md). If that code
 # moves or stops depending on the key, the key should leave this list.
 # Keys k3s does not recognise are not refused: k3s logs and ignores those
-# itself. node-taint and disable are absent on purpose. The default taint
+# itself. k3s does recognise every name a flag has in a configuration
+# file, its one-letter aliases included, so an alias of an owned key is
+# owned too. The aliases were checked against pkg/cli/cmds/server.go and
+# agent.go at v1.21.1+k3s1 and at k3s commit bdb2a3e, and are the same in
+# both. node-taint and disable are absent on purpose. The default taint
 # goes in config.yaml so that a caller's node-taint replaces it, and
 # servicelb's disable+ goes in a file read after the caller's so that it
 # appends to their disable rather than being replaced by it.
@@ -212,6 +216,8 @@ K3S_SERVER_OWNED_KEYS = frozenset([
     # The registration token fetches in install_control_plane() and
     # K3S_MANIFEST_DIR both hardcode /var/lib/rancher/k3s.
     'data-dir',
+    # k3s's alias for data-dir.
+    'd',
     # K3S_URL in install_k3s_component() hardcodes port 6443.
     'https-listen-port',
     # remove_worker() addresses a k3s node by its lowercased instance
@@ -220,6 +226,8 @@ K3S_SERVER_OWNED_KEYS = frozenset([
     # install_k3s_component() points extra servers at the first one
     # through K3S_URL, and a server key would point them somewhere else.
     'server',
+    # k3s's alias for server.
+    's',
     # Set in the plugin's config.yaml by install_control_plane() to the
     # floating API address, which is the server address in every
     # kubeconfig the plugin hands out. A bare tls-san in a later file
@@ -228,6 +236,8 @@ K3S_SERVER_OWNED_KEYS = frozenset([
     # install_k3s_component() joins nodes with K3S_TOKEN, the token
     # install_control_plane() fetched from the first server.
     'token',
+    # k3s's alias for token.
+    't',
     # The same thing as token, by another route.
     'token-file',
     # Appends an id to the node name, which breaks remove_worker()'s
@@ -236,6 +246,8 @@ K3S_SERVER_OWNED_KEYS = frozenset([
     # Every kubectl and helm command the plugin runs on a server, and the
     # credential fetch in create(), read /etc/rancher/k3s/k3s.yaml.
     'write-kubeconfig',
+    # k3s's alias for write-kubeconfig.
+    'o',
     # Set to 0644 in the plugin's config.yaml by install_control_plane(),
     # which is what lets the credential fetch read the kubeconfig.
     'write-kubeconfig-mode',
@@ -245,6 +257,8 @@ K3S_AGENT_OWNED_KEYS = frozenset([
     # refused so that every node keeps the layout the server-side reads of
     # /var/lib/rancher/k3s assume, rather than the two roles differing.
     'data-dir',
+    # k3s's alias for data-dir.
+    'd',
     # remove_worker() drains and deletes the k3s node by the worker's
     # lowercased instance name, and agent_config is applied to every
     # worker, so a node-name would also give them all the same one.
@@ -252,9 +266,13 @@ K3S_AGENT_OWNED_KEYS = frozenset([
     # install_k3s_component() joins the agent to the first server through
     # K3S_URL.
     'server',
+    # k3s's alias for server.
+    's',
     # install_k3s_component() joins the agent with K3S_TOKEN, the node
     # token install_control_plane() fetched from the first server.
     'token',
+    # k3s's alias for token.
+    't',
     # The same thing as token, by another route.
     'token-file',
     # Appends an id to the node name, which breaks remove_worker()'s
@@ -549,6 +567,13 @@ def validate_k3s_config(config, role):
         if not isinstance(key, str):
             raise exceptions.K3sConfigError.non_string_key(role, key)
 
+        # k3s passes each key on as --key=value and takes the flag name to
+        # be everything before the first '=', so token=abc: x would set
+        # token to abc=x without being the key token. No k3s flag name
+        # contains an '=', so any key which does is refused.
+        if '=' in key:
+            raise exceptions.K3sConfigError.key_contains_equals(role, key)
+
         # rstrip rather than removesuffix, which is Python 3.9: a key
         # ending in more than one '+' is not a k3s spelling of anything,
         # and refusing it with the key it was presumably meant to be is
@@ -558,11 +583,15 @@ def validate_k3s_config(config, role):
 
         # json.dumps() raises TypeError for a type it cannot serialise at
         # all (datetime.date, bytes, set) and ValueError for a circular
-        # reference. A type it can serialise but not give back -- a tuple,
-        # a non-string key inside a value, a NaN -- comes back different
-        # and fails the comparison instead.
+        # reference, and with allow_nan=False for NaN and both infinities
+        # too, which YAML reads from .nan and .inf: by default it would
+        # write them as NaN and Infinity, which are not JSON, and an
+        # infinity would even survive the comparison below. A type it can
+        # serialise but not give back -- a tuple, a non-string key inside a
+        # value -- comes back different and fails the comparison instead.
         try:
-            representable = json.loads(json.dumps(value)) == value
+            representable = json.loads(
+                json.dumps(value, allow_nan=False)) == value
         except (TypeError, ValueError):
             representable = False
         if not representable:
@@ -572,8 +601,12 @@ def validate_k3s_config(config, role):
     if not config:
         return ''
 
+    # Sorted, so the file on a node reads the same whatever order the
+    # mapping was in. safe_dump() sorts by default; sort_keys is not passed
+    # because the keyword only exists from PyYAML 5.1, which pyproject.toml
+    # does not require, and older releases sort unconditionally anyway.
     text = yaml.safe_dump(json.loads(json.dumps(config)),
-                          default_flow_style=False, sort_keys=True)
+                          default_flow_style=False)
 
     # The same check read_manifests() makes, on the text that will be
     # written rather than on the values it came from. PyYAML indents every
@@ -590,6 +623,29 @@ def validate_k3s_config(config, role):
     return text
 
 
+class _NoAliasSafeLoader(yaml.SafeLoader):
+    """yaml.SafeLoader, except that a YAML alias is a parse error.
+
+    safe_load() builds an alias as a second reference to the node it names,
+    which is cheap. validate_k3s_config()'s JSON round trip and its dump
+    then write out every reference in full, so each level of nested
+    aliases multiplies the text: a 350 byte file of them took 80 seconds
+    and 175 MB to validate, and would have been stored in the metadata and
+    written to every node. k3s configuration has no use for aliases, so
+    read_k3s_config() refuses them rather than bounding what they cost. An
+    anchor which nothing refers to is harmless and still parses.
+    """
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            event = self.peek_event()
+            raise yaml.composer.ComposerError(
+                None, None,
+                'found an alias, which k3s configuration may not use',
+                event.start_mark)
+        return super(_NoAliasSafeLoader, self).compose_node(parent, index)
+
+
 def read_k3s_config(path, role):
     """Read a k3s configuration file for role, and return the mapping it holds.
 
@@ -604,7 +660,10 @@ def read_k3s_config(path, role):
     validate_k3s_config(). A file holding more than one YAML document is
     refused as unreadable rather than read for its first document, because
     k3s reads a configuration file as a single mapping and a second
-    document is more likely a mistake than a request to ignore it.
+    document is more likely a mistake than a request to ignore it. So is a
+    file which uses a YAML alias, for the reason _NoAliasSafeLoader gives.
+    A library caller which passes create() a mapping it built itself is
+    not parsing YAML, and is not affected.
 
     The file is read as UTF-8, and OSError, UnicodeDecodeError and
     yaml.YAMLError are all turned into exceptions.K3sConfigError.unreadable,
@@ -615,7 +674,7 @@ def read_k3s_config(path, role):
     """
     try:
         with open(path, encoding='utf-8') as f:
-            config = yaml.safe_load(f.read())
+            config = yaml.load(f.read(), Loader=_NoAliasSafeLoader)
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
         raise exceptions.K3sConfigError.unreadable(path, str(e))
 
@@ -640,14 +699,27 @@ def check_k3s_release(release, channel):
     That needs a channel which resolves to exactly one, and the v1.21
     channel resolves to v1.21.14+k3s1.
 
+    What follows the version does have to look like a suffix, though: a
+    '-' or '+' and then only ASCII letters, digits, '.', '-' and '+'. The
+    release comes from the k3s update API, or from the namespace's cache
+    of it, which is third-party writable. A string with a control
+    character or a newline after a good prefix would otherwise be accepted
+    and land in too_old()'s message as it stands, and a component of
+    thousands of digits makes int() raise on newer Pythons. Each component
+    is ASCII digits for the same reason: the regular expression digit class
+    also matches digits from other scripts, which int() reads.
+
     A release this cannot parse raises
     exceptions.UnsupportedReleaseError.unparseable rather than being let
     through, because a version which cannot be read is not one the plugin
-    can promise drop-in configuration on (decision 6 of the phase 2 plan).
+    can promise drop-in configuration on (decision 6 of
+    docs/plans/PLAN-node-customisation-phase-02-k3s-config.md).
     """
     match = None
     if isinstance(release, str):
-        match = re.match(r'^v(\d+)\.(\d+)\.(\d+)', release)
+        match = re.match(
+            r'v([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(?:[-+][0-9A-Za-z.+-]*)?\Z',
+            release)
     if not match:
         raise exceptions.UnsupportedReleaseError.unparseable(release, channel)
 
@@ -1422,11 +1494,14 @@ class Cluster:
     # cluster created without workers stays untainted once expand-workers
     # adds some; nothing rewrites a running server's configuration.
     #
-    # Every body goes through a heredoc with a quoted delimiter, per rule 2
-    # above read_manifests(). The paths are literals of this method, so
-    # rule 1 has nothing to quote; the floating address is substituted into
-    # a YAML document rather than into a command line, and yaml.safe_dump()
-    # quotes it as YAML needs.
+    # Every file is written through heredoc(), per rule 2 above
+    # read_manifests(). It quotes the path, although the paths are literals
+    # of this method, and refuses a body which would end its own heredoc:
+    # validate_k3s_config() has already refused that for a caller's
+    # configuration, as a K3sConfigError, so the helper's refusal is what
+    # covers the two bodies this method composes itself. The floating
+    # address is substituted into a YAML document rather than into a
+    # command line, and yaml.safe_dump() quotes it as YAML needs.
     def _k3s_config_commands(self, md, role, first_server=False):
         """The shell commands which write a node's k3s configuration files.
 
@@ -1462,8 +1537,7 @@ class Cluster:
             if md.get('worker_nodes'):
                 plugin_config['node-taint'] = [
                     'node-role.kubernetes.io/control-plane:NoSchedule']
-            main = yaml.safe_dump(plugin_config, default_flow_style=False,
-                                  sort_keys=True)
+            main = yaml.safe_dump(plugin_config, default_flow_style=False)
         elif role == 'agent':
             main = ('# Written by shakenfist_client_k3s; caller '
                     'configuration is in config.yaml.d/.\n')
@@ -1474,12 +1548,6 @@ class Cluster:
                 "role must be 'server' or 'agent', not %r" % (role,))
 
         def write(path, body):
-            # Through heredoc() rather than built here, per rule 2 at the
-            # top of this module. The validation above already refuses a
-            # configuration whose YAML contains the delimiter and raises
-            # K3sConfigError for it; routing the write through the helper
-            # is what quotes the path, and what keeps the refusal beside
-            # the write for a body this method composed itself.
             return heredoc(path, body, delimiter=K3S_CONFIG_DELIMITER)
 
         cmds = ['mkdir -p /etc/rancher/k3s/config.yaml.d',
@@ -1499,7 +1567,7 @@ class Cluster:
                 '/etc/rancher/k3s/config.yaml.d/'
                 '90-sf-client-k3s-enforced.yaml',
                 yaml.safe_dump({'disable+': ['servicelb']},
-                               default_flow_style=False, sort_keys=True)))
+                               default_flow_style=False)))
 
         return cmds
 
@@ -1920,11 +1988,8 @@ class Cluster:
         The defaults are DEFAULT_NODE_SIZE, 2 vCPUs, 2048 MB and 50 GB for
         both roles, which is what every node was built at before these
         arguments existed. 2048 MB is a size a control plane node runs at,
-        not one it holds up at: measured on a cluster built at exactly that
-        size, k3s's server process alone held 709 MB, and a burst of pod
-        creations drove the node into a global OOM which took the API
-        server down for around thirty seconds (open question 3 of
-        docs/plans/PLAN-node-customisation.md). It is still the default,
+        not one it holds up at; the "Sizing" section of docs/usage.md gives
+        the measurement and recommends 4096 MB. It is still the default,
         because changing it would change what an existing invocation
         builds, and validation still accepts any positive integer, because
         a hard minimum would be a guess about workloads this method cannot
@@ -2224,10 +2289,16 @@ class Cluster:
         p.phase('Fetching cluster credentials')
         aop = self.client.instance_get(
             md['control_plane_nodes'][0], '/etc/rancher/k3s/k3s.yaml')
-        kubeconfig = self.await_fetch(aop).replace(
-            '127.0.0.1', md['api_address_floating'])
+        kc = yaml.safe_load(self.await_fetch(aop))
 
-        kc = yaml.safe_load(kubeconfig)
+        # Set rather than rewritten. k3s writes https://127.0.0.1:6443 here
+        # only when no bind-address is configured, and the bind address when
+        # one is, which a caller's server_config can do; substituting for
+        # 127.0.0.1 would then leave the kubeconfig pointing at the bind
+        # address, with nothing failing. 6443 is the port K3S_URL assumes,
+        # and https-listen-port is an owned key.
+        kc['clusters'][0]['cluster']['server'] = (
+            'https://%s:6443' % md['api_address_floating'])
         fqcn = '%s.%s' % (self.name, self.namespace)
         kc['clusters'][0]['name'] = fqcn
         kc['contexts'][0]['name'] = fqcn
@@ -2370,10 +2441,11 @@ class Cluster:
         to know that ``state = initial`` in a screenful of key/value pairs
         is the line that matters and that the answer to it is a delete.
 
-        ``node_sizes`` is the one key this reports which may not be stored.
-        A cluster created before node sizes were recorded has no such key,
-        and for one of those this returns a copy of the metadata with
-        ``node_sizes`` filled in from DEFAULT_NODE_SIZE for both roles.
+        ``node_sizes``, ``server_config`` and ``agent_config`` are the three
+        keys this reports which may not be stored. A cluster created before
+        node sizes were recorded has no ``node_sizes``, and for one of those
+        this returns a copy of the metadata with ``node_sizes`` filled in
+        from DEFAULT_NODE_SIZE for both roles.
         That departs from "show reports what is stored", and it is right
         here because the filled in values are a statement of fact rather
         than a guess: before the key existed there was no way to build a
@@ -2644,9 +2716,15 @@ class Cluster:
         # property that holds only while one caller remembers a flag; and
         # -v is exactly the flag somebody adds when a delete is failing,
         # which is also when they paste the output into a bug report.
+        #
+        # The caller's k3s configuration is redacted whole whenever there is
+        # any. k3s takes credentials inline as configuration keys
+        # (etcd-s3-secret-key, agent-token, a datastore-endpoint carrying a
+        # password), and a list of those here would go stale with k3s.
         self.reporter.debug('Cluster metadata:')
         for k in md:
-            if k in SECRET_METADATA_KEYS and md[k] is not None:
+            if ((k in SECRET_METADATA_KEYS and md[k] is not None)
+                    or (k in ('server_config', 'agent_config') and md[k])):
                 self.reporter.debug('    %s = %s' % (k, progress.REDACTED))
             else:
                 self.reporter.debug('    %s = %s' % (k, md[k]))

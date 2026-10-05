@@ -344,8 +344,8 @@ than expected.
 |-------|------|--------|--------|
 | 1. Per-role sizing | [PLAN-node-customisation-phase-01-sizing.md](PLAN-node-customisation-phase-01-sizing.md) -- `create_instance(node_type)`; `node_sizes` in metadata with fallback defaults for existing clusters; six CLI flags and matching `create()` parameters; `show` displays sizes, including the 2 / 2048 / 50 fallback for clusters created before them (it already prints every recorded key); the documented sizing floor from open question 3; drop the bare `apt-get install -y` at `cluster.py:1052`; unit tests for the metadata fallback and for the sizes reaching `client.create_instance`; regenerate the `tests/cli_contract/` snapshots; update `docs/usage.md` and `docs/library-api.md`. Unit tests can verify everything except the live build. | Complete | `ddb1f3b` (#92) |
 | 2. k3s configuration pass-through | [PLAN-node-customisation-phase-02-k3s-config.md](PLAN-node-customisation-phase-02-k3s-config.md) -- Open question 1 and the `config.yaml.d` version floor are resolved in the phase plan; a pure validation function for the caller's mapping; `--server-config` / `--agent-config` (loaded with `yaml.safe_load`, UTF-8) and `server_config` / `agent_config` on `create()`; write the drop-in on every server and agent before its installer runs, including in `install_k3s_component()` and on `expand-workers`; record both in metadata; write the default control plane `node-taint` per design 7 (only when the cluster has workers) and disable `servicelb` through a later, plugin-enforced drop-in whenever `install_metallb` is true, per open question 1; refuse k3s releases older than v1.21.1+k3s1; unit tests for validation, the file content, `expand-workers` reusing the recorded config, the default taint being present, and a caller's `node-taint: []` replacing it; docs with an OpenStack-Helm-flavoured example (`disable: [traefik]`, role labels). (The sizing floor moved to phase 1, where open question 3 put it; this row used to repeat it.) The drop-in content must reach the node through a quoted heredoc, following rule 2 at the top of `cluster.py`. | Complete | `b791364` (#98) |
-| 3. Live validation | [PLAN-node-customisation-phase-03-live-validation.md](PLAN-node-customisation-phase-03-live-validation.md) -- Extend `tools/ci_deploy_test.sh` to create the main cluster with non-default sizes on both roles and both config files (disable Traefik, label control plane and workers differently), then assert with `kubectl`: no Traefik, no `svclb-*` pods, the expected labels on each node, the default `NoSchedule` taint on every control plane node, the recorded sizes in `show` and in Shaken Fist's own `instance show`, and a worker added by `expand-workers` carrying the agent label and worker sizes. The minimal cluster gains one worker and carries the `node-taint: []` opt-out, because a zero-worker cluster is never tainted and could not show it; it is also the positive control for the absence checks. Run the merge tier against the branch through `workflow_dispatch`. (This row used to ask for a run of the homelab OpenStack-Helm prototype's provision stage; that stage has not been built, and design 7's question to it was answered from the chart source instead.) | In progress | |
-| 4. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-3 against `develop` | Not started | |
+| 3. Live validation | [PLAN-node-customisation-phase-03-live-validation.md](PLAN-node-customisation-phase-03-live-validation.md) -- Extend `tools/ci_deploy_test.sh` to create the main cluster with non-default sizes on both roles and both config files (disable Traefik, label control plane and workers differently), then assert with `kubectl`: no Traefik, no `svclb-*` pods, the expected labels on each node, the default `NoSchedule` taint on every control plane node, the recorded sizes in `show` and in Shaken Fist's own `instance show`, and a worker added by `expand-workers` carrying the agent label and worker sizes. The minimal cluster gains one worker and carries the `node-taint: []` opt-out, because a zero-worker cluster is never tainted and could not show it; it is also the positive control for the absence checks. Run the merge tier against the branch through `workflow_dispatch`. (This row used to ask for a run of the homelab OpenStack-Helm prototype's provision stage; that stage has not been built, and design 7's question to it was answered from the chart source instead.) | Complete | `51ff6f4` (#108) |
+| 4. Push audit | [PLAN-node-customisation-phase-04-push-audit.md](PLAN-node-customisation-phase-04-push-audit.md) -- Run `PUSH-AUDIT.md` over the union of the three recorded merges (`ddb1f3b`, `b791364`, `51ff6f4`), each diffed against its first parent, judging that code as it stands after #107, which has since swept the library API audit's rules over part of it. (This row used to say "against `develop`", which is empty once the phases have merged.) | Complete | |
 
 <!-- shared-block: plan-push-audit-phase v3 -->
 Push audit phase (shared block; do not edit -- the canonical
@@ -690,6 +690,27 @@ because the following statements will be true:
 * `ARCHITECTURE.md`, `README.md`, and `AGENTS.md` have been
   updated if the change adds or modifies modules or CLI commands.
 
+Checked at the close of the push audit (phase 4), each against the
+tree rather than ticked:
+
+* `tox -epy3` (579 tests), `tox -eflake8` and `pre-commit run
+  --all-files` pass, and the plugin imports cleanly.
+* Python >= 3.7 holds by reading only: the audit found no syntax or
+  standard library API newer than 3.7, but nothing runs the suite on
+  3.7 (#82). The one floor problem it found was a dependency floor
+  (PyYAML 5.1), now gone.
+* Unit tests cover the new parsing and refusals, and
+  `tools/mutation-check.py` now carries ten mutations of this plan's
+  properties, all caught.
+* Style: no line over 120 columns, no triple single quotes.
+* Live validation: phase 3's merge tier run, and the push audit's own
+  [dispatch](https://github.com/shakenfist/client-python-k3s/actions/runs/37366720133)
+  with the release-floor refusal added.
+* The documentation criterion is read narrowly. The plan added no
+  module and no command, only options on `k3s create`, so `README.md`
+  and `AGENTS.md` did not change. `ARCHITECTURE.md`'s cluster assembly
+  description gained one clause naming the k3s configuration step.
+
 !!! note "In this project"
 
     The close-out sections below apply as written, with one
@@ -726,10 +747,33 @@ chosen to defer to here, so that we do not forget them.
   one control plane plus two workers has two Longhorn storage nodes
   against a default of three replicas, so new volumes run degraded.
   They work, but it is the wrong default. See the phase 2 plan, risk 3.
-* Surfacing the new options in the `shakenfist.k3s` collection.
-  Phase 5 of the library API plan landed first (#90), so its
-  `sf_k3s_cluster` module needs the sizing and config options added
-  once both have landed.
+* Surfacing the new options in the `shakenfist.k3s` collection:
+  [#112](https://github.com/shakenfist/client-python-k3s/issues/112).
+  Phase 5 of the library API plan landed first (#90), so
+  `sf_k3s_cluster` passes no sizes or k3s configuration. Its
+  `initial_workers` defaults to 0, so a collection-built cluster also
+  never gets the control plane taint; `docs/collection.md` says so
+  until the options land. 33fl's CI runner plan is waiting on this.
+* The homelab OpenStack-Helm prototype's notes
+  (`notes/openstack-helm-k3s-plan.md` in the private
+  `homelab-deployments-lfs`) predate phase 2 and are wrong in two
+  places: they treat servicelb as the caller's choice, and they count
+  on the control plane as a Longhorn storage node. As written, the
+  prototype also needs `node-taint: []` in its `server.yaml`, since
+  every chart it deploys ships its control-plane toleration disabled
+  (the phase 3 plan, survey finding 3). That work lives in that
+  repository, so it has no issue here.
+* No live coverage of the zero-worker taint exception. It needs a
+  zero-worker cluster with MetalLB, which neither merge-tier cluster
+  is; the phase 3 plan's decision 2 and the push audit's finding T-7
+  explain why that is acceptable (it was never covered live, and it
+  fails loudly).
+* No highly available control plane in the merge tier, so extra
+  servers' k3s configuration has never run for real:
+  [#110](https://github.com/shakenfist/client-python-k3s/issues/110).
+* The "read a caller's file" pattern is written out three times
+  (`read_manifests()`, `read_k3s_config()`, `create()`'s ssh key):
+  [#111](https://github.com/shakenfist/client-python-k3s/issues/111).
 
 ### Bugs fixed during this work
 
@@ -741,6 +785,33 @@ while planning it.
 
 * `install_k3s_component()` runs a bare `sudo apt-get install -y`
   with no package named (`cluster.py:1052`). Fixed in phase 1, step 1a.
+
+The push audit (phase 4) fixed these in the plan's own code; the full
+triage is `docs/plans/audit-node-customisation/triage.md`:
+
+* The owned-key refusal could be bypassed through k3s's one-letter
+  flag aliases (`t`, `d`, `s`, `o`) and through an `=` inside a key,
+  which k3s turns into `--token=...`. Both are now refused.
+* A caller's `bind-address` silently left the kubeconfig `getconfig`
+  hands out pointing at the bind address, because the plugin rewrote
+  the text `127.0.0.1`. The server URL is now set structurally.
+* A 350-byte YAML file of nested aliases cost 80 seconds and 175 MB to
+  validate. `read_k3s_config()` now refuses aliases.
+* `yaml.safe_dump(..., sort_keys=True)` needs PyYAML 5.1, which the
+  unpinned `pyyaml` dependency does not promise; the redundant keyword
+  is gone.
+* `.inf` passed the JSON-representability check; it is now refused.
+* `delete -v` printed the caller's k3s configuration unredacted; it is
+  now redacted, and `docs/usage.md` says the mappings are stored and
+  shown in clear.
+* `check_k3s_release()` accepted non-ASCII digits, a release with a
+  newline after a valid prefix, and crashed on a 5000-digit component;
+  it now accepts only well-formed releases (#104's shape, in new code).
+* `docs/usage.md` still called the OpenStack-Helm taint question open,
+  and two exception facts in `docs/library-api.md` were stale.
+* Two test defects: the CLI's "bad config leaves no namespace" test
+  could not fail, and nothing pinned that a caller's own `+` key is
+  accepted.
 
 ### Back brief
 

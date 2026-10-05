@@ -44,7 +44,7 @@ Builds a cluster and, unless `--no-kubeconfig` is given, leaves it in
 | `--worker-memory` | 2048 | RAM, in MB, for each worker node. A positive integer. |
 | `--worker-disk` | 50 | Disk, in GB, for each worker node. A positive integer. |
 | `--server-config PATH` | none | A YAML mapping of k3s configuration keys, applied to every control plane node. A few keys the plugin depends on are refused; see "k3s configuration", below. |
-| `--agent-config PATH` | none | A YAML mapping of k3s configuration keys, applied to every worker, including workers added later by `expand-workers`. The same keys are refused for the agent role as listed below. |
+| `--agent-config PATH` | none | A YAML mapping of k3s configuration keys, applied to every worker, including workers added later by `expand-workers`. A smaller set of keys is refused for the agent role; see "k3s configuration", below. |
 
 Each node is a Shaken Fist instance on a Debian 12 base image, with a
 floating address and the `sf-agent2` side channel enabled. Nodes
@@ -84,9 +84,11 @@ k3s's own `config.yaml` spells them. The server file is applied to
 every control plane node and the agent file to every worker. Neither
 is interpreted: keys are not checked against k3s's flags, and k3s logs
 and ignores a key it does not recognise for the role. An empty file
-means no configuration. Both mappings are recorded in the cluster's
-metadata, which is how `expand-workers` gives a new worker the agent
-configuration the cluster was created with.
+means no configuration. A file which uses a YAML alias (`*name`, which
+`<<:` merge keys need too) is refused, because a few hundred bytes of
+nested aliases expand to gigabytes. Both mappings are recorded in the
+cluster's metadata, which is how `expand-workers` gives a new worker
+the agent configuration the cluster was created with.
 
 Each node gets up to three files in `/etc/rancher/k3s/`, all written
 before the k3s installer first runs, and k3s reads them in this order:
@@ -127,6 +129,11 @@ this, because on a string key `+` appends to the plugin's value.
 | server | `write-kubeconfig`, `write-kubeconfig-mode` | Every `kubectl` and `helm` command, and the credential fetch, read `/etc/rancher/k3s/k3s.yaml`, and the plugin sets its mode. |
 | agent | `data-dir`, `node-name`, `with-node-id`, `server`, `token`, `token-file` | As for servers: every node keeps the same layout, and the plugin joins and names workers itself. |
 
+k3s's one-letter aliases for these keys are refused in the same way:
+`d` (`data-dir`), `s` (`server`) and `t` (`token`) in both roles, and
+`o` (`write-kubeconfig`) on servers. So is any key containing `=`,
+because k3s reads only the part before the `=` as the key's name.
+
 Other things to know:
 
 - Control plane nodes are tainted
@@ -149,13 +156,28 @@ Other things to know:
   check.
 - A bad file, a refused key, or a release that is too old is reported
   before anything is built or the cluster's name is registered.
+- Both mappings are stored in the cluster's metadata, printed by
+  `show`, and written to each node as a file whose mode follows the
+  node's umask. k3s accepts credentials inline as keys
+  (`etcd-s3-secret-key`, `agent-token`, a `datastore-endpoint` with a
+  password in it), so keep them out of these files; `delete -v`
+  redacts both mappings, but nothing else does.
+- The refused keys protect the plugin's own operations. They are not a
+  security boundary: whoever writes either file controls the security
+  of every node in that role (`kube-apiserver-arg` alone can turn off
+  the API server's authentication), which is no more than the
+  cluster's owner can already do. A tool which accepts configuration
+  from someone it trusts less than that must apply its own allowlist
+  of keys.
 
 An example for an OpenStack-Helm deployment. `servers.yaml` keeps
-Traefik out of the way and labels the control plane nodes:
+Traefik out of the way, labels the control plane nodes, and removes the
+default taint:
 
 ```yaml
 disable: [traefik]
 node-label: [openstack-control-plane=enabled]
+node-taint: []
 ```
 
 and `agents.yaml` labels the workers as compute nodes:
@@ -169,12 +191,12 @@ sf-client k3s create mycluster \
     --server-config servers.yaml --agent-config agents.yaml
 ```
 
-The servers end up with traefik and servicelb both disabled. Because
-the default taint applies, OpenStack services labelled for the control
-plane would be blocked from those nodes, so such a deployment may want
-`node-taint: []` on the servers or must add tolerations. Which of the
-two is right is still being settled against a live cluster; see
-`docs/plans/PLAN-node-customisation.md`.
+The servers end up with traefik and servicelb both disabled, and
+untainted. Without `node-taint: []` they would keep the default taint,
+and OpenStack-Helm's charts ship their control plane toleration
+disabled, so every OpenStack service labelled for the control plane
+would stay Pending. Enabling that toleration in each chart is the
+alternative.
 
 **Behaviour changes.** These apply to every new cluster, whether or not
 the options above are used, and existing clusters are untouched:
