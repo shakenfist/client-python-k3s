@@ -62,10 +62,18 @@ The **merge tier** runs on `merge_group` events from the develop
 branch's merge queue, and on a manual `workflow_dispatch`.
 `cluster_deploy` runs `tools/ci_deploy_test.sh`, which creates a real
 k3s cluster, verifies it serves a LoadBalancer service, expands its
-workers and addresses, and deletes it. It runs on an ephemeral VM
+workers and addresses, and deletes it. That cluster is built with
+non-default node sizes and with `--server-config` and `--agent-config`,
+and the script asserts that the sizes reached both the cluster metadata
+and Shaken Fist, that Traefik and servicelb are absent, that each role's
+nodes carry its label (a worker added by `expand-workers` included), and
+that the control plane carries the default `NoSchedule` taint. A second,
+minimal cluster with one worker asserts the `node-taint: []` opt-out,
+and is the positive control for the absence checks: Traefik and its
+`svclb-traefik-*` pods have to appear there. The script runs on an ephemeral VM
 runner, in that runner's own per-job Shaken Fist namespace on the
 under-cloud, so everything the test creates dies with the runner. A
-full run is 15-25 minutes.
+full run is 20-30 minutes.
 
 `can_enqueue` and `can_merge` are the required status checks.
 `can_enqueue` reports on pull requests and `can_merge` on merge queue
