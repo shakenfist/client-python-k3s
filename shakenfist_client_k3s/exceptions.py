@@ -667,6 +667,10 @@ class K3sConfigError(_ReasonedK3sException):
     - ``non_string_key(role, key)``: a key is not a string. YAML reads
       ``1: x`` as an integer key, which names no k3s flag, and which the
       JSON the metadata is stored as cannot hold unchanged either.
+    - ``key_contains_equals(role, key)``: a key contains ``=``. k3s
+      passes each key on as ``--key=value`` and reads the flag name as
+      everything before the first ``=``, so ``token=abc`` would set
+      ``token`` past the owned-key check. No k3s flag name contains one.
     - ``not_representable(role, key, value)``: a value does not survive a
       round trip through JSON unchanged. The mapping is recorded in the
       cluster's namespace metadata, which is a JSON document, so that
@@ -681,9 +685,10 @@ class K3sConfigError(_ReasonedK3sException):
       change that, because on a string key k3s's ``+`` appends to the
       plugin's value rather than leaving it alone. The one exception is
       ``tls-san+``, which is how a caller adds SANs to the plugin's; the
-      message for a bare ``tls-san`` says so. The keys and why each is
-      owned are listed beside ``K3S_SERVER_OWNED_KEYS`` and
-      ``K3S_AGENT_OWNED_KEYS`` in ``cluster.py``.
+      message for a bare ``tls-san`` says so. k3s's one-letter aliases
+      for owned keys (``d``, ``o``, ``s``, ``t``) are owned too. The keys
+      and why each is owned are listed beside ``K3S_SERVER_OWNED_KEYS``
+      and ``K3S_AGENT_OWNED_KEYS`` in ``cluster.py``.
     - ``delimiter_collision(role, delimiter)``: a line of the YAML the
       configuration is written as is exactly the heredoc delimiter the
       write uses, which would end the heredoc early and truncate the
@@ -730,6 +735,14 @@ class K3sConfigError(_ReasonedK3sException):
             'keys are flag names, such as node-label.'
         ) % (role, key)
         return cls('non_string_key', message, role=role, key=key)
+
+    @classmethod
+    def key_contains_equals(cls, role, key):
+        message = (
+            "k3s %s configuration key %r contains '=', which no k3s flag name\n"
+            "does. k3s would read the flag name as the part before the '='."
+        ) % (role, key)
+        return cls('key_contains_equals', message, role=role, key=key)
 
     @classmethod
     def not_representable(cls, role, key, value):

@@ -200,7 +200,11 @@ K3S_CONFIG_DELIMITER = 'SFK3SCONFIG'
 # docs/plans/PLAN-node-customisation-phase-02-k3s-config.md). If that code
 # moves or stops depending on the key, the key should leave this list.
 # Keys k3s does not recognise are not refused: k3s logs and ignores those
-# itself. node-taint and disable are absent on purpose. The default taint
+# itself. k3s does recognise every name a flag has in a configuration
+# file, its one-letter aliases included, so an alias of an owned key is
+# owned too. The aliases were checked against pkg/cli/cmds/server.go and
+# agent.go at v1.21.1+k3s1 and at k3s commit bdb2a3e, and are the same in
+# both. node-taint and disable are absent on purpose. The default taint
 # goes in config.yaml so that a caller's node-taint replaces it, and
 # servicelb's disable+ goes in a file read after the caller's so that it
 # appends to their disable rather than being replaced by it.
@@ -212,6 +216,8 @@ K3S_SERVER_OWNED_KEYS = frozenset([
     # The registration token fetches in install_control_plane() and
     # K3S_MANIFEST_DIR both hardcode /var/lib/rancher/k3s.
     'data-dir',
+    # k3s's alias for data-dir.
+    'd',
     # K3S_URL in install_k3s_component() hardcodes port 6443.
     'https-listen-port',
     # remove_worker() addresses a k3s node by its lowercased instance
@@ -220,6 +226,8 @@ K3S_SERVER_OWNED_KEYS = frozenset([
     # install_k3s_component() points extra servers at the first one
     # through K3S_URL, and a server key would point them somewhere else.
     'server',
+    # k3s's alias for server.
+    's',
     # Set in the plugin's config.yaml by install_control_plane() to the
     # floating API address, which is the server address in every
     # kubeconfig the plugin hands out. A bare tls-san in a later file
@@ -228,6 +236,8 @@ K3S_SERVER_OWNED_KEYS = frozenset([
     # install_k3s_component() joins nodes with K3S_TOKEN, the token
     # install_control_plane() fetched from the first server.
     'token',
+    # k3s's alias for token.
+    't',
     # The same thing as token, by another route.
     'token-file',
     # Appends an id to the node name, which breaks remove_worker()'s
@@ -236,6 +246,8 @@ K3S_SERVER_OWNED_KEYS = frozenset([
     # Every kubectl and helm command the plugin runs on a server, and the
     # credential fetch in create(), read /etc/rancher/k3s/k3s.yaml.
     'write-kubeconfig',
+    # k3s's alias for write-kubeconfig.
+    'o',
     # Set to 0644 in the plugin's config.yaml by install_control_plane(),
     # which is what lets the credential fetch read the kubeconfig.
     'write-kubeconfig-mode',
@@ -245,6 +257,8 @@ K3S_AGENT_OWNED_KEYS = frozenset([
     # refused so that every node keeps the layout the server-side reads of
     # /var/lib/rancher/k3s assume, rather than the two roles differing.
     'data-dir',
+    # k3s's alias for data-dir.
+    'd',
     # remove_worker() drains and deletes the k3s node by the worker's
     # lowercased instance name, and agent_config is applied to every
     # worker, so a node-name would also give them all the same one.
@@ -252,9 +266,13 @@ K3S_AGENT_OWNED_KEYS = frozenset([
     # install_k3s_component() joins the agent to the first server through
     # K3S_URL.
     'server',
+    # k3s's alias for server.
+    's',
     # install_k3s_component() joins the agent with K3S_TOKEN, the node
     # token install_control_plane() fetched from the first server.
     'token',
+    # k3s's alias for token.
+    't',
     # The same thing as token, by another route.
     'token-file',
     # Appends an id to the node name, which breaks remove_worker()'s
@@ -548,6 +566,13 @@ def validate_k3s_config(config, role):
     for key, value in config.items():
         if not isinstance(key, str):
             raise exceptions.K3sConfigError.non_string_key(role, key)
+
+        # k3s passes each key on as --key=value and takes the flag name to
+        # be everything before the first '=', so token=abc: x would set
+        # token to abc=x without being the key token. No k3s flag name
+        # contains an '=', so any key which does is refused.
+        if '=' in key:
+            raise exceptions.K3sConfigError.key_contains_equals(role, key)
 
         # rstrip rather than removesuffix, which is Python 3.9: a key
         # ending in more than one '+' is not a k3s spelling of anything,

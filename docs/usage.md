@@ -127,6 +127,11 @@ this, because on a string key `+` appends to the plugin's value.
 | server | `write-kubeconfig`, `write-kubeconfig-mode` | Every `kubectl` and `helm` command, and the credential fetch, read `/etc/rancher/k3s/k3s.yaml`, and the plugin sets its mode. |
 | agent | `data-dir`, `node-name`, `with-node-id`, `server`, `token`, `token-file` | As for servers: every node keeps the same layout, and the plugin joins and names workers itself. |
 
+k3s's one-letter aliases for these keys are refused in the same way:
+`d` (`data-dir`), `s` (`server`) and `t` (`token`) in both roles, and
+`o` (`write-kubeconfig`) on servers. So is any key containing `=`,
+because k3s reads only the part before the `=` as the key's name.
+
 Other things to know:
 
 - Control plane nodes are tainted

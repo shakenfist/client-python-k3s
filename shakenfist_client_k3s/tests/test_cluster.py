@@ -1967,9 +1967,13 @@ class ValidateNodeSizesTestCase(testtools.TestCase):
 SERVER_OWNED_KEYS = (
     'cluster-init', 'data-dir', 'https-listen-port', 'node-name', 'server',
     'tls-san', 'token', 'token-file', 'with-node-id', 'write-kubeconfig',
-    'write-kubeconfig-mode')
+    'write-kubeconfig-mode',
+    # k3s's aliases for data-dir, server, token and write-kubeconfig.
+    'd', 's', 't', 'o')
 AGENT_OWNED_KEYS = (
-    'data-dir', 'node-name', 'server', 'token', 'token-file', 'with-node-id')
+    'data-dir', 'node-name', 'server', 'token', 'token-file', 'with-node-id',
+    # k3s's aliases for data-dir, server and token.
+    'd', 's', 't')
 
 
 class ValidateK3sConfigTestCase(testtools.TestCase):
@@ -2107,6 +2111,27 @@ class ValidateK3sConfigTestCase(testtools.TestCase):
             {'tls-san+': ['k3s.example.com']}, 'server')
         self.assertEqual({'tls-san+': ['k3s.example.com']},
                          yaml.safe_load(text))
+
+    def test_k3s_aliases_of_owned_keys_are_refused(self):
+        # k3s accepts a flag's one-letter alias in a configuration file as
+        # readily as its long name, so t: is token by another spelling.
+        for key, role in (('t', 'agent'), ('s', 'agent'), ('d', 'server'),
+                          ('o', 'server'), ('t+', 'server')):
+            e = self._assert_refused('owned_key', {key: 'x'}, role)
+            self.assertEqual(key, e.key)
+
+        # o is write-kubeconfig on a server only; an agent has no such flag.
+        self.assertNotEqual(
+            '', cluster_module.validate_k3s_config({'o': 'x'}, 'agent'))
+
+    def test_a_key_containing_equals_is_refused(self):
+        # k3s would pass token=abc: def on as --token=abc=def, which sets
+        # token. Refused whatever precedes the '=', since no flag has one.
+        for key in ('token=abc', 'node-label=a', '=x'):
+            for role in ('server', 'agent'):
+                e = self._assert_refused('key_contains_equals', {key: 'x'}, role)
+                self.assertEqual(key, e.key)
+                self.assertIn(repr(key), str(e))
 
     def test_a_callers_own_plus_key_is_accepted(self):
         # docs/usage.md tells a caller to write node-taint+ to add a taint
