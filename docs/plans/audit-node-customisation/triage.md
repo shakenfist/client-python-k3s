@@ -165,3 +165,12 @@ That is 42 + 2 − 2 + 2 = 44.
 `tools/ci_deploy_test.sh` changed in `18db6d4`. Before the pull request
 opens, the merge tier must be dispatched on this branch, and its URL
 recorded here or in the close-out.
+
+The merge tier was dispatched on this branch after 4f. The first run
+(https://github.com/shakenfist/client-python-k3s/actions/runs/37363868706)
+failed at `expand-workers` on a 502 from the under-cloud API, after the
+release-floor refusal and every node customisation assertion had
+passed; that is shakenfist/shakenfist#3664, where the occurrence is
+recorded. The re-dispatch
+(https://github.com/shakenfist/client-python-k3s/actions/runs/37366720133)
+passed end to end.

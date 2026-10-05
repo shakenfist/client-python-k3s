@@ -214,6 +214,60 @@ sub-agent's summary. 4b-4e run concurrently once 4a is committed. Their
 findings files are committed together, as `Record what the four audit
 lenses found.`, before 4f starts.
 
+## What running the phase found
+
+Four lenses produced 42 findings: code quality and style 14, tests 12,
+documentation 9, security 7. Only the documentation lens rated any
+`fix` (two). Triage (`audit-node-customisation/triage.md`) has 44 rows:
+D-6 split three ways, two pairs merged, and two rediscovered issues
+(#104's shape and #93's) found in this plan's own code. Of those rows,
+**23 were taken** in 16 commits, **11 declined**, **4 routed to 4g** and
+**6 informational**. Two issues were filed from the declines, #110 (no
+HA control plane in the merge tier) and #111 (the caller-file read
+written three times), and 4g filed #112 for the collection follow-on.
+The suite went from 565 tests to 579, and `tools/mutation-check.py`
+from 12 mutations to 22, all caught.
+
+Because 4f changed `tools/ci_deploy_test.sh`, the merge tier was
+dispatched on the branch. The first run failed on an under-cloud 502
+(shakenfist/shakenfist#3664) after every new assertion had passed; the
+[re-dispatch](https://github.com/shakenfist/client-python-k3s/actions/runs/37366720133)
+passed end to end in 26 minutes.
+
+The central security question came back clean: caller YAML cannot
+reach a guest shell unquoted or end its heredoc, and a 100,000-case
+fuzz of the serialiser agreed. The real defects were one layer up, in
+what the plugin promised about the configuration rather than how it
+wrote it: the owned-key refusal could be walked round with k3s's
+one-letter aliases or an `=` in a key, a caller's `bind-address`
+silently broke the kubeconfig `getconfig` hands out, and a small file
+of YAML aliases cost over a minute to validate. All three are fixed.
+
+### Sub-agents could not write their findings files
+
+The harness refuses report files written by sub-agents, so all four
+lenses returned their findings as text and the management session
+saved them, after spot-checking two or three findings per lens against
+the worktree. Each findings file says so in its header. The read-only
+constraint held: no lens changed anything else. A future audit brief
+should say "return your findings as text" rather than naming a file,
+which is a candidate correction to how push-audit steps are written
+in `shakenfist/development`.
+
+### Auditing at 3e84907 was the right revision
+
+Decision 1 had every lens judge the code as it stood after #107, not
+at each merge. No lens re-raised anything `2aba0e6` had already fixed,
+and the code lens found one comment that commit left stale (CQ-3),
+which only reading the current code could find.
+
+### The documentation criterion took a reading
+
+The master plan's last success criterion asks for `ARCHITECTURE.md`,
+`README.md` and `AGENTS.md` to change if the plan "adds or modifies
+modules or CLI commands". It added options, not commands, and the
+master plan now records that reading rather than ticking the box.
+
 ## Risks and mitigations
 
 1. **A lens audits the wrong revision.** That was the library API
