@@ -84,7 +84,9 @@ that; this section is only the shape.
   and a Shaken Fist server and guest image recent enough to speak
   `sf-agent2`; there is no fallback to the legacy `sf-agent`
   channel
-- **Cluster assembly**: the first control plane node is installed
+- **Cluster assembly**: every node has its k3s configuration files
+  written before its installer runs (see "k3s configuration" in
+  `docs/usage.md`), the first control plane node is installed
   with `k3s server`, additional control plane nodes and workers join
   using the node token, and, unless a caller opts out, MetalLB is
   installed (from the official metallb helm chart -- the Bitnami
