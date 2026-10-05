@@ -54,7 +54,6 @@ classifiers = [
 requires-python = ">=3.7"
 dependencies = [
     "click >= 8.0.0",           # bsd
-    "prettytable",              # bsd
     # 0.7.7 is the first release which supports the sf-agent2 side channel.
     "shakenfist_client >= 0.7.7",  # apache2
     "packaging",                # apache2 and bsd
