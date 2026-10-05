@@ -38,18 +38,20 @@ class K3sClusterException(Exception):
 class _ReasonedK3sException(K3sClusterException):
     """Base for the exceptions built through classmethods rather than directly.
 
-    Seven of the classes below describe several distinct failures that read
+    Eight of the classes below describe several distinct failures that read
     the same way to a caller: a manifest cannot be staged, a release
     lookup failed. Each is built through a classmethod per failure, each
     records which one ran in ``reason``, each renders a message its
     classmethod composed, and each carries the failure's details as
-    attributes. That shape was written out seven times, byte for byte, and
-    the duplication is a cross-phase one: two copies arrived with the
-    exception hierarchy, two more when later verbs needed their own
-    reasoned errors, a fifth with the heredoc refusal, and the last two
-    with k3s configuration pass-through -- which landed on the default
-    branch while this base class was being written, and is why the count
-    in this docstring is worth keeping accurate rather than approximate.
+    attributes. That shape was written out seven times, byte for byte,
+    before this base existed, and the duplication was a cross-phase one:
+    two copies arrived with the exception hierarchy, two more when later
+    verbs needed their own reasoned errors, a fifth with the heredoc
+    refusal, and two with k3s configuration pass-through -- which landed
+    on the default branch while this base class was being written, and is
+    why the count in this docstring is worth keeping accurate rather than
+    approximate. The eighth, ``ClusterMetadataError``, was written against
+    this base from the start.
     ``UnsupportedReleaseError`` named its three fields in its own
     ``__init__`` rather than taking ``**fields``; it declares them in
     ``FIELDS`` like the others now.

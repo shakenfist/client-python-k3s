@@ -250,9 +250,9 @@ stall note.
 
 Every failure this library detects and reports is a
 `K3sClusterException` subclass; `apiclient` exceptions, and
-`OSError`/`yaml.YAMLError` from local file and subprocess work (an
-unreadable `sshkey` path, a `~/.kube/config` write, a malformed
-kubeconfig), propagate unchanged rather than being wrapped. Every
+`OSError`/`yaml.YAMLError` from local file and subprocess work (a
+`~/.kube/config` write, a malformed kubeconfig), propagate unchanged
+rather than being wrapped. Every
 `K3sClusterException` subclass's `__str__` renders exactly the text
 `sf-client k3s ...` printed before this line existed as an exception
 at all -- catching the base class and printing `str(e)` reproduces
@@ -291,7 +291,7 @@ a correct caller never needs to catch it.
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
-| `KubeconfigError` | a local `~/.kube/config` write, merge or `kubectl config unset` fails |
+| `KubeconfigError` | a local `~/.kube/config` merge or `kubectl config unset` fails, or a merge is needed and there is no local `kubectl`. A failed write of the file itself is an `OSError` |
 
 Each exception's docstring in `shakenfist_client_k3s/exceptions.py`
 names the exact call site and the attributes it carries; several are
@@ -301,7 +301,7 @@ constructors, because one class covers several call sites whose
 message text differs.
 
 Where a class has classmethods, **they are the interface and the
-constructor is not**. The seven classes that carry a `reason` share a
+constructor is not**. The eight classes that carry a `reason` share a
 base whose `__init__` takes `(reason, message, **fields)`, so every
 attribute past `message` is keyword-only, and the set of attributes a
 class carries is its `FIELDS` tuple rather than a parameter list.
