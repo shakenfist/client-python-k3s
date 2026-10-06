@@ -245,6 +245,14 @@ cluster with control plane nodes only, which is what a play that hands
 the cluster straight to such a scaler wants, rather than the command
 line's default of `2`.
 
+The module checks `name` only when it would create the cluster, so a
+cluster that already exists under a name `create` would now refuse is
+still found, reported unchanged and deletable (the two release cache
+names are refused for every state). The counts are checked at
+`state: present` before a client is built, so a bad count fails the
+same way in check mode as in a real run, and names the module's own
+parameter (`initial_workers`, not `worker_count`).
+
 Every other shape parameter the module takes -- `control_plane_count`,
 `metal_address_count`, `network`, `release_channel`, `sshkey`,
 `install_metallb`, `install_longhorn` and `manifests` -- is creation-time

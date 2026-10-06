@@ -242,7 +242,7 @@ itself out in that pull request and records no `Merged` cell.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Argument validation | This file, steps below | In progress | |
+| 1. Argument validation | This file, steps below | Complete | |
 | 2. Push audit | `PUSH-AUDIT.md` over phase 1's diff against `develop`, before push | Not started | |
 
 ### Phase 1 steps

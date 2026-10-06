@@ -87,6 +87,13 @@ options:
       - The name of the cluster. Cluster names are unique within
         O(namespace), and the cluster's state is stored in that namespace's
         metadata under a key derived from this name.
+      - When this module creates the cluster the name may contain only ASCII
+        letters, digits and hyphens, must start and end with a letter or
+        digit, and may be at most 48 characters, because it becomes part of
+        every node's instance name. An existing cluster is not checked
+        against this, so one with another name can still be reported on and
+        destroyed. V(k3s_version_cache) and V(longhorn_version_cache) are
+        refused in every state.
     required: true
     type: str
   namespace:
@@ -132,7 +139,7 @@ options:
       - The default of 0 builds a cluster with control plane nodes only,
         which is what a play that hands the cluster straight to such a
         scaler wants. It is deliberately not the command line's default of
-        2.
+        2. Must be an integer of at least 0.
     required: false
     default: 0
     type: int
@@ -141,7 +148,7 @@ options:
       - How many control plane nodes to give the cluster when this module
         creates it. Like O(initial_workers), this is a creation parameter
         and is not reconciled - there is no verb which adds a control plane
-        node to a built cluster.
+        node to a built cluster. Must be an integer of at least 1.
     required: false
     default: 1
     type: int
@@ -149,7 +156,8 @@ options:
     description:
       - How many floating addresses to route into the cluster's network for
         metallb to manage, when this module creates the cluster. Accepted
-        and ignored when O(install_metallb) is V(false).
+        and ignored when O(install_metallb) is V(false). Must be an integer of
+        at least 0.
     required: false
     default: 5
     type: int

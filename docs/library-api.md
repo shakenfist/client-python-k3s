@@ -123,6 +123,15 @@ module in check mode, a form which wants to reject a file before the
 operator waits twenty minutes -- can do the same check the real call
 will do. It touches no cluster and no API client.
 
+The argument checks `create()` and the expand verbs run first are
+public pure functions too, for the same reason: `validate_cluster_name(name)`,
+`validate_counts(floor, **counts)`, `validate_create_counts(...)`,
+`validate_create_arguments(...)` (every check `create()` can make without
+the API, in one call) and `CLUSTER_NAME_MAX_LENGTH`. They raise
+`ClusterNameError`, `ShapeError` and the other errors above, touch no
+cluster and no API client, and let an Ansible module in check mode or a
+form refuse a bad request before the operator waits for it.
+
 `read_k3s_config(path, role)` is public on the same terms. It takes the
 path of a k3s configuration file and `'server'` or `'agent'`, and
 returns the mapping the file holds, ready to pass as `server_config` or
@@ -288,6 +297,8 @@ a correct caller never needs to catch it.
 | `GuestFileError` | a file this library writes onto a cluster node carries a line equal to the heredoc marker used to write it, so writing it would run the rest as commands on the node. The values that reach these bodies come from the namespace metadata document, which is third-party writable |
 | `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
 | `NodeSizeError` | `create()` is given a node size that is not a positive integer (a bool counts as not), before anything is built or the name is registered |
+| `ClusterNameError` | `create()` is given a name that cannot become a node's instance name, before anything is built or the name is registered: `invalid_characters` (not a string, empty, or not ASCII letters, digits and hyphens starting and ending alphanumeric), `too_long` (over `CLUSTER_NAME_MAX_LENGTH`, 48). Any verb, `create()` included, raises `reserved` for `k3s_version_cache` and `longhorn_version_cache`, which collide with the release caches' metadata keys |
+| `ShapeError` | `create()`, `expand_workers()` or `expand_addresses()` is given a count that is not an integer (`not_an_integer`; a bool counts as not) or is below its floor (`below_floor`): 1 for `control_plane_count` and for the two expand counts, 0 for `worker_count` and `metal_address_count` on `create()`. Raised before anything is built |
 | `K3sConfigError` | `create(server_config=..., agent_config=...)` is given a mapping that cannot be used -- not a mapping, a non-string key, a key containing `=`, a value that does not survive a JSON round trip, a key the plugin owns (or k3s's alias for one), or text that collides with the heredoc marker -- or `read_k3s_config()` cannot read or parse its file, before anything is built or the name is registered |
 | `UnsupportedReleaseError` | `create()` resolves a k3s release older than `v1.21.1+k3s1`, or one it cannot parse, right after the channel lookup and before anything is built or the name is registered |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
@@ -295,7 +306,7 @@ a correct caller never needs to catch it.
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
-| `KubeconfigError` | a local `~/.kube/config` merge fails, or `delete()`'s cleanup cannot read the kubeconfig or remove an entry from it, or either needs a local `kubectl` and there is none. A failed write of the file itself is an `OSError` |
+| `KubeconfigError` | a local `~/.kube/config` merge fails (`merge_failed`), or `delete()`'s cleanup cannot read the kubeconfig or remove an entry from it, or either needs a local `kubectl` and there is none. A failed write of the file itself is an `OSError` |
 
 Each exception's docstring in `shakenfist_client_k3s/exceptions.py`
 names the exact call site and the attributes it carries; several are
