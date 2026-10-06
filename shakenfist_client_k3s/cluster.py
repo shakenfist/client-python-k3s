@@ -420,6 +420,22 @@ NODE_SIGNAL_STATE_RE = re.compile(r'\A[a-z-]{1,32}\Z')
 #    agent takes a command line.
 
 
+def _local_kubeconfig_path():
+    """The file create(write_kubeconfig=True) writes, and delete()'s cleanup acts on.
+
+    Always ~/.kube/config, whatever KUBECONFIG says: create() writes or
+    merges into this file and nowhere else, so the cleanup has to read and
+    edit the same one rather than whichever files the caller's KUBECONFIG
+    happens to list. One function, so the two cannot drift apart.
+
+    Every component is chosen by this module -- the user's home
+    directory, a fixed directory name and a fixed file name -- so the join
+    needs no containment check and there is nothing for a realpath() guard
+    to prove. An outside value appearing in it later would need both.
+    """
+    return os.path.join(os.path.expanduser('~'), '.kube', 'config')
+
+
 def _is_address(value):
     """True if value is a string holding an IP address.
 
@@ -3032,14 +3048,11 @@ class Cluster:
         # here. See create()'s docstring, and decision 6 of the phase 3 plan.
         if write_kubeconfig:
             p.phase('Updating local kubeconfig')
-            # Every component of these paths is chosen by this module -- the
-            # user's home directory, a fixed directory name, a fixed file
-            # name, and below a tempfile directory -- so the joins need no
-            # containment check and there is nothing for a realpath() guard
-            # to prove. An outside value appearing in one of them later
-            # would need both.
-            kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
-            main_config_path = os.path.join(kube_dir, 'config')
+            # ~/.kube/config, and ~/.kube; see _local_kubeconfig_path(). The
+            # merge's temporary file below is also a fixed name under a
+            # tempfile directory, so it needs no containment check either.
+            main_config_path = _local_kubeconfig_path()
+            kube_dir = os.path.dirname(main_config_path)
 
             # 0700, rather than whatever the process umask makes of 0777. A
             # k3s kubeconfig embeds client-certificate-data and
@@ -3566,10 +3579,11 @@ class Cluster:
         This is the body of ``sf-client k3s delete``.
 
         update_kubeconfig governs one thing: whether this cluster's entries
-        are removed from the local ~/.kube/config. It is the counterpart of
-        ``create()``'s write_kubeconfig and it defaults off for the same
-        reason -- the calling machine's kubectl configuration is not part of
-        the cluster, and a library should not edit it unasked. ``k3s
+        are removed from ~/.kube/config, the file create() writes, whatever
+        KUBECONFIG says. It is the counterpart of ``create()``'s
+        write_kubeconfig and it defaults off for the same reason -- the
+        calling machine's kubectl configuration is not part of the
+        cluster, and a library should not edit it unasked. ``k3s
         delete`` passes True unless --no-kubeconfig was given, so the
         command line is unchanged. Decision 6 of the phase 3 plan has the
         argument.
@@ -3741,8 +3755,13 @@ class Cluster:
         if update_kubeconfig:
             self._delete_kubeconfig_entries()
 
-    def _run_local_kubectl(self, argv, fqcn, log_stdout=True):
+    def _run_local_kubectl(self, argv, main_config_path, fqcn, log_stdout=True):
         """Run a local kubectl argument list for delete(), capturing its output.
+
+        KUBECONFIG is set to main_config_path for the child alone, so the
+        command acts on the file create() wrote rather than on whatever
+        the caller's KUBECONFIG lists. A literal path rather than a list:
+        it is one file, from _local_kubeconfig_path().
 
         capture_output is what stops kubectl's 'deleted context ...' lines
         going to the process's file descriptor 1, which the reporter does not
@@ -3756,9 +3775,10 @@ class Cluster:
         the kubeconfig read; its stderr is still logged.
         """
         try:
-            result = subprocess.run(argv, capture_output=True)
+            result = subprocess.run(argv, capture_output=True,
+                                    env={**os.environ, 'KUBECONFIG': main_config_path})
         except FileNotFoundError:
-            raise exceptions.KubeconfigError.missing_kubectl_on_delete(fqcn)
+            raise exceptions.KubeconfigError.missing_kubectl_on_delete(main_config_path, fqcn)
         if result.returncode == 0:
             outputs = [result.stderr]
             if log_stdout:
@@ -3769,14 +3789,27 @@ class Cluster:
         return result
 
     def _delete_kubeconfig_entries(self):
-        """Remove the user, context and cluster create() named fqcn from the local kubeconfig.
+        """Remove the user, context and cluster create() named fqcn from ~/.kube/config.
+
+        The file is the one create() writes, whatever KUBECONFIG says; see
+        _local_kubeconfig_path(). If it does not exist there is nothing to
+        remove, and kubectl is neither run nor required.
 
         kubectl's delete-* subcommands fail on a name which is not there, so
         the names present are read first and only those are deleted. That
-        keeps a second delete, or one of a cluster created without
-        write_kubeconfig, succeeding without touching anything.
+        keeps the cleanup succeeding without touching anything for a
+        cluster created without write_kubeconfig, and for entries the user
+        has already removed. It does not make a second delete work: by the
+        time this runs the cluster's metadata has gone, so a re-run raises
+        ClusterNotFoundError before it gets here, and each failure below
+        says how to remove the entries by hand instead.
         """
         fqcn = '%s.%s' % (self.name, self.namespace)
+        main_config_path = _local_kubeconfig_path()
+        if not os.path.exists(main_config_path):
+            self.reporter.debug('There is no %s, so there are no kubeconfig entries to remove'
+                                % main_config_path)
+            return
 
         # Not --raw, but that does not make the output safe to log. Without
         # it kubectl replaces tokens, passwords and the certificate, key
@@ -3785,14 +3818,15 @@ class Cluster:
         # values as they are -- for every cluster in the file, not only
         # this one. The output is therefore secret: it is parsed for names
         # and never logged.
-        view = self._run_local_kubectl(['kubectl', 'config', 'view', '-o', 'json'], fqcn,
-                                       log_stdout=False)
+        view = self._run_local_kubectl(['kubectl', 'config', 'view', '-o', 'json'],
+                                       main_config_path, fqcn, log_stdout=False)
         if view.returncode != 0:
             # Decoded at the raise, matching merge_failed() on the create side.
             stderr = None
             if view.stderr:
                 stderr = view.stderr.decode('utf-8', errors='replace')
-            raise exceptions.KubeconfigError.view_failed(view.returncode, stderr)
+            raise exceptions.KubeconfigError.view_failed(
+                main_config_path, fqcn, view.returncode, stderr)
 
         # An empty section is null rather than an empty list in kubectl's
         # JSON, hence the 'or []'.
@@ -3802,7 +3836,7 @@ class Cluster:
             for section in ('contexts', 'users', 'clusters'):
                 present[section] = {entry['name'] for entry in config.get(section) or []}
         except (ValueError, AttributeError, KeyError, TypeError) as e:
-            raise exceptions.KubeconfigError.view_unparseable(str(e))
+            raise exceptions.KubeconfigError.view_unparseable(main_config_path, fqcn, str(e))
 
         # The context first, because it is the entry which refers to the
         # other two.
@@ -3817,7 +3851,8 @@ class Cluster:
             # property-path grammar 'kubectl config unset' used cannot
             # express a cluster name containing a dot, or a namespace named
             # like a kubeconfig field, such as 'cluster' or 'user'.
-            deleted = self._run_local_kubectl(['kubectl', 'config', command, fqcn], fqcn)
+            deleted = self._run_local_kubectl(['kubectl', 'config', command, fqcn],
+                                              main_config_path, fqcn)
             if deleted.returncode != 0:
                 # The other half of capturing the output: kubectl's
                 # explanation of the failure reaches nobody unless the
@@ -3825,7 +3860,8 @@ class Cluster:
                 stderr = None
                 if deleted.stderr:
                     stderr = deleted.stderr.decode('utf-8', errors='replace')
-                raise exceptions.KubeconfigError.delete_failed(command, fqcn, stderr)
+                raise exceptions.KubeconfigError.delete_failed(
+                    main_config_path, command, fqcn, stderr)
 
     def expand_workers(self, worker_count):
         """Add worker nodes to this cluster.

@@ -177,7 +177,9 @@ it.
 govern the only two things either call does to the machine it runs on
 rather than to the cluster: writing and merging `~/.kube/config`, and
 shelling out to `kubectl config delete-context`, `delete-user` and
-`delete-cluster`. Both default to `False` here,
+`delete-cluster` against that same file. Both act on `~/.kube/config`
+whatever `KUBECONFIG` says, and the cleanup does nothing when that
+file does not exist. Both default to `False` here,
 which is the one place a `Cluster` method's default differs from what
 `sf-client k3s` does -- the command line passes `True` unless
 `--no-kubeconfig` was given, so `sf-client k3s` behaves as it always
@@ -306,7 +308,7 @@ a correct caller never needs to catch it.
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
-| `KubeconfigError` | a local `~/.kube/config` merge fails (`merge_failed`), or `delete()`'s cleanup cannot read the kubeconfig or remove an entry from it, or either needs a local `kubectl` and there is none. A failed write of the file itself is an `OSError` |
+| `KubeconfigError` | a local `~/.kube/config` merge fails (`merge_failed`), or `delete()`'s cleanup cannot read `~/.kube/config` (`view_failed`, `view_unparseable`) or remove an entry from it (`delete_failed`), or either needs a local `kubectl` and there is none (`missing_kubectl`, `missing_kubectl_on_delete`). The four cleanup reasons are raised after the cluster has gone, so a retry of `delete()` raises `ClusterNotFoundError`; each carries `main_config_path` and `entry_name`, and its message gives the `kubectl` commands that remove the entries by hand. A failed write of the file itself is an `OSError` |
 
 Each exception's docstring in `shakenfist_client_k3s/exceptions.py`
 names the exact call site and the attributes it carries; several are

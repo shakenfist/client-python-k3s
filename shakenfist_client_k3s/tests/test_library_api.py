@@ -126,10 +126,13 @@ class LibraryTestCase(testtools.TestCase):
 
         The presence of a file here is what sends create() down its merge
         path rather than its write-a-new-file path, so both the merge tests
-        and the tests which assert the merge did not happen need one.
+        and the tests which assert the merge did not happen need one. It
+        is also what delete()'s cleanup needs before it runs kubectl at
+        all, so a test of that cleanup which did not ask create() for the
+        file writes this one instead.
         """
         kube_dir = os.path.join(self.home, '.kube')
-        os.makedirs(kube_dir)
+        os.makedirs(kube_dir, exist_ok=True)
         with open(self._kubeconfig_path(), 'w') as f:
             f.write(yaml.dump({
                 'apiVersion': 'v1',
@@ -238,7 +241,9 @@ class ClusterLifecycleTestCase(LibraryTestCase):
         # Present in the kubeconfig, or the delete commands under test are
         # never run and the assertions below iterate over the read alone.
         self.kubectl.names = ['foo; touch /tmp/pwned.testns']
-        # update_kubeconfig, or the cleanup under test does not run at all.
+        # update_kubeconfig and a file to clean, or the cleanup under test
+        # does not run at all.
+        self._write_existing_kubeconfig()
         c.delete(update_kubeconfig=True)
 
         self.assertEqual(4, len(self.subprocess_run.call_args_list))
@@ -252,6 +257,7 @@ class ClusterLifecycleTestCase(LibraryTestCase):
     def test_delete_raises_when_a_kubectl_delete_fails(self):
         c = self._cluster()
         c.create(1, 1, 1)
+        self._write_existing_kubeconfig()
         self.subprocess_run.return_value.returncode = 1
 
         e = self.assertRaises(exceptions.KubeconfigError, c.delete,
@@ -1152,6 +1158,7 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
     def test_delete_removes_all_three_entries_when_asked(self):
         c = self._cluster()
         c.create(1, 1, 1)
+        self._write_existing_kubeconfig()
         c.delete(update_kubeconfig=True)
 
         self.assertEqual(
@@ -1164,6 +1171,36 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         # Nothing else shelled out, since this create declined the write.
         self.assertEqual(4, len(self.subprocess_run.call_args_list))
 
+    def test_the_cleanup_acts_on_the_file_create_writes(self):
+        # create() writes ~/.kube/config whatever KUBECONFIG says, so the
+        # cleanup has to act on that file too. Left to the caller's
+        # KUBECONFIG, it would read and edit some other file -- and find
+        # nothing, or remove a same-named entry that create() never wrote.
+        c = self._cluster()
+        with mock.patch.dict('os.environ', {'KUBECONFIG': '/elsewhere/config'}):
+            c.create(1, 1, 1, write_kubeconfig=True)
+            c.delete(update_kubeconfig=True)
+
+        calls = self._kubectl_calls(_is_kubectl)
+        self.assertEqual(4, len(calls))
+        for call in calls:
+            self.assertEqual(self._kubeconfig_path(),
+                             call.kwargs['env']['KUBECONFIG'], call)
+
+    def test_no_kubeconfig_file_means_nothing_to_clean(self):
+        # A cluster created without write_kubeconfig on a machine with no
+        # ~/.kube/config: there is nothing to remove, so no kubectl runs,
+        # and a machine without kubectl is not an error.
+        c = self._cluster()
+        c.create(1, 1, 1)
+        self.subprocess_run.side_effect = FileNotFoundError(2, 'No such file', 'kubectl')
+
+        c.delete(update_kubeconfig=True)
+
+        self.assertEqual([], self._kubectl_calls(_is_kubectl))
+        self.assertFalse(os.path.exists(self._kubeconfig_path()))
+        self.assertNotIn(MD_KEY, self.client.metadata)
+
     def test_the_kubectl_calls_capture_their_output(self):
         # What KubectlUnsetLeakTestCase used to pin, inverted. sys.stdout is
         # a Python object and these calls are child processes, so without
@@ -1173,6 +1210,7 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         # read is included: its output is the whole kubeconfig.
         c = self._cluster()
         c.create(1, 1, 1)
+        self._write_existing_kubeconfig()
         c.delete(update_kubeconfig=True)
 
         calls = self._kubectl_calls(_is_kubectl)
@@ -1191,6 +1229,7 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         # was the current one.
         c = self._cluster()
         c.create(1, 1, 1)
+        self._write_existing_kubeconfig()
         self.subprocess_run.return_value.stdout = (
             b'deleted context banana.testns from /home/u/.kube/config\n')
         self.subprocess_run.return_value.stderr = (
@@ -1210,6 +1249,7 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         # it failed used to reach the terminal by itself.
         c = self._cluster()
         c.create(1, 1, 1)
+        self._write_existing_kubeconfig()
         self.subprocess_run.return_value.returncode = 1
         self.subprocess_run.return_value.stderr = (
             b'error: unable to parse /home/u/.kube/config\n')
@@ -1224,10 +1264,15 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         self.assertEqual('banana.testns', e.entry_name)
         self.assertEqual('error: unable to parse /home/u/.kube/config\n',
                          e.stderr)
+        self.assertEqual(self._kubeconfig_path(), e.main_config_path)
         self.assertEqual(
-            "Could not remove banana.testns from the local kubeconfig with "
+            "Could not remove banana.testns from %s with "
             "'kubectl config delete-context'\n"
-            'error: unable to parse /home/u/.kube/config\n', str(e))
+            'error: unable to parse /home/u/.kube/config\n'
+            % self._kubeconfig_path(),
+            str(e).split('The cluster has been deleted')[0])
+        self.assertIn('kubectl --kubeconfig %s config delete-context banana.testns'
+                      % self._kubeconfig_path(), str(e))
 
 
 class KubeconfigCleanupTestCase(LibraryTestCase):
@@ -1249,6 +1294,8 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
     """
 
     def _delete(self, name, namespace):
+        # The cleanup only runs kubectl when there is a file to clean.
+        self._write_existing_kubeconfig()
         self.client.metadata[cluster_module.METADATA_KEY % name] = (
             copy.deepcopy(DELETABLE_MD))
         self.client.metadata[primitives.CLUSTER_LIST] = [name]
@@ -1282,8 +1329,8 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
 
     def test_entries_already_gone_are_not_deleted_again(self):
         # delete-* fails on a name which is not there, where unset exited
-        # zero. A cluster created without write_kubeconfig, or a second
-        # cleanup after a first which got some way, has to succeed without
+        # zero. A cluster created without write_kubeconfig, or one whose
+        # entries the user has already removed, has to succeed without
         # running any of them -- and an unrelated entry is left alone.
         self.kubectl.names = ['other']
         self._delete('banana', 'testns')
@@ -1357,6 +1404,8 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
                               'banana', 'testns')
 
         self.assertEqual('view_failed', e.reason)
+        self.assertEqual(self._kubeconfig_path(), e.main_config_path)
+        self.assertEqual('banana.testns', e.entry_name)
         self.assertEqual(1, e.returncode)
         self.assertEqual('error: unable to parse /home/u/.kube/config\n',
                          e.stderr)
@@ -1371,6 +1420,7 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
                                   'banana', 'testns')
 
             self.assertEqual('view_unparseable', e.reason, stdout)
+            self.assertEqual('banana.testns', e.entry_name, stdout)
             self.assertTrue(e.detail, stdout)
             self.assertEqual([], self._deletes())
 
@@ -1385,6 +1435,7 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
 
         self.assertEqual('missing_kubectl_on_delete', e.reason)
         self.assertEqual('banana.testns', e.entry_name)
+        self.assertEqual(self._kubeconfig_path(), e.main_config_path)
         self.assertNotIn(MD_KEY, self.client.metadata)
 
 

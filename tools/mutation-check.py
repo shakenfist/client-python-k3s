@@ -468,10 +468,19 @@ MUTATIONS = [
     (
         "delete -v does not log the kubeconfig read, which carries other clusters' credentials",
         PKG + '/cluster.py',
-        "fqcn,\n                                       log_stdout=False)",
-        "fqcn,\n                                       log_stdout=True)",
+        'main_config_path, fqcn, log_stdout=False)',
+        'main_config_path, fqcn, log_stdout=True)',
         PKG + '.tests.test_library_api.KubeconfigCleanupTestCase'
         '.test_the_kubeconfig_read_is_never_logged',
+        'stestr',
+    ),
+    (
+        "delete's kubeconfig cleanup acts on the file create wrote, not on KUBECONFIG",
+        PKG + '/cluster.py',
+        "env={**os.environ, 'KUBECONFIG': main_config_path})",
+        'env=dict(os.environ))',
+        PKG + '.tests.test_library_api.OptionalKubeconfigTestCase'
+        '.test_the_cleanup_acts_on_the_file_create_writes',
         'stestr',
     ),
     (

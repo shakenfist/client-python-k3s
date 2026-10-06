@@ -375,6 +375,8 @@ class CommandWiringTestCase(testtools.TestCase):
                       result.output)
 
     def test_delete_updates_the_local_kubeconfig(self):
+        # A file to clean, or the cleanup runs no kubectl at all.
+        fakes.home_with_kubeconfig(self)
         result = self.runner.invoke(
             shakenfist_client_k3s.k3s, ['delete', 'banana'],
             obj={'VERBOSE': False, 'CLIENT': self.client})

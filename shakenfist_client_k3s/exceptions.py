@@ -27,6 +27,7 @@ hierarchy must not be caught by that machinery.
 """
 
 import json
+import shlex
 
 from shakenfist_client_k3s import progress
 
@@ -1210,32 +1211,35 @@ class KubeconfigError(_ReasonedK3sException):
       ``subprocess`` returns at the raise, and the second line is only
       rendered when it is non-empty, matching the original's conditional
       ``print()``.
-    - ``missing_kubectl_on_delete(entry_name)``: raised by
-      ``Cluster.delete()`` when it was asked to clean up the local
-      kubeconfig and there is no local ``kubectl`` to do it with. That
-      is a machine which created its first cluster, which needs no
+    - ``missing_kubectl_on_delete(main_config_path, entry_name)``: raised
+      by ``Cluster.delete()`` when it was asked to clean up the local
+      kubeconfig and there is no local ``kubectl`` to do it with. That is
+      a machine which created its first cluster, which needs no
       ``kubectl`` because there was nothing to merge into, and used to be
-      a ``FileNotFoundError`` traceback. The cluster is already gone by
-      then, so the message names the entries left behind rather than
-      suggesting a retry, which would find no cluster.
-    - ``view_failed(returncode, stderr)``: raised by ``Cluster.delete()``
-      when the ``kubectl config view -o json`` it reads the present entry
-      names from exits non-zero.
-    - ``view_unparseable(detail)``: raised by ``Cluster.delete()`` when
-      that view exits zero but its output is not the JSON config document
-      it should be; ``detail`` is the parser's complaint. The output
-      itself is not carried.
-    - ``delete_failed(command, entry_name, stderr)``: raised by
-      ``Cluster.delete()`` when one of its ``kubectl config
+      a ``FileNotFoundError`` traceback.
+    - ``view_failed(main_config_path, entry_name, returncode, stderr)``:
+      raised by ``Cluster.delete()`` when the ``kubectl config view -o
+      json`` it reads the present entry names from exits non-zero.
+    - ``view_unparseable(main_config_path, entry_name, detail)``: raised
+      by ``Cluster.delete()`` when that view exits zero but its output is
+      not the JSON config document it should be; ``detail`` is the
+      parser's complaint. The output itself is not carried, because it
+      holds other clusters' credentials.
+    - ``delete_failed(main_config_path, command, entry_name, stderr)``:
+      raised by ``Cluster.delete()`` when one of its ``kubectl config
       delete-context``, ``delete-user`` or ``delete-cluster`` calls exits
-      non-zero. ``command`` is the subcommand which failed and
-      ``entry_name`` the name it was given. These four name entries
-      rather than a config file path, but they are still
-      local-kubectl-state, so they live on this class rather than on
-      ``ClusterNotFoundError``. ``stderr`` is carried for the same reason
-      as ``merge_failed()``'s: the calls capture the child's output, so
-      kubectl's own account of why it failed reaches nobody unless the
-      exception renders it.
+      non-zero. ``command`` is the subcommand which failed.
+
+    These last four are the cleanup's failures, and all four happen
+    after the cluster's metadata has gone, so re-running ``delete``
+    raises ``ClusterNotFoundError`` before it reaches the cleanup again.
+    Each therefore carries ``main_config_path``, the file the cleanup
+    acts on, and ``entry_name``, the user, context and cluster name
+    ``create()`` gave the cluster there, and ends by saying which entries
+    may remain where and the commands which remove them. ``stderr`` is
+    carried for the same reason as ``merge_failed()``'s: the calls
+    capture the child's output, so kubectl's own account of why it failed
+    reaches nobody unless the exception renders it.
 
     As with ``ReleaseLookupError``, the union of the fields the
     classmethods set is declared explicitly, so which attributes an
@@ -1265,35 +1269,55 @@ class KubeconfigError(_ReasonedK3sException):
         return cls('merge_failed', message, main_config_path=main_config_path,
                    returncode=returncode, stderr=stderr)
 
-    @classmethod
-    def missing_kubectl_on_delete(cls, entry_name):
-        message = (
-            'A local kubectl binary is required to remove the cluster from\n'
-            'the local kubeconfig, but none was found. The cluster has been\n'
-            'deleted, and any user, context or cluster entry named %s is\n'
-            'still there.'
-        ) % entry_name
-        return cls('missing_kubectl_on_delete', message, entry_name=entry_name)
+    @staticmethod
+    def _cleanup_failure(lines, main_config_path, entry_name, stderr=None):
+        """Render a cleanup failure: its own lines, kubectl's stderr, then the way out.
 
-    @classmethod
-    def view_failed(cls, returncode, stderr=None):
-        lines = ['Could not read the local kubeconfig, return code %d' % returncode]
+        The way out is the same for all four: the cluster has gone, so
+        the entries have to be removed by hand. The commands name the file
+        with --kubeconfig, because that is the file the cleanup acted on
+        whatever the caller's KUBECONFIG says.
+        """
         if stderr:
-            lines.append(stderr)
-        message = '\n'.join(lines)
-        return cls('view_failed', message, returncode=returncode, stderr=stderr)
+            lines.append(stderr.rstrip('\n'))
+        lines.append(
+            'The cluster has been deleted, but kubeconfig entries named %s\n'
+            'may remain in %s. Remove them with:' % (entry_name, main_config_path))
+        for command in ('delete-context', 'delete-user', 'delete-cluster'):
+            lines.append('    kubectl --kubeconfig %s config %s %s'
+                         % (shlex.quote(main_config_path), command, shlex.quote(entry_name)))
+        return '\n'.join(lines)
 
     @classmethod
-    def view_unparseable(cls, detail):
-        message = 'Could not parse the local kubeconfig as kubectl reported it: %s' % detail
-        return cls('view_unparseable', message, detail=detail)
+    def missing_kubectl_on_delete(cls, main_config_path, entry_name):
+        message = cls._cleanup_failure(
+            ['A local kubectl binary is required to remove the cluster from\n'
+             '%s, but none was found.' % main_config_path],
+            main_config_path, entry_name)
+        return cls('missing_kubectl_on_delete', message,
+                   main_config_path=main_config_path, entry_name=entry_name)
 
     @classmethod
-    def delete_failed(cls, command, entry_name, stderr=None):
-        lines = ["Could not remove %s from the local kubeconfig with 'kubectl config %s'"
-                 % (entry_name, command)]
-        if stderr:
-            lines.append(stderr)
-        message = '\n'.join(lines)
-        return cls('delete_failed', message, command=command, entry_name=entry_name,
-                   stderr=stderr)
+    def view_failed(cls, main_config_path, entry_name, returncode, stderr=None):
+        message = cls._cleanup_failure(
+            ['Could not read %s, return code %d' % (main_config_path, returncode)],
+            main_config_path, entry_name, stderr)
+        return cls('view_failed', message, main_config_path=main_config_path,
+                   entry_name=entry_name, returncode=returncode, stderr=stderr)
+
+    @classmethod
+    def view_unparseable(cls, main_config_path, entry_name, detail):
+        message = cls._cleanup_failure(
+            ['Could not parse %s as kubectl reported it: %s' % (main_config_path, detail)],
+            main_config_path, entry_name)
+        return cls('view_unparseable', message, main_config_path=main_config_path,
+                   entry_name=entry_name, detail=detail)
+
+    @classmethod
+    def delete_failed(cls, main_config_path, command, entry_name, stderr=None):
+        message = cls._cleanup_failure(
+            ["Could not remove %s from %s with 'kubectl config %s'"
+             % (entry_name, main_config_path, command)],
+            main_config_path, entry_name, stderr)
+        return cls('delete_failed', message, main_config_path=main_config_path,
+                   command=command, entry_name=entry_name, stderr=stderr)

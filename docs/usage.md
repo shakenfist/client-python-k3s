@@ -327,15 +327,23 @@ side and not on the create side.
 
 Deletes every instance in the cluster, unroutes its floating
 addresses, deletes the node network if `create` made it, and removes
-the cluster's namespace metadata. It then removes the cluster's entries from the
-local kubeconfig, unless `--no-kubeconfig` is given, in which case that
-step is skipped and a local `kubectl` is not needed. The cleanup reads
-the entries present with `kubectl config view` and then runs
+the cluster's namespace metadata. It then removes the cluster's
+entries -- a user, context and cluster named `NAME.NAMESPACE` -- from
+`~/.kube/config`, unless `--no-kubeconfig` is given, in which case
+that step is skipped and a local `kubectl` is not needed.
+
+The cleanup acts on `~/.kube/config` whatever `KUBECONFIG` says,
+because that is the file `create` writes. If the file does not exist
+there is nothing to remove, and `kubectl` is not run. Otherwise it
+reads the entries present with `kubectl config view` and then runs
 `kubectl config delete-context`, `delete-user` and `delete-cluster`
 for each one by name, so it requires `kubectl` v1.20 or later
-(`delete-user` arrived in v1.20.0). Having no local `kubectl` at that
-point is an error naming the entries left behind, after the cluster
-itself has gone.
+(`delete-user` arrived in v1.20.0). Any failure here -- no local
+`kubectl`, or a `kubectl` call that fails -- comes after the cluster
+itself has gone, so running `delete` again only reports that the
+cluster does not exist. The error says which entries may remain and
+gives the `kubectl --kubeconfig ~/.kube/config config delete-*`
+commands that remove them by hand.
 
 This also works on a cluster that never finished being built --
 indeed it is the supported way to clear one: whatever nodes, network

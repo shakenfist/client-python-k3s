@@ -214,6 +214,7 @@ class CommandExceptionTestCase(ClientTestCase):
         completed.returncode = 1
         completed.stdout = b''
         completed.stderr = b'error: unable to parse /home/u/.kube/config\n'
+        main_config_path = fakes.home_with_kubeconfig(self)
         with mock.patch('subprocess.run', return_value=completed,
                         side_effect=fakes.FakeKubectl(['banana.clientns'])):
             e = self._assert_raises(
@@ -224,6 +225,7 @@ class CommandExceptionTestCase(ClientTestCase):
         self.assertEqual('delete_failed', e.reason)
         self.assertEqual('delete-context', e.command)
         self.assertEqual('banana.clientns', e.entry_name)
+        self.assertEqual(main_config_path, e.main_config_path)
         self.assertEqual('error: unable to parse /home/u/.kube/config\n',
                          e.stderr)
 
@@ -328,16 +330,22 @@ class GroupHandlerTestCase(ClientTestCase):
         completed.returncode = 1
         completed.stdout = b''
         completed.stderr = b'error: unable to parse /home/u/.kube/config\n'
+        main_config_path = fakes.home_with_kubeconfig(self)
         with mock.patch('subprocess.run', return_value=completed,
                         side_effect=fakes.FakeKubectl(['banana.clientns'])):
             self._assert_cli_failure(
                 ['delete', 'banana'],
-                # kubectl's stderr keeps its own trailing newline, exactly
-                # as the create side's merge_failed renders it, so the
-                # handler's newline lands after it as a blank line.
-                "Could not remove banana.clientns from the local kubeconfig with "
+                # The cluster has gone by now, so the message ends with how
+                # to remove the entries by hand rather than with a retry.
+                "Could not remove banana.clientns from %(path)s with "
                 "'kubectl config delete-context'\n"
-                'error: unable to parse /home/u/.kube/config\n\n',
+                'error: unable to parse /home/u/.kube/config\n'
+                'The cluster has been deleted, but kubeconfig entries named banana.clientns\n'
+                'may remain in %(path)s. Remove them with:\n'
+                '    kubectl --kubeconfig %(path)s config delete-context banana.clientns\n'
+                '    kubectl --kubeconfig %(path)s config delete-user banana.clientns\n'
+                '    kubectl --kubeconfig %(path)s config delete-cluster banana.clientns\n'
+                % {'path': main_config_path},
                 {CLUSTER_LIST: ['banana'], MD_KEY: copy.deepcopy(DELETABLE_MD)})
 
     def test_query_k3s_version_http_error(self):

@@ -13,7 +13,9 @@ the health verb both drive.
 
 import io
 import json
+import os
 import subprocess
+import tempfile
 
 import mock
 from shakenfist_client import apiclient
@@ -62,6 +64,26 @@ users:
 
 # What Cluster.delete() runs to learn which kubeconfig entries are present.
 KUBECTL_CONFIG_VIEW_JSON = ['kubectl', 'config', 'view', '-o', 'json']
+
+
+def home_with_kubeconfig(testcase):
+    """Point HOME at a temporary directory holding a ~/.kube/config, and return its path.
+
+    delete()'s kubeconfig cleanup acts on ~/.kube/config and runs no
+    kubectl when there is no such file, so a test of the cleanup needs one
+    -- and needs it somewhere other than the operator's own home.
+    """
+    home = tempfile.TemporaryDirectory()
+    testcase.addCleanup(home.cleanup)
+    patcher = mock.patch.dict('os.environ', {'HOME': home.name})
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+
+    path = os.path.join(home.name, '.kube', 'config')
+    os.makedirs(os.path.dirname(path))
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(KUBECONFIG)
+    return path
 
 
 class FakeKubectl:
