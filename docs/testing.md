@@ -9,7 +9,7 @@ pre-commit run --all-files
 ```
 
 Unit tests live in `shakenfist_client_k3s/tests/` and mock the Shaken
-Fist API, the k3s update API and the GitHub releases API. They cannot
+Fist API, the k3s update API and the Longhorn chart index. They cannot
 reach the orchestration path -- whether a cluster actually assembles is
 only answerable against a live Shaken Fist cloud, which is what the
 merge tier of CI is for.

@@ -17,6 +17,7 @@ from packaging.version import InvalidVersion, Version
 import requests
 from shakenfist_client import apiclient
 import time
+import yaml
 
 from shakenfist_client_k3s import exceptions
 
@@ -37,6 +38,22 @@ LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
 # vehicle for terminal escape sequences in somebody's terminal.
 RESPONSE_SNIPPET_BYTES = 512
 
+K3S_CHANNELS_URL = 'https://update.k3s.io/v1-release/channels'
+
+# The index of the Helm repository the Longhorn install itself uses (see
+# Cluster.setup_longhorn()), so the version found here is by construction
+# one the install can fetch. It is a static file with no API rate limit.
+# This lookup used to page through the GitHub releases API instead, which
+# allows 60 anonymous requests an hour per source address: behind a shared
+# NAT that failed creates at the Longhorn phase, after every instance had
+# been built (#97).
+LONGHORN_CHART_INDEX_URL = 'https://charts.longhorn.io/index.yaml'
+
+# How long a release lookup waits on its upstream, in seconds, to connect
+# and then between bytes of the response. Without it an upstream which
+# accepts the connection and never answers hangs the command, silently.
+RELEASE_LOOKUP_TIMEOUT = 30
+
 
 def list_clusters(client, namespace):
     """Return the names of the managed k3s clusters in a namespace.
@@ -48,6 +65,35 @@ def list_clusters(client, namespace):
     """
     namespace_md = client.get_namespace_metadata(namespace)
     return namespace_md.get(CLUSTER_LIST, [])
+
+
+def _fetch_release_data(product, url, accept, reporter):
+    """GET one release lookup's upstream document.
+
+    Every way the fetch can fail becomes a ReleaseLookupError naming the
+    product and the URL, rather than a requests traceback. Parsing the
+    body is left to the caller, which knows what format to expect.
+    """
+    reporter.debug(f'Fetching {url}')
+    try:
+        r = requests.request(
+            'GET', url,
+            headers={
+                'Accept': accept,
+                'User-Agent': apiclient.get_user_agent()
+            },
+            timeout=RELEASE_LOOKUP_TIMEOUT)
+    except requests.RequestException as e:
+        raise exceptions.ReleaseLookupError.request_failed(product, url, str(e))
+
+    if r.status_code not in [200, 201, 204]:
+        # Truncated: whoever controls this response -- the upstream, or a
+        # proxy holding a certificate the client trusts -- otherwise
+        # decides how many bytes reach the user's terminal and an Ansible
+        # msg.
+        raise exceptions.ReleaseLookupError.http_status(
+            product, url, r.status_code, r.text[:RESPONSE_SNIPPET_BYTES])
+    return r
 
 
 def get_k3s_release(client, namespace, reporter, force_cache_update=False,
@@ -71,27 +117,24 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
     if time.time() - updated > 24 * 3600:
         reporter.debug('Updating release version cache')
 
-        url = 'https://update.k3s.io/v1-release/channels'
-        reporter.debug(f'Fetching {url}')
-        r = requests.request(
-            'GET', url,
-            headers={
-                'Accept': 'application/json',
-                'User-Agent': apiclient.get_user_agent()
-            })
-        if r.status_code not in [200, 201, 204]:
-            # Truncated, like the json.dumps(d)[:512] below: whoever
-            # controls this response -- the upstream, or a proxy holding a
-            # certificate the client trusts -- otherwise decides how many
-            # bytes reach the user's terminal and an Ansible msg.
-            raise exceptions.ReleaseLookupError.http_status(
-                'k3s', url, r.status_code, r.text[:RESPONSE_SNIPPET_BYTES])
+        url = K3S_CHANNELS_URL
+        r = _fetch_release_data('k3s', url, 'application/json', reporter)
+        try:
+            d = r.json()
+        except ValueError:
+            # A 200 carrying HTML -- a captive portal, a proxy error page.
+            raise exceptions.ReleaseLookupError.unreadable_response(
+                'k3s', url, r.text[:RESPONSE_SNIPPET_BYTES])
 
-        d = r.json()
         releases = {}
         reporter.debug('Fetched release data:')
         reporter.debug(json.dumps(d, indent=4, sort_keys=True))
-        for reldata in d.get('data', []):
+        # A document of the wrong shape yields no channels, and so the
+        # no_usable_k3s_channels error below rather than a traceback.
+        channels = d.get('data', []) if isinstance(d, dict) else []
+        for reldata in channels if isinstance(channels, list) else []:
+            if not isinstance(reldata, dict):
+                continue
             # Some channels (for example v1.16-testing) have no released
             # version and therefore no 'latest' key.
             if 'name' not in reldata or 'latest' not in reldata:
@@ -141,52 +184,66 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
     if time.time() - updated > 24 * 3600:
         reporter.debug('Updating release version cache')
 
-        releases = {}
-        for page in range(5):
-            url = f'https://api.github.com/repos/longhorn/longhorn/releases?page={page}'
-            reporter.debug(f'Fetching {url}')
-            r = requests.request(
-                'GET', url,
-                headers={
-                    'Accept': 'application/vnd.github+json',
-                    'User-Agent': apiclient.get_user_agent()
-                })
+        r = _fetch_release_data(
+            'Longhorn', LONGHORN_CHART_INDEX_URL, 'application/yaml, */*',
+            reporter)
+        try:
+            # safe_load, because this is third-party data. It is no less
+            # trusted than the chart the install then runs from the same
+            # host, but it should not be able to construct objects here.
+            index = yaml.safe_load(r.text)
+        except yaml.YAMLError:
+            raise exceptions.ReleaseLookupError.unreadable_response(
+                'Longhorn', LONGHORN_CHART_INDEX_URL,
+                r.text[:RESPONSE_SNIPPET_BYTES])
 
-            if r.status_code not in [200, 201, 204]:
-                # Truncated, per get_k3s_release() above.
-                raise exceptions.ReleaseLookupError.http_status(
-                    'Longhorn', url, r.status_code,
-                    r.text[:RESPONSE_SNIPPET_BYTES])
+        # A Helm repository index maps each chart name under 'entries' to
+        # a list of that chart's versions. A document of any other shape
+        # -- an error page which happens to parse as YAML, a reshaped
+        # index -- yields no releases, and so the no_parsable_longhorn_release
+        # error below rather than a traceback.
+        entries = index.get('entries') if isinstance(index, dict) else None
+        charts = entries.get('longhorn') if isinstance(entries, dict) else None
 
-            d = r.json()
-            reporter.debug('Fetched release data:')
-            reporter.debug(json.dumps(d, indent=4, sort_keys=True))
-            for reldata in d:
-                if reldata['prerelease']:
-                    continue
-                tagname = reldata['tag_name'].lstrip('v')
-                releases[tagname] = reldata['tarball_url']
-
-        # Find the most recent version. Longhorn has occasionally
-        # published tags which are not valid PEP 440 versions (for
-        # example v1.4.0-hotfix1), so skip anything unparsable.
+        releases = []
         latest = None
-        for tagname in list(releases.keys()):
-            try:
-                parsed_version = Version(tagname)
-            except InvalidVersion:
-                reporter.debug(f'Skipping unparsable tag {tagname}')
+        for chart in charts if isinstance(charts, list) else []:
+            if not isinstance(chart, dict) or chart.get('deprecated'):
                 continue
-            if not latest:
+
+            # The chart version, not appVersion, because it is what helm
+            # install --version takes. Longhorn has kept the two equal so
+            # far, apart from appVersion's leading 'v', which is also why a
+            # cache written by the old GitHub lookup is still a valid
+            # answer until it expires. A version YAML
+            # read as something other than a string (1.10 is the float
+            # 1.1) is not one to trust, so it is skipped.
+            chart_version = chart.get('version')
+            if not isinstance(chart_version, str):
+                continue
+
+            # Helm chart versions are SemVer, which PEP 440 mostly
+            # accepts: 1.7.0-rc1 parses as a prerelease and is skipped as
+            # one. Longhorn has published versions which are not valid at
+            # all (v1.4.0-hotfix1 was a release tag), so skip those too.
+            try:
+                parsed_version = Version(chart_version)
+            except InvalidVersion:
+                reporter.debug(f'Skipping unparsable chart version {chart_version}')
+                continue
+            if parsed_version.is_prerelease:
+                continue
+
+            releases.append(chart_version)
+            if latest is None or parsed_version > latest:
                 latest = parsed_version
-            elif parsed_version > latest:
-                latest = parsed_version
+                latest_version = chart_version
 
         if latest is None:
             raise exceptions.ReleaseLookupError.no_parsable_longhorn_release()
 
         version_cache['releases'] = releases
-        version_cache['latest'] = str(latest)
+        version_cache['latest'] = latest_version
         version_cache['updated'] = time.time()
         client.set_namespace_metadata_item(
             namespace, LONGHORN_VERSION_CACHE_KEY, version_cache)
