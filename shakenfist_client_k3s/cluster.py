@@ -1279,22 +1279,45 @@ class Cluster:
         including ones another process queued, and a read only health check
         must not block on somebody else's k3s install.
 
+        The work is split between _submit_probe() and _collect_probe(), and
+        this is a thin wrapper which runs one after the other. The split is
+        there so that a caller with more than one command to run can submit
+        all of them before waiting for any, against one shared deadline,
+        without copying the branches which turn an operation into a report.
+        Waiting here is bounded by HEALTH_PROBE_TIMEOUT_SECONDS from just
+        before the command is submitted.
+
         Returns the dict health() reports under ``api``; see health()'s
-        docstring for the keys. Nothing here raises for an unhealthy answer.
-        apiclient.APIException is caught, rather than only its
-        ResourceNotFoundException subclass, because every way the API can
-        refuse to run a command on this node -- the instance is gone, it is
-        in a state which cannot accept agent operations, the cluster is
-        unwell enough to return a 500 -- is a fact about this cluster's
-        health rather than a bug in this code. An authentication or
-        authorisation failure would already have stopped get_metadata()
-        before we got here.
+        docstring for the keys. Nothing here raises for an unhealthy answer;
+        see _probe_refused() for which API errors are caught and why.
         """
         # --kubeconfig explicitly, matching remove_worker(): bare kubectl
         # works on these nodes today, and being consistent about saying so
         # keeps the next reader from wondering which spelling matters.
         command = 'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'
-        probe = {
+
+        # The deadline is taken before submission, so the budget covers the
+        # submission as well as the wait. That starts the clock earlier, by
+        # however long the submission takes, than await_execute() started it
+        # when this was one call, and is the rule health() will need once it
+        # submits more than one probe against a single deadline.
+        deadline = time.monotonic() + HEALTH_PROBE_TIMEOUT_SECONDS
+
+        self.reporter.debug('Asking %s whether the k3s API answers' % instance_uuid)
+        aop, probe = self._submit_probe(instance_uuid, command)
+        if probe is not None:
+            return probe
+        return self._collect_probe(instance_uuid, command, aop, deadline)
+
+    def _new_probe(self, instance_uuid, command):
+        """Build a probe report for a command which has not been run yet.
+
+        The starting point both halves of a probe fill in. ``probed`` starts
+        True and ``answered`` False, so every branch only has to say what
+        went wrong, and the one which reads a zero exit code is the only
+        place ``answered`` becomes True.
+        """
+        return {
             'probed': True,
             'answered': False,
             'instance_uuid': instance_uuid,
@@ -1305,20 +1328,70 @@ class Cluster:
             'error': None
         }
 
-        self.reporter.debug('Asking %s whether the k3s API answers' % instance_uuid)
+    def _probe_refused(self, probe, instance_uuid, e):
+        """Record in a probe report that the API would not run its command.
+
+        apiclient.APIException is caught, rather than only its
+        ResourceNotFoundException subclass, because every way the API can
+        refuse to run a command on this node -- the instance is gone, it is
+        in a state which cannot accept agent operations, the cluster is
+        unwell enough to return a 500 -- is a fact about this cluster's
+        health rather than a bug in this code. An authentication or
+        authorisation failure would already have stopped get_metadata()
+        before we got here.
+
+        Both halves of a probe call this: _submit_probe() for a refused
+        submission, and _collect_probe() for an API error while polling the
+        operation, which was caught by the same handler before the two
+        halves were split apart.
+        """
+        # apiclient's exceptions never pass their message to
+        # Exception.__init__(), so str() on one is the empty string and
+        # the only way to the explanation is the attribute.
+        detail = getattr(e, 'message', None) or str(e) or 'no detail given'
+        probe['probed'] = False
+        probe['error'] = ('the command could not be run on instance %s: %s: %s'
+                          % (instance_uuid, e.__class__.__name__, detail))
+        return probe
+
+    def _submit_probe(self, instance_uuid, command):
+        """Submit a probe's command to an instance's agent, without waiting for it.
+
+        The first half of a probe; _collect_probe() is the second. Returns a
+        tuple ``(aop, probe)`` with exactly one of the two not None. If the
+        API accepted the command, ``aop`` is the agent operation to pass to
+        _collect_probe() and ``probe`` is None. If the API refused it,
+        ``aop`` is None and ``probe`` is the finished report, with
+        ``probed`` False and ``error`` saying why; there is nothing to
+        collect, and the caller reports it as is. Nothing here raises for a
+        refusal; see _probe_refused().
+        """
+        try:
+            return self.client.instance_execute(instance_uuid, command), None
+        except apiclient.APIException as e:
+            return None, self._probe_refused(
+                self._new_probe(instance_uuid, command), instance_uuid, e)
+
+    def _collect_probe(self, instance_uuid, command, aop, deadline):
+        """Wait for a submitted probe's command, and turn its ending into a report.
+
+        The second half of a probe; _submit_probe() is the first, and aop
+        is the agent operation it returned. deadline is a time.monotonic()
+        value rather than a budget, so that several probes submitted
+        together can share one: each waits only for what is left of it, and
+        one which is collected after the deadline has passed looks once and
+        does not wait at all.
+
+        Returns a probe report in the shape health() reports under ``api``;
+        see health()'s docstring for the keys. Nothing here raises for an
+        unhealthy answer.
+        """
+        probe = self._new_probe(instance_uuid, command)
         try:
             aop = self.await_execute(
-                self.client.instance_execute(instance_uuid, command),
-                timeout=HEALTH_PROBE_TIMEOUT_SECONDS)
+                aop, timeout=max(0, deadline - time.monotonic()))
         except apiclient.APIException as e:
-            # apiclient's exceptions never pass their message to
-            # Exception.__init__(), so str() on one is the empty string and
-            # the only way to the explanation is the attribute.
-            detail = getattr(e, 'message', None) or str(e) or 'no detail given'
-            probe['probed'] = False
-            probe['error'] = ('the command could not be run on instance %s: %s: %s'
-                              % (instance_uuid, e.__class__.__name__, detail))
-            return probe
+            return self._probe_refused(probe, instance_uuid, e)
 
         if aop['state'] in AGENT_OP_PENDING_STATES:
             # The wait gave up. This is the state a node whose agent is not
@@ -1332,6 +1405,9 @@ class Cluster:
             # command is still queued against the instance, and this is
             # where an operator or a polling caller finds out which one to
             # look at. See health()'s docstring for what that costs.
+            # The number of seconds named is the budget every probe's
+            # deadline is measured from, rather than whatever was left of it
+            # by the time this probe was collected.
             probe['probed'] = False
             probe['error'] = (
                 "'%s' had not finished after %s seconds (agent operation %s "
