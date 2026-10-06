@@ -1995,10 +1995,10 @@ class ValidateNodeSizesTestCase(testtools.TestCase):
     It is read_manifests()'s sibling: a pure function create() calls before
     it registers the name, so that a size which cannot be built costs the
     caller an error rather than a claimed name and a metadata document
-    stuck in 'initial'. The command line's click.IntRange(min=1) refuses
-    most of these first, but a library caller -- an Ansible variable, a
-    YAML document -- has no click, so each refusal is pinned here against
-    the function itself.
+    stuck in 'initial'. It is the only floor: the command line passes the
+    sizes through as plain integers, and a library caller -- an Ansible
+    variable, a YAML document -- has no click at all, so each refusal is
+    pinned here against the function itself.
     """
 
     def _sizes(self, role=None, field=None, value=None):
@@ -2285,6 +2285,65 @@ class ValidateCountsTestCase(testtools.TestCase):
             exceptions.ShapeError, cluster_module.validate_counts, 0,
             worker_count=1, metal_address_count='x')
         self.assertEqual('metal_address_count', e.parameter)
+
+
+class ValidateCreateArgumentsTestCase(testtools.TestCase):
+    """validate_create_arguments() makes create()'s checks in create()'s order, and hands back what they read.
+
+    Each rule is pinned against its own validator above; what is pinned here
+    is the composition every caller shares: the order, so that the command
+    line, the Ansible module and create() refuse a doubly bad request for
+    the same reason, and the return value, which is what create() stages
+    and records.
+    """
+
+    def test_the_defaults_are_accepted(self):
+        staged, node_sizes = cluster_module.validate_create_arguments(
+            'banana', 1, 0, 0)
+        self.assertEqual([], staged)
+        self.assertEqual(
+            {'control_plane': cluster_module.DEFAULT_NODE_SIZE,
+             'worker': cluster_module.DEFAULT_NODE_SIZE}, node_sizes)
+
+    def test_the_sizes_come_back_in_the_recorded_shape(self):
+        _, node_sizes = cluster_module.validate_create_arguments(
+            'banana', 1, 1, 1, control_plane_cpus=4, worker_disk=60)
+        self.assertEqual(4, node_sizes['control_plane']['cpus'])
+        self.assertEqual(60, node_sizes['worker']['disk'])
+
+    def test_the_name_is_checked_first(self):
+        self.assertRaises(
+            exceptions.ClusterNameError,
+            cluster_module.validate_create_arguments, 'my.cluster', 0, -1, -1,
+            worker_memory=0, server_config={'token': 'x'})
+
+    def test_the_counts_are_checked_before_the_sizes(self):
+        self.assertRaises(
+            exceptions.ShapeError,
+            cluster_module.validate_create_arguments, 'banana', 0, 1, 1,
+            worker_memory=0)
+
+    def test_the_sizes_are_checked_before_the_configuration(self):
+        self.assertRaises(
+            exceptions.NodeSizeError,
+            cluster_module.validate_create_arguments, 'banana', 1, 1, 1,
+            worker_memory=0, server_config={'token': 'x'})
+
+    def test_the_counts_can_be_named_for_the_caller(self):
+        # How the Ansible module has a refusal name initial_workers, the
+        # option a play set, rather than create()'s worker_count.
+        e = self.assertRaises(
+            exceptions.ShapeError, cluster_module.validate_create_counts,
+            1, -1, 0, names=('control_plane_count', 'initial_workers',
+                             'metal_address_count'))
+        self.assertEqual('initial_workers', e.parameter)
+        self.assertEqual(0, e.floor)
+
+    def test_the_configuration_is_checked(self):
+        self.assertRaises(
+            exceptions.K3sConfigError,
+            cluster_module.validate_create_arguments, 'banana', 1, 1, 1,
+            agent_config={'node-name': 'w'})
 
 
 class ReservedClusterNameTestCase(testtools.TestCase):

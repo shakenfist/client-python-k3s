@@ -470,21 +470,37 @@ def _present(module, cluster, reporter, mutation):
     # 6 of the phase 5 plan promised, and it caches its answer -- including
     # a miss -- so the health() calls below cost no second read.
     if cluster.get_metadata() is None:
+        # The second entry of shape below is the whole of this module's
+        # involvement with worker counts: initial_workers becomes the count
+        # create() needs, on the one path which creates a cluster. Do not
+        # grow a branch which compares it against a cluster that already
+        # exists -- see the DOCUMENTATION for initial_workers for what that
+        # would race with. It is also deliberately the only occurrence of
+        # that argument's name anywhere under collection/, which the phase 5
+        # plan's done criteria check for exactly this reason.
+        shape = {
+            'control_plane_count': module.params['control_plane_count'],
+            'worker_count': module.params['initial_workers'],
+            'metal_address_count': module.params['metal_address_count'],
+            'manifests': module.params['manifests'],
+        }
+
+        # create() makes these checks itself, first, but a refusal raised
+        # from inside it would be reported as a create which may have built
+        # something. Checked here, before mutation.creating(), a name the
+        # rule refuses fails the task with changed=False and no advice to
+        # delete anything -- and check mode predicts the refusal rather than
+        # a create. Only on this path: the name rule is create()'s alone, so
+        # that a cluster which already exists under such a name is still
+        # present.
+        sf_cluster.validate_create_arguments(cluster.name, **shape)
+
         if module.check_mode:
             # Nothing above this point mutated anything, and nothing below
             # it runs: a check mode run of a play which would build a
             # cluster must not build one.
             module.exit_json(changed=True, health=None, log=reporter.lines)
 
-        # The line below is the whole of this module's involvement with
-        # worker counts: initial_workers becomes the count create() needs,
-        # on the one path which creates a cluster. Do not grow a branch
-        # which compares it against a cluster that already exists -- see the
-        # DOCUMENTATION for initial_workers for what that would race with.
-        # It is also deliberately the only occurrence of that argument's
-        # name anywhere under collection/, which the phase 5 plan's done
-        # criteria check for exactly this reason.
-        #
         # Two of create()'s parameters are deliberately left at their
         # library defaults rather than exposed. write_kubeconfig stays False
         # because ~/.kube/config on whichever machine ran this module is not
@@ -494,15 +510,12 @@ def _present(module, cluster, reporter, mutation):
         # property of the cluster a play is declaring.
         mutation.creating()
         cluster.create(
-            control_plane_count=module.params['control_plane_count'],
-            worker_count=module.params['initial_workers'],
-            metal_address_count=module.params['metal_address_count'],
             network=module.params['network'],
             release_channel=module.params['release_channel'],
             sshkey=module.params['sshkey'],
             install_metallb=module.params['install_metallb'],
             install_longhorn=module.params['install_longhorn'],
-            manifests=module.params['manifests'])
+            **shape)
         # Probed through _probe() rather than inline in exit_json(): a
         # health() which raises there loses the fact that a create just
         # succeeded.
@@ -606,33 +619,26 @@ def run_module():
                         'requirements.txt is a separate step')),
             exception=SF_K3S_IMPORT_ERROR)
 
-    # Range checked here rather than in the argument spec, which has no way
-    # to express a minimum. A module fed from inventory variables meets
-    # these values far more often than a human typing the CLI does: a
-    # templated control_plane_count which resolved to 0 or an empty string
-    # coerced to 0 builds a cluster with no control plane, and the failure
-    # arrives tens of minutes later from somewhere that does not mention
-    # the count. Only for state: present, because none of the three means
-    # anything on a delete and refusing them there would fail a task whose
-    # request is perfectly clear.
-    #
-    # Deliberately not pushed down into Cluster.create() even though the
-    # CLI would benefit, which the review of #90 suggested: that changes a
-    # library signature's contract for every caller and belongs in its own
-    # change rather than in a review round on a collection. Tracked in
-    # shakenfist/client-python-k3s#96.
+    # The counts a create would be refused for are refused here, before a
+    # client is built, by the library's validate_create_counts(): the
+    # floors live in the library, which applies them again in create(), and
+    # this only applies them sooner. The counts are named after this
+    # module's options, so that the message names the option the playbook
+    # set. Only for state: present, because a delete reads none of them.
+    # The name is deliberately not checked here: the name rule is create()'s
+    # alone, so that a cluster which already exists under a name it refuses
+    # can still be declared present and removed. create() refuses it, before
+    # it changes anything, when this run would actually create.
     if module.params['state'] == 'present':
-        floors = (('control_plane_count', 1), ('initial_workers', 0),
-                  ('metal_address_count', 0))
-        for name, floor in floors:
-            if module.params[name] < floor:
-                module.fail_json(
-                    msg=('%s must be at least %d, and is %d. A cluster built '
-                         'with that value would either fail during the build '
-                         'or come up unusable, tens of minutes from now and '
-                         'with an error that does not mention this option.'
-                         % (name, floor, module.params[name])),
-                    health=None, log=[])
+        try:
+            sf_cluster.validate_create_counts(
+                module.params['control_plane_count'],
+                module.params['initial_workers'],
+                module.params['metal_address_count'],
+                names=('control_plane_count', 'initial_workers',
+                       'metal_address_count'))
+        except sf_exceptions.ShapeError as e:
+            module.fail_json(msg=str(e), health=None, log=[])
 
     # Where the orchestration's output goes. A Reporter is file like and
     # Progress writes to it as a stream, so this one object catches

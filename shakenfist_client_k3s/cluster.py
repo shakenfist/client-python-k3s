@@ -1073,6 +1073,85 @@ def validate_k3s_config(config, role):
     return text
 
 
+# What create() calls its three counts, which is what validate_create_counts()
+# names them in a refusal unless its caller spells them differently.
+CREATE_COUNT_NAMES = ('control_plane_count', 'worker_count',
+                      'metal_address_count')
+
+
+def validate_create_counts(control_plane_count, worker_count,
+                           metal_address_count, names=CREATE_COUNT_NAMES):
+    """Refuse create()'s three counts below their floors, before anything is built.
+
+    The one statement of create()'s floors: control_plane_count at least 1,
+    worker_count and metal_address_count at least 0, for the reasons
+    validate_counts() gives. names is the three counts' names, in that
+    order, as the refusal should spell them. The Ansible module passes its
+    own option names, so that a play is told about initial_workers, which
+    it set, rather than about a parameter it has never seen.
+    """
+    control_plane_name, worker_name, address_name = names
+    validate_counts(1, **{control_plane_name: control_plane_count})
+    validate_counts(0, **{worker_name: worker_count,
+                          address_name: metal_address_count})
+
+
+def validate_create_arguments(name, control_plane_count, worker_count,
+                              metal_address_count, manifests=None,
+                              control_plane_cpus=DEFAULT_NODE_SIZE['cpus'],
+                              control_plane_memory=DEFAULT_NODE_SIZE['memory'],
+                              control_plane_disk=DEFAULT_NODE_SIZE['disk'],
+                              worker_cpus=DEFAULT_NODE_SIZE['cpus'],
+                              worker_memory=DEFAULT_NODE_SIZE['memory'],
+                              worker_disk=DEFAULT_NODE_SIZE['disk'],
+                              server_config=None, agent_config=None):
+    """Refuse every argument Cluster.create() can check without the API.
+
+    The arguments are create()'s, under its names and with its defaults,
+    and name is the cluster's. create() calls this as its first act, and
+    the command line calls it before it creates a namespace too, so that a
+    refused create leaves nothing behind. Each
+    check is still made by the one function which owns the rule, in this
+    order: validate_cluster_name(), validate_create_counts(),
+    read_manifests(), validate_node_sizes() and validate_k3s_config() for
+    each role. The first refusal is raised.
+
+    Returns ``(staged_manifests, node_sizes)``: what read_manifests()
+    read, and the six sizes in the nested shape the metadata records.
+    create() stages and records exactly these rather than reading or
+    building them again. A caller which only wants the refusal ignores
+    them.
+
+    Not quite pure: read_manifests() reads the manifest files. A caller
+    which runs this ahead of create() therefore reads them twice, which is
+    harmless, because create() stages only what its own call read.
+    """
+    validate_cluster_name(name)
+    validate_create_counts(control_plane_count, worker_count,
+                           metal_address_count)
+    staged_manifests = read_manifests(manifests)
+    node_sizes = {
+        'control_plane': {
+            'cpus': control_plane_cpus,
+            'memory': control_plane_memory,
+            'disk': control_plane_disk,
+        },
+        'worker': {
+            'cpus': worker_cpus,
+            'memory': worker_memory,
+            'disk': worker_disk,
+        },
+    }
+    validate_node_sizes(node_sizes)
+    # The text validate_k3s_config() returns is not kept: what create()
+    # records is the mapping, so that show displays its structure rather
+    # than a block of YAML, and the text is produced again from the
+    # recorded mapping when a node is configured.
+    validate_k3s_config(server_config, 'server')
+    validate_k3s_config(agent_config, 'agent')
+    return staged_manifests, node_sizes
+
+
 class _NoAliasSafeLoader(yaml.SafeLoader):
     """yaml.SafeLoader, except that a YAML alias is a parse error.
 
@@ -2661,55 +2740,46 @@ class Cluster:
         K3S_RELEASE_FLOOR, v1.21.1, whichever configuration it was given:
         older releases ignore the drop-in directory, or the ``+`` suffix,
         without saying so. check_k3s_release() has the detail.
+
+        The cluster's name and the three counts are checked before anything
+        is asked of the API, as the sizes and the configuration are, by
+        validate_create_arguments(). The name must be one
+        validate_cluster_name() accepts, because it becomes part of every
+        node's instance name; create() is the only verb which checks it, so
+        that a cluster created before the rule existed can still be shown
+        and deleted. control_plane_count must be at least 1, and
+        worker_count and metal_address_count at least 0; validate_counts()
+        gives the reasons.
         """
-        # Read the manifests before anything else happens, which is
-        # earlier than this function checks any of its other arguments --
-        # sshkey is read after the name and the network have been settled.
-        # A bad path or a duplicate basename discovered once a network has
-        # been allocated and several instances booted is a cluster the
-        # caller has to delete before the name can be used again, and the
-        # only thing between a library caller and that is this line.
+        # Every argument which can be refused without the API is refused
+        # here, before anything else happens -- sshkey, by contrast, is read
+        # after the name and the network have been settled. The placement
+        # matters more than it looks. The name is registered in the cluster
+        # list a few lines below, and the metadata document written in state
+        # 'initial' shortly after; a value which can never be valid (a name
+        # with a dot in it, a zero size, a key the plugin owns) discovered
+        # once those exist leaves a claimed name and a document stuck in
+        # 'initial' that only a delete clears. Discovered later still, once
+        # a network has been allocated and instances booted, it is a cluster
+        # the caller has to delete before the name can be used again.
+        # test_an_invalid_size_registers_nothing and its siblings pin this.
+        # None of it is a check of what Shaken Fist will accept: a valid
+        # size the API still refuses, for quota or because no hypervisor has
+        # the room, fails mid-create, as any other API refusal there does.
         #
-        # The result is kept and handed to install_control_plane() below,
-        # rather than letting it read the paths again. There are ten to
-        # twenty minutes between here and there, and a file which changed
-        # in that window would make this check a check of something else.
-        #
-        # The node sizes are checked here for the same reason, and the
-        # placement matters more than it looks. The name is registered in
-        # the cluster list a few lines below, and the metadata document
-        # written in state 'initial' shortly after; a size which can never
-        # be valid (zero, a string, True) discovered once those exist
-        # leaves a claimed name and a document stuck in 'initial' that only
-        # a delete clears. Moving this one line later turns a typo into
-        # that, which is what test_an_invalid_size_registers_nothing pins.
-        # This is not a check of what Shaken Fist will accept: a valid size
-        # the API still refuses, for quota or because no hypervisor has the
-        # room, fails mid-create, as any other API refusal there does.
-        #
-        # The k3s configuration is checked here too, for the same reason
-        # and with one more: it is recorded in the initial metadata below,
-        # which is JSON, so a value set_metadata() cannot store would
-        # otherwise surface as a failed write after the name is claimed.
-        # The text validate_k3s_config() returns is not kept: what is
-        # recorded is the mapping, so that show displays its structure
-        # rather than a block of YAML.
-        staged_manifests = read_manifests(manifests)
-        node_sizes = {
-            'control_plane': {
-                'cpus': control_plane_cpus,
-                'memory': control_plane_memory,
-                'disk': control_plane_disk,
-            },
-            'worker': {
-                'cpus': worker_cpus,
-                'memory': worker_memory,
-                'disk': worker_disk,
-            },
-        }
-        validate_node_sizes(node_sizes)
-        validate_k3s_config(server_config, 'server')
-        validate_k3s_config(agent_config, 'agent')
+        # The manifests read here are kept and handed to
+        # install_control_plane() below, rather than letting it read the
+        # paths again. There are ten to twenty minutes between here and
+        # there, and a file which changed in that window would make this
+        # check a check of something else. node_sizes is kept for the same
+        # reason: what is recorded is what was checked.
+        staged_manifests, node_sizes = validate_create_arguments(
+            self.name, control_plane_count, worker_count, metal_address_count,
+            manifests=manifests, control_plane_cpus=control_plane_cpus,
+            control_plane_memory=control_plane_memory,
+            control_plane_disk=control_plane_disk, worker_cpus=worker_cpus,
+            worker_memory=worker_memory, worker_disk=worker_disk,
+            server_config=server_config, agent_config=agent_config)
 
         # Phases: create control plane nodes, create workers, install control
         # plane, install workers, fetch credentials, metallb, longhorn, and
@@ -3729,7 +3799,12 @@ class Cluster:
         ``md['node_token']``, which an interrupted create may never have
         fetched, and a k3s agent install carrying a token of None builds
         instances which are charged for and can never join anything.
+
+        worker_count must be at least 1, and is checked before the
+        metadata is read: zero or a negative count would otherwise report
+        success having added nothing.
         """
+        validate_counts(1, worker_count=worker_count)
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
@@ -4053,7 +4128,11 @@ class Cluster:
         ones have been routed, and ``heredoc()`` refuses a body one of
         them could end -- a refusal which is correct and which would
         otherwise arrive after the allocation.
+
+        address_count must be at least 1, and is checked before the
+        metadata is read, for the reason expand_workers() gives.
         """
+        validate_counts(1, address_count=address_count)
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)

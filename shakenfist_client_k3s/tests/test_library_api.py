@@ -672,6 +672,120 @@ class K3sConfigTestCase(LibraryTestCase):
         self.assertEqual(self.AGENT, self._stored()['agent_config'])
 
 
+class NameAndCountRefusalTestCase(LibraryTestCase):
+    """create() and the expand verbs refuse a bad name or count before asking the API anything.
+
+    NodeSizingTestCase's claim for two more checks, made stronger: these
+    are refused before the release lookup as well as before the name is
+    registered, so the client is wrapped and asserted not to have been
+    called at all. The expand verbs refuse a count before they read the
+    metadata, which is why a refusal is a ShapeError even though no
+    cluster of this name exists here: the count is looked at first.
+    """
+
+    def setUp(self):
+        super(NameAndCountRefusalTestCase, self).setUp()
+        self.wrapped = mock.MagicMock(wraps=self.client)
+
+    def _assert_nothing_asked(self):
+        self.assertEqual([], self.wrapped.mock_calls)
+        self.assertFalse(primitives.get_k3s_release.called)
+        self.assertEqual({}, self.client.metadata)
+        self.assertEqual([], self.client.allocated_networks)
+        self.assertEqual({}, self.client.instances)
+
+    def _refused_create(self, exception, *counts, name='banana'):
+        c = Cluster(self.wrapped, name, 'testns', reporter=self.reporter)
+        e = self.assertRaises(exception, c.create, *counts)
+        self._assert_nothing_asked()
+        return e
+
+    def _refused_expand(self, verb, count):
+        c = Cluster(self.wrapped, 'banana', 'testns', reporter=self.reporter)
+        e = self.assertRaises(exceptions.ShapeError, getattr(c, verb), count)
+        self._assert_nothing_asked()
+        return e
+
+    def test_a_name_with_a_dot_registers_nothing(self):
+        e = self._refused_create(exceptions.ClusterNameError, 1, 1, 1,
+                                 name='my.cluster')
+        self.assertEqual('invalid_characters', e.reason)
+        self.assertEqual('my.cluster', e.name)
+
+    def test_a_name_with_an_underscore_registers_nothing(self):
+        e = self._refused_create(exceptions.ClusterNameError, 1, 1, 1,
+                                 name='my_cluster')
+        self.assertEqual('invalid_characters', e.reason)
+
+    def test_a_name_which_is_too_long_registers_nothing(self):
+        e = self._refused_create(exceptions.ClusterNameError, 1, 1, 1,
+                                 name='a' * 49)
+        self.assertEqual('too_long', e.reason)
+        self.assertEqual(48, e.max_length)
+
+    def test_no_control_plane_registers_nothing(self):
+        e = self._refused_create(exceptions.ShapeError, 0, 1, 1)
+        self.assertEqual('below_floor', e.reason)
+        self.assertEqual('control_plane_count', e.parameter)
+        self.assertEqual(1, e.floor)
+        self.assertEqual('control_plane_count must be at least 1, not 0.',
+                         str(e))
+
+    def test_a_negative_worker_count_registers_nothing(self):
+        e = self._refused_create(exceptions.ShapeError, 1, -1, 1)
+        self.assertEqual('worker_count', e.parameter)
+        self.assertEqual(0, e.floor)
+
+    def test_a_negative_address_count_registers_nothing(self):
+        e = self._refused_create(exceptions.ShapeError, 1, 1, -1)
+        self.assertEqual('metal_address_count', e.parameter)
+        self.assertEqual(0, e.floor)
+
+    def test_a_bool_count_registers_nothing(self):
+        e = self._refused_create(exceptions.ShapeError, True, 1, 1)
+        self.assertEqual('not_an_integer', e.reason)
+        self.assertEqual('control_plane_count', e.parameter)
+
+    def test_the_name_is_checked_before_the_counts(self):
+        self._refused_create(exceptions.ClusterNameError, 0, -1, -1,
+                             name='my.cluster')
+
+    def test_a_mixed_case_name_is_still_created(self):
+        # Documented in docs/usage.md: Shaken Fist accepts it, and k3s
+        # lowercases the host name for the node name.
+        c = Cluster(self.client, 'MixedCase', 'testns', reporter=self.reporter)
+        c.create(1, 1, 1)
+        self.assertEqual('created', c.show()['state'])
+        self.assertIn('k3s-MixedCase-node-001',
+                      [name for name, _, _, _ in self.client.instance_sizes])
+
+    def test_no_workers_and_no_addresses_are_still_created(self):
+        # The floor on create is zero for both: a cluster which runs its
+        # workloads on the control plane, with no load balancer pool yet,
+        # is one a caller can mean to build.
+        c = self._cluster()
+        c.create(1, 0, 0)
+        self.assertEqual('created', c.show()['state'])
+
+    def test_expand_workers_by_zero_reads_nothing(self):
+        e = self._refused_expand('expand_workers', 0)
+        self.assertEqual('worker_count', e.parameter)
+        self.assertEqual(1, e.floor)
+
+    def test_expand_workers_by_a_negative_count_reads_nothing(self):
+        e = self._refused_expand('expand_workers', -2)
+        self.assertEqual('below_floor', e.reason)
+
+    def test_expand_addresses_by_zero_reads_nothing(self):
+        e = self._refused_expand('expand_addresses', 0)
+        self.assertEqual('address_count', e.parameter)
+        self.assertEqual(1, e.floor)
+
+    def test_expand_addresses_by_a_negative_count_reads_nothing(self):
+        e = self._refused_expand('expand_addresses', -1)
+        self.assertEqual('below_floor', e.reason)
+
+
 class BindAddressClient(RecordingClient):
     """A client whose node wrote its kubeconfig for a configured bind-address.
 

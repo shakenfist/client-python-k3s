@@ -201,10 +201,15 @@ class CreateNodeSizingOptionsTestCase(testtools.TestCase):
         self.assertEqual(size['disk'], kwargs['worker_disk'])
 
     def test_a_zero_size_is_refused_before_create_is_called(self):
+        # By the library's validate_create_arguments(), not by click: the
+        # option is a plain click.INT, so this is the library's message and
+        # the group handler's exit code 1. ArgumentRefusalTestCase in
+        # test_cli_errors.py asserts the streams separately.
         result = self._invoke('--worker-memory', '0')
 
-        self.assertEqual(2, result.exit_code)
-        self.assertIn('--worker-memory', result.output)
+        self.assertEqual(1, result.exit_code)
+        self.assertIn('worker memory must be a positive integer, not 0',
+                      result.output)
         self.create.assert_not_called()
 
     def _write_config(self, text):

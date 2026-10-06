@@ -235,7 +235,11 @@ def build_fake_client(spec):
             worker_nodes=['worker-uuid-%d' % n
                           for n in range(spec['worker_nodes'])])
         md['state'] = spec['cluster_state']
-        namespace_md[cluster_module.METADATA_KEY % CLUSTER_NAME] = md
+        # Under the name the module was asked about, which is CLUSTER_NAME
+        # unless a scenario is about the name itself.
+        name = spec['params'].get('name', CLUSTER_NAME)
+        md['name'] = name
+        namespace_md[cluster_module.METADATA_KEY % name] = md
 
     client = mock.MagicMock()
     client.get_namespace_metadata.return_value = namespace_md

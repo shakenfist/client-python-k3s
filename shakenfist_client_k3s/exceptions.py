@@ -616,10 +616,10 @@ class NodeSizeError(K3sClusterException):
     That is the point of raising early: a size discovered to be unusable
     once the name is in the namespace's cluster list leaves a claimed name
     and a metadata document stuck in ``initial``, which only a delete
-    clears. The command line also refuses these with
-    ``click.IntRange(min=1)``, in click's own style, but a library caller
-    has no click, and an Ansible variable or a YAML document is exactly
-    where ``0``, ``'2'`` or ``yes`` comes from.
+    clears. This is the only floor: the command line passes the sizes
+    through as plain integers, so that it and a library caller are refused
+    by the same rule with the same message, and an Ansible variable or a
+    YAML document is exactly where ``0``, ``'2'`` or ``yes`` comes from.
 
     Only "not a positive integer" is refused. ``bool`` counts as not an
     integer, because ``True`` is an ``int`` in Python and would otherwise
@@ -699,7 +699,10 @@ class ClusterNameError(_ReasonedK3sException):
       name they would refuse has to stay possible to show, repair and
       delete. Both reserved names contain an underscore, so the full rule
       would refuse them as well; the constructor runs first, so
-      ``reserved`` is what a caller sees.
+      ``reserved`` is what a library caller and the Ansible module see.
+      ``k3s create`` calls ``validate_create_arguments()`` before it
+      builds a ``Cluster``, so that a refusal leaves no namespace behind,
+      and reports ``invalid_characters``.
 
     ``name`` is what was passed, unchanged, and every message renders it
     with ``repr()``, so that an empty name, a trailing space or a control
@@ -772,7 +775,10 @@ class ShapeError(_ReasonedK3sException):
       for the same reasons.
 
     ``parameter`` is the count's keyword argument name as the library
-    spells it, ``value`` is what was passed, unchanged, and ``floor`` is
+    spells it -- except from the Ansible module, which has
+    ``validate_create_counts()`` name the counts after its own options,
+    ``initial_workers`` among them. ``value`` is what was passed,
+    unchanged, and ``floor`` is
     the smallest count the verb accepts. Both classmethods set all three,
     and the messages render the value with ``repr()`` so that ``'2'`` and
     ``2`` are told apart. Which classmethod built an instance is recorded

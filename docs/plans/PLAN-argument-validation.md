@@ -722,6 +722,12 @@ while planning it.
 * `delete()`'s kubeconfig cleanup fails for valid names in namespaces
   whose names match a kubeconfig field. This was found while planning,
   is not in #96's text, and is fixed by step 1c.
+* `k3s create --namespace NEW` with two manifests sharing a basename
+  created the namespace and then failed: the CLI created the namespace
+  before `create()` ran its own checks. Found in step 1b, where removing
+  `IntRange` would have exposed sizes, names and counts in the same way.
+  Fixed by `validate_create_arguments()`, which the CLI calls before it
+  creates the namespace.
 
 ### Back brief
 

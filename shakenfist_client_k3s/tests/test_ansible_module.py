@@ -35,6 +35,7 @@ import tempfile
 import testtools
 
 from shakenfist_client_k3s import client as sf_client
+from shakenfist_client_k3s import exceptions as sf_exceptions
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.tests import module_harness
 
@@ -754,29 +755,36 @@ class ShapeRangeTestCase(ModuleTestCase):
     not mention the option. Raised by the review of #90, which noted a
     declarative module is far likelier to receive such a value than the
     CLI is.
+
+    The floors are the library's validate_create_counts(), which the module
+    calls before it builds a client, so each refusal is asserted to have
+    asked nothing of the API. The messages are asserted whole, because the
+    module has the counts named after its own options and the message has
+    to name the option the playbook set rather than create()'s parameter.
     """
 
-    def test_a_cluster_with_no_control_plane_is_refused(self):
-        run = self.run_module(base_params(control_plane_count=0),
-                              expect_failure=True)
+    def _assert_refused(self, params, message):
+        run = self.run_module(base_params(**params), expect_failure=True)
 
-        self.assertIn('control_plane_count must be at least 1', run.msg)
+        self.assertEqual(message, run.msg)
+        self.assertIsNone(run.result['health'])
         # Refused before anything was asked of the API, which is the point:
         # the alternative is finding out after the instances exist.
         self.assertEqual([], run.diagnostics['cluster_calls'])
         self.assertEqual([], run.diagnostics['client_calls'])
+        return run
+
+    def test_a_cluster_with_no_control_plane_is_refused(self):
+        self._assert_refused({'control_plane_count': 0},
+                             'control_plane_count must be at least 1, not 0.')
 
     def test_a_negative_worker_count_is_refused(self):
-        run = self.run_module(base_params(initial_workers=-1),
-                              expect_failure=True)
-
-        self.assertIn('initial_workers must be at least 0', run.msg)
+        self._assert_refused({'initial_workers': -1},
+                             'initial_workers must be at least 0, not -1.')
 
     def test_a_negative_address_count_is_refused(self):
-        run = self.run_module(base_params(metal_address_count=-5),
-                              expect_failure=True)
-
-        self.assertIn('metal_address_count must be at least 0', run.msg)
+        self._assert_refused({'metal_address_count': -5},
+                             'metal_address_count must be at least 0, not -5.')
 
     def test_the_checks_do_not_apply_to_a_delete(self):
         """None of the three means anything when removing a cluster.
@@ -789,6 +797,62 @@ class ShapeRangeTestCase(ModuleTestCase):
 
         self.assertFalse(run.failed)
         self.assertFalse(run.result['changed'])
+
+
+class NameRuleTestCase(ModuleTestCase):
+    """The cluster name rule applies only when this run would create the cluster.
+
+    The rule is create()'s alone, so that a cluster which already exists
+    under a name it refuses -- one created before the rule did -- can still
+    be declared present, and removed. A play which would create such a
+    cluster is refused before anything is built, and must say so with
+    changed false and without advising a delete of debris which does not
+    exist.
+    """
+
+    NAME = 'my.cluster'
+
+    def test_present_on_a_new_cluster_is_refused(self):
+        run = self.run_module(base_params(name=self.NAME),
+                              cluster_exists=False, expect_failure=True)
+
+        self.assertEqual(
+            '%s Nothing was changed, so the task can simply be run again.'
+            % sf_exceptions.ClusterNameError.invalid_characters(self.NAME),
+            run.msg)
+        self.assertIs(False, run.result['changed'])
+        self.assertIsNone(run.result['health'])
+        self.assertNotIn('create', run.cluster_calls)
+        self.assertNothingMutated(run)
+
+    def test_check_mode_on_a_new_cluster_predicts_the_refusal(self):
+        run = self.run_module(
+            base_params(name=self.NAME, **{'_ansible_check_mode': True}),
+            cluster_exists=False, expect_failure=True)
+
+        self.assertIn("Cluster name 'my.cluster' cannot be used.", run.msg)
+        self.assertIs(False, run.result['changed'])
+        self.assertNothingMutated(run)
+
+    def test_present_on_an_existing_cluster_is_not_a_change(self):
+        run = self.run_module(base_params(name=self.NAME),
+                              cluster_exists=True)
+
+        self.assertFalse(run.failed)
+        self.assertFalse(run.changed)
+        self.assertNothingMutated(run)
+
+    def test_absent_is_not_refused(self):
+        """absent on such a name reaches the library's delete path.
+
+        The fake serves no metadata for this name, so the library finds no
+        cluster to delete and the task reports no change.
+        """
+        run = self.run_module(base_params(name=self.NAME, state='absent'))
+
+        self.assertFalse(run.failed)
+        self.assertFalse(run.result['changed'])
+        self.assertNotIn('Cluster name', run.msg)
 
 
 class ReservedNameTestCase(ModuleTestCase):
