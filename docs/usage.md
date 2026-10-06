@@ -78,8 +78,7 @@ use in the namespace's metadata.
 
 The counts are checked the same way, and a boolean or a value that is
 not an integer is refused. `expand-workers` and `expand-addresses`
-require a count of at least 1; a count of 0 or less used to report
-success having done nothing.
+require a count of at least 1, because 0 or less asks for nothing.
 
 The size options below are checked by the library rather than by
 Click, so an out-of-range size exits 1 with the library's message, like

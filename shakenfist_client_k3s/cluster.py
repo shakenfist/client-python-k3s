@@ -894,40 +894,21 @@ CLUSTER_NAME_PATTERN = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\Z')
 def validate_cluster_name(name):
     """Refuse a cluster name which cannot become a node's instance name, before anything is built.
 
-    Returns nothing, and raises exceptions.ClusterNameError if the name is
-    unusable: ``invalid_characters`` if it is not a string, is empty, or
-    does not match CLUSTER_NAME_PATTERN, and ``too_long`` if it is longer
-    than CLUSTER_NAME_MAX_LENGTH. Characters are checked before length,
-    because a name with a dot in it can never be made to work by
-    shortening it.
+    Raises exceptions.ClusterNameError: ``invalid_characters`` unless the
+    name is a string matching CLUSTER_NAME_PATTERN, then ``too_long`` past
+    CLUSTER_NAME_MAX_LENGTH. Characters come first because no amount of
+    shortening fixes a dot. The rule is Shaken Fist's instance name rule
+    applied to the part of the name this package does not choose, so that
+    a bad name fails here rather than at the first instance create, after
+    the name is registered and the network allocated; ClusterNameError
+    gives each refusal's reasoning, mixed case included.
 
-    The rule is Shaken Fist's rule for an instance name, applied to the
-    part of the instance name this package does not choose. Shaken Fist
-    refuses an instance name which is not a DNS host name, which contains
-    a dot, or which is longer than 63 characters, and the cluster name is
-    embedded in every node's instance name. Without this check such a name
-    is refused at the first instance create, by which time create() has
-    registered the name and allocated the node network: the caller is
-    left with an interrupted cluster to delete rather than an error. The
-    first and last characters must be alphanumeric because a DNS label's
-    must be, and because a trailing hyphen would make the join with
-    '-node-' ambiguous.
-
-    Mixed case is accepted on purpose. Shaken Fist accepts it, k3s
-    lowercases the host name for the Kubernetes node name, and
-    docs/usage.md documents a mixed case name working.
-
-    Only create() calls this. Every other verb acts on a cluster which
-    already exists, and a cluster created before this check under a name it
-    refuses has to stay possible to show, repair and delete. The two names
-    no verb may use -- the ones whose metadata key is one of
-    primitives.RESERVED_METADATA_KEYS -- are refused by Cluster.__init__
-    instead, and this rule refuses them as well, because both contain an
-    underscore.
-
-    A pure function, like validate_node_sizes(), so that it can be tested
-    without a client and so that create() can call it before it has
-    talked to the API at all.
+    Only the create paths call this: create(), and through
+    validate_create_arguments() the command line's create and the Ansible
+    module's create path. Every other verb acts on a cluster which already
+    exists, and one created under a name this refuses has to stay possible
+    to show, repair and delete. Pure, like validate_node_sizes(), so that
+    it runs before anything talks to the API.
     """
     if not isinstance(name, str) or not CLUSTER_NAME_PATTERN.match(name):
         raise exceptions.ClusterNameError.invalid_characters(name)
@@ -939,38 +920,26 @@ def validate_cluster_name(name):
 def validate_counts(floor, **counts):
     """Refuse a count which is not an integer of at least floor, before anything is built.
 
-    counts are keyword arguments named as the calling verb names them --
-    ``validate_counts(1, control_plane_count=control_plane_count)`` -- so
-    that the error can say which count was wrong. Returns nothing, and
-    raises exceptions.ShapeError naming the parameter, the floor and the
-    value for the first count which is not usable, in the order they were
-    passed: ``not_an_integer`` for anything which is not an int, and
-    ``below_floor`` for an int smaller than floor.
+    counts are keyword arguments named as the verb names them, so that the
+    exceptions.ShapeError raised for the first unusable one, in order, can
+    name it: ``not_an_integer`` for a non-int or a bool, ``below_floor``
+    for an int under floor. The floor is an argument because it is the
+    verb's, not the count's. This is the one statement of the floors and
+    their reasons:
 
-    The floor is an argument rather than a table here because it belongs
-    to the verb rather than to the count's name: worker_count is zero or
-    more on create and one or more on expand_workers(). The floors are:
-
-    - control_plane_count on create(): at least 1. A cluster with no
-      control plane has no API server, and the create would otherwise
-      fail tens of minutes in with an error which does not name the count.
-    - worker_count and metal_address_count on create(): at least 0. A
-      cluster with no workers runs its workloads on an untainted control
-      plane, as docs/usage.md describes, and one with no addresses has no
-      load balancer pool until expand_addresses() adds some. Both are
-      clusters a caller can mean to build.
+    - control_plane_count on create(): 1. With no control plane there is
+      no API server, and the create fails tens of minutes in without
+      naming the count.
+    - worker_count and metal_address_count on create(): 0. Both are
+      clusters a caller can mean: workloads run on an untainted control
+      plane (docs/usage.md), and expand_addresses() can add a pool later.
     - worker_count on expand_workers() and address_count on
-      expand_addresses(): at least 1. Zero is a request for nothing, and
-      the verb would otherwise report success having done nothing; a
-      negative count does the same, because range() of it is empty.
+      expand_addresses(): 1. Zero or less asks for nothing, and the verb
+      would report success having done nothing.
 
-    bool and every non-int are refused for the reasons
-    validate_node_sizes() gives: True is an int and is >= 1, so it would
-    build one node from a YAML ``yes`` and say nothing, and a float is
-    refused rather than truncated because rounding a request quietly is
-    not what the caller asked for.
-
-    A pure function, like validate_node_sizes(), for the same reasons.
+    A bool is refused because True >= 1 would build a node from a YAML
+    ``yes``, and a float rather than rounded quietly, as in
+    validate_node_sizes(). Pure, like that function.
     """
     for parameter, value in counts.items():
         if not isinstance(value, int) or isinstance(value, bool):
@@ -1099,12 +1068,11 @@ def validate_create_counts(control_plane_count, worker_count,
                            metal_address_count, names=CREATE_COUNT_NAMES):
     """Refuse create()'s three counts below their floors, before anything is built.
 
-    The one statement of create()'s floors: control_plane_count at least 1,
-    worker_count and metal_address_count at least 0, for the reasons
-    validate_counts() gives. names is the three counts' names, in that
-    order, as the refusal should spell them. The Ansible module passes its
-    own option names, so that a play is told about initial_workers, which
-    it set, rather than about a parameter it has never seen.
+    The floors are validate_counts()'s. names is the three counts' names,
+    in that order, as the refusal should spell them. The Ansible module
+    passes its own option names, so that a play is told about
+    initial_workers, which it set, rather than about a parameter it has
+    never seen.
     """
     control_plane_name, worker_name, address_name = names
     validate_counts(1, **{control_plane_name: control_plane_count})
@@ -1125,12 +1093,12 @@ def validate_create_arguments(name, control_plane_count, worker_count,
 
     The arguments are create()'s, under its names and with its defaults,
     and name is the cluster's. create() calls this as its first act, and
-    the command line calls it before it creates a namespace too, so that a
-    refused create leaves nothing behind. Each
-    check is still made by the one function which owns the rule, in this
-    order: validate_cluster_name(), validate_create_counts(),
-    read_manifests(), validate_node_sizes() and validate_k3s_config() for
-    each role. The first refusal is raised.
+    the command line calls it before it creates a namespace too, so that
+    a refused create leaves nothing behind. Each check is still made by
+    the one function which owns the rule, in this order:
+    validate_cluster_name(), validate_create_counts(), read_manifests(),
+    validate_node_sizes() and validate_k3s_config() for each role. The
+    first refusal is raised.
 
     Returns ``(staged_manifests, node_sizes)``: what read_manifests()
     read, and the six sizes in the nested shape the metadata records.
@@ -1284,21 +1252,13 @@ class Cluster:
     no Cluster at all and calls the module level functions in
     ``primitives`` instead.
 
-    Constructing one raises ``exceptions.ClusterNameError`` for a name
-    whose metadata key is one of ``primitives.RESERVED_METADATA_KEYS``,
+    Constructing one refuses a reserved name (``ClusterNameError.reserved``),
     which is the only check on the name made here.
     """
 
     def __init__(self, client, name, namespace, reporter=None):
-        # A name whose metadata key is one this package already uses for
-        # something else is refused here, on every verb, rather than only by
-        # create(): no cluster of such a name can ever have been created, so
-        # nothing is stranded, and every verb reading or writing that key
-        # would otherwise be reading or writing a release cache. This is
-        # deliberately not validate_cluster_name(). That rule is create()'s
-        # alone, so that a cluster which already exists under a name it
-        # would refuse can still be shown, repaired and deleted. See
-        # ClusterNameError.
+        # Every verb refuses a reserved name, while validate_cluster_name()
+        # is the create paths' alone; ClusterNameError has why.
         md_key = METADATA_KEY % name
         if md_key in primitives.RESERVED_METADATA_KEYS:
             raise exceptions.ClusterNameError.reserved(name, md_key)
@@ -2763,9 +2723,7 @@ class Cluster:
         validate_cluster_name() accepts, because it becomes part of every
         node's instance name; create() is the only verb which checks it, so
         that a cluster created before the rule existed can still be shown
-        and deleted. control_plane_count must be at least 1, and
-        worker_count and metal_address_count at least 0; validate_counts()
-        gives the reasons.
+        and deleted. validate_counts() states the counts' floors.
         """
         # Every argument which can be refused without the API is refused
         # here, before anything else happens -- sshkey, by contrast, is read
@@ -3872,9 +3830,8 @@ class Cluster:
         fetched, and a k3s agent install carrying a token of None builds
         instances which are charged for and can never join anything.
 
-        worker_count must be at least 1, and is checked before the
-        metadata is read: zero or a negative count would otherwise report
-        success having added nothing.
+        worker_count is checked against its floor (validate_counts())
+        before the metadata is read, so a refusal costs no API call.
         """
         validate_counts(1, worker_count=worker_count)
         md = self.get_metadata()
@@ -4201,8 +4158,8 @@ class Cluster:
         them could end -- a refusal which is correct and which would
         otherwise arrive after the allocation.
 
-        address_count must be at least 1, and is checked before the
-        metadata is read, for the reason expand_workers() gives.
+        address_count is checked against its floor (validate_counts())
+        before the metadata is read, so a refusal costs no API call.
         """
         validate_counts(1, address_count=address_count)
         md = self.get_metadata()

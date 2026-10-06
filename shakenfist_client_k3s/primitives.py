@@ -32,16 +32,12 @@ K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
 LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
 
 # The namespace metadata keys this package uses for something other than a
-# cluster, which no cluster's own key may ever be. A cluster's state is
-# stored under cluster.METADATA_KEY, 'orchestrated_k3s_cluster_%s', and the
-# two version caches above share that prefix, so clusters named
-# k3s_version_cache and longhorn_version_cache would be stored in the
-# caches' documents. Cluster.__init__ refuses a name whose key is in this
-# set, on every verb; ClusterNameError's docstring says what went wrong
-# before it did. CLUSTER_LIST is not here because it cannot collide: it is
-# 'orchestrated_k3s_clusters', and every cluster key has an underscore
-# where that has its final 's'. A key added to the namespace document
-# later which does share the prefix belongs here.
+# cluster, and which share cluster.METADATA_KEY's prefix, so no cluster's
+# key may be one of them; ClusterNameError.reserved has why. CLUSTER_LIST
+# is not here because it cannot collide: it is 'orchestrated_k3s_clusters',
+# and every cluster key has an underscore where that has its final 's'. A
+# key added to the namespace document later which does share the prefix
+# belongs here.
 RESERVED_METADATA_KEYS = frozenset((K3S_VERSION_CACHE_KEY,
                                     LONGHORN_VERSION_CACHE_KEY))
 

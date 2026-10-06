@@ -53,11 +53,12 @@ class CliContractTestCase(testtools.TestCase):
     typed; for a new option the command's fixture is regenerated the same
     way. Nothing existing may change in the diff.
 
-    The other is a plan which decides to change the contract and records
-    the change in docs/usage.md. The argument validation plan did, when
-    the six size options lost click.IntRange(min=1) so that the library's
-    validate_node_sizes() is the only floor; create.txt was regenerated
-    the same way, and only those six options changed in its diff.
+    The other is a deliberate change to the contract, recorded in
+    docs/usage.md. The six size options are bare click.INT rather than
+    click.IntRange(min=1), so that the library's validate_node_sizes() is
+    the only floor and every front door refuses a size with the same
+    message; create.txt was regenerated the same way for that, and only
+    those six options changed in its diff.
     """
 
     def setUp(self):

@@ -754,19 +754,11 @@ class ShapeError(_ReasonedK3sException):
     ``metal_address_count``, ``expand_workers()``'s ``worker_count`` and
     ``expand_addresses()``'s ``address_count``. ``validate_counts()`` in
     ``cluster.py`` checks them before the API is asked for anything, for
-    the reason ``NodeSizeError`` gives, and because the failures an
-    unusable count causes otherwise are late and do not name the count: a
-    cluster with no control plane has no API server, and finds out tens of
-    minutes into the create; an expand by zero, or by a negative number,
-    reports success having done nothing. Construct via the classmethods
-    below, one per refusal:
+    the reason ``NodeSizeError`` gives, and states each verb's floor and
+    why. Construct via the classmethods below, one per refusal:
 
     - ``below_floor(parameter, value, floor)``: the count is an integer
-      below the floor its verb sets: at least one control plane node;
-      zero or more workers and load balancer addresses on create, because
-      a cluster with neither is still a working cluster; and at least one
-      of whatever an expand verb adds, because zero is a request for
-      nothing. ``validate_counts()`` gives the reasoning at more length.
+      below the floor its verb sets.
     - ``not_an_integer(parameter, value, floor)``: the count is not an
       ``int``, or is a ``bool``. ``True`` is an ``int`` in Python and
       ``True >= 1`` holds, so without the check a YAML ``yes`` would build
@@ -779,11 +771,10 @@ class ShapeError(_ReasonedK3sException):
     spells it -- except from the Ansible module, which has
     ``validate_create_counts()`` name the counts after its own options,
     ``initial_workers`` among them. ``value`` is what was passed,
-    unchanged, and ``floor`` is
-    the smallest count the verb accepts. Both classmethods set all three,
-    and the messages render the value with ``repr()`` so that ``'2'`` and
-    ``2`` are told apart. Which classmethod built an instance is recorded
-    in ``reason``.
+    unchanged, and ``floor`` is the smallest count the verb accepts. Both
+    classmethods set all three, and the messages render the value with
+    ``repr()`` so that ``'2'`` and ``2`` are told apart. Which classmethod
+    built an instance is recorded in ``reason``.
     """
 
     #: The union of the fields the classmethods below set. See
