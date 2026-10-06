@@ -117,13 +117,23 @@ AGENT_OP_FINISHED_STATES = ('complete', 'deleted')
 AGENT_OP_KNOWN_STATES = (AGENT_OP_PENDING_STATES + AGENT_OP_FAILED_STATES
                          + AGENT_OP_FINISHED_STATES)
 
-# How long health()'s read only probe waits for its one command before it
-# reports a timeout as a finding. The server's own deadline would bound it
-# eventually, but ten minutes of silence is not a health check: a
-# 'kubectl get nodes' on a cluster which is answering returns in well
-# under a second, so a cluster which has not answered in thirty is the
-# answer rather than a slow one.
+# How long health()'s read only probes wait for their commands before each
+# one still running is reported as a timeout. It is one budget for the
+# whole call rather than one per probe: health() submits every probe before
+# waiting for any and measures them all against a single deadline, so a
+# cluster of any size is answered within it. The server's own deadline
+# would bound the wait eventually, but ten minutes of silence is not a
+# health check: a 'kubectl get nodes' on a cluster which is answering
+# returns in well under a second, and the node signals command reads a few
+# files and sizes two directories, so a node which has not answered in
+# thirty is the answer rather than a slow one.
 HEALTH_PROBE_TIMEOUT_SECONDS = 30
+
+# The command health() runs on the first control plane node to ask whether
+# the k3s API answers. --kubeconfig explicitly, matching remove_worker():
+# bare kubectl works on these nodes today, and being consistent about saying
+# so keeps the next reader from wondering which spelling matters.
+K3S_API_PROBE_COMMAND = 'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'
 
 # The timeout passed to 'kubectl drain'. Without it a drain which cannot
 # evict a pod blocks until the agent operation's own deadline expires,
@@ -1438,14 +1448,14 @@ class Cluster:
         timeout is a budget in seconds measured on the monotonic clock,
         after which the operation
         as last seen is returned with whatever state it had. It is None for
-        every caller but health()'s probe: an install which takes eleven
+        every caller but health()'s probes: an install which takes eleven
         minutes is a slow install rather than a failed one, and abandoning
         it would leave the caller believing a command it can still see
         running did not happen. Abandoning a read only 'kubectl get nodes'
-        costs nothing, which is why that one caller can. A caller passing a
-        timeout has to be prepared for a pending state in the returned
-        operation; reap_execute() does not pass one, and so its own state
-        check is exhaustive.
+        or signals read costs nothing, which is why that one caller can. A
+        caller passing a timeout has to be prepared for a pending state in
+        the returned operation; reap_execute() does not pass one, and so its
+        own state check is exhaustive.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while aop['state'] in AGENT_OP_PENDING_STATES:
@@ -1517,54 +1527,6 @@ class Cluster:
         for aop in aops:
             self.reap_execute(aop)
 
-    def _probe_k3s_api(self, instance_uuid):
-        """Ask a control plane node whether its k3s API answers, and report the answer.
-
-        This is execute_and_await()'s read only sibling, and exists because
-        that method cannot be used here. It submits every command and only
-        then reaps the results, and its reaping raises: await_idle() raises
-        AgentOperationError for an operation which entered the error state,
-        and reap_execute() raises CommandFailedError for a non-zero return
-        code. A failing kubectl is the finding health() exists to report, so
-        raising on it would defeat the verb. This therefore submits the
-        command itself, waits for that one operation with await_execute(),
-        and reads the return code as data.
-
-        await_idle() is deliberately not called either, for a second reason:
-        it waits for *every* agent operation on the instance to complete,
-        including ones another process queued, and a read only health check
-        must not block on somebody else's k3s install.
-
-        The work is split between _submit_probe() and _collect_probe(), and
-        this is a thin wrapper which runs one after the other. The split is
-        there so that a caller with more than one command to run can submit
-        all of them before waiting for any, against one shared deadline,
-        without copying the branches which turn an operation into a report.
-        Waiting here is bounded by HEALTH_PROBE_TIMEOUT_SECONDS from just
-        before the command is submitted.
-
-        Returns the dict health() reports under ``api``; see health()'s
-        docstring for the keys. Nothing here raises for an unhealthy answer;
-        see _probe_refused() for which API errors are caught and why.
-        """
-        # --kubeconfig explicitly, matching remove_worker(): bare kubectl
-        # works on these nodes today, and being consistent about saying so
-        # keeps the next reader from wondering which spelling matters.
-        command = 'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'
-
-        # The deadline is taken before submission, so the budget covers the
-        # submission as well as the wait. That starts the clock earlier, by
-        # however long the submission takes, than await_execute() started it
-        # when this was one call, and is the rule health() will need once it
-        # submits more than one probe against a single deadline.
-        deadline = time.monotonic() + HEALTH_PROBE_TIMEOUT_SECONDS
-
-        self.reporter.debug('Asking %s whether the k3s API answers' % instance_uuid)
-        aop, probe = self._submit_probe(instance_uuid, command)
-        if probe is not None:
-            return probe
-        return self._collect_probe(instance_uuid, command, aop, deadline)
-
     def _new_probe(self, instance_uuid, command):
         """Build a probe report for a command which has not been run yet.
 
@@ -1613,14 +1575,37 @@ class Cluster:
     def _submit_probe(self, instance_uuid, command):
         """Submit a probe's command to an instance's agent, without waiting for it.
 
-        The first half of a probe; _collect_probe() is the second. Returns a
-        tuple ``(aop, probe)`` with exactly one of the two not None. If the
-        API accepted the command, ``aop`` is the agent operation to pass to
-        _collect_probe() and ``probe`` is None. If the API refused it,
-        ``aop`` is None and ``probe`` is the finished report, with
-        ``probed`` False and ``error`` saying why; there is nothing to
-        collect, and the caller reports it as is. Nothing here raises for a
-        refusal; see _probe_refused().
+        The first half of a probe; _collect_probe() is the second. A probe
+        is how health() asks a node something -- whether the k3s API
+        answers, and what the node's signals read -- and the pair is
+        execute_and_await()'s read only sibling, which exists because that
+        method cannot be used here. It submits every command and only then
+        reaps the results, and its reaping raises: await_idle() raises
+        AgentOperationError for an operation which entered the error state,
+        and reap_execute() raises CommandFailedError for a non-zero return
+        code. A failing kubectl is the finding health() exists to report, so
+        raising on it would defeat the verb. A probe therefore submits its
+        command itself, waits for that one operation with await_execute(),
+        and reads the return code as data.
+
+        await_idle() is deliberately not called either, for a second reason:
+        it waits for *every* agent operation on the instance to complete,
+        including ones another process queued, and a read only health check
+        must not block on somebody else's k3s install.
+
+        The two halves are separate methods so that health(), which runs a
+        probe on every node able to answer one, can submit all of them
+        before waiting for any, against one shared deadline, while every
+        probe still goes through the one set of branches which turn an
+        operation into a report.
+
+        Returns a tuple ``(aop, probe)`` with exactly one of the two not
+        None. If the API accepted the command, ``aop`` is the agent
+        operation to pass to _collect_probe() and ``probe`` is None. If the
+        API refused it, ``aop`` is None and ``probe`` is the finished
+        report, with ``probed`` False and ``error`` saying why; there is
+        nothing to collect, and the caller reports it as is. Nothing here
+        raises for a refusal; see _probe_refused().
         """
         try:
             return self.client.instance_execute(instance_uuid, command), None
@@ -1628,7 +1613,7 @@ class Cluster:
             return None, self._probe_refused(
                 self._new_probe(instance_uuid, command), instance_uuid, e)
 
-    def _collect_probe(self, instance_uuid, command, aop, deadline):
+    def _collect_probe(self, instance_uuid, command, aop, deadline, name=None):
         """Wait for a submitted probe's command, and turn its ending into a report.
 
         The second half of a probe; _submit_probe() is the first, and aop
@@ -1637,6 +1622,13 @@ class Cluster:
         together can share one: each waits only for what is left of it, and
         one which is collected after the deadline has passed looks once and
         does not wait at all.
+
+        name is how the error messages refer to the command. Left None, they
+        quote the command line, which for 'kubectl get nodes' is the clearest
+        thing they could say. The node signals command is several hundred
+        characters of printf and awk, which tells the reader of an error
+        nothing and would bury the part that does, so health() names that
+        one instead.
 
         Returns a probe report in the shape health() reports under ``api``;
         see health()'s docstring for the keys. Nothing here raises for an
@@ -1666,17 +1658,17 @@ class Cluster:
             # by the time this probe was collected.
             probe['probed'] = False
             probe['error'] = (
-                "'%s' had not finished after %s seconds (agent operation %s "
+                '%s had not finished after %s seconds (agent operation %s '
                 'is still %s), so the wait was abandoned'
-                % (command, HEALTH_PROBE_TIMEOUT_SECONDS, aop['uuid'],
-                   aop['state']))
+                % (name or "'%s'" % command, HEALTH_PROBE_TIMEOUT_SECONDS,
+                   aop['uuid'], aop['state']))
             return probe
 
         if aop['state'] in AGENT_OP_FAILED_STATES:
             probe['error'] = (
                 'the agent operation for %s entered the %s state'
-                % (progress.describe_agent_op(aop, max_len=None) or command,
-                   aop['state']))
+                % (name or progress.describe_agent_op(aop, max_len=None)
+                   or command, aop['state']))
             return probe
 
         # Anything left is an ending this version does not know about:
@@ -1708,7 +1700,8 @@ class Cluster:
         probe['stderr'] = result.get('stderr')
         probe['answered'] = probe['return_code'] == 0
         if not probe['answered']:
-            probe['error'] = "'%s' exited %s" % (command, probe['return_code'])
+            probe['error'] = ('%s exited %s'
+                              % (name or "'%s'" % command, probe['return_code']))
         return probe
 
     def _unprobed(self, instance_uuid, error):
@@ -1729,6 +1722,58 @@ class Cluster:
             'stderr': None,
             'error': error
         }
+
+    def _cannot_answer(self, subject, node):
+        """Say why a probe was not run on a node which is not able to answer it.
+
+        node is one of health()'s node entries, which is not healthy. The
+        API probe and the signals probe are skipped for the same reason and
+        say so in the same words, built here so that they cannot drift
+        apart: a caller matching on one has matched on both. The fallbacks
+        are for the values the API leaves as None -- an instance which no
+        longer exists has no state, an agent which has never been reached
+        has no agent_state -- so that None never reaches the message as
+        text.
+        """
+        return ('%s is not in a state which can answer: instance %s, agent %s'
+                % (subject, node['state'] or 'gone',
+                   node['agent_state'] or 'not contactable'))
+
+    def _unprobed_signals(self, role, error):
+        """Build a node's ``signals`` report for a signals probe which was not run.
+
+        The same keys as one which was, which is the rule _unprobed()
+        follows for ``api`` and for the same reason: a caller must not have
+        to work out what happened from which keys exist. Every reading is
+        None, because none was taken, except ``k3s_unit``, which is not a
+        reading but the name of the unit one would have been taken from,
+        and is known from the role alone.
+        """
+        signals = {'probed': False, 'error': error}
+        signals.update(dict.fromkeys(NODE_SIGNAL_KEYS))
+        signals['k3s_unit'] = k3s_unit_for_role(role)
+        return signals
+
+    def _signals_from_probe(self, role, probe):
+        """Turn a collected or refused signals probe into a node's ``signals`` report.
+
+        ``probed`` and ``error`` mean what they mean in ``api``, because
+        they come from the same _submit_probe() and _collect_probe(). The
+        readings are parsed from stdout whatever the exit code was: the
+        command is built so that no one unreadable source can fail it, so a
+        non-zero exit says something went wrong around the readings rather
+        than that the ones it printed are false, and each reading it did
+        print is still a reading. A probe with no stdout -- refused,
+        abandoned, failed -- parses to every reading None.
+
+        Nothing else from the probe is kept. The command line, its stdout
+        and its stderr are raw material rather than findings, and what a
+        caller receives -- including the Ansible module's result -- is
+        exactly the keys health()'s docstring lists.
+        """
+        signals = {'probed': probe['probed'], 'error': probe['error']}
+        signals.update(parse_node_signals(probe['stdout'], role))
+        return signals
 
     def _node_health(self, instance_uuid, role):
         """Report the Shaken Fist state of one node, whether or not it still exists.
@@ -2854,22 +2899,27 @@ class Cluster:
         Nothing about an unhealthy cluster raises. An instance in the error
         state, an instance the metadata names which no longer exists, a
         cluster which was interrupted mid-create, a cluster with no control
-        plane node at all, and a kubectl which exits non-zero are all
-        findings in the returned report. The only thing which raises is a
-        cluster this namespace has no metadata for, which is not an
-        unhealthy cluster but a question about a cluster that does not
-        exist.
+        plane node at all, and a kubectl or signals command which exits
+        non-zero are all findings in the returned report. The only thing
+        which raises is a cluster this namespace has no metadata for, which
+        is not an unhealthy cluster but a question about a cluster that does
+        not exist.
 
-        Nor does it hang. The k3s API probe is only attempted when the node
-        it would be run on looks able to answer -- the node entry this
-        method has just built says whether the instance exists, is created
-        and has a ready agent -- and it carries a wall clock timeout even
-        then. An agent operation queued against an instance whose agent is
-        not connected never leaves its queued state, so a probe which is
-        attempted anyway waits forever on exactly the cluster this verb
-        exists to describe. Every one of those outcomes is ``probed``
-        False with an ``error`` saying which, so a caller never has to
-        tell them apart by which keys are present.
+        Nor does it hang. Each probe -- the k3s API probe on the first
+        control plane node, and a signals probe on every node -- is only
+        attempted when the node it would be run on looks able to answer --
+        the node entry this method has just built says whether the instance
+        exists, is created and has a ready agent -- and they share one wall
+        clock timeout even then. An agent operation queued against an
+        instance whose agent is not connected never leaves its queued
+        state, so a probe which is attempted anyway waits forever on exactly
+        the cluster this verb exists to describe. Every probe is submitted
+        before any is waited for, and every one is waited for against a
+        single deadline, HEALTH_PROBE_TIMEOUT_SECONDS from before the first
+        submission, so the bound is one budget on a cluster of any size
+        rather than one per node. Every one of those outcomes is ``probed``
+        False with an ``error`` saying which, so a caller never has to tell
+        them apart by which keys are present.
 
         The report is::
 
@@ -2886,7 +2936,21 @@ class Cluster:
                         'exists': bool,         # the instance still exists
                         'state': str or None,   # the instance state
                         'agent_state': str or None,
-                        'healthy': bool         # created, and its agent ready
+                        'healthy': bool,        # created, and its agent ready
+                        'signals': {
+                            'probed': bool,                 # the command ran at all
+                            'error': str or None,           # why not, or why it failed
+                            'boot_id': str or None,         # /proc/sys/kernel/random/boot_id
+                            'booted_at': int or None,       # /proc/stat btime, Unix seconds
+                            'k3s_unit': str,                # 'k3s' or 'k3s-agent', by role
+                            'k3s_state': str or None,       # systemd ActiveState
+                            'k3s_restarts': int or None,    # systemd NRestarts
+                            'oom_kills': int or None,       # /proc/vmstat oom_kill, since boot
+                            'memory_total_bytes': int or None,
+                            'memory_available_bytes': int or None,
+                            'etcd_bytes': int or None,      # control plane only
+                            'etcd_snapshot_bytes': int or None
+                        }
                     },
                     ...
                 ],
@@ -2910,6 +2974,37 @@ class Cluster:
         'not yet contactable' is the caller's business, as it is in
         await_boot().
 
+        ``signals`` is what the node says about itself, read through its
+        agent by the command node_signals_command() builds; that function
+        and parse_node_signals() say where each reading comes from. Every
+        node entry carries it, always with the same keys. A node which was
+        not probed -- its instance is gone, or it is not in a state which
+        can answer -- says why in ``error``, in the words ``api`` uses for
+        a skipped probe. A reading which could not be taken is None on its
+        own and voids none of the others; ``error`` is for the probe as a
+        whole -- not run, abandoned, failed, or exited non-zero.
+        ``k3s_state`` and ``k3s_restarts`` are None when the unit is not
+        loaded, because systemd reports a restart count of zero for a unit
+        which does not exist and zero would be a claim. The etcd sizes are
+        always None on a worker, and memory is converted from
+        /proc/meminfo's kB so that every size here is in bytes.
+
+        The readings are raw and cumulative, and health() stores none of
+        them: a verb whose contract is that it has no side effects beyond
+        its probes does not grow a metadata write to remember the last
+        answer, and "since anyone last asked" means nothing when the
+        command line, a daily poll and an Ansible play all ask. A caller
+        which wants a delta keeps its own previous report as a baseline and
+        reads the counters by one rule: a changed ``boot_id``, or a counter
+        lower than its baseline under an unchanged one, voids the baseline,
+        and the current value is the delta. Every reading but the etcd sizes
+        resets at boot, which ``boot_id`` detects; systemd is understood to
+        clear ``k3s_restarts`` when an operator restarts the unit by hand,
+        which only the lower-than-baseline half catches. ``oom_kills``
+        counts every OOM kill the kernel makes, cgroup kills included, so a
+        pod killed for exceeding its own memory limit increments it just as
+        a node running out of memory does.
+
         The top level ``healthy`` is the conjunction a caller would
         otherwise have to write itself: the cluster finished being built,
         every node in it exists and is up, and the k3s API answered. The
@@ -2922,6 +3017,14 @@ class Cluster:
         unhealthy because there was no k3s API to ask, which is the same
         answer for the more informative reason.
 
+        Nothing in ``signals`` affects ``healthy``, at node or cluster
+        level, and nothing in it is judged against a threshold: a restart
+        count with no baseline, or available memory with no workload to
+        compare it with, cannot be judged here. A signals probe which fails
+        on a node that is otherwise up leaves that node healthy, with the
+        failure in ``signals['error']``, so that a slow ``du`` cannot flip
+        a ``--strict`` run.
+
         Unlike expand_workers(), remove_worker() and expand_addresses() this
         does not call _require_usable(): reporting on a cluster which never
         finished being built is exactly what the verb is for, so an
@@ -2931,16 +3034,21 @@ class Cluster:
         probe rather than an IndexError.
 
         One thing this leaves behind, which matters to a caller polling it in
-        a loop: the probe submits an agent operation, and when it gives up
-        waiting the operation is still queued against the control plane node.
-        Nothing here reaps it, because there is nothing to reap it with -- the
-        command may yet run -- so the server's own deadline ends it, and until
-        then an await_idle() in a later expand-workers or update-os waits for
-        it along with everything else. The uuid of an abandoned operation is in
-        ``api['error']`` so that wait can be accounted for rather than
-        guessed at. This is bounded rather than free: a reconcile loop
-        polling health() against a node whose agent is intermittently slow
-        pays for it in a delayed later verb, not in a hang.
+        a loop: every probe submits an agent operation -- one on each node it
+        probes, and the kubectl one beside it on the first control plane
+        node -- and each one still waiting when the shared deadline passes is
+        abandoned while queued against its node. Nothing here reaps them,
+        because there is nothing to reap them with -- the commands may yet
+        run -- so the server's own deadline ends each one, and until then an
+        await_idle() in a later expand-workers or update-os waits for them
+        along with everything else. That is up to one operation per probed
+        node, plus the kubectl one, rather than one in total. The uuid of
+        each abandoned operation is in its probe's ``error`` --
+        ``api['error']``, or the node's ``signals['error']`` -- so that wait
+        can be accounted for rather than guessed at. This is bounded rather
+        than free: a reconcile loop polling health() against nodes whose
+        agents are intermittently slow pays for it in a delayed later verb,
+        not in a hang.
         """
         md = self.get_metadata()
         if not md:
@@ -2952,14 +3060,32 @@ class Cluster:
             for instance_uuid in md.get(md_key) or []:
                 nodes.append(self._node_health(instance_uuid, role))
 
+        # One deadline for every probe, taken before the first is submitted
+        # so that the budget covers the submissions as well as the waits.
+        # Everything is submitted before anything is waited for, so the
+        # waits overlap rather than queue: the first probe collected waits
+        # for whatever is left of the budget, and each one after it only for
+        # whatever is left after that, which is what bounds this call at one
+        # budget on a cluster of any size rather than one per node. Taking
+        # it here starts every probe's clock a little early, by however long
+        # the submissions before it take -- a few API calls -- which decision
+        # 8 of the cumulative health signals phase 1 plan accepts.
+        deadline = time.monotonic() + HEALTH_PROBE_TIMEOUT_SECONDS
+
         # The k3s API is asked through the first control plane node, which an
         # interrupted create may never have made. That is a finding rather
         # than an error, so it is reported the same way a kubectl which
-        # exits non-zero is.
+        # exits non-zero is. It is submitted before any node's signals, so
+        # that on the first control plane node, where both run, the
+        # established finding is not queued behind a du.
         control_plane = md.get('control_plane_nodes') or []
         first = nodes[0] if control_plane else None
+        api_aop = None
         if first and first['exists'] and first['healthy']:
-            api = self._probe_k3s_api(control_plane[0])
+            self.reporter.debug(
+                'Asking %s whether the k3s API answers' % control_plane[0])
+            api_aop, api = self._submit_probe(
+                control_plane[0], K3S_API_PROBE_COMMAND)
         elif not control_plane:
             api = self._unprobed(
                 None,
@@ -2975,10 +3101,54 @@ class Cluster:
             # verb most needs to answer about.
             api = self._unprobed(
                 control_plane[0],
-                'the first control plane node is not in a state which can '
-                'answer: instance %s, agent %s'
-                % (first['state'] or 'gone',
-                   first['agent_state'] or 'not contactable'))
+                self._cannot_answer('the first control plane node', first))
+
+        # The snapshot directory is the one value in the signals command
+        # which is the caller's rather than this module's: etcd-snapshot-dir
+        # is not an owned key, so a server_config can move the snapshots.
+        # Metadata written before server_config was recorded has none. Only
+        # a string is passed on, because node_signals_command() quotes it
+        # and anything else is not a directory k3s could have been given;
+        # and the document is checked for being a dict rather than trusted
+        # to be one, because this is the verb which must describe a cluster
+        # whose metadata it did not write.
+        server_config = md.get('server_config')
+        snapshot_dir = None
+        if isinstance(server_config, dict):
+            snapshot_dir = server_config.get('etcd-snapshot-dir')
+            if not isinstance(snapshot_dir, str):
+                snapshot_dir = None
+
+        # Each node's signals are read under the API probe's rule, for the
+        # API probe's reason: a node is asked only when its entry says it
+        # can answer, and one which cannot says why instead.
+        submitted = []
+        for node in nodes:
+            if not node['exists']:
+                node['signals'] = self._unprobed_signals(
+                    node['role'], 'this instance no longer exists')
+            elif not node['healthy']:
+                node['signals'] = self._unprobed_signals(
+                    node['role'], self._cannot_answer('this node', node))
+            else:
+                command = node_signals_command(
+                    node['role'],
+                    snapshot_dir if node['role'] == 'control_plane' else None)
+                self.reporter.debug('Reading the signals of %s' % node['uuid'])
+                aop, probe = self._submit_probe(node['uuid'], command)
+                submitted.append((node, command, aop, probe))
+
+        # Only now is anything waited for. A probe the API refused at
+        # submission has no operation and its report is already final.
+        if api_aop is not None:
+            api = self._collect_probe(
+                control_plane[0], K3S_API_PROBE_COMMAND, api_aop, deadline)
+        for node, command, aop, probe in submitted:
+            if aop is not None:
+                probe = self._collect_probe(
+                    node['uuid'], command, aop, deadline,
+                    name='the node signals command')
+            node['signals'] = self._signals_from_probe(node['role'], probe)
 
         # _interrupted_state() answers 'unknown' rather than None for
         # metadata carrying no state at all, so interrupted is True for that
