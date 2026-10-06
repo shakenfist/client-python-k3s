@@ -438,6 +438,45 @@ adding assertions here would mean writing them twice.
       answers, and its Future work names the recovery plan (decision
       10) and the agent operation deadline (survey finding 5).
 
+## Live results
+
+Step 1f dispatched the merge tier's `functional-tests.yml` against this
+branch at `bdc934c`:
+[run 37422129990](https://github.com/shakenfist/client-python-k3s/actions/runs/37422129990),
+which passed. Both `health --strict` steps in `tools/ci_deploy_test.sh`
+rendered signals for every node. From the main (`ciMixed`) cluster:
+
+```
+    [ok] k3s-ciMixed-node-001 (23ec4a84-3ef7-41d3-8f5c-5624ca043a12, control plane): instance created, agent ready
+        booted 2026-10-06T06:47:11Z, k3s active, 0 restarts, 0 OOM kills, 2702 of 3914 MiB available, etcd 138 MiB, snapshots 0 MiB
+    [ok] k3s-ciMixed-node-002 (c5ca29ae-b75f-4054-9022-2977b5e6fc02, worker): instance created, agent ready
+        booted 2026-10-06T06:50:41Z, k3s-agent active, 0 restarts, 0 OOM kills, 2173 of 2971 MiB available
+```
+
+and from the minimal (`ciMinimal`) cluster, built at the 2048 MB
+default:
+
+```
+    [ok] k3s-ciMinimal-node-001 (9ec464d4-073e-490e-a11c-ccecb5eb0c96, control plane): instance created, agent ready
+        booted 2026-10-06T07:02:43Z, k3s active, 0 restarts, 0 OOM kills, 808 of 1966 MiB available, etcd 138 MiB, snapshots 0 MiB
+    [ok] k3s-ciMinimal-node-002 (515579c7-0feb-4481-bf19-32b1a4ce3faa, worker): instance created, agent ready
+        booted 2026-10-06T07:04:20Z, k3s-agent active, 0 restarts, 0 OOM kills, 1610 of 1966 MiB available
+```
+
+No reading rendered as `unknown` on either role, so none was `None`:
+the unit is `k3s-agent` on workers and `k3s` on control plane nodes,
+both loaded and active; `oom_kills` and `k3s_restarts` are integers;
+and the etcd sizes were readable, which also confirms that agent
+commands run as root (the data directory is not world readable).
+`snapshots 0 MiB` is a directory that exists and holds less than a
+MiB, not a missing reading, which would render as `unknown`: no
+snapshot has been taken on a cluster minutes old.
+
+One incidental observation, which is the master plan's premise in
+miniature: the minimal cluster's 2048 MB control plane had 808 MiB
+available minutes after creation, against 2702 of 3914 MiB on the
+larger one.
+
 ## Back brief
 
 Before executing any step of this plan, back brief the operator on
