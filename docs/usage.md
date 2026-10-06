@@ -459,9 +459,9 @@ Cluster mycluster in namespace default is healthy
   state: created
   nodes:
     [ok] k3s-mycluster-node-001 (3fa85f64-5717-4562-b3fc-2c963f66afa6, control plane): instance created, agent ready
-        booted 2025-10-06T14:13:20Z, k3s active, 0 restarts, 0 OOM kills, 2900 of 4096 MiB available, etcd 61 MiB, snapshots 0 MiB
+        booted 2026-10-06T06:47:11Z, k3s active, 0 restarts, 0 OOM kills, 2702 of 3914 MiB available, etcd 138 MiB, snapshots 0 MiB
     [ok] k3s-mycluster-node-002 (7c9e6679-7425-40de-944b-e07fc1f90ae7, worker): instance created, agent ready
-        booted 2025-10-06T14:13:20Z, k3s-agent active, 0 restarts, 0 OOM kills, 2900 of 4096 MiB available
+        booted 2026-10-06T06:50:41Z, k3s-agent active, 0 restarts, 0 OOM kills, 2173 of 2971 MiB available
   k3s API: answered on 3fa85f64-5717-4562-b3fc-2c963f66afa6
     NAME                     STATUS   ROLES                  AGE   VERSION
     k3s-mycluster-node-001   Ready    control-plane,master   10m   v1.30.2+k3s1

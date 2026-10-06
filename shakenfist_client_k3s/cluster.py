@@ -356,7 +356,16 @@ NODE_SIGNAL_KEYS = (
 # sign, '_' digit separators and non-ASCII digits, none of which the
 # command prints, so a value carrying one is not a reading and is reported
 # as None rather than coerced into one.
-NODE_SIGNAL_INTEGER_RE = re.compile(r'\A[0-9]+\Z')
+#
+# It is also capped at twenty digits, which is as long as the largest
+# value any reading can hold: every one of them is a kernel or systemd
+# counter or size of at most 64 bits, and 2**64 - 1 has twenty digits.
+# Uncapped, a garbage reading could be thousands of digits long, and the
+# report would then break whoever serialises it -- Python 3.11 and later
+# refuse to turn an int of more than 4300 digits into a string, and
+# memory is scaled by 1024 after parsing, so json.dumps() of the Ansible
+# module's result would raise on a reading this parser had accepted.
+NODE_SIGNAL_INTEGER_RE = re.compile(r'\A[0-9]{1,20}\Z')
 
 # Every command this module builds is a shell command line, run as root on
 # a cluster node by the in-guest agent. Two rules keep that safe, and they
@@ -523,8 +532,9 @@ def node_signals_command(role, snapshot_dir=None):
     server_config, and is caller data, so it is quoted per rule 1 above;
     it is the only value here which is not one of this module's literals.
     None or an empty string means K3S_ETCD_SNAPSHOT_DIR, as an empty
-    etcd-snapshot-dir does to k3s. It is ignored for a worker, which has
-    no etcd member to size.
+    etcd-snapshot-dir does to k3s. A relative one is not sized, and its
+    reading is printed empty and so parses to None; the comment below says
+    why. It is ignored for a worker, which has no etcd member to size.
     """
     unit = k3s_unit_for_role(role)
     commands = [
@@ -543,10 +553,28 @@ def node_signals_command(role, snapshot_dir=None):
         commands.append(_signal_reading(
             'etcd_bytes',
             'du -sb -- %s 2>/dev/null | cut -f1' % K3S_ETCD_DIR))
-        commands.append(_signal_reading(
-            'etcd_snapshot_bytes',
-            'du -sb -- %s 2>/dev/null | cut -f1'
-            % shlex.quote(snapshot_dir or K3S_ETCD_SNAPSHOT_DIR)))
+        # A relative etcd-snapshot-dir is not sized at all. du here would
+        # resolve it against the agent's working directory, and what k3s
+        # resolved it against when it took the snapshots -- its own working
+        # directory as systemd started it, or anything else k3s chooses -- is
+        # not something this can know from here. du would then report None
+        # for a directory which exists, or worse, the size of an unrelated
+        # directory which happens to share the name, and a wrong number is
+        # worse than None: None says the reading could not be taken, and a
+        # number is a claim a caller would diff against its baseline. The
+        # key is still printed, with an empty value, so the output keeps the
+        # shape _signal_reading() promises and the parser reports None.
+        # startswith('/') rather than os.path.isabs(), because the path is
+        # the node's, which is POSIX whatever runs this. The printf is a
+        # literal, and its format carries the newline, as every other
+        # reading's does.
+        if snapshot_dir and not snapshot_dir.startswith('/'):
+            commands.append("printf 'etcd_snapshot_bytes=\\n'")
+        else:
+            commands.append(_signal_reading(
+                'etcd_snapshot_bytes',
+                'du -sb -- %s 2>/dev/null | cut -f1'
+                % shlex.quote(snapshot_dir or K3S_ETCD_SNAPSHOT_DIR)))
 
     return '; '.join(commands)
 
@@ -556,16 +584,13 @@ def _signal_integer(raw, key, scale=1):
 
     None for a key the output did not carry, for an empty value (a reading
     which could not be taken), and for anything NODE_SIGNAL_INTEGER_RE does
-    not match. int() is still guarded, because Python 3.11 and later refuse
-    to convert a string of more than 4300 digits, and this must not raise.
+    not match. What it does match is at most twenty ASCII digits, which
+    int() always converts, so nothing here can raise.
     """
     value = raw.get(key)
     if value is None or not NODE_SIGNAL_INTEGER_RE.match(value):
         return None
-    try:
-        return int(value) * scale
-    except ValueError:
-        return None
+    return int(value) * scale
 
 
 def parse_node_signals(stdout, role):
@@ -1446,23 +1471,44 @@ class Cluster:
         judgement.
 
         timeout is a budget in seconds measured on the monotonic clock,
-        after which the operation
-        as last seen is returned with whatever state it had. It is None for
-        every caller but health()'s probes: an install which takes eleven
-        minutes is a slow install rather than a failed one, and abandoning
-        it would leave the caller believing a command it can still see
-        running did not happen. Abandoning a read only 'kubectl get nodes'
-        or signals read costs nothing, which is why that one caller can. A
-        caller passing a timeout has to be prepared for a pending state in
-        the returned operation; reap_execute() does not pass one, and so its
-        own state check is exhaustive.
+        after which the operation as last seen is returned with whatever
+        state it had. It is None for every caller but health()'s probes: an
+        install which takes eleven minutes is a slow install rather than a
+        failed one, and abandoning it would leave the caller believing a
+        command it can still see running did not happen. Abandoning a read
+        only 'kubectl get nodes' or signals read costs nothing, which is why
+        that one caller can. A caller passing a timeout has to be prepared
+        for a pending state in the returned operation; reap_execute() does
+        not pass one, and so its own state check is exhaustive.
+
+        For an operation handed in pending, "as last seen" always means as
+        read from the server by this call, never only as handed in; one
+        handed in already finished is returned as it is, since nothing can
+        move it on. The operation a caller passes is usually
+        the one instance_execute() returned, and this plugin's client is
+        built with ASYNC_CONTINUE, so that is the operation in its
+        submission state -- pending, whatever has happened since. A timeout
+        which has already run out when this is called (health() collects
+        every probe against one shared deadline, so all but the first may
+        arrive with nothing left of it) therefore still reads the operation
+        once, without sleeping, before returning it: otherwise a probe which
+        finished long ago would be reported abandoned on the strength of a
+        state it left before anybody looked. An operation the loop has
+        already read is not read a second time at the deadline, because
+        nothing has happened between that read and the deadline check which
+        a second read could see. An API error from that read propagates
+        exactly as one from the loop's reads does.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
+        looked = False
         while aop['state'] in AGENT_OP_PENDING_STATES:
             if deadline is not None and time.monotonic() >= deadline:
+                if not looked:
+                    aop = self.client.get_agent_operation(aop['uuid'])
                 return aop
             time.sleep(1)
             aop = self.client.get_agent_operation(aop['uuid'])
+            looked = True
         return aop
 
     def reap_execute(self, aop):
@@ -1621,7 +1667,11 @@ class Cluster:
         value rather than a budget, so that several probes submitted
         together can share one: each waits only for what is left of it, and
         one which is collected after the deadline has passed looks once and
-        does not wait at all.
+        does not wait at all. Looking once means reading the operation from
+        the server, which await_execute() does even with no time left: aop
+        is the operation as submitted, and so pending however long ago the
+        command finished, and judging it on that would report every probe
+        collected after a slow first one as abandoned.
 
         name is how the error messages refer to the command. Left None, they
         quote the command line, which for 'kubectl get nodes' is the clearest
@@ -2917,9 +2967,13 @@ class Cluster:
         before any is waited for, and every one is waited for against a
         single deadline, HEALTH_PROBE_TIMEOUT_SECONDS from before the first
         submission, so the bound is one budget on a cluster of any size
-        rather than one per node. Every one of those outcomes is ``probed``
-        False with an ``error`` saying which, so a caller never has to tell
-        them apart by which keys are present.
+        rather than one per node. A skipped probe and an abandoned one are
+        both ``probed`` False with an ``error`` saying which, so a caller
+        never has to tell them apart by which keys are present. A probe
+        collected after that deadline has passed is still read from the
+        server once, without waiting, so one which finished while an earlier
+        probe used up the budget is reported as it finished rather than as
+        abandoned.
 
         The report is::
 

@@ -251,6 +251,17 @@ class HealthClient(FakeClusterClient):
     instance, so a pending kubectl probe and a complete signals probe -- or
     the other way around -- can be in flight together, which is the shape
     of the cases worth testing.
+
+    Submission and reading are modelled as the real server does them for
+    this plugin, whose client is built with ASYNC_CONTINUE: instance_execute()
+    returns the operation as submitted, 'queued' with no results, and only
+    get_agent_operation() reports what the command did. So the scripted
+    attributes -- probe_state, signals_state and the rest -- say what the
+    operation is when it is read, never what instance_execute() hands back.
+    This fake used to return the scripted ending from instance_execute()
+    itself, which let a probe that was never read report a result it had not
+    looked for, and so hid a wait that judged probes on their submission
+    state.
     """
 
     def __init__(self):
@@ -269,7 +280,9 @@ class HealthClient(FakeClusterClient):
         # What the kubectl probe does. Between them these cover the three
         # ways it can fail: the command runs and exits non-zero, the agent
         # operation itself errors, and the API refuses to accept the
-        # command at all.
+        # command at all. probe_state is the state the operation is in when
+        # it is read; at submission it is always 'queued' (see the class
+        # docstring).
         self.probe_return_code = 0
         self.probe_stdout = (
             'NAME                  STATUS   ROLES\n'
@@ -281,9 +294,9 @@ class HealthClient(FakeClusterClient):
         # What each node's signals probe does, keyed by instance uuid, so
         # one node can be made to fail while the others answer. The same
         # three ways to fail as the kubectl probe, plus what the command
-        # prints. An instance with no entry answers as a healthy node would:
-        # state 'complete', exit 0, and the realistic output above for the
-        # role the command was built for.
+        # prints. An instance with no entry answers as a healthy node would
+        # when read: state 'complete', exit 0, and the realistic output above
+        # for the role the command was built for.
         self.signals_stdout = {}
         self.signals_stderr = {}
         self.signals_return_code = {}
@@ -332,9 +345,10 @@ class HealthClient(FakeClusterClient):
     def _answer(self, kind, instance_ref, commandline):
         """Return (state, results) for an operation of kind on instance_ref.
 
-        Read afresh on every call rather than captured at submission, as
-        the probe_* answer always was, so a test may change an attribute
-        between submission and the wait.
+        Called only when an operation is read, never at submission, and
+        read afresh on every call rather than captured, as the probe_*
+        answer always was, so a test may change an attribute between
+        submission and the wait, or between one read and the next.
         """
         if kind == 'kubectl':
             return self.probe_state, {
@@ -370,6 +384,12 @@ class HealthClient(FakeClusterClient):
         kind, instance_ref, commandline = self.operations.get(
             operation_uuid, ('kubectl', None, None))
         state, results = self._answer(kind, instance_ref, commandline)
+        # The command the operation was submitted with, as the server
+        # reports it on every read, so that a description of the operation
+        # built from what was read names it.
+        commands = []
+        if commandline is not None:
+            commands = [{'command': 'execute', 'commandline': commandline}]
         if reads > self.max_agent_operation_reads:
             raise AssertionError(
                 'the wait re-read the agent operation %s %d times without '
@@ -380,7 +400,7 @@ class HealthClient(FakeClusterClient):
             'uuid': operation_uuid,
             'instance_uuid': instance_ref,
             'state': state,
-            'commands': [],
+            'commands': commands,
             'results': results
         }
 
@@ -394,14 +414,18 @@ class HealthClient(FakeClusterClient):
         if raises:
             raise raises
 
+        # The operation as the server returns it on submission: queued,
+        # with nothing run and so no results, whatever the scripted ending
+        # is. A caller which wants to know how the command went has to read
+        # the operation, which is the path health() takes on a real cluster
+        # and so the one its tests must exercise.
         self.aop_serial += 1
         operation_uuid = 'aop-%03d' % self.aop_serial
         self.operations[operation_uuid] = (kind, instance_ref, commandline)
-        state, results = self._answer(kind, instance_ref, commandline)
         return {
             'uuid': operation_uuid,
             'instance_uuid': instance_ref,
-            'state': state,
+            'state': 'queued',
             'commands': [{'command': 'execute', 'commandline': commandline}],
-            'results': results
+            'results': {}
         }

@@ -3155,6 +3155,38 @@ class NodeSignalsCommandTestCase(testtools.TestCase):
             cluster_module.node_signals_command('control_plane'),
             cluster_module.node_signals_command('control_plane', ''))
 
+    def test_a_relative_snapshot_directory_is_not_sized(self):
+        # du would resolve it against the agent's working directory, which
+        # need not be what k3s resolved it against, and a size of the wrong
+        # directory is worse than no size. The key is still printed, empty,
+        # so it parses to None like any reading which could not be taken.
+        for snapshot_dir in ('snapshots', './snapshots', '../var/snaps',
+                             'srv/etcd snaps/$HOME'):
+            command = cluster_module.node_signals_command(
+                'control_plane', snapshot_dir)
+
+            # The command ends with the empty reading, and neither the
+            # caller's directory nor the default one is sized instead: the
+            # one du left is the etcd member's.
+            self.assertTrue(
+                command.endswith("; printf 'etcd_snapshot_bytes=\\n'"),
+                command)
+            self.assertNotIn(snapshot_dir, command)
+            self.assertNotIn(shlex.quote(snapshot_dir), command)
+            self.assertEqual(1, command.count('du -sb'), snapshot_dir)
+            self.assertIn('du -sb -- %s ' % cluster_module.K3S_ETCD_DIR,
+                          command)
+            self.assertNotIn(cluster_module.K3S_ETCD_SNAPSHOT_DIR, command,
+                             snapshot_dir)
+
+    def test_an_absolute_snapshot_directory_is_still_sized(self):
+        # The negative of the above: only the leading slash decides.
+        command = cluster_module.node_signals_command(
+            'control_plane', '/srv/snapshots')
+
+        self.assertEqual(2, command.count('du -sb'))
+        self.assertIn('du -sb -- /srv/snapshots 2>/dev/null', command)
+
     def test_a_worker_ignores_the_snapshot_directory(self):
         self.assertEqual(
             cluster_module.node_signals_command('worker'),
@@ -3301,6 +3333,34 @@ class ParseNodeSignalsTestCase(testtools.TestCase):
         expected['k3s_unit'] = 'k3s'
         self.assertEqual(expected, signals)
 
+    def test_a_reading_is_at_most_twenty_digits_and_always_serialises(self):
+        # Twenty digits is 2**64 - 1's length, the most any reading here
+        # can hold, and is accepted; twenty-one is not a reading. The cap
+        # is what keeps the report serialisable: memory is scaled by 1024
+        # after parsing, and json.dumps() refuses an int of more than 4300
+        # digits on Python 3.11 and later, which would break the Ansible
+        # module's result over one garbage line.
+        twenty = '9' * 20
+        stdout = ''.join('%s=%s\n' % (key, twenty) for key in (
+            'booted_at', 'oom_kills', 'memory_total_kb',
+            'memory_available_kb', 'NRestarts', 'etcd_bytes',
+            'etcd_snapshot_bytes'))
+        signals = cluster_module.parse_node_signals(
+            'LoadState=loaded\n' + stdout, 'control_plane')
+
+        self.assertEqual(int(twenty), signals['oom_kills'])
+        self.assertEqual(int(twenty) * 1024, signals['memory_total_bytes'])
+        json.dumps(signals)
+
+        signals = cluster_module.parse_node_signals(
+            'oom_kills=%s\n' % ('9' * 21), 'control_plane')
+        self.assertIsNone(signals['oom_kills'])
+
+        signals = cluster_module.parse_node_signals(
+            'memory_total_kb=%s\n' % ('9' * 4300), 'control_plane')
+        self.assertIsNone(signals['memory_total_bytes'])
+        json.dumps(signals)
+
     def test_trailing_whitespace_and_crlf_are_stripped(self):
         stdout = SERVER_SIGNALS_OUTPUT.replace('\n', ' \r\n').replace(
             'oom_kills=2', 'oom_kills=\t2')
@@ -3387,14 +3447,14 @@ class NodeSignalsCommandRunsTestCase(testtools.TestCase):
             f.write('#!/bin/sh\n' + script)
         os.chmod(path, 0o755)
 
-    def _run(self, role, snapshot_dir=None):
+    def _run(self, role, snapshot_dir=None, cwd=None):
         env = dict(os.environ)
         env['PATH'] = '%s:%s' % (self.bin, env.get('PATH', '/usr/bin:/bin'))
         return subprocess.run(
             ['/bin/sh', '-c',
              cluster_module.node_signals_command(role, snapshot_dir)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            universal_newlines=True, env=env)
+            universal_newlines=True, env=env, cwd=cwd)
 
     def test_a_control_plane_node(self):
         self._systemctl(
@@ -3438,6 +3498,22 @@ class NodeSignalsCommandRunsTestCase(testtools.TestCase):
         self._systemctl('exit 0\n')
         result = self._run('control_plane',
                            os.path.join(self.tmp, 'does-not-exist'))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('etcd_snapshot_bytes=\n', result.stdout)
+        self.assertIsNone(cluster_module.parse_node_signals(
+            result.stdout, 'control_plane')['etcd_snapshot_bytes'])
+
+    def test_a_relative_directory_is_none_even_where_it_resolves(self):
+        # The command is run from a working directory in which the relative
+        # name does exist and has something in it, which is the case a du
+        # would have answered with a confident size for a directory nobody
+        # knows is the one k3s writes to.
+        self._systemctl('exit 0\n')
+        os.mkdir(os.path.join(self.tmp, 'snaps'))
+        with open(os.path.join(self.tmp, 'snaps', 'snapshot'), 'wb') as f:
+            f.write(b'x' * 5000)
+
+        result = self._run('control_plane', 'snaps', cwd=self.tmp)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn('etcd_snapshot_bytes=\n', result.stdout)
         self.assertIsNone(cluster_module.parse_node_signals(
@@ -4291,6 +4367,62 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
         self.assertEqual('queued', aop['state'])
         self.assertEqual(5, elapsed)
 
+    def test_an_operation_past_its_deadline_is_read_once(self):
+        # health() collects every probe against one shared deadline, so all
+        # but the first may be collected with none of it left, and each is
+        # handed the operation instance_execute() returned: queued, because
+        # the plugin's client does not wait for anything it submits.
+        # Returning that as given would report a command which finished
+        # long ago as abandoned without anybody having looked.
+        client, cluster = self._cluster(['complete'])
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=0))
+
+        self.assertEqual('complete', aop['state'])
+        self.assertEqual(0, elapsed)
+        self.assertEqual(1, client.get_agent_operation.call_count)
+
+    def test_an_operation_still_pending_past_its_deadline_is_read_only_once(self):
+        # Looking once is not waiting: one read, no sleep, and the pending
+        # state that read found is returned for the caller to report.
+        client, cluster = self._cluster(['queued'] * 100)
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=0))
+
+        self.assertEqual('queued', aop['state'])
+        self.assertEqual(0, elapsed)
+        self.assertEqual(1, client.get_agent_operation.call_count)
+
+    def test_an_operation_read_by_the_wait_is_not_read_again_at_the_deadline(self):
+        # The last read of the wait lands on the deadline, and nothing can
+        # have happened between it and the deadline check, so the look the
+        # timeout path takes is only for an operation this call has not
+        # read at all. One read a second for five seconds is five reads.
+        client, cluster = self._cluster(['queued'] * 100)
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=5))
+
+        self.assertEqual('queued', aop['state'])
+        self.assertEqual(5, elapsed)
+        self.assertEqual(5, client.get_agent_operation.call_count)
+
+    def test_an_api_error_from_the_look_past_the_deadline_propagates(self):
+        # As one from the wait's own reads does: _collect_probe() catches
+        # apiclient.APIException around await_execute() and reports it, and
+        # this must not swallow it into a pending state on its way there.
+        client, cluster = self._cluster([])
+        client.get_agent_operation.side_effect = apiclient.APIException(
+            'the server is too busy to answer', 'GET',
+            'http://sf-1:13000/agentoperations/aop-001', 503, 'busy')
+
+        self.assertRaises(
+            apiclient.APIException,
+            self._with_clock,
+            lambda: cluster.await_execute(_pending_aop(), timeout=0))
+
     def test_no_timeout_keeps_waiting(self):
         # Which is every caller but the probe. An install which takes
         # eleven minutes is a slow install, and abandoning it would leave
@@ -4337,6 +4469,14 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
             self.client.instances[instance_uuid] = {
                 'uuid': instance_uuid, 'name': name, 'state': 'created',
                 'agent_state': 'ready'}
+
+        # HealthClient hands every operation out queued, as the server does,
+        # so even a probe which completes is waited for through one sleep
+        # and one read. Real seconds would make this class slow for nothing.
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         self.cluster = _make_cluster(self.client)
 
     def test_an_agentless_control_plane_node_is_not_asked(self):
@@ -4673,9 +4813,22 @@ class HealthSignalsTestCase(testtools.TestCase):
 
         self.assertEqual(8, len(self.client.executed))
         self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS, elapsed)
-        # One read a second, for one budget, across every operation.
-        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS,
+        # One read a second for one budget, and then one look each at the
+        # operations left. The kubectl probe is collected first, with the
+        # whole budget: a sleep and a read each second, so 30 reads, the
+        # last landing exactly on the deadline, which the wait then finds
+        # has passed and does not read again. Each of the seven signals
+        # probes is collected after that with no time left, and is read once
+        # without sleeping, because the state it was handed is the one it
+        # was submitted in. 30 + 7 = 37, and it is exact rather than a range:
+        # fewer would mean a probe judged without being read, and more a
+        # wait which slept or looked twice after the deadline.
+        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 7,
                          self.client.agent_operation_reads)
+        self.assertEqual(
+            [cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS] + [1] * 7,
+            [self.client.agent_operation_reads_by_uuid.get(uuid, 0)
+             for uuid in sorted(self.client.operations)])
 
         self.assertFalse(report['api']['probed'])
         for node in report['nodes']:
@@ -4707,6 +4860,88 @@ class HealthSignalsTestCase(testtools.TestCase):
         self.assertTrue(self._node(report, 'inst-w1')['signals']['probed'])
         self.assertFalse(self._node(report, 'inst-w2')['signals']['probed'])
         self.assertTrue(report['healthy'])
+
+    def _signals_operation(self, instance_uuid):
+        return [uuid for uuid, (kind, inst, _) in self.client.operations.items()
+                if kind == 'signals' and inst == instance_uuid][0]
+
+    def test_signals_collected_after_the_deadline_are_read_not_judged_as_submitted(self):
+        # The kubectl probe never leaves 'queued' and so uses up the whole
+        # budget; it is collected first. Every signals operation is
+        # 'queued' as submitted, as the server returns every operation to
+        # an ASYNC_CONTINUE client, and 'complete' the first time anybody
+        # reads it. Collected after the deadline, each must still be read
+        # once and reported as the finished probe it is. The bug was that
+        # with no time left the wait returned the operation it was handed
+        # without reading it, so every node's signals were reported
+        # abandoned, still 'queued', on a cluster where every one of them
+        # had answered.
+        self.client.probe_state = 'queued'
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        # One budget, spent on the kubectl probe, which is abandoned.
+        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS, elapsed)
+        self.assertFalse(report['api']['probed'])
+        self.assertIn('had not finished after 30 seconds',
+                      report['api']['error'])
+        self.assertIn('agent operation aop-001 is still queued',
+                      report['api']['error'])
+
+        # And every node's signals, read once each after the deadline.
+        for node in report['nodes']:
+            self.assertTrue(node['healthy'], node)
+            signals = node['signals']
+            self.assertTrue(signals['probed'], signals)
+            self.assertIsNone(signals['error'], signals)
+            self.assertEqual(
+                1, self.client.agent_operation_reads_by_uuid.get(
+                    self._signals_operation(node['uuid']), 0), node['uuid'])
+
+        self.assertEqual(
+            {'probed': True, 'error': None,
+             'boot_id': '3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11',
+             'booted_at': 1759712345, 'k3s_unit': 'k3s',
+             'k3s_state': 'active', 'k3s_restarts': 3, 'oom_kills': 2,
+             'memory_total_bytes': 4022148 * 1024,
+             'memory_available_bytes': 2876544 * 1024,
+             'etcd_bytes': 68321280, 'etcd_snapshot_bytes': 41943040},
+            self._node(report, 'inst-cp1')['signals'])
+        for worker in ('inst-w1', 'inst-w2'):
+            signals = self._node(report, worker)['signals']
+            self.assertEqual('9a1d7c22-0e4b-4c5f-a0b3-77c1e2d4f6a8',
+                             signals['boot_id'])
+            self.assertEqual('k3s-agent', signals['k3s_unit'])
+            self.assertEqual('activating', signals['k3s_state'])
+            self.assertEqual(1102336 * 1024, signals['memory_available_bytes'])
+
+    def test_a_signals_probe_still_pending_after_the_deadline_is_abandoned(self):
+        # The other half of looking once: the one read after the deadline
+        # finds inst-w2's operation still queued, and that is reported as
+        # abandoned, naming the operation, without a second read or any
+        # further wait. The nodes beside it are read and answer.
+        self.client.probe_state = 'queued'
+        self.client.signals_state['inst-w2'] = 'queued'
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS, elapsed)
+        operation = self._signals_operation('inst-w2')
+        self.assertEqual(
+            1, self.client.agent_operation_reads_by_uuid.get(operation, 0))
+
+        signals = self._node(report, 'inst-w2')['signals']
+        self.assertFalse(signals['probed'])
+        self.assertEqual(
+            'the node signals command had not finished after 30 seconds '
+            '(agent operation %s is still queued), so the wait was '
+            'abandoned' % operation, signals['error'])
+        self.assertIsNone(signals['boot_id'])
+        self.assertTrue(self._node(report, 'inst-w2')['healthy'])
+
+        for other in ('inst-cp1', 'inst-w1'):
+            self.assertTrue(self._node(report, other)['signals']['probed'],
+                            other)
 
     # A signals probe never moves healthy.
 

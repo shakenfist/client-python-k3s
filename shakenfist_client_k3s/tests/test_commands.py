@@ -815,6 +815,61 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
             'etcd unknown MiB, snapshots 32 MiB\n', reporter.getvalue())
         self.assertNotIn('None', reporter.getvalue())
 
+    def test_a_boot_time_datetime_cannot_hold_renders_unknown(self):
+        # The parser accepts any count of digits as a btime, and datetime
+        # does not: 10**20 seconds is far past the year 9999, and
+        # fromtimestamp() raises for it (OverflowError, OSError or
+        # ValueError, depending on the platform and where it overflows).
+        # That must cost the one reading, not the report: the rest of the
+        # line, and the rest of the nodes, are rendered as usual.
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals']['booted_at'] = 10 ** 20
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn(
+            '        booted unknown, k3s active, 1 restarts, '
+            '0 OOM kills, 3000 of 4000 MiB available, '
+            'etcd 64 MiB, snapshots 32 MiB\n', reporter.getvalue())
+        self.assertIn('signals: not read (instance is gone)',
+                      reporter.getvalue())
+        self.assertIn('k3s API: answered on inst-cp1', reporter.getvalue())
+
+    def test_the_epoch_is_a_boot_time_and_not_unknown(self):
+        # The negative of the above: zero is a timestamp datetime can hold,
+        # and a falsy one, so it is rendered rather than caught or mistaken
+        # for a reading which was not taken.
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals']['booted_at'] = 0
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn('        booted 1970-01-01T00:00:00Z, k3s active, ',
+                      reporter.getvalue())
+
+    def test_the_largest_sizes_the_parser_can_make_still_render(self):
+        # The other conversions on an int, swept for the same failure:
+        # Python 3.11 and later refuse str() of an int past 4300 digits. The
+        # parser caps a reading at twenty digits, so it cannot produce one,
+        # but the renderer also takes reports a caller built, and must not
+        # raise on those either. A size near the limit, scaled by 1024 as
+        # memory is, renders because mib() divides before str() sees it.
+        biggest = int('9' * 4300)
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals'].update({
+            'memory_total_bytes': biggest * 1024,
+            'memory_available_bytes': biggest * 1024,
+            'k3s_restarts': biggest, 'oom_kills': biggest,
+            'etcd_bytes': biggest, 'etcd_snapshot_bytes': biggest})
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn('k3s API: answered on inst-cp1', reporter.getvalue())
+        self.assertIn(' MiB available, etcd ', reporter.getvalue())
+
     def test_a_worker_line_has_no_etcd(self):
         report = copy.deepcopy(self.REPORT)
         report['nodes'][1].update({'exists': True, 'name': 'w', 'state': 'created',

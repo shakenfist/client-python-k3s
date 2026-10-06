@@ -417,7 +417,7 @@ command, so it lives on that machine's entry.
 | `memory_total_bytes` | `MemTotal` from `/proc/meminfo`, converted from kB to bytes. |
 | `memory_available_bytes` | `MemAvailable` from `/proc/meminfo`, in bytes. |
 | `etcd_bytes` | Size of the embedded etcd data directory. Control plane nodes only. |
-| `etcd_snapshot_bytes` | Size of the etcd snapshot directory: the `etcd-snapshot-dir` recorded in the cluster's `server_config` when it has one, otherwise k3s's default. Control plane nodes only. |
+| `etcd_snapshot_bytes` | Size of the etcd snapshot directory: the `etcd-snapshot-dir` recorded in the cluster's `server_config` when it has one, otherwise k3s's default. A relative `etcd-snapshot-dir` reports `None`, because what k3s resolved it against cannot be known from the node's agent, and a size of the wrong directory would be worse than none. Control plane nodes only. |
 
 A reading which could not be taken is `None` on its own and voids none
 of the others; `error` is for the probe as a whole. `k3s_state` and

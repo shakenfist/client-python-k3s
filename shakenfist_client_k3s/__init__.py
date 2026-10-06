@@ -462,14 +462,30 @@ def _render_signals(out, node):
     def mib(reading):
         return 'unknown' if reading is None else str(reading // 1048576)
 
+    # The two conversions above cannot raise on anything the parser hands
+    # over: every reading is None or a non-negative int, str() of which is
+    # only refused past 4300 digits (Python 3.11 and later), the parser only
+    # converts strings of up to 4300 digits, and the only readings it scales
+    # beyond that, the memory sizes by 1024, reach str() through mib(),
+    # whose division by 1048576 takes them back under it. A timestamp is
+    # different, because the parser accepts any count and datetime does not:
+    # a btime past the year 9999, or past what the platform's time_t holds,
+    # raises OverflowError, OSError or ValueError depending on where it
+    # overflows. That is a reading which cannot be shown rather than a
+    # reason to lose the whole report, and the parser's rule is that
+    # nothing about a node's output can raise, so the renderer's has to be
+    # too: such a btime is 'unknown', as one which could not be read is.
     booted_at = signals.get('booted_at')
-    if booted_at is None:
-        booted = 'unknown'
-    else:
-        # Explicitly UTC: the operator and the node are rarely in the same
-        # timezone and a bare local time would be wrong for one of them.
-        booted = datetime.fromtimestamp(booted_at, timezone.utc).strftime(
-            '%Y-%m-%dT%H:%M:%SZ')
+    booted = 'unknown'
+    if booted_at is not None:
+        try:
+            # Explicitly UTC: the operator and the node are rarely in the
+            # same timezone and a bare local time would be wrong for one of
+            # them.
+            booted = datetime.fromtimestamp(booted_at, timezone.utc).strftime(
+                '%Y-%m-%dT%H:%M:%SZ')
+        except (OverflowError, OSError, ValueError):
+            booted = 'unknown'
 
     readings = [
         'booted %s' % booted,
