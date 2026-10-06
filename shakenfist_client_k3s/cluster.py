@@ -2184,6 +2184,13 @@ class Cluster:
             'state': 'initial',
             'node_serial': 1,
             'node_network': node_network['uuid'],
+            # Whether the network above is this cluster's to destroy. A
+            # network handed in with network= belongs to whoever made it,
+            # and may be carrying other clusters or instances, so delete()
+            # removes only one this create allocated. Its reader is
+            # _owns_node_network(), which classifies a cluster built before
+            # this key existed by the network's name instead.
+            'node_network_created': not network,
             'node_token': None,
             'control_plane_nodes': [],
             'worker_nodes': [],
@@ -2666,6 +2673,38 @@ class Cluster:
                         and api['answered'])
         }
 
+    def _owns_node_network(self, md):
+        """Return True if create() allocated md's node network, so delete() may destroy it.
+
+        A network handed to ``create(network=...)`` is borrowed: it belongs
+        to whoever made it, and may be carrying other clusters or
+        instances. Destroying it with the cluster was
+        shakenfist/client-python-k3s#41.
+
+        create() records which it was as ``node_network_created``. A
+        cluster built before that key existed has no record, and neither
+        default is safe for it: True keeps destroying borrowed networks,
+        and False leaks the network of every such cluster that made its
+        own. So those are classified by the network's name instead, which
+        is exact in the direction that matters -- create() has always
+        named the network it allocates ``k3s-<cluster>-node``, and a
+        borrowed network carrying that name would have to have been named
+        after this cluster by somebody else.
+
+        A network the API no longer has is not this cluster's to delete,
+        whoever made it: there is nothing left to remove.
+        """
+        if 'node_network_created' in md:
+            return bool(md['node_network_created'])
+
+        try:
+            network = self.client.get_network(md['node_network'])
+        except apiclient.ResourceNotFoundException:
+            return False
+        if not network:
+            return False
+        return network.get('name') == 'k3s-%s-node' % self.name
+
     def delete(self, update_kubeconfig=False):
         """Destroy this cluster and everything created alongside it.
 
@@ -2684,6 +2723,11 @@ class Cluster:
         wrote, which is why the two are symmetrical rather than
         independently defaulted: a caller which asked for the write asks for
         the cleanup too.
+
+        The node network is destroyed only if ``create()`` allocated it. A
+        network passed as ``create(network=...)`` is left in place, with
+        the cluster's routed addresses unrouted from it; see
+        _owns_node_network().
 
         This works on a cluster which never reached ``created``, and that
         is the only way out of an interrupted create: decision 5 of the
@@ -2782,13 +2826,17 @@ class Cluster:
                     self.reporter.debug(
                         '...Address %s was not routed to this network' % addr)
 
-            # Delete node network. This deletes the node network whether or
-            # not create allocated it, so a network handed to
-            # "create --network" is destroyed along with the cluster which
-            # borrowed it. That is shakenfist/client-python-k3s#41, and it is
-            # preserved here deliberately: this step moves code without
-            # changing what it does, and the fix belongs in its own change.
-            self.client.delete_network(md['node_network'])
+            # Delete the node network, but only if create allocated it. A
+            # network handed to "create --network" is borrowed, and is left
+            # for whoever owns it (shakenfist/client-python-k3s#41).
+            if self._owns_node_network(md):
+                self.reporter.debug('Deleting node network %s'
+                                    % md['node_network'])
+                self.client.delete_network(md['node_network'])
+            else:
+                self.reporter.debug(
+                    'Leaving node network %s in place: this cluster did not '
+                    'create it' % md['node_network'])
             # None, not []: everywhere else this key holds a network uuid
             # string, and create_instance() reads it as one.
             md['node_network'] = None

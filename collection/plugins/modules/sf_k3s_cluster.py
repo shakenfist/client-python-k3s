@@ -110,8 +110,9 @@ options:
       - Whether the cluster should be present or absent.
       - V(present) creates a cluster which does not exist and leaves one
         which does alone. V(absent) destroys the cluster, its instances and
-        the node network, and works on a cluster an earlier run interrupted
-        half way through building - which is the only way to clear one.
+        the node network if this module created it, and works on a cluster
+        an earlier run interrupted half way through building - which is the
+        only way to clear one.
     required: false
     default: present
     choices: [present, absent]
@@ -157,9 +158,8 @@ options:
       - The name or UUID of an existing Shaken Fist network to attach the
         cluster's nodes to. When omitted a network is created for the
         cluster.
-      - A borrowed network is destroyed along with the cluster, which is
-        shakenfist/client-python-k3s#41. Until that is fixed, do not point
-        two clusters at one network.
+      - A network named here is borrowed, so V(absent) leaves it in place
+        and only unroutes the addresses the cluster routed into it.
     required: false
     type: str
   release_channel:
