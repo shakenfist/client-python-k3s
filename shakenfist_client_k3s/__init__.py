@@ -1,4 +1,5 @@
 import click
+from datetime import datetime, timezone
 from shakenfist_client import apiclient
 import sys
 
@@ -401,6 +402,7 @@ def _render_health(out, report):
         if not node['exists']:
             out.write('    [%s] %s (%s): this instance no longer exists\n'
                       % (marker, node['uuid'], role))
+            _render_signals(out, node)
             continue
         # 'or' on the name for the same reason as on the agent state:
         # _node_health() reads every field with .get() so that a health
@@ -409,6 +411,7 @@ def _render_health(out, report):
         out.write('    [%s] %s (%s, %s): instance %s, agent %s\n' % (
             marker, node['name'] or '(unnamed)', node['uuid'], role,
             node['state'], node['agent_state'] or 'not yet contactable'))
+        _render_signals(out, node)
 
     api = report['api']
     if api['answered']:
@@ -424,6 +427,71 @@ def _render_health(out, report):
             if line:
                 out.write('    %s\n' % line)
     out.flush()
+
+
+def _render_signals(out, node):
+    """Write the one-line summary of a node's signals, if it has any.
+
+    The line is indented further than the node line it belongs to, so that
+    it reads as a property of that node and not as another node, and it is
+    only ever a statement of what was read. Nothing is judged here: there
+    are no markers and no thresholds, because whether 3 restarts or 200 MiB
+    available is a problem depends on what the cluster is for, and the
+    caller who knows that diffs the raw readings against a baseline (see
+    docs/library-api.md). A reading which could not be taken is written as
+    'unknown' rather than dropped, so the line keeps its shape and a
+    missing reading is visibly missing, and the literal string None never
+    appears.
+
+    A report without 'signals' at all (from an older library, or a
+    hand-built dict) is skipped rather than reported as an error, as
+    nothing was probed and nothing is being claimed.
+    """
+    signals = node.get('signals')
+    if signals is None:
+        return
+
+    if not signals.get('probed'):
+        out.write('        signals: not read (%s)\n'
+                  % (signals.get('error') or 'unknown'))
+        return
+
+    def value(reading):
+        return 'unknown' if reading is None else str(reading)
+
+    def mib(reading):
+        return 'unknown' if reading is None else str(reading // 1048576)
+
+    booted_at = signals.get('booted_at')
+    if booted_at is None:
+        booted = 'unknown'
+    else:
+        # Explicitly UTC: the operator and the node are rarely in the same
+        # timezone and a bare local time would be wrong for one of them.
+        booted = datetime.fromtimestamp(booted_at, timezone.utc).strftime(
+            '%Y-%m-%dT%H:%M:%SZ')
+
+    readings = [
+        'booted %s' % booted,
+        '%s %s, %s restarts' % (
+            value(signals.get('k3s_unit')), value(signals.get('k3s_state')),
+            value(signals.get('k3s_restarts'))),
+        '%s OOM kills' % value(signals.get('oom_kills')),
+        '%s of %s MiB available' % (
+            mib(signals.get('memory_available_bytes')),
+            mib(signals.get('memory_total_bytes')))]
+
+    # etcd only exists on the control plane, so a worker's line is shorter
+    # by design rather than by a failed reading.
+    if node.get('role') == 'control_plane':
+        readings.append('etcd %s MiB, snapshots %s MiB' % (
+            mib(signals.get('etcd_bytes')),
+            mib(signals.get('etcd_snapshot_bytes'))))
+
+    line = ', '.join(readings)
+    if signals.get('error'):
+        line += ' (%s)' % signals['error']
+    out.write('        %s\n' % line)
 
 
 @k3s.command(name='delete', help='Destroy a k3s cluster')

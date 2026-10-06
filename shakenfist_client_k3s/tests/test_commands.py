@@ -574,6 +574,64 @@ class HealthCommandTestCase(testtools.TestCase):
         self.assertIn('k3s-banana-node-001   Ready    control-plane',
                       result.output)
 
+    def test_a_healthy_cluster_renders_each_nodes_signals_under_its_line(self):
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+
+        # etcd is only read on the control plane, so only its line has the
+        # etcd readings.
+        self.assertIn(
+            '(inst-cp1, control plane): instance created, agent ready\n'
+            '        booted 2025-10-06T00:59:05Z, k3s active, 3 restarts, '
+            '2 OOM kills, 2809 of 3927 MiB available, '
+            'etcd 65 MiB, snapshots 40 MiB\n', result.output)
+        self.assertIn(
+            '(inst-w1, worker): instance created, agent ready\n'
+            '        booted 2025-10-06T00:59:59Z, k3s-agent activating, '
+            '0 restarts, 0 OOM kills, 1076 of 1963 MiB available\n',
+            result.output)
+        self.assertEqual(1, result.output.count('etcd '))
+        self.assertNotIn('None', result.output)
+
+    def test_a_node_whose_signals_were_skipped_says_so(self):
+        del self.client.instances['inst-w2']
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn(
+            '[!!] inst-w2 (worker): this instance no longer exists\n'
+            '        signals: not read (', result.output)
+        self.assertNotIn('None', result.output)
+
+    def test_a_node_with_missing_readings_renders_unknown(self):
+        # No memory or etcd lines at all, so those readings are None in
+        # the report and the line must keep its shape.
+        self.client.signals_stdout['inst-cp1'] = (
+            'boot_id=3f0c3c4e\nbooted_at=1759712345\noom_kills=2\n'
+            'NRestarts=3\nLoadState=loaded\nActiveState=active\n')
+
+        result = self._invoke()
+
+        self.assertIn(
+            '        booted 2025-10-06T00:59:05Z, k3s active, 3 restarts, '
+            '2 OOM kills, unknown of unknown MiB available, '
+            'etcd unknown MiB, snapshots unknown MiB\n', result.output)
+        self.assertNotIn('None', result.output)
+
+    def test_a_probed_node_with_an_error_appends_it(self):
+        self.client.signals_return_code['inst-w1'] = 1
+        self.client.signals_stderr['inst-w1'] = 'du: cannot read\n'
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertRegex(
+            result.output,
+            r'1076 of 1963 MiB available \(.+\)\n')
+        self.assertNotIn('None', result.output)
+
     def test_an_unhealthy_cluster_renders_and_still_exits_zero(self):
         self._make_unhealthy()
 
@@ -680,10 +738,24 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
         'nodes': [
             {'uuid': 'inst-cp1', 'role': 'control_plane',
              'name': 'k3s-banana-node-001', 'exists': True,
-             'state': 'created', 'agent_state': 'ready', 'healthy': True},
+             'state': 'created', 'agent_state': 'ready', 'healthy': True,
+             'signals': {
+                 'probed': True, 'error': None, 'boot_id': 'abc',
+                 'booted_at': 1759712345, 'k3s_unit': 'k3s',
+                 'k3s_state': 'active', 'k3s_restarts': 1, 'oom_kills': 0,
+                 'memory_total_bytes': 4 * 1048576 * 1000,
+                 'memory_available_bytes': 3 * 1048576 * 1000,
+                 'etcd_bytes': 64 * 1048576,
+                 'etcd_snapshot_bytes': 32 * 1048576}},
             {'uuid': 'inst-w1', 'role': 'worker', 'name': None,
              'exists': False, 'state': None, 'agent_state': None,
-             'healthy': False}
+             'healthy': False,
+             'signals': {
+                 'probed': False, 'error': 'instance is gone',
+                 'boot_id': None, 'booted_at': None, 'k3s_unit': 'k3s-agent',
+                 'k3s_state': None, 'k3s_restarts': None, 'oom_kills': None,
+                 'memory_total_bytes': None, 'memory_available_bytes': None,
+                 'etcd_bytes': None, 'etcd_snapshot_bytes': None}}
         ],
         'api': {
             'probed': True, 'answered': True, 'instance_uuid': 'inst-cp1',
@@ -711,6 +783,75 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
         self.assertIn('[!!] (unnamed) (inst-w1, worker): instance created',
                       reporter.getvalue())
         self.assertNotIn('None', reporter.getvalue())
+
+    def test_signals_render_under_each_node_line(self):
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, self.REPORT)
+
+        self.assertIn(
+            '(inst-cp1, control plane): instance created, agent ready\n'
+            '        booted 2025-10-06T00:59:05Z, k3s active, 1 restarts, '
+            '0 OOM kills, 3000 of 4000 MiB available, '
+            'etcd 64 MiB, snapshots 32 MiB\n', reporter.getvalue())
+        self.assertIn(
+            'this instance no longer exists\n'
+            '        signals: not read (instance is gone)\n',
+            reporter.getvalue())
+        self.assertNotIn('None', reporter.getvalue())
+
+    def test_unread_values_render_unknown_and_never_None(self):
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals'].update({
+            'k3s_state': None, 'k3s_restarts': None, 'booted_at': None,
+            'memory_available_bytes': None, 'etcd_bytes': None})
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn(
+            '        booted unknown, k3s unknown, unknown restarts, '
+            '0 OOM kills, unknown of 4000 MiB available, '
+            'etcd unknown MiB, snapshots 32 MiB\n', reporter.getvalue())
+        self.assertNotIn('None', reporter.getvalue())
+
+    def test_a_worker_line_has_no_etcd(self):
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][1].update({'exists': True, 'name': 'w', 'state': 'created',
+                                   'agent_state': 'ready'})
+        report['nodes'][1]['signals'].update({
+            'probed': True, 'error': None, 'booted_at': 0,
+            'k3s_state': 'active', 'k3s_restarts': 0, 'oom_kills': 0,
+            'memory_total_bytes': 1048576, 'memory_available_bytes': 1048576})
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn(
+            '        booted 1970-01-01T00:00:00Z, k3s-agent active, '
+            '0 restarts, 0 OOM kills, 1 of 1 MiB available\n',
+            reporter.getvalue())
+
+    def test_a_probed_node_with_an_error_appends_it(self):
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals']['error'] = 'du timed out'
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn('snapshots 32 MiB (du timed out)\n', reporter.getvalue())
+
+    def test_a_node_with_no_signals_at_all_is_skipped(self):
+        # A report from an older library, or built by hand.
+        report = copy.deepcopy(self.REPORT)
+        for node in report['nodes']:
+            del node['signals']
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertNotIn('booted', reporter.getvalue())
+        self.assertNotIn('signals:', reporter.getvalue())
 
     def test_the_report_goes_to_the_reporter_and_not_to_stdout(self):
         reporter = progress.CollectingReporter()
