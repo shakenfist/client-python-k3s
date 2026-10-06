@@ -466,6 +466,15 @@ MUTATIONS = [
         'tox',
     ),
     (
+        "delete -v does not log the kubeconfig read, which carries other clusters' credentials",
+        PKG + '/cluster.py',
+        "fqcn,\n                                       log_stdout=False)",
+        "fqcn,\n                                       log_stdout=True)",
+        PKG + '.tests.test_library_api.KubeconfigCleanupTestCase'
+        '.test_the_kubeconfig_read_is_never_logged',
+        'stestr',
+    ),
+    (
         'delete removes only the kubeconfig entries which are present',
         PKG + '/cluster.py',
         '            if fqcn not in present[section]:',

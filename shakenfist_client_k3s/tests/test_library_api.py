@@ -1313,6 +1313,42 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
             [['kubectl', 'config', 'delete-cluster', 'banana.testns']],
             self._deletes())
 
+    def test_the_kubeconfig_read_is_never_logged(self):
+        # Without --raw, kubectl config view redacts tokens, passwords and
+        # certificate data, but not an auth-provider's config or an exec
+        # plugin's env values -- and the read covers every cluster in the
+        # file, not only this one. A verbose delete must not log any of it.
+        # The kubectl output this cleanup is allowed to log is asserted
+        # too, so that this cannot pass because nothing was logged at all.
+        secrets = ['ID-TOKEN-SECRET', 'REFRESH-TOKEN-SECRET', 'EXEC-ENV-SECRET']
+        self.kubectl.view_stdout = json.dumps({
+            'kind': 'Config', 'apiVersion': 'v1',
+            'clusters': [{'name': 'banana.testns', 'cluster': {}},
+                         {'name': 'other', 'cluster': {}}],
+            'contexts': [{'name': 'banana.testns', 'context': {}}],
+            'users': [
+                {'name': 'banana.testns', 'user': {}},
+                {'name': 'oidc', 'user': {'auth-provider': {
+                    'name': 'oidc',
+                    'config': {'id-token': 'ID-TOKEN-SECRET',
+                               'refresh-token': 'REFRESH-TOKEN-SECRET'}}}},
+                {'name': 'aws', 'user': {'exec': {
+                    'command': 'aws-iam-authenticator',
+                    'env': [{'name': 'AWS_SECRET_ACCESS_KEY',
+                             'value': 'EXEC-ENV-SECRET'}]}}}],
+            'current-context': 'banana.testns'}).encode('utf-8')
+        self.kubectl.view_stderr = b'warning: from the read\n'
+        self.subprocess_run.return_value.stdout = b'deleted context banana.testns\n'
+        self.reporter = progress.CollectingReporter(verbose=True)
+
+        self._delete('banana', 'testns')
+
+        logged = self.reporter.getvalue()
+        self.assertIn('warning: from the read', logged)
+        self.assertIn('deleted context banana.testns', logged)
+        for secret in secrets:
+            self.assertNotIn(secret, logged)
+
     def test_a_failed_read_raises_and_deletes_nothing(self):
         self.kubectl.view_returncode = 1
         self.kubectl.view_stderr = b'error: unable to parse /home/u/.kube/config\n'

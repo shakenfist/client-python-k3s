@@ -3741,7 +3741,7 @@ class Cluster:
         if update_kubeconfig:
             self._delete_kubeconfig_entries()
 
-    def _run_local_kubectl(self, argv, fqcn):
+    def _run_local_kubectl(self, argv, fqcn, log_stdout=True):
         """Run a local kubectl argument list for delete(), capturing its output.
 
         capture_output is what stops kubectl's 'deleted context ...' lines
@@ -3751,13 +3751,19 @@ class Cluster:
         only confirm something the caller asked for. So does stderr on
         success, which is where kubectl warns that the context it removed
         was the current one.
+
+        log_stdout=False is for a command whose output is secret, which is
+        the kubeconfig read; its stderr is still logged.
         """
         try:
             result = subprocess.run(argv, capture_output=True)
         except FileNotFoundError:
             raise exceptions.KubeconfigError.missing_kubectl_on_delete(fqcn)
         if result.returncode == 0:
-            for output in (result.stdout, result.stderr):
+            outputs = [result.stderr]
+            if log_stdout:
+                outputs.insert(0, result.stdout)
+            for output in outputs:
                 if output:
                     self.reporter.debug(output.decode('utf-8', errors='replace').rstrip())
         return result
@@ -3772,9 +3778,15 @@ class Cluster:
         """
         fqcn = '%s.%s' % (self.name, self.namespace)
 
-        # Not --raw: only the names are needed, and without it kubectl
-        # redacts the credentials rather than handing them to this process.
-        view = self._run_local_kubectl(['kubectl', 'config', 'view', '-o', 'json'], fqcn)
+        # Not --raw, but that does not make the output safe to log. Without
+        # it kubectl replaces tokens, passwords and the certificate, key
+        # and CA data, but prints an auth-provider's config (an OIDC
+        # id-token, refresh-token or client-secret) and an exec plugin's env
+        # values as they are -- for every cluster in the file, not only
+        # this one. The output is therefore secret: it is parsed for names
+        # and never logged.
+        view = self._run_local_kubectl(['kubectl', 'config', 'view', '-o', 'json'], fqcn,
+                                       log_stdout=False)
         if view.returncode != 0:
             # Decoded at the raise, matching merge_failed() on the create side.
             stderr = None
