@@ -625,6 +625,84 @@ class DeleteClearsTheKeysCreateWroteTestCase(testtools.TestCase):
         self.assertIsNone(self._delete_and_capture()[-1]['node_network'])
 
 
+class DeleteNodeNetworkOwnershipTestCase(testtools.TestCase):
+    """delete() destroys the node network only if create() allocated it.
+
+    A network handed to create --network is borrowed, and destroying it
+    with the cluster took down whatever else was on it
+    (shakenfist/client-python-k3s#41). create() now records which it was as
+    node_network_created; a cluster built before that has no record, and
+    is classified by the network's name, because create() has always named
+    the network it allocates k3s-<cluster>-node. The end to end halves,
+    through create(), are in test_library_api.
+    """
+
+    def _delete(self, network=None, recorded=None):
+        """Delete a seeded cluster, returning the client it was deleted with.
+
+        network is what get_network() answers for the node network, or None
+        for a network the API no longer has. recorded is the
+        node_network_created value, or None for a cluster created before
+        the key existed.
+        """
+        class NetworkClient(ActionLogClient):
+            def get_network(self, network_ref):
+                self.network_lookups.append(network_ref)
+                if network is None:
+                    raise fakes.not_found(network_ref)
+                return network
+
+        client = NetworkClient()
+        client.network_lookups = []
+        client.metadata[primitives.CLUSTER_LIST] = ['banana']
+        md = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 1, 'node_network': 'net-1', 'node_token': None,
+            'control_plane_nodes': [], 'worker_nodes': [],
+            'routed_addresses': ['192.168.10.1']}
+        if recorded is not None:
+            md['node_network_created'] = recorded
+        client.metadata[MD_KEY] = md
+
+        with mock.patch('time.sleep', lambda seconds: None):
+            _make_cluster(client).delete()
+
+        # Whichever way the network went, the cluster's addresses are given
+        # back and the cluster itself is gone.
+        self.assertEqual([('net-1', '192.168.10.1')],
+                         client.unrouted_addresses)
+        self.assertNotIn(MD_KEY, client.metadata)
+        return client
+
+    def test_a_recorded_created_network_is_deleted_without_a_lookup(self):
+        client = self._delete(recorded=True)
+        self.assertEqual(['net-1'], client.deleted_networks)
+        self.assertEqual([], client.network_lookups)
+
+    def test_a_recorded_borrowed_network_is_kept_whatever_its_name(self):
+        # Named exactly as create would have named its own: the record is
+        # what decides, not the name.
+        client = self._delete(
+            network={'uuid': 'net-1', 'name': 'k3s-banana-node'},
+            recorded=False)
+        self.assertEqual([], client.deleted_networks)
+        self.assertEqual([], client.network_lookups)
+
+    def test_an_older_cluster_with_create_s_network_name_is_deleted(self):
+        client = self._delete(
+            network={'uuid': 'net-1', 'name': 'k3s-banana-node'})
+        self.assertEqual(['net-1'], client.deleted_networks)
+
+    def test_an_older_cluster_on_any_other_network_keeps_it(self):
+        for name in ('shared', 'k3s-apple-node', None):
+            client = self._delete(network={'uuid': 'net-1', 'name': name})
+            self.assertEqual([], client.deleted_networks, name)
+
+    def test_an_older_cluster_whose_network_is_gone_still_deletes(self):
+        client = self._delete(network=None)
+        self.assertEqual([], client.deleted_networks)
+
+
 class RemoveWorkerTestCase(testtools.TestCase):
     """remove-worker drains a worker out of k3s before it destroys it.
 

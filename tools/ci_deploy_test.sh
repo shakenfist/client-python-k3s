@@ -32,7 +32,12 @@ CLUSTER=ciMixed
 # default. It also disables and labels nothing, which makes it the positive
 # control for the main cluster's absence checks: Traefik and its svclb pods
 # have to appear here, or those checks are looking for the wrong names.
+#
+# It is also built on a network this script makes and hands it with
+# --network, because only a real delete can show that a borrowed network
+# outlives the cluster which borrowed it (shakenfist/client-python-k3s#41).
 MINIMAL_CLUSTER=ciMinimal
+MINIMAL_NETWORK=ciMinimalNet
 # Node sizes for the main cluster, shared by its create and the assertions
 # which read them back. Every value differs from the 2 / 2048 / 50 default
 # and from the other role's, so a dropped flag or a swapped role shows up
@@ -200,6 +205,16 @@ assert_instance_size() {
             "disk ${found_disk:-none} GB"
         exit 1
     fi
+}
+
+network_field() {
+    # One field of sf-client --simple network show, which prints NAME:VALUE
+    # lines. Fails, and so ends the script, if there is no such network.
+    local network=$1
+    local field=$2
+    local show_output
+    show_output=$(sf-client --simple network show "${network}")
+    echo "${show_output}" | awk -F: -v field="${field}" '$1 == field {print $2}'
 }
 
 count_labelled_nodes() {
@@ -523,6 +538,25 @@ if [ "${remaining}" -ne 0 ]; then
     exit 1
 fi
 
+status 'Create a network for the minimal cluster to borrow'
+# The shape create allocates for itself: DHCP and NAT, which are
+# sf-client's defaults. Waited for here because create looks a borrowed
+# network up but does not wait for it to finish being set up.
+sf-client network create "${MINIMAL_NETWORK}" 10.0.0.0/16 > /dev/null
+minimal_network_uuid=$(network_field "${MINIMAL_NETWORK}" uuid)
+minimal_network_state=''
+for _ in $(seq 60); do
+    minimal_network_state=$(network_field "${minimal_network_uuid}" state)
+    if [ "${minimal_network_state}" = 'created' ]; then
+        break
+    fi
+    sleep 2
+done
+if [ "${minimal_network_state}" != 'created' ]; then
+    echo "Network ${MINIMAL_NETWORK} is in state ${minimal_network_state:-unknown} after two minutes"
+    exit 1
+fi
+
 status 'Create a cluster with none of the optional components'
 # HOME is left alone on purpose: --no-kubeconfig has to be the thing that
 # leaves ~/.kube/config alone, not the absence of a home directory.
@@ -548,6 +582,7 @@ SERVERCONFIG
 sf-client k3s create "${MINIMAL_CLUSTER}" \
     --control-plane-count 1 --worker-count 1 --metal-address-count 0 \
     --no-metallb --no-longhorn --no-kubeconfig \
+    --network "${minimal_network_uuid}" \
     --server-config "${minimal_config_dir}/ci-server.yaml"
 
 # On the cluster and in its metadata now, as for the main cluster above.
@@ -662,5 +697,17 @@ if [ "${kubeconfig_before}" != "${kubeconfig_after}" ]; then
     echo "delete --no-kubeconfig changed ${HOME}/.kube/config anyway"
     exit 1
 fi
+
+status 'Verify the minimal cluster left the network it borrowed'
+# The state rather than the lookup succeeding, because a network Shaken
+# Fist has deleted can still be shown, in state deleted.
+minimal_network_state=$(network_field "${minimal_network_uuid}" state)
+if [ "${minimal_network_state}" != 'created' ]; then
+    echo "delete destroyed ${MINIMAL_NETWORK}, which create was given with --network"
+    echo "It is in state ${minimal_network_state:-unknown}"
+    exit 1
+fi
+# Left for the namespace teardown to remove, like anything else this
+# script makes.
 
 status 'Success'

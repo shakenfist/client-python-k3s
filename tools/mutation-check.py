@@ -237,6 +237,31 @@ MUTATIONS = [
         PKG + '.tests.test_cluster.ProgressIsStartedInOnePlaceTestCase',
         'stestr',
     ),
+    (
+        'delete leaves a network it did not create in place',
+        PKG + '/cluster.py',
+        '            if self._owns_node_network(md):',
+        '            if True:',
+        PKG + '.tests.test_cluster.DeleteNodeNetworkOwnershipTestCase',
+        'stestr',
+    ),
+    (
+        'create records a network it was given as borrowed',
+        PKG + '/cluster.py',
+        "            'node_network_created': not network,",
+        "            'node_network_created': True,",
+        PKG + '.tests.test_library_api.ClusterLifecycleTestCase'
+        '.test_delete_leaves_a_network_it_was_given',
+        'stestr',
+    ),
+    (
+        'an older cluster is classified by its network name',
+        PKG + '/cluster.py',
+        "        return network.get('name') == 'k3s-%s-node' % self.name",
+        '        return True',
+        PKG + '.tests.test_cluster.DeleteNodeNetworkOwnershipTestCase',
+        'stestr',
+    ),
 ]
 
 
