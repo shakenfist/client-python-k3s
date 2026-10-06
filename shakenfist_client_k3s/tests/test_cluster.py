@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -3049,6 +3050,389 @@ class HeredocDelimiterTestCase(testtools.TestCase):
                         '90-sf-client-k3s-enforced.yaml'):
             self.assertIn('/etc/rancher/k3s/config.yaml.d/' + drop_in,
                           destinations)
+
+
+class NodeSignalsCommandTestCase(testtools.TestCase):
+    """The command health() will run on each node to take its signals.
+
+    Decisions 5 and 6 of the cumulative health signals phase 1 plan: the
+    k3s unit is chosen by role, because a worker's is k3s-agent and asking
+    it about k3s reports a unit which does not exist as never having
+    restarted; and etcd is sized on control plane nodes only, at the
+    caller's etcd-snapshot-dir when there is one. That directory is the
+    one value in the command which is not a literal of cluster.py, so it
+    is the one rule 1 applies to.
+    """
+
+    def test_a_control_plane_node_reads_k3s_and_etcd(self):
+        command = cluster_module.node_signals_command('control_plane')
+
+        self.assertIn('systemctl show k3s -p LoadState -p ActiveState '
+                      '-p NRestarts', command)
+        self.assertNotIn('k3s-agent', command)
+        self.assertIn('etcd_bytes=', command)
+        self.assertIn('etcd_snapshot_bytes=', command)
+        self.assertIn('du -sb -- %s ' % cluster_module.K3S_ETCD_DIR, command)
+        self.assertIn('du -sb -- %s ' % cluster_module.K3S_ETCD_SNAPSHOT_DIR,
+                      command)
+
+    def test_a_worker_reads_k3s_agent_and_no_etcd(self):
+        command = cluster_module.node_signals_command('worker')
+
+        self.assertIn('systemctl show k3s-agent -p LoadState -p ActiveState '
+                      '-p NRestarts', command)
+        self.assertNotIn('systemctl show k3s ', command)
+        self.assertNotIn('etcd', command)
+        self.assertNotIn('du ', command)
+
+    def test_every_role_reads_the_same_proc_signals(self):
+        for role in ('control_plane', 'worker'):
+            command = cluster_module.node_signals_command(role)
+            for key in ('boot_id', 'booted_at', 'oom_kills',
+                        'memory_total_kb', 'memory_available_kb'):
+                self.assertIn("printf '%s=%%s\\n'" % key, command)
+            self.assertIn('/proc/sys/kernel/random/boot_id', command)
+            self.assertIn('"btime"', command)
+            self.assertIn('"oom_kill"', command)
+            self.assertIn('"MemTotal:"', command)
+            self.assertIn('"MemAvailable:"', command)
+
+    def test_the_command_is_one_line(self):
+        # The agent takes one command line. The '\n' in each printf format
+        # is a backslash and an n, for printf to interpret on the node.
+        for role in ('control_plane', 'worker'):
+            self.assertNotIn(
+                '\n', cluster_module.node_signals_command(role, '/x'))
+
+    def test_a_failing_systemctl_does_not_fail_the_command(self):
+        # On a worker the systemctl call is the last command, so its exit
+        # status would be the command line's.
+        for role in ('control_plane', 'worker'):
+            self.assertIn(
+                'NRestarts || true',
+                cluster_module.node_signals_command(role))
+
+    def test_the_snapshot_directory_is_quoted(self):
+        snapshot_dir = '/srv/etcd snaps/$HOME; touch /pwned'
+        command = cluster_module.node_signals_command(
+            'control_plane', snapshot_dir)
+
+        self.assertIn('du -sb -- %s 2>/dev/null' % shlex.quote(snapshot_dir),
+                      command)
+        self.assertNotIn(snapshot_dir,
+                         command.replace(shlex.quote(snapshot_dir), ''))
+        self.assertNotIn(cluster_module.K3S_ETCD_SNAPSHOT_DIR, command)
+
+    def test_an_empty_snapshot_directory_is_the_default(self):
+        # As it is to k3s, which uses its default for an empty
+        # etcd-snapshot-dir.
+        self.assertEqual(
+            cluster_module.node_signals_command('control_plane'),
+            cluster_module.node_signals_command('control_plane', ''))
+
+    def test_a_worker_ignores_the_snapshot_directory(self):
+        self.assertEqual(
+            cluster_module.node_signals_command('worker'),
+            cluster_module.node_signals_command('worker', '/srv/snaps'))
+
+    def test_an_unknown_role_is_refused(self):
+        # k3s's own role names are the likeliest mistake, because
+        # install_k3s_component() is handed those.
+        for role in ('server', 'agent', 'controlplane', '', None,
+                     ['worker']):
+            self.assertRaises(ValueError,
+                              cluster_module.node_signals_command, role)
+            self.assertRaises(ValueError,
+                              cluster_module.parse_node_signals, '', role)
+
+
+SERVER_SIGNALS_OUTPUT = (
+    'boot_id=3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11\n'
+    'booted_at=1759712345\n'
+    'oom_kills=2\n'
+    'memory_total_kb=4022148\n'
+    'memory_available_kb=2876544\n'
+    'NRestarts=3\n'
+    'LoadState=loaded\n'
+    'ActiveState=active\n'
+    'etcd_bytes=68321280\n'
+    'etcd_snapshot_bytes=41943040\n')
+
+WORKER_SIGNALS_OUTPUT = (
+    'boot_id=9a1d7c22-0e4b-4c5f-a0b3-77c1e2d4f6a8\n'
+    'booted_at=1759712399\n'
+    'oom_kills=0\n'
+    'memory_total_kb=2010264\n'
+    'memory_available_kb=1102336\n'
+    'NRestarts=0\n'
+    'LoadState=loaded\n'
+    'ActiveState=activating\n')
+
+
+class ParseNodeSignalsTestCase(testtools.TestCase):
+    """What a node's signals output becomes in health()'s report.
+
+    Decision 1 of the cumulative health signals phase 1 plan: always the
+    same keys, a reading which could not be taken is None on its own, and
+    a zero is only reported where it was measured. The output comes from a
+    node which may be unwell, so nothing a node prints may make this raise.
+    """
+
+    def test_a_realistic_server_output(self):
+        self.assertEqual(
+            {
+                'boot_id': '3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11',
+                'booted_at': 1759712345,
+                'k3s_unit': 'k3s',
+                'k3s_state': 'active',
+                'k3s_restarts': 3,
+                'oom_kills': 2,
+                'memory_total_bytes': 4022148 * 1024,
+                'memory_available_bytes': 2876544 * 1024,
+                'etcd_bytes': 68321280,
+                'etcd_snapshot_bytes': 41943040,
+            },
+            cluster_module.parse_node_signals(
+                SERVER_SIGNALS_OUTPUT, 'control_plane'))
+
+    def test_a_realistic_worker_output(self):
+        self.assertEqual(
+            {
+                'boot_id': '9a1d7c22-0e4b-4c5f-a0b3-77c1e2d4f6a8',
+                'booted_at': 1759712399,
+                'k3s_unit': 'k3s-agent',
+                'k3s_state': 'activating',
+                'k3s_restarts': 0,
+                'oom_kills': 0,
+                'memory_total_bytes': 2010264 * 1024,
+                'memory_available_bytes': 1102336 * 1024,
+                'etcd_bytes': None,
+                'etcd_snapshot_bytes': None,
+            },
+            cluster_module.parse_node_signals(
+                WORKER_SIGNALS_OUTPUT, 'worker'))
+
+    def test_the_key_set_is_always_the_same(self):
+        expected = set(cluster_module.NODE_SIGNAL_KEYS)
+        self.assertEqual(10, len(expected))
+        for stdout, role in ((SERVER_SIGNALS_OUTPUT, 'control_plane'),
+                             (WORKER_SIGNALS_OUTPUT, 'worker'),
+                             ('', 'control_plane'), (None, 'worker'),
+                             ('rubbish', 'worker')):
+            self.assertEqual(
+                expected,
+                set(cluster_module.parse_node_signals(stdout, role)))
+
+    def test_a_unit_which_is_not_loaded_has_no_state_or_restarts(self):
+        # What systemctl prints for a unit which does not exist: a zero
+        # restart count which would otherwise read as a measurement.
+        stdout = SERVER_SIGNALS_OUTPUT.replace(
+            'LoadState=loaded', 'LoadState=not-found').replace(
+            'NRestarts=3', 'NRestarts=0').replace(
+            'ActiveState=active', 'ActiveState=inactive')
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+
+        self.assertEqual('k3s', signals['k3s_unit'])
+        self.assertIsNone(signals['k3s_state'])
+        self.assertIsNone(signals['k3s_restarts'])
+        # The other readings are not voided by it.
+        self.assertEqual(2, signals['oom_kills'])
+        self.assertEqual(68321280, signals['etcd_bytes'])
+
+    def test_a_missing_load_state_is_not_loaded(self):
+        stdout = SERVER_SIGNALS_OUTPUT.replace('LoadState=loaded\n', '')
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+        self.assertIsNone(signals['k3s_state'])
+        self.assertIsNone(signals['k3s_restarts'])
+
+    def test_empty_output_is_all_none_but_the_unit(self):
+        for stdout in ('', None, '\n\n'):
+            for role, unit in (('control_plane', 'k3s'),
+                               ('worker', 'k3s-agent')):
+                expected = dict.fromkeys(cluster_module.NODE_SIGNAL_KEYS)
+                expected['k3s_unit'] = unit
+                self.assertEqual(
+                    expected,
+                    cluster_module.parse_node_signals(stdout, role))
+
+    def test_readings_which_could_not_be_taken_are_none_on_their_own(self):
+        # What the command prints when a source is unreadable: the key,
+        # with nothing after it.
+        stdout = SERVER_SIGNALS_OUTPUT.replace(
+            'oom_kills=2', 'oom_kills=').replace(
+            'boot_id=3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11', 'boot_id=').replace(
+            'etcd_snapshot_bytes=41943040', 'etcd_snapshot_bytes=')
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+
+        self.assertIsNone(signals['oom_kills'])
+        self.assertIsNone(signals['boot_id'])
+        self.assertIsNone(signals['etcd_snapshot_bytes'])
+        self.assertEqual(1759712345, signals['booted_at'])
+        self.assertEqual(68321280, signals['etcd_bytes'])
+        self.assertEqual(3, signals['k3s_restarts'])
+
+    def test_garbage_values_are_none(self):
+        # Each is something int() would either refuse or, worse, accept:
+        # a sign, a digit separator, non-ASCII digits, and a string longer
+        # than Python 3.11 will convert at all.
+        stdout = (
+            'boot_id=   \n'
+            'booted_at=yesterday\n'
+            'oom_kills=-1\n'
+            'memory_total_kb=12.5\n'
+            'memory_available_kb=١٢٣\n'
+            'LoadState=loaded\n'
+            'ActiveState=\n'
+            'NRestarts=+3\n'
+            'etcd_bytes=1_000\n'
+            'etcd_snapshot_bytes=%s\n' % ('9' * 5000))
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+
+        expected = dict.fromkeys(cluster_module.NODE_SIGNAL_KEYS)
+        expected['k3s_unit'] = 'k3s'
+        self.assertEqual(expected, signals)
+
+    def test_trailing_whitespace_and_crlf_are_stripped(self):
+        stdout = SERVER_SIGNALS_OUTPUT.replace('\n', ' \r\n').replace(
+            'oom_kills=2', 'oom_kills=\t2')
+        self.assertEqual(
+            cluster_module.parse_node_signals(
+                SERVER_SIGNALS_OUTPUT, 'control_plane'),
+            cluster_module.parse_node_signals(stdout, 'control_plane'))
+
+    def test_a_worker_has_no_etcd_whatever_it_prints(self):
+        stdout = WORKER_SIGNALS_OUTPUT + (
+            'etcd_bytes=68321280\n'
+            'etcd_snapshot_bytes=41943040\n')
+        signals = cluster_module.parse_node_signals(stdout, 'worker')
+        self.assertIsNone(signals['etcd_bytes'])
+        self.assertIsNone(signals['etcd_snapshot_bytes'])
+
+    def test_lines_and_keys_which_are_not_readings_are_ignored(self):
+        stdout = ('sh: 1: something: not found\n'
+                  'Unit=k3s\n'
+                  'k3s_unit=k3s-agent\n'
+                  '=7\n' + SERVER_SIGNALS_OUTPUT)
+        self.assertEqual(
+            cluster_module.parse_node_signals(
+                SERVER_SIGNALS_OUTPUT, 'control_plane'),
+            cluster_module.parse_node_signals(stdout, 'control_plane'))
+
+    def test_a_value_is_split_from_its_key_at_the_first_equals(self):
+        stdout = SERVER_SIGNALS_OUTPUT.replace(
+            'ActiveState=active', 'ActiveState=a=b')
+        self.assertEqual(
+            'a=b',
+            cluster_module.parse_node_signals(
+                stdout, 'control_plane')['k3s_state'])
+
+    def test_the_first_occurrence_of_a_key_wins(self):
+        # The snapshot size is printed last and is the one value derived
+        # from caller data, so a directory name holding a newline and a
+        # line of its own cannot replace a reading printed before it.
+        stdout = SERVER_SIGNALS_OUTPUT + 'boot_id=evil\nNRestarts=0\n'
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+        self.assertEqual('3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11',
+                         signals['boot_id'])
+        self.assertEqual(3, signals['k3s_restarts'])
+
+    def test_no_string_makes_it_raise(self):
+        for stdout in ('=', '==', '\x00=\x00', 'booted_at=\udcff',
+                       '\n'.join('%s=%s' % (k, k)
+                                 for k in cluster_module.NODE_SIGNAL_KEYS),
+                       'LoadState=loaded\nNRestarts=²'):
+            for role in ('control_plane', 'worker'):
+                cluster_module.parse_node_signals(stdout, role)
+
+
+class NodeSignalsCommandRunsTestCase(testtools.TestCase):
+    """The command parses as shell and survives its own quoting.
+
+    The other tests compare the command with strings, which cannot tell
+    whether the awk programs' quotes nest correctly inside the command
+    substitutions, or whether a quoted snapshot directory reaches du
+    intact. This runs it with the local /bin/sh. systemctl is replaced by
+    a script on PATH, so that the unit's readings are this test's rather
+    than the host's. The /proc readings are the host's, so the only
+    assertions about them are that they are there and are numbers; it is
+    skipped where there is no /proc to read.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if not sys.platform.startswith('linux'):
+            self.skipTest('the command reads Linux /proc files')
+        for path in ('/bin/sh', '/proc/stat', '/proc/meminfo'):
+            if not os.path.exists(path):
+                self.skipTest('%s does not exist' % path)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.bin = os.path.join(self.tmp, 'bin')
+        os.mkdir(self.bin)
+
+    def _systemctl(self, script):
+        path = os.path.join(self.bin, 'systemctl')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#!/bin/sh\n' + script)
+        os.chmod(path, 0o755)
+
+    def _run(self, role, snapshot_dir=None):
+        env = dict(os.environ)
+        env['PATH'] = '%s:%s' % (self.bin, env.get('PATH', '/usr/bin:/bin'))
+        return subprocess.run(
+            ['/bin/sh', '-c',
+             cluster_module.node_signals_command(role, snapshot_dir)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, env=env)
+
+    def test_a_control_plane_node(self):
+        self._systemctl(
+            'printf "NRestarts=4\\nLoadState=loaded\\nActiveState=active\\n"\n')
+        # Every character rule 1 exists for, in the one value it covers.
+        snapshot_dir = os.path.join(
+            self.tmp, 'snaps $HOME \'q\' "dq" ) `id`; x')
+        os.mkdir(snapshot_dir)
+        with open(os.path.join(snapshot_dir, 'snapshot'), 'wb') as f:
+            f.write(b'x' * 5000)
+
+        result = self._run('control_plane', snapshot_dir)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        signals = cluster_module.parse_node_signals(
+            result.stdout, 'control_plane')
+        self.assertIsInstance(signals['booted_at'], int, result.stdout)
+        self.assertIsInstance(signals['memory_total_bytes'], int,
+                              result.stdout)
+        self.assertEqual('active', signals['k3s_state'])
+        self.assertEqual(4, signals['k3s_restarts'])
+        # du -sb counts the directory as well as the file.
+        self.assertGreaterEqual(signals['etcd_snapshot_bytes'], 5000,
+                                result.stdout)
+
+    def test_a_worker_whose_systemctl_fails(self):
+        # The last command on a worker, and the one whose exit status
+        # '|| true' keeps from becoming the probe's.
+        self._systemctl(
+            'echo "System has not been booted with systemd" >&2\nexit 1\n')
+
+        result = self._run('worker')
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        signals = cluster_module.parse_node_signals(result.stdout, 'worker')
+        self.assertIsInstance(signals['booted_at'], int, result.stdout)
+        self.assertIsNone(signals['k3s_state'])
+        self.assertIsNone(signals['k3s_restarts'])
+
+    def test_a_missing_directory_is_none_not_zero(self):
+        self._systemctl('exit 0\n')
+        result = self._run('control_plane',
+                           os.path.join(self.tmp, 'does-not-exist'))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('etcd_snapshot_bytes=\n', result.stdout)
+        self.assertIsNone(cluster_module.parse_node_signals(
+            result.stdout, 'control_plane')['etcd_snapshot_bytes'])
 
 
 # The framing every k3s configuration file is written with: a quoted

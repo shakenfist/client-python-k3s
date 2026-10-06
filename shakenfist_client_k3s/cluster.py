@@ -291,6 +291,63 @@ K3S_AGENT_OWNED_KEYS = frozenset([
 # check_k3s_release() parses from the release string.
 K3S_RELEASE_FLOOR = (1, 21, 1)
 
+# The systemd unit k3s runs as on each kind of node, keyed by the role
+# strings health() and _node_health() use. The names are not ours to
+# choose: install_control_plane() and install_k3s_component() run the
+# installer as 'sh -s - <role>', and get.k3s.io names the unit 'k3s' for
+# 'server' and 'k3s-<role>' for anything else, so a worker's is
+# 'k3s-agent'. Asking a worker about 'k3s' is not an error -- systemctl
+# reports a unit which does not exist as LoadState=not-found and
+# NRestarts=0, which reads as "never restarted" -- and that is why the
+# unit is chosen by role rather than assumed (survey finding 2 of
+# docs/plans/PLAN-cumulative-health-signals-phase-01-agent-signals.md).
+K3S_UNIT_BY_ROLE = {
+    'control_plane': 'k3s',
+    'worker': 'k3s-agent',
+}
+
+# Where a server keeps its embedded etcd member. Every cluster this plugin
+# builds runs embedded etcd, because install_control_plane() sets
+# cluster-init on the first server, and the path is fixed because
+# data-dir is in K3S_SERVER_OWNED_KEYS: k3s's server data directory is
+# /var/lib/rancher/k3s/server, and the member lives in db/etcd under it.
+K3S_ETCD_DIR = '/var/lib/rancher/k3s/server/db/etcd'
+
+# Where k3s writes etcd snapshots when nobody says otherwise: its
+# etcd-snapshot-dir defaults to db/snapshots under the same server data
+# directory. Unlike data-dir, etcd-snapshot-dir is not an owned key, so a
+# caller's server_config can move the snapshots, which is why
+# node_signals_command() takes the directory as an argument and only falls
+# back to this one.
+K3S_ETCD_SNAPSHOT_DIR = '/var/lib/rancher/k3s/server/db/snapshots'
+
+# The readings parse_node_signals() returns: the keys of the ``signals``
+# dict health() reports on each node, less ``probed`` and ``error`` (decision
+# 1 of the cumulative health signals phase 1 plan). Named here so that the
+# report for a node which was never probed can be built with exactly the
+# keys of one which was, which is the rule the ``api`` report already
+# follows: a caller must not have to work out what happened from which
+# keys exist.
+NODE_SIGNAL_KEYS = (
+    'boot_id',
+    'booted_at',
+    'k3s_unit',
+    'k3s_state',
+    'k3s_restarts',
+    'oom_kills',
+    'memory_total_bytes',
+    'memory_available_bytes',
+    'etcd_bytes',
+    'etcd_snapshot_bytes',
+)
+
+# Matches a reading parse_node_signals() will believe is a count or a
+# size. Narrower than what int() accepts on purpose: int() also takes a
+# sign, '_' digit separators and non-ASCII digits, none of which the
+# command prints, so a value carrying one is not a reading and is reported
+# as None rather than coerced into one.
+NODE_SIGNAL_INTEGER_RE = re.compile(r'\A[0-9]+\Z')
+
 # Every command this module builds is a shell command line, run as root on
 # a cluster node by the in-guest agent. Two rules keep that safe, and they
 # are rules rather than case by case judgements because the next reader
@@ -367,6 +424,205 @@ def heredoc(remote_path, body, delimiter='EOF'):
             remote_path, delimiter)
     return ("cat - > %s << '%s'\n%s%s\n"
             % (shlex.quote(remote_path), delimiter, body, delimiter))
+
+
+def k3s_unit_for_role(role):
+    """Return the systemd unit k3s runs as on a node of role.
+
+    role is 'control_plane' or 'worker', the strings _node_health() is
+    given; see K3S_UNIT_BY_ROLE for why the answer differs. Anything else
+    raises ValueError rather than falling back to either unit, because the
+    wrong unit is not an error systemctl reports: it is a unit which is not
+    loaded, which would turn every reading of it into None on a node whose
+    k3s is perfectly well.
+    """
+    try:
+        return K3S_UNIT_BY_ROLE[role]
+    except (KeyError, TypeError):
+        raise ValueError(
+            'role must be one of %s, not %r'
+            % (', '.join(sorted(K3S_UNIT_BY_ROLE)), role)) from None
+
+
+def _signal_reading(key, reading):
+    """Build the command which prints 'key=<what reading printed>', always.
+
+    The key line is printed whether or not reading succeeds, and a reading
+    which fails prints an empty value, so one unreadable source can neither
+    hide the others nor fail the command line it is part of. That is what
+    lets parse_node_signals() report a reading it could not take as None on
+    its own, and what keeps a missing directory from being reported as the
+    whole probe failing.
+
+    printf rather than echo, because Debian's /bin/sh is dash, whose echo
+    interprets backslash escapes in its arguments; printf only interprets
+    them in its format, which is a literal here. The command substitution
+    strips the reading's trailing newline, which is the one the format puts
+    back. Quoting inside "$( )" starts afresh, so a reading may carry its
+    own single quoted awk program.
+    """
+    return "printf '%s=%%s\\n' \"$(%s)\"" % (key, reading)
+
+
+def _proc_field(path, field):
+    """Build the command which prints the second field of path's line for field.
+
+    /proc/stat, /proc/vmstat and /proc/meminfo are all lines of a name and
+    a number, separated by whitespace. field is matched against the whole
+    first field, so 'MemTotal:' keeps its colon and 'oom_kill' does not
+    also match 'oom_kill_other' should a later kernel add one. exit after
+    the first match so that a name appearing twice still prints one value.
+    The program is POSIX awk, because Debian 12 ships mawk and not gawk.
+    Both arguments are this module's literals, so neither is quoted (rule
+    1 above).
+    """
+    return "awk '$1 == \"%s\" { print $2; exit }' %s" % (field, path)
+
+
+def node_signals_command(role, snapshot_dir=None):
+    """Build the read only command which takes a node's health signals.
+
+    Returns one shell command line, for the in-guest agent to run as root,
+    which prints 'key=value' lines for parse_node_signals() to read:
+    boot_id, booted_at, oom_kills, memory_total_kb and memory_available_kb
+    from /proc; then whatever 'systemctl show' prints for the k3s unit's
+    LoadState, ActiveState and NRestarts; and on a control plane node only,
+    etcd_bytes and etcd_snapshot_bytes, the 'du -sb' sizes of the embedded
+    etcd member and of its snapshot directory. Each reading is independent
+    of the others, and one which cannot be taken prints its key with an
+    empty value (see _signal_reading()).
+
+    The command exits 0 whatever it finds. Every /proc reading and both
+    sizes end in a printf, which succeeds; systemctl is the one command
+    whose own exit status would otherwise reach the caller -- as the last
+    command on a worker -- and it is followed by '|| true' because the only
+    way it fails is a node without a running systemd, where it prints
+    nothing and the unit's readings are None, which says so. A non-zero exit
+    is therefore left meaning what it should: the agent could not run the
+    command at all.
+
+    du's errors are discarded because a snapshot directory which does not
+    exist is an expected state, not a fault -- k3s creates it with the first
+    snapshot -- and decision 6 reports it as None rather than as 0. The
+    other readings' errors are left on stderr: none of them is expected to
+    fail, so one which does is worth finding in the agent operation log.
+    '--' ends du's options, so that a snapshot directory beginning with a
+    hyphen is a path and not a flag.
+
+    snapshot_dir is the cluster's etcd-snapshot-dir, from a caller's
+    server_config, and is caller data, so it is quoted per rule 1 above;
+    it is the only value here which is not one of this module's literals.
+    None or an empty string means K3S_ETCD_SNAPSHOT_DIR, as an empty
+    etcd-snapshot-dir does to k3s. It is ignored for a worker, which has
+    no etcd member to size.
+    """
+    unit = k3s_unit_for_role(role)
+    commands = [
+        _signal_reading('boot_id', 'cat /proc/sys/kernel/random/boot_id'),
+        _signal_reading('booted_at', _proc_field('/proc/stat', 'btime')),
+        _signal_reading('oom_kills', _proc_field('/proc/vmstat', 'oom_kill')),
+        _signal_reading('memory_total_kb',
+                        _proc_field('/proc/meminfo', 'MemTotal:')),
+        _signal_reading('memory_available_kb',
+                        _proc_field('/proc/meminfo', 'MemAvailable:')),
+        ('systemctl show %s -p LoadState -p ActiveState -p NRestarts || true'
+         % unit),
+    ]
+
+    if role == 'control_plane':
+        commands.append(_signal_reading(
+            'etcd_bytes',
+            'du -sb -- %s 2>/dev/null | cut -f1' % K3S_ETCD_DIR))
+        commands.append(_signal_reading(
+            'etcd_snapshot_bytes',
+            'du -sb -- %s 2>/dev/null | cut -f1'
+            % shlex.quote(snapshot_dir or K3S_ETCD_SNAPSHOT_DIR)))
+
+    return '; '.join(commands)
+
+
+def _signal_integer(raw, key, scale=1):
+    """Return raw[key] as an int times scale, or None if it is not a count.
+
+    None for a key the output did not carry, for an empty value (a reading
+    which could not be taken), and for anything NODE_SIGNAL_INTEGER_RE does
+    not match. int() is still guarded, because Python 3.11 and later refuse
+    to convert a string of more than 4300 digits, and this must not raise.
+    """
+    value = raw.get(key)
+    if value is None or not NODE_SIGNAL_INTEGER_RE.match(value):
+        return None
+    try:
+        return int(value) * scale
+    except ValueError:
+        return None
+
+
+def parse_node_signals(stdout, role):
+    """Turn node_signals_command()'s output into health()'s readings.
+
+    Returns a dict with exactly the keys in NODE_SIGNAL_KEYS, whatever
+    stdout holds. A reading the output does not carry, or carries in a
+    form which is not a reading, is None on its own and voids none of the
+    others. None of it is judged: these are facts for a caller who has a
+    baseline to compare them with (decisions 2 and 3 of the cumulative
+    health signals phase 1 plan).
+
+    Lines are split on their first '=', so a value may contain one; a line
+    without one, and a key this does not know, are ignored, which is how
+    a stray line of output is survived rather than reported. Keys and
+    values are stripped, so that a CRLF or trailing space does not make a
+    count unparsable. The first occurrence of a key wins: the command
+    prints every key this reads before the one value which derives from
+    caller data, the snapshot directory's size, so a directory name
+    carrying a newline and a 'key=' line of its own cannot replace a
+    reading which came before it.
+
+    The units are made uniform here rather than in the command: memory is
+    converted from /proc/meminfo's kB (which are KiB) to bytes, so every
+    size in the report is in bytes. k3s_state and k3s_restarts are None
+    unless the unit's LoadState is 'loaded', because systemctl reports
+    NRestarts=0 for a unit which does not exist and zero would be a claim.
+    The etcd sizes are None on a worker whatever the output says, because
+    a worker has no etcd member and a number there would be one somebody
+    else's command printed. k3s_unit is always the unit the command asked
+    about, from role, so a reader does not have to know the installer's
+    naming to know what k3s_state describes.
+
+    stdout of None is read as empty. Nothing here raises for any string,
+    which matters because the output comes from a node which is, by the
+    time anybody asks, possibly unwell. role is validated as it is by
+    node_signals_command(), and raises ValueError for the same reasons.
+    """
+    unit = k3s_unit_for_role(role)
+
+    raw = {}
+    for line in (stdout or '').splitlines():
+        key, separator, value = line.partition('=')
+        if not separator:
+            continue
+        raw.setdefault(key.strip(), value.strip())
+
+    signals = dict.fromkeys(NODE_SIGNAL_KEYS)
+    signals['k3s_unit'] = unit
+    signals['boot_id'] = raw.get('boot_id') or None
+    signals['booted_at'] = _signal_integer(raw, 'booted_at')
+    signals['oom_kills'] = _signal_integer(raw, 'oom_kills')
+    signals['memory_total_bytes'] = _signal_integer(
+        raw, 'memory_total_kb', scale=1024)
+    signals['memory_available_bytes'] = _signal_integer(
+        raw, 'memory_available_kb', scale=1024)
+
+    if raw.get('LoadState') == 'loaded':
+        signals['k3s_state'] = raw.get('ActiveState') or None
+        signals['k3s_restarts'] = _signal_integer(raw, 'NRestarts')
+
+    if role == 'control_plane':
+        signals['etcd_bytes'] = _signal_integer(raw, 'etcd_bytes')
+        signals['etcd_snapshot_bytes'] = _signal_integer(
+            raw, 'etcd_snapshot_bytes')
+
+    return signals
 
 
 def read_manifests(paths):
