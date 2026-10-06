@@ -359,11 +359,16 @@ result.
 `kubectl` probe carries a timeout, and it is skipped altogether when
 the node it would run on is not up. Both are reported as
 `api['probed'] is False` with an explanatory `api['error']`, and
-neither raises. An abandoned probe does leave its operation queued
-against the control plane node until the server's deadline ends it, and
-`api['error']` names that operation: a caller polling `health()` in a
-loop should know that a later `expand_workers()` or `update_os()` waits
-for those alongside its own commands.
+neither raises. Every probe -- the `kubectl` one and one signals probe
+per healthy node (see "What `signals` reports", below) -- is submitted
+before any is waited for, and all of them are waited for under one
+shared budget, so the bound is one budget on a cluster of any size.
+An abandoned run does leave operations queued until the server's
+deadline ends them: up to one per probed node, plus the `kubectl` one
+on the control plane node. `api['error']` names the `kubectl`
+operation, and a caller polling `health()` in a loop should know that a
+later `expand_workers()` or `update_os()` waits for those alongside its
+own commands.
 
 That wait is a delay and not a failure, and the mechanism is worth
 stating because the obvious implementation gets it wrong.
@@ -391,6 +396,58 @@ how the cluster was built rather than on what state it is in.
 cluster metadata, and a verb that drives one of those components reads
 it before it does anything. Metadata written before those keys existed
 is read as having both components, which every such cluster does.
+
+### What `signals` reports
+
+Every node entry in `health()`'s report carries a `signals` dict, with
+the same twelve keys in every outcome. Each reading is a fact about one
+machine, read through that machine's agent by one short read-only
+command, so it lives on that machine's entry.
+
+| Key | What it is, and where it comes from |
+|---|---|
+| `probed` | The command ran at all. |
+| `error` | Why it did not, or why it failed: the instance is gone, the node is not up, the probe was abandoned at the deadline, the operation failed, or the command exited non-zero. A node that was not probed says why in the words `api['error']` uses for a skipped probe. `None` when the probe ran cleanly. |
+| `boot_id` | `/proc/sys/kernel/random/boot_id`, which changes at every boot. |
+| `booted_at` | `btime` from `/proc/stat`, in Unix seconds. The same fact as `boot_id`, in a form a person can read. |
+| `k3s_unit` | The systemd unit k3s runs as: `k3s` on control plane nodes and `k3s-agent` on workers. Reported so that a reader does not have to know the installer's naming. |
+| `k3s_state` | That unit's systemd `ActiveState`. |
+| `k3s_restarts` | That unit's systemd `NRestarts`. |
+| `oom_kills` | `oom_kill` from `/proc/vmstat`: every kernel OOM kill since boot, including a pod exceeding its own memory limit. |
+| `memory_total_bytes` | `MemTotal` from `/proc/meminfo`, converted from kB to bytes. |
+| `memory_available_bytes` | `MemAvailable` from `/proc/meminfo`, in bytes. |
+| `etcd_bytes` | Size of the embedded etcd data directory. Control plane nodes only. |
+| `etcd_snapshot_bytes` | Size of the etcd snapshot directory: the `etcd-snapshot-dir` recorded in the cluster's `server_config` when it has one, otherwise k3s's default. Control plane nodes only. |
+
+A reading which could not be taken is `None` on its own and voids none
+of the others; `error` is for the probe as a whole. `k3s_state` and
+`k3s_restarts` are `None` when the unit is not loaded, because systemd
+reports a restart count of zero for a unit that does not exist and zero
+would be a claim. A directory that does not exist (k3s creates the
+snapshot directory with the first snapshot) is `None`, not zero. The
+etcd sizes are always `None` on a worker.
+
+Every reading is raw, the counters among them are cumulative since
+boot, and `health()` stores nothing. A health check that wrote would have new ways to fail, and
+"since the last call" is meaningless when the command line, a daily
+poll and an Ansible play all call it. The caller keeps the baseline,
+usually yesterday's report, and diffs:
+
+* A changed `boot_id` voids the baseline, because every reading here
+  except the etcd sizes resets at boot. Treat the current value as the
+  delta. An unexpected reboot is itself a finding the current report
+  cannot show on its own.
+* A counter lower than its baseline with an unchanged `boot_id` has
+  been reset by some other route, and the same rule applies. systemd is
+  understood to reset `NRestarts` when the unit is restarted by hand.
+
+Signals never affect `healthy`, on a node or on the cluster. They are
+facts, not judgements: whether three restarts or 200 MiB available is a
+problem depends on a baseline and a workload that `health()` does not
+have and the caller does. A probe that fails on a node which is
+otherwise up reports it in `signals['error']` and leaves the node
+healthy, so a slow `du` cannot flip the Ansible module's gate or
+`--strict`.
 
 ## Worked example
 
