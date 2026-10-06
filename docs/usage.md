@@ -536,6 +536,14 @@ the version cache held in namespace metadata; pass
 `create` uses, so these are the commands to check what a create would
 install.
 
+Each Longhorn chart states the Kubernetes versions it supports, and
+`create` installs the newest chart which supports the k3s release it
+resolved, not simply the newest chart: Longhorn 1.13.0 needs Kubernetes
+1.34 or newer, so a cluster on the `v1.33` channel gets 1.12.1. That
+makes the Longhorn answer depend on the channel, so
+`query-longhorn-version` takes `--release-channel` (default `stable`,
+as for `create`) and says which k3s release it answered for.
+
 The k3s version comes from the k3s update API
 (`https://update.k3s.io/v1-release/channels`), and the Longhorn version
 from the index of Longhorn's Helm repository

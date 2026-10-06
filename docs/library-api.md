@@ -198,6 +198,9 @@ cluster, so they stay module level functions rather than `Cluster`
 methods: `primitives.list_clusters(client, namespace)`,
 `primitives.get_k3s_release(client, namespace, reporter, ...)` and
 `primitives.get_longhorn_release(client, namespace, reporter, ...)`.
+Pass `get_longhorn_release()` the k3s release as `k3s_version=` to get
+the newest Longhorn chart that release can run, which is what `create()`
+installs; without it the newest chart is returned whatever it supports.
 
 ## The reporter
 

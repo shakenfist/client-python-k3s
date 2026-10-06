@@ -1881,8 +1881,12 @@ class Cluster:
         p = self.get_progress()
         md = self.get_metadata()
 
+        # The newest chart this cluster's k3s can run, rather than the
+        # newest chart: helm install refuses one whose kubeVersion excludes
+        # the cluster (#118).
         version = primitives.get_longhorn_release(
-            self.client, self.namespace, self.reporter)
+            self.client, self.namespace, self.reporter,
+            k3s_version=md['k3s_version'])
         p.phase(f'Setting up longhorn version {version}')
 
         self.execute_and_await(

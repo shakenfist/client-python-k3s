@@ -244,8 +244,11 @@ class CommandExceptionTestCase(ClientTestCase):
         self.assertEqual('unknown_channel', e.reason)
 
     def test_query_longhorn_version_http_error(self):
+        # The k3s lookup comes first, as it does in create(), so it is
+        # answered and the Longhorn one is the failure.
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
-                        return_value=_response(None, status_code=500)):
+                        side_effect=[_response(K3S_CHANNELS),
+                                     _response(None, status_code=500)]):
             e = self._assert_raises(
                 shakenfist_client_k3s.k3s_query_longhorn_version,
                 ['--refresh-version-cache'],
@@ -346,10 +349,23 @@ class GroupHandlerTestCase(ClientTestCase):
 
     def test_query_longhorn_version_no_parsable_release(self):
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
-                        return_value=_response([])):
+                        side_effect=[_response(K3S_CHANNELS),
+                                     _response(None, text='entries: {}')]):
             self._assert_cli_failure(
                 ['query-longhorn-version', '--refresh-version-cache'],
                 'Unable to determine the latest Longhorn release\n', {})
+
+    def test_query_longhorn_version_no_compatible_release(self):
+        index = ('entries:\n'
+                 '  longhorn:\n'
+                 '  - {version: 1.13.0, kubeVersion: ">=1.34.0-0"}\n')
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        side_effect=[_response(K3S_CHANNELS),
+                                     _response(None, text=index)]):
+            self._assert_cli_failure(
+                ['query-longhorn-version', '--refresh-version-cache'],
+                'No Longhorn release supports k3s v1.33.4+k3s1: no Longhorn '
+                'chart states a kubeVersion which admits it\n', {})
 
 
 class GroupHandlerScopeTestCase(testtools.TestCase):

@@ -877,6 +877,9 @@ class ReleaseLookupError(_ReasonedK3sException):
       ``primitives.get_longhorn_release()`` when the chart index parsed
       but listed no Longhorn chart version which is a valid, final (not
       prerelease, not deprecated) PEP 440 version.
+    - ``no_compatible_longhorn_release(k3s_version)``: raised by
+      ``primitives.get_longhorn_release()`` when there are Longhorn charts,
+      but none whose kubeVersion admits ``k3s_version`` (#118).
 
     Which classmethod built an instance is recorded in ``reason``, but it
     does not decide which attributes exist: every field any of them sets
@@ -887,7 +890,7 @@ class ReleaseLookupError(_ReasonedK3sException):
     #: The union of the fields the classmethods below set. See
     #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('product', 'url', 'error', 'status_code', 'response_text',
-              'response_snippet', 'release_channel')
+              'response_snippet', 'release_channel', 'k3s_version')
 
     @classmethod
     def request_failed(cls, product, url, error):
@@ -940,6 +943,14 @@ class ReleaseLookupError(_ReasonedK3sException):
     def no_parsable_longhorn_release(cls):
         return cls('no_parsable_longhorn_release',
                    'Unable to determine the latest Longhorn release')
+
+    @classmethod
+    def no_compatible_longhorn_release(cls, k3s_version):
+        message = (
+            'No Longhorn release supports k3s %s: no Longhorn chart '
+            'states a kubeVersion which admits it' % k3s_version)
+        return cls('no_compatible_longhorn_release', message,
+                   k3s_version=k3s_version)
 
 
 class AgentOperationError(K3sClusterException):

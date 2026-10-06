@@ -282,22 +282,35 @@ def k3s_query_k3s_version(ctx, release_channel=None, namespace=None,
 
 @k3s.command(name='query-longhorn-version',
              help='Lookup the current longhorn version')
+@click.option('--release-channel', default='stable',
+              help=('The k3s release channel to find a Longhorn version for, '
+                    'as create takes it. Each Longhorn chart supports a range '
+                    'of Kubernetes versions, so the answer depends on it.'))
 @click.option('--namespace', type=click.STRING,
               help=('If you are an admin, you can control which namespace the '
                     'version cache is retrieved from.'))
 @click.option('--refresh-version-cache/--no-refresh-version-cache', default=False,
-              help=('Force a refresh of the longhorn version cache.'))
+              help=('Force a refresh of the k3s and longhorn version caches.'))
 @click.pass_context
-def k3s_query_longhorn_version(ctx, namespace=None, refresh_version_cache=False):
+def k3s_query_longhorn_version(ctx, release_channel='stable', namespace=None,
+                               refresh_version_cache=False):
     client, namespace, reporter = _bind_namespace_context(ctx, namespace)
 
+    # The same two lookups create() makes, in the same order, so that this
+    # answers what a create on this channel would install.
+    k3s_release = primitives.get_k3s_release(
+        client, namespace, reporter,
+        force_cache_update=refresh_version_cache,
+        release_channel=release_channel)
     target_release = primitives.get_longhorn_release(
         client, namespace, reporter,
-        force_cache_update=refresh_version_cache)
+        force_cache_update=refresh_version_cache,
+        k3s_version=k3s_release)
     # Terminal output: presentation of the looked up value. A library
     # caller calls primitives.get_longhorn_release() and gets
     # target_release.
-    print(f'Longhorn has {target_release} as its latest version.')
+    print(f'Longhorn has {target_release} as its latest version for k3s '
+          f'{k3s_release} (release channel {release_channel}).')
 
 
 @k3s.command(name='getconfig', help='Get kubeconfig for an existing k3s cluster')

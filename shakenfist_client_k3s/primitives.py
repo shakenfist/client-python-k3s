@@ -14,6 +14,7 @@ way, so that a Cluster can call these lookups.
 
 import json
 from packaging.version import InvalidVersion, Version
+import re
 import requests
 from shakenfist_client import apiclient
 import time
@@ -164,22 +165,165 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
     return most_recent
 
 
-def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
+# One Kubernetes version as Helm writes them in a chart's kubeVersion,
+# and as k3s names its releases: an optional 'v', one to three numeric
+# components, then an optional SemVer pre-release and build. Only the
+# numbers are kept. Components are ASCII digits and bounded in length, for
+# the reasons check_k3s_release() in cluster.py gives.
+_KUBE_VERSION_RE = re.compile(
+    r'v?([0-9]{1,9})(?:\.([0-9]{1,9}))?(?:\.([0-9]{1,9}))?'
+    r'(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z')
+
+_KUBE_CONSTRAINT_RE = re.compile(r'(>=|<=|!=|==|=|>|<)?(.+)\Z')
+
+_KUBE_COMPARISONS = {
+    '>=': lambda a, b: a >= b,
+    '<=': lambda a, b: a <= b,
+    '>': lambda a, b: a > b,
+    '<': lambda a, b: a < b,
+    '!=': lambda a, b: a != b,
+    '==': lambda a, b: a == b,
+    '=': lambda a, b: a == b,
+    None: lambda a, b: a == b,
+}
+
+
+def parse_kube_version(text):
+    """Return a Kubernetes or k3s version as a (major, minor, patch) tuple.
+
+    Missing components are zero, so '1.25' is (1, 25, 0). A pre-release
+    or build suffix -- the '+k3s1' on every k3s release, the '-0' Helm
+    charts put on a constraint's bound -- is accepted and ignored.
+    Returns None for anything else.
+    """
+    if not isinstance(text, str):
+        return None
+    match = _KUBE_VERSION_RE.match(text)
+    if not match:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def kube_version_satisfies(constraint, version):
+    """Whether a (major, minor, patch) tuple satisfies a chart's kubeVersion.
+
+    Returns True or False, or None when the constraint is not one this can
+    read. That is a subset of Helm's syntax: '||' between alternatives,
+    and within one alternative comparisons (>=, <=, >, <, =, !=, or none
+    for equality) separated by commas or spaces, with optional space after
+    the operator. That covers every kubeVersion Longhorn's chart index has
+    used: '>=1.25.0-0', '>=1.18.0-0 <1.25.0-0', '>=v1.18.0' and
+    '>= v1.16.0-0, < v1.22.0-0'. Tilde and caret ranges, wildcards and
+    hyphen ranges are not read, and give None rather than a guess.
+
+    Pre-releases are compared as their release, on both sides. Helm's
+    '-0' on a bound exists to let pre-releases of that version through,
+    and k3s channels resolve to releases, so for every version this is
+    asked about the answer is the one Helm gives.
+    """
+    if not isinstance(constraint, str) or not constraint.strip():
+        return None
+
+    # Parsed whole before any of it is evaluated, so that a constraint
+    # with an unreadable part is unreadable whether or not an earlier
+    # alternative would already have matched.
+    alternatives = []
+    for alternative in constraint.split('||'):
+        alternative = re.sub(r'(>=|<=|!=|==|=|>|<)\s+', r'\1', alternative)
+        tokens = [t for t in re.split(r'[\s,]+', alternative) if t]
+        if not tokens:
+            return None
+
+        comparisons = []
+        for token in tokens:
+            match = _KUBE_CONSTRAINT_RE.match(token)
+            bound = parse_kube_version(match.group(2)) if match else None
+            if bound is None:
+                return None
+            comparisons.append((_KUBE_COMPARISONS[match.group(1)], bound))
+        alternatives.append(comparisons)
+
+    return any(all(compare(version, bound) for compare, bound in comparisons)
+               for comparisons in alternatives)
+
+
+def _select_longhorn_chart(charts, k3s_version, reporter):
+    """Return the newest chart version in charts which k3s_version can run.
+
+    charts maps a chart version to its kubeVersion constraint, as the
+    cache records it: '' for a chart which states none, which Helm installs
+    anywhere, and None for one whose constraint was not a string. The map
+    is re-validated here rather than trusted, because it may have come
+    back from namespace metadata, which anybody holding the namespace's
+    credentials can write.
+
+    With k3s_version None, compatibility is not considered and the newest
+    chart is returned.
+    """
+    candidates = []
+    for chart_version in charts:
+        try:
+            parsed = Version(chart_version)
+        except (InvalidVersion, TypeError):
+            continue
+        if not parsed.is_prerelease:
+            candidates.append((parsed, chart_version))
+    if not candidates:
+        raise exceptions.ReleaseLookupError.no_parsable_longhorn_release()
+    candidates.sort(reverse=True)
+
+    if k3s_version is None:
+        return candidates[0][1]
+
+    kube = parse_kube_version(k3s_version)
+    if kube is not None:
+        for _, chart_version in candidates:
+            constraint = charts[chart_version]
+            if constraint == '':
+                return chart_version
+            fits = kube_version_satisfies(constraint, kube)
+            if fits:
+                return chart_version
+            if fits is None:
+                reporter.debug(f'Skipping Longhorn {chart_version}: cannot read '
+                               f'its kubeVersion {constraint!r}')
+            else:
+                reporter.debug(f'Skipping Longhorn {chart_version}: it needs '
+                               f'Kubernetes {constraint}, not {k3s_version}')
+    raise exceptions.ReleaseLookupError.no_compatible_longhorn_release(
+        k3s_version)
+
+
+def get_longhorn_release(client, namespace, reporter, force_cache_update=False,
+                         k3s_version=None):
+    """Return the newest Longhorn chart version a cluster can install.
+
+    k3s_version is the k3s release the cluster runs or will run, such as
+    'v1.36.5+k3s1'. Each chart in the index states the Kubernetes versions
+    it supports, and a chart outside them is one helm install refuses, so
+    the newest chart whose kubeVersion admits this release is returned.
+    Left as None, compatibility is not considered and the newest chart is
+    returned; create() always passes one (#118).
+    """
     if force_cache_update:
         version_cache = {'updated': 0}
         reporter.debug('Forcing cache update')
     else:
         namespace_md = client.get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
-            LONGHORN_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
-        if not isinstance(version_cache, dict) or 'latest' not in version_cache:
+            LONGHORN_VERSION_CACHE_KEY, {'updated': 0})
+        # A cache without 'charts' -- one written before the lookup
+        # recorded each chart's kubeVersion, or anything else -- cannot
+        # answer a compatibility question, so it is refetched.
+        if (not isinstance(version_cache, dict)
+                or not isinstance(version_cache.get('charts'), dict)):
             reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
     updated = version_cache.get('updated', 0)
 
     reporter.debug(f'Cached version information from {updated}: '
-                   f'{version_cache.get("releases", {})}')
+                   f'{version_cache.get("charts", {})}')
 
     if time.time() - updated > 24 * 3600:
         reporter.debug('Updating release version cache')
@@ -203,19 +347,16 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
         # index -- yields no releases, and so the no_parsable_longhorn_release
         # error below rather than a traceback.
         entries = index.get('entries') if isinstance(index, dict) else None
-        charts = entries.get('longhorn') if isinstance(entries, dict) else None
+        listed = entries.get('longhorn') if isinstance(entries, dict) else None
 
-        releases = []
-        latest = None
-        for chart in charts if isinstance(charts, list) else []:
+        charts = {}
+        for chart in listed if isinstance(listed, list) else []:
             if not isinstance(chart, dict) or chart.get('deprecated'):
                 continue
 
             # The chart version, not appVersion, because it is what helm
             # install --version takes. Longhorn has kept the two equal so
-            # far, apart from appVersion's leading 'v', which is also why a
-            # cache written by the old GitHub lookup is still a valid
-            # answer until it expires. A version YAML
+            # far, apart from appVersion's leading 'v'. A version YAML
             # read as something other than a string (1.10 is the float
             # 1.1) is not one to trust, so it is skipped.
             chart_version = chart.get('version')
@@ -234,18 +375,23 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False):
             if parsed_version.is_prerelease:
                 continue
 
-            releases.append(chart_version)
-            if latest is None or parsed_version > latest:
-                latest = parsed_version
-                latest_version = chart_version
+            # '' for a chart which states no kubeVersion, which Helm will
+            # install on anything; None for one which states something
+            # other than a string, which is not a constraint to guess at.
+            kube_version = chart.get('kubeVersion', '')
+            charts[chart_version] = (
+                kube_version if isinstance(kube_version, str) else None)
 
-        if latest is None:
+        # Don't persist an empty parse result, for the reason
+        # get_k3s_release() gives.
+        if not charts:
             raise exceptions.ReleaseLookupError.no_parsable_longhorn_release()
 
-        version_cache['releases'] = releases
-        version_cache['latest'] = latest_version
-        version_cache['updated'] = time.time()
+        version_cache = {'charts': charts, 'updated': time.time()}
         client.set_namespace_metadata_item(
             namespace, LONGHORN_VERSION_CACHE_KEY, version_cache)
 
-    return version_cache['latest']
+    selected = _select_longhorn_chart(
+        version_cache['charts'], k3s_version, reporter)
+    reporter.debug(f'Selected Longhorn version: {selected}')
+    return selected

@@ -160,6 +160,14 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'a Longhorn kubeVersion this cannot read rules its chart out',
+        PKG + '/primitives.py',
+        '            if fits:\n',
+        '            if fits is not False:\n',
+        PKG + '.tests.test_primitives.LonghornCompatibilityTestCase',
+        'stestr',
+    ),
+    (
         'every reasoned exception answers all of its fields',
         PKG + '/exceptions.py',
         "    FIELDS = ('name', 'key', 'value')",

@@ -81,6 +81,35 @@ class NamespaceDefaultingTestCase(testtools.TestCase):
         self.client.get_namespace_metadata.assert_called_once_with('clientns')
         self.assertIn('v1.33.4+k3s1', result.output)
 
+    def test_query_longhorn_version_answers_for_a_channel(self):
+        # The Longhorn answer depends on the k3s release, so the command
+        # resolves the channel first, as create() does, and says which
+        # release it answered for.
+        self.client.get_namespace_metadata.return_value = {
+            primitives.K3S_VERSION_CACHE_KEY: {
+                'updated': time.time(),
+                'releases': {'stable': 'v1.33.4+k3s1',
+                             'latest': 'v1.36.5+k3s1'}
+            },
+            primitives.LONGHORN_VERSION_CACHE_KEY: {
+                'updated': time.time(),
+                'charts': {'1.13.0': '>=1.34.0-0', '1.12.1': '>=1.25.0-0'}
+            },
+        }
+
+        result = self._invoke(['query-longhorn-version'])
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(
+            'Longhorn has 1.12.1 as its latest version for k3s '
+            'v1.33.4+k3s1 (release channel stable).\n', result.output)
+        self.assertEqual([mock.call('clientns')] * 2,
+                         self.client.get_namespace_metadata.call_args_list)
+
+        result = self._invoke(
+            ['query-longhorn-version', '--release-channel', 'latest'])
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn('Longhorn has 1.13.0 as its latest version', result.output)
+
 
 class CreateNamespaceNoticeTestCase(testtools.TestCase):
     """create's 'Created namespace %s' notice now goes through a reporter.
