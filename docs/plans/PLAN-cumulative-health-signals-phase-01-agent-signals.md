@@ -408,33 +408,36 @@ adding assertions here would mean writing them twice.
 
 ## Definition of done
 
-- [ ] `tox -epy3`, `tox -eflake8` and `pre-commit run --all-files` pass,
+- [x] `tox -epy3`, `tox -eflake8` and `pre-commit run --all-files` pass,
       and `python3 -c 'import shakenfist_client_k3s'` succeeds.
-- [ ] Step 1a's commit touches no file under
+- [x] Step 1a's commit touches no file under
       `shakenfist_client_k3s/tests/`:
       `git show --stat <1a sha> -- shakenfist_client_k3s/tests` is
       empty.
-- [ ] No CLI option changed:
+- [x] No CLI option changed:
       `git diff develop -- shakenfist_client_k3s/tests/cli_contract/`
       is empty.
-- [ ] A test asserts that every node entry carries a `signals` dict with
+- [x] A test asserts that every node entry carries a `signals` dict with
       exactly decision 1's twelve keys, in the healthy, gone, unready
       and probe-failed cases.
-- [ ] A test asserts that, with every operation pending, `health()`
+- [x] A test asserts that, with every operation pending, `health()`
       returns within one probe budget whatever the node count.
-- [ ] `healthy` is computed exactly as on `develop`:
+- [x] `healthy` is computed exactly as on `develop`:
       `git diff develop -- shakenfist_client_k3s/cluster.py | grep
       "^[-+].*'healthy':"` shows no change to either expression.
-- [ ] No page still describes `health()` as submitting a single agent
+      (It prints one pair of lines: the docstring schema's
+      `'healthy': bool` gaining a trailing comma because `signals` now
+      follows it. Neither expression changed.)
+- [x] No page still describes `health()` as submitting a single agent
       operation: `grep -rn -i "one read-only agent operation\|one agent
       operation" docs collection` finds nothing that says so.
-- [ ] Each of the twelve keys is defined in exactly one prose place
+- [x] Each of the twelve keys is defined in exactly one prose place
       (`docs/library-api.md`) and in the `health()` docstring schema;
       `docs/usage.md` and the module `RETURN` point at the library page
       rather than redefining them.
-- [ ] The *Live results* section records a merge tier run against this
+- [x] The *Live results* section records a merge tier run against this
       branch with no `None` reading on either role.
-- [ ] The master plan's open questions 1, 2, 3 and 5 point at their
+- [x] The master plan's open questions 1, 2, 3 and 5 point at their
       answers, and its Future work names the recovery plan (decision
       10) and the agent operation deadline (survey finding 5).
 
@@ -476,6 +479,45 @@ One incidental observation, which is the master plan's premise in
 miniature: the minimal cluster's 2048 MB control plane had 808 MiB
 available minutes after creation, against 2702 of 3914 MiB on the
 larger one.
+
+## Deviations and bugs fixed during this work
+
+Where the implementation departed from the step briefs, and what review
+on [#116](https://github.com/shakenfist/client-python-k3s/pull/116)
+found and fixed:
+
+- **`_probe_k3s_api()` was removed in step 1c**, not kept as a wrapper.
+  `health()` calls `_submit_probe()` and `_collect_probe()` directly, and
+  the wrapper's explanation of why `execute_and_await()` and
+  `await_idle()` are not used moved to `_submit_probe()`.
+- **`_collect_probe()` takes an optional `name`**, so that an error from
+  the signals probe names "the node signals command" rather than quoting
+  several hundred characters of shell. The `kubectl` probe's messages are
+  unchanged.
+- **Probes collected after the deadline were judged on their
+  submission-time state** (review round 1, fix). The plugin runs its
+  client with `ASYNC_CONTINUE`, so `instance_execute()` returns an
+  operation that is still `queued`, and `await_execute()` returned it
+  unread when no time was left. A `kubectl` probe that used the whole
+  budget made every node's signals read as abandoned. Neither the live
+  run (whose `kubectl` answered at once) nor the tests caught it, because
+  `HealthClient` returned the scripted terminal state at submission. The
+  fake now returns `queued` at submission and reports the scripted state
+  only when the operation is read, as the server does.
+- **Collecting probes one after another cost a second per node** (review
+  round 2, fix). `await_execute()` slept before its first read, so a
+  healthy cluster of N nodes took about N+1 seconds. It now reads before
+  it sleeps, which also guarantees the read past the deadline that round
+  1 needed, and collection costs about the slowest probe rather than the
+  sum, because every operation keeps running on the server while an
+  earlier one is waited on.
+- **Smaller fixes from review:** an out-of-range or non-integer reading
+  renders as `unknown` rather than crashing `sf-client k3s health`; a
+  relative `etcd-snapshot-dir` is reported as `None` rather than sizing
+  whatever the agent's working directory makes of it; and the parser caps
+  a reading at twenty digits, the length of 2**64 - 1, because an uncapped
+  garbage reading scaled by 1024 made `json.dumps()` of the report raise
+  on Python 3.11 and later, which would break the Ansible module's result.
 
 ## Back brief
 

@@ -4350,7 +4350,45 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
             lambda: cluster.await_execute(_pending_aop(), timeout=30))
 
         self.assertEqual('complete', aop['state'])
-        self.assertEqual(3, elapsed)
+        # Read at 0 (queued), sleep, read at 1 (executing), sleep, read at 2
+        # (complete), return: three reads and two seconds. It was three
+        # seconds when the wait slept before each read, the first sleep
+        # being for an operation nobody had yet looked at.
+        self.assertEqual(2, elapsed)
+        self.assertEqual(3, client.get_agent_operation.call_count)
+
+    def test_an_operation_finished_on_its_first_read_costs_no_sleep(self):
+        # The property health()'s run time rests on. Its probes are
+        # collected one after another, but all of them are running on the
+        # server while the first is waited for, so the later ones have
+        # usually finished by their turn. Each costs one read and nothing
+        # else; a sleep before that read was a second per node on a
+        # cluster with nothing wrong with it.
+        client, cluster = self._cluster(['complete'])
+        sleep = mock.MagicMock()
+
+        with mock.patch('time.sleep', sleep):
+            aop = cluster.await_execute(_pending_aop(), timeout=30)
+
+        self.assertEqual('complete', aop['state'])
+        self.assertEqual(1, client.get_agent_operation.call_count)
+        sleep.assert_not_called()
+
+    def test_an_operation_handed_in_finished_is_not_read(self):
+        # Nothing can move a finished operation on, so there is nothing a
+        # read could tell the caller. With a timeout or without, and with
+        # the timeout already spent: the at-least-once read is for an
+        # operation handed in pending, not for every operation.
+        for timeout in (None, 30, 0):
+            client, cluster = self._cluster([])
+            given = _pending_aop('complete')
+
+            aop, elapsed = self._with_clock(
+                lambda: cluster.await_execute(given, timeout=timeout))
+
+            self.assertIs(given, aop, timeout)
+            self.assertEqual(0, elapsed, timeout)
+            client.get_agent_operation.assert_not_called()
 
     def test_a_wall_clock_step_does_not_move_the_deadline(self):
         # time.time() is not the clock for measuring how long something has
@@ -4395,11 +4433,12 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
         self.assertEqual(0, elapsed)
         self.assertEqual(1, client.get_agent_operation.call_count)
 
-    def test_an_operation_read_by_the_wait_is_not_read_again_at_the_deadline(self):
-        # The last read of the wait lands on the deadline, and nothing can
-        # have happened between it and the deadline check, so the look the
-        # timeout path takes is only for an operation this call has not
-        # read at all. One read a second for five seconds is five reads.
+    def test_a_wait_reads_at_each_second_up_to_and_including_the_deadline(self):
+        # Read first, then sleep, so a budget of five seconds is reads at
+        # 0, 1, 2, 3, 4 and 5: six, the last landing on the deadline. That
+        # read finds the deadline passed and is the last thing the wait
+        # does, so there is no sixth sleep -- elapsed is 5, not 6 -- and no
+        # seventh read of an operation whose state was read a moment ago.
         client, cluster = self._cluster(['queued'] * 100)
 
         aop, elapsed = self._with_clock(
@@ -4407,7 +4446,22 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
 
         self.assertEqual('queued', aop['state'])
         self.assertEqual(5, elapsed)
-        self.assertEqual(5, client.get_agent_operation.call_count)
+        self.assertEqual(6, client.get_agent_operation.call_count)
+
+    def test_a_deadline_which_passes_mid_sleep_still_gets_its_read(self):
+        # A budget which is not a whole number of seconds: the read at 2
+        # finds 0.5 seconds left, so the wait sleeps a whole second past
+        # the deadline and reads once more at 3. That read is the one at
+        # least once the deadline has passed, and finds the operation done.
+        client, cluster = self._cluster(['queued', 'queued', 'queued',
+                                         'complete'])
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=2.5))
+
+        self.assertEqual('complete', aop['state'])
+        self.assertEqual(3, elapsed)
+        self.assertEqual(4, client.get_agent_operation.call_count)
 
     def test_an_api_error_from_the_look_past_the_deadline_propagates(self):
         # As one from the wait's own reads does: _collect_probe() catches
@@ -4434,7 +4488,11 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
             lambda: cluster.await_execute(_pending_aop()))
 
         self.assertEqual('complete', aop['state'])
-        self.assertEqual(601, elapsed)
+        # 600 pending reads at 0 to 599, each followed by a sleep, and the
+        # 601st at 600 finds it complete. It was 601 seconds when the wait
+        # slept before its first read as well as between them.
+        self.assertEqual(600, elapsed)
+        self.assertEqual(601, client.get_agent_operation.call_count)
 
 
 class HealthProbeIsSkippedTestCase(testtools.TestCase):
@@ -4471,8 +4529,9 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
                 'agent_state': 'ready'}
 
         # HealthClient hands every operation out queued, as the server does,
-        # so even a probe which completes is waited for through one sleep
-        # and one read. Real seconds would make this class slow for nothing.
+        # so every probe is read at least once, and one scripted to stay
+        # pending is waited on through sleeps. Real seconds would make the
+        # tests which do that slow for nothing.
         patcher = mock.patch('time.sleep', lambda seconds: None)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -4659,15 +4718,33 @@ class HealthSignalsTestCase(testtools.TestCase):
     def _with_clock(self, fn):
         # A fake clock, as AwaitExecuteTimeoutTestCase uses, because the
         # point is how long health() waits: real time would make the
-        # assertion either slow or untrue.
+        # assertion either slow or untrue. Every sleep is recorded as well
+        # as added to the clock, so a test can say there were none.
         clock = [1000.0]
+        self.sleeps = []
 
         def sleep(seconds):
+            self.sleeps.append(seconds)
             clock[0] += seconds
 
         with mock.patch('time.monotonic', lambda: clock[0]), \
                 mock.patch('time.sleep', sleep):
             return fn(), clock[0] - 1000.0
+
+    def _seven_nodes(self):
+        # One control plane node and six workers, all able to answer: eight
+        # probes, the kubectl one and seven signals.
+        self.md['worker_nodes'] = ['inst-w%d' % n for n in range(1, 7)]
+        for n in range(3, 7):
+            self.client.instances['inst-w%d' % n] = {
+                'uuid': 'inst-w%d' % n, 'name': 'k3s-banana-node-%03d' % (n + 1),
+                'state': 'created', 'agent_state': 'ready'}
+
+    def _reads_by_operation(self):
+        # In submission order: aop-001 is the kubectl probe, and then each
+        # node's signals in node order.
+        return [self.client.agent_operation_reads_by_uuid.get(uuid, 0)
+                for uuid in sorted(self.client.operations)]
 
     def _everything_pending(self):
         self.client.probe_state = 'queued'
@@ -4802,33 +4879,29 @@ class HealthSignalsTestCase(testtools.TestCase):
         # Seven nodes, none of which ever answers. Waited for one after
         # another this is eight budgets; submitted together against one
         # deadline it is one.
-        self.md['worker_nodes'] = ['inst-w%d' % n for n in range(1, 7)]
-        for n in range(3, 7):
-            self.client.instances['inst-w%d' % n] = {
-                'uuid': 'inst-w%d' % n, 'name': 'k3s-banana-node-%03d' % (n + 1),
-                'state': 'created', 'agent_state': 'ready'}
+        self._seven_nodes()
         self._everything_pending()
 
         report, elapsed = self._with_clock(self.cluster.health)
 
         self.assertEqual(8, len(self.client.executed))
         self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS, elapsed)
-        # One read a second for one budget, and then one look each at the
-        # operations left. The kubectl probe is collected first, with the
-        # whole budget: a sleep and a read each second, so 30 reads, the
-        # last landing exactly on the deadline, which the wait then finds
-        # has passed and does not read again. Each of the seven signals
-        # probes is collected after that with no time left, and is read once
-        # without sleeping, because the state it was handed is the one it
-        # was submitted in. 30 + 7 = 37, and it is exact rather than a range:
-        # fewer would mean a probe judged without being read, and more a
-        # wait which slept or looked twice after the deadline.
-        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 7,
+        # One read a second across one budget, and then one read each of
+        # the operations left. The kubectl probe is collected first, with
+        # the whole budget: a read and then a sleep each second, so reads at
+        # 0, 1, ..., 30 -- 31 of them, the last landing exactly on the
+        # deadline, after which the wait returns without sleeping. Each of
+        # the seven signals probes is collected after that with no time
+        # left, and is read once without sleeping, because the state it was
+        # handed is the one it was submitted in. 31 + 7 = 38, and it is
+        # exact rather than a range: fewer would mean a probe judged without
+        # being read, and more a wait which slept or read twice after the
+        # deadline.
+        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 1 + 7,
                          self.client.agent_operation_reads)
         self.assertEqual(
-            [cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS] + [1] * 7,
-            [self.client.agent_operation_reads_by_uuid.get(uuid, 0)
-             for uuid in sorted(self.client.operations)])
+            [cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 1] + [1] * 7,
+            self._reads_by_operation())
 
         self.assertFalse(report['api']['probed'])
         for node in report['nodes']:
@@ -4838,6 +4911,57 @@ class HealthSignalsTestCase(testtools.TestCase):
             self.assertIn('is still queued', node['signals']['error'])
             # The node itself is as healthy as it was.
             self.assertTrue(node['healthy'])
+
+    def test_a_healthy_cluster_of_seven_nodes_costs_no_sleep(self):
+        # The other end of the budget, and the case it is spent on almost
+        # every time: nothing wrong, and every operation finished by the
+        # time it is first read. Collection is one probe after another, so a
+        # wait which slept before its first read cost a second a probe --
+        # eight seconds here, and the whole budget on a cluster of thirty --
+        # for a cluster with nothing to report. Read first, each probe is
+        # one read and no sleep, so the call takes no time on the fake clock
+        # at all.
+        self._seven_nodes()
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        self.assertEqual(0, elapsed)
+        self.assertEqual([], self.sleeps)
+        self.assertEqual([1] * 8, self._reads_by_operation())
+        self.assertTrue(report['healthy'])
+        self.assertTrue(report['api']['answered'])
+        self.assertEqual(7, len(report['nodes']))
+        for node in report['nodes']:
+            self.assertTrue(node['signals']['probed'], node['uuid'])
+            self.assertIsNone(node['signals']['error'], node['uuid'])
+
+    def test_a_slow_first_probe_costs_its_own_time_not_one_second_per_node(self):
+        # The kubectl probe is still running when it is first read, and
+        # done on its second, one sleep later. The signals probes ran
+        # alongside it on their nodes, so each has finished by the time it
+        # is collected and is read once without sleeping. The call takes
+        # the slowest probe's second, not that second plus one per node.
+        self._seven_nodes()
+        self.client.probe_state = 'executing'
+        original = self.client.get_agent_operation
+
+        def read(operation_uuid):
+            aop = original(operation_uuid)
+            # Whatever was read, the kubectl command finishes straight
+            # after: the first read, of aop-001, finds it executing, and
+            # every later one finds it complete.
+            self.client.probe_state = 'complete'
+            return aop
+
+        self.client.get_agent_operation = read
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        self.assertEqual(1, elapsed)
+        self.assertEqual([1], self.sleeps)
+        self.assertEqual([2] + [1] * 7, self._reads_by_operation())
+        self.assertTrue(report['healthy'])
+        self.assertTrue(all(n['signals']['probed'] for n in report['nodes']))
 
     def test_a_pending_kubectl_probe_does_not_hold_up_the_signals(self):
         # Each operation answers for itself: the API probe is abandoned and

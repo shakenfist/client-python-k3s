@@ -836,6 +836,69 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
                       reporter.getvalue())
         self.assertIn('k3s API: answered on inst-cp1', reporter.getvalue())
 
+    # Every int reading, and the line they render to when none of them is an
+    # int. The unit and its state are strings and stay as they are.
+    INT_READINGS = ('booted_at', 'k3s_restarts', 'oom_kills',
+                    'memory_total_bytes', 'memory_available_bytes',
+                    'etcd_bytes', 'etcd_snapshot_bytes')
+    ALL_UNKNOWN = (
+        '        booted unknown, k3s active, unknown restarts, '
+        'unknown OOM kills, unknown of unknown MiB available, '
+        'etcd unknown MiB, snapshots unknown MiB\n')
+
+    def _render_with(self, readings):
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals'].update(readings)
+        reporter = progress.CollectingReporter()
+        shakenfist_client_k3s._render_health(reporter, report)
+        return reporter.getvalue()
+
+    def test_string_readings_render_unknown(self):
+        # A caller which built the report by hand, or read it back from
+        # somewhere that stores everything as text. '1759712345' // 1048576
+        # and fromtimestamp('1759712345') both raise TypeError, which used
+        # to lose the whole report; '3' restarts rendered as if it had been
+        # read from systemd.
+        rendered = self._render_with(
+            {key: '1759712345' for key in self.INT_READINGS})
+
+        self.assertIn(self.ALL_UNKNOWN, rendered)
+        self.assertIn('k3s API: answered on inst-cp1', rendered)
+
+    def test_float_readings_render_unknown(self):
+        # The shape a JSON round trip through something which does not keep
+        # ints apart from floats leaves. A float size used to render as a
+        # fractional MiB, and a float restart count as '3.0 restarts'; a
+        # float boot time happened to render, but is no more a reading this
+        # package took than the others are.
+        rendered = self._render_with(
+            {key: 1759712345.0 for key in self.INT_READINGS})
+
+        self.assertIn(self.ALL_UNKNOWN, rendered)
+        self.assertNotIn('.0', rendered)
+        self.assertNotIn('2025-', rendered)
+
+    def test_bool_readings_render_unknown(self):
+        # bool is a subclass of int, so isinstance(True, int) alone would
+        # let True through as a restart count of 1 and a boot time of one
+        # second past the epoch. It is not a reading of either.
+        for flag in (True, False):
+            rendered = self._render_with(
+                {key: flag for key in self.INT_READINGS})
+
+            self.assertIn(self.ALL_UNKNOWN, rendered, flag)
+            self.assertNotIn('True', rendered, flag)
+            self.assertNotIn('False', rendered, flag)
+            self.assertNotIn('1970-', rendered, flag)
+
+    def test_a_unit_state_which_is_not_a_string_renders_unknown(self):
+        # The same rule for the two string readings: a state of 7 is not
+        # something systemd said.
+        rendered = self._render_with({'k3s_unit': 7, 'k3s_state': True})
+
+        self.assertIn('        booted 2025-10-06T00:59:05Z, unknown unknown, '
+                      '1 restarts, ', rendered)
+
     def test_the_epoch_is_a_boot_time_and_not_unknown(self):
         # The negative of the above: zero is a timestamp datetime can hold,
         # and a falsy one, so it is rendered rather than caught or mistaken

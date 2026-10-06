@@ -363,7 +363,11 @@ neither raises. Every probe -- the `kubectl` one and one signals probe
 per healthy node (see "What `signals` reports", below) -- is submitted
 before any is waited for, and all of them are waited for under one
 shared budget, so the bound is one budget on a cluster of any size.
-An abandoned run does leave operations queued until the server's
+The budget is a ceiling, not a cost: every command runs on its node
+while earlier ones are waited for, and one which has finished by the
+time it is collected costs a single read, so a healthy cluster answers
+in about the time its slowest probe takes rather than a second per
+node. An abandoned run does leave operations queued until the server's
 deadline ends them: up to one per probed node, plus the `kubectl` one
 on the control plane node. `api['error']` names the `kubectl`
 operation, and a caller polling `health()` in a loop should know that a

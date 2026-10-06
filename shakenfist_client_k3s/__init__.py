@@ -446,6 +446,18 @@ def _render_signals(out, node):
     A report without 'signals' at all (from an older library, or a
     hand-built dict) is skipped rather than reported as an error, as
     nothing was probed and nothing is being claimed.
+
+    The same reports are why every reading is checked for being the type
+    health() documents before it is shown, and one which is not is
+    'unknown' exactly as None is. The counts, the sizes and the boot time
+    must be an int -- and not a bool, which Python counts as one, but which
+    a report saying ``True`` OOM kills is not a count of -- and the unit and
+    its state must be a string. Without that a boot time or size which
+    went through JSON as a float, or was written as a string by a caller
+    building the dict, raises TypeError from the arithmetic or from
+    datetime and loses the whole report, or renders as a fractional MiB,
+    and ``'3'`` restarts or ``True`` OOM kills render as if they were
+    readings; a value the renderer cannot vouch for is not shown as one.
     """
     signals = node.get('signals')
     if signals is None:
@@ -456,28 +468,36 @@ def _render_signals(out, node):
                   % (signals.get('error') or 'unknown'))
         return
 
-    def value(reading):
-        return 'unknown' if reading is None else str(reading)
+    def is_count(reading):
+        return isinstance(reading, int) and not isinstance(reading, bool)
+
+    def text(reading):
+        return reading if isinstance(reading, str) else 'unknown'
+
+    def count(reading):
+        return str(reading) if is_count(reading) else 'unknown'
 
     def mib(reading):
-        return 'unknown' if reading is None else str(reading // 1048576)
+        return str(reading // 1048576) if is_count(reading) else 'unknown'
 
-    # The two conversions above cannot raise on anything the parser hands
-    # over: every reading is None or a non-negative int, str() of which is
-    # only refused past 4300 digits (Python 3.11 and later), the parser only
-    # converts strings of up to 4300 digits, and the only readings it scales
-    # beyond that, the memory sizes by 1024, reach str() through mib(),
-    # whose division by 1048576 takes them back under it. A timestamp is
-    # different, because the parser accepts any count and datetime does not:
-    # a btime past the year 9999, or past what the platform's time_t holds,
-    # raises OverflowError, OSError or ValueError depending on where it
-    # overflows. That is a reading which cannot be shown rather than a
-    # reason to lose the whole report, and the parser's rule is that
-    # nothing about a node's output can raise, so the renderer's has to be
-    # too: such a btime is 'unknown', as one which could not be read is.
+    # The type checks mean only an int ever reaches the division, str() or
+    # datetime, whoever built the report. The conversions above cannot then
+    # raise on anything the parser hands over: every reading is None or a
+    # non-negative int, str() of which is only refused past 4300 digits
+    # (Python 3.11 and later), the parser only converts strings of up to
+    # 4300 digits, and the only readings it scales beyond that, the memory
+    # sizes by 1024, reach str() through mib(), whose division by 1048576
+    # takes them back under it. A timestamp is different, because the parser
+    # accepts any count and datetime does not: a btime past the year 9999,
+    # or past what the platform's time_t holds, raises OverflowError,
+    # OSError or ValueError depending on where it overflows. That is a
+    # reading which cannot be shown rather than a reason to lose the whole
+    # report, and the parser's rule is that nothing about a node's output
+    # can raise, so the renderer's has to be too: such a btime is 'unknown',
+    # as one which could not be read is.
     booted_at = signals.get('booted_at')
     booted = 'unknown'
-    if booted_at is not None:
+    if is_count(booted_at):
         try:
             # Explicitly UTC: the operator and the node are rarely in the
             # same timezone and a bare local time would be wrong for one of
@@ -490,9 +510,9 @@ def _render_signals(out, node):
     readings = [
         'booted %s' % booted,
         '%s %s, %s restarts' % (
-            value(signals.get('k3s_unit')), value(signals.get('k3s_state')),
-            value(signals.get('k3s_restarts'))),
-        '%s OOM kills' % value(signals.get('oom_kills')),
+            text(signals.get('k3s_unit')), text(signals.get('k3s_state')),
+            count(signals.get('k3s_restarts'))),
+        '%s OOM kills' % count(signals.get('oom_kills')),
         '%s of %s MiB available' % (
             mib(signals.get('memory_available_bytes')),
             mib(signals.get('memory_total_bytes')))]

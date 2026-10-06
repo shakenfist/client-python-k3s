@@ -495,7 +495,10 @@ agent state -- and they share a thirty second budget even then,
 because a command queued against an instance whose agent is not
 connected is accepted and then never runs. Each of those outcomes is
 reported with the reason, on the `k3s API:` line or on the node's
-signals line, rather than waited on.
+signals line, rather than waited on. The budget is only spent when
+something is wrong: the probes run on every node at once, so a
+healthy cluster answers in about as long as its slowest probe takes,
+whatever its size.
 
 An abandoned run leaves operations queued: up to one per probed node,
 plus the `kubectl get nodes` against the control plane node. The

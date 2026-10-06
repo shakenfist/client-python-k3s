@@ -1481,34 +1481,53 @@ class Cluster:
         for a pending state in the returned operation; reap_execute() does
         not pass one, and so its own state check is exhaustive.
 
-        For an operation handed in pending, "as last seen" always means as
-        read from the server by this call, never only as handed in; one
-        handed in already finished is returned as it is, since nothing can
-        move it on. The operation a caller passes is usually
-        the one instance_execute() returned, and this plugin's client is
-        built with ASYNC_CONTINUE, so that is the operation in its
-        submission state -- pending, whatever has happened since. A timeout
-        which has already run out when this is called (health() collects
-        every probe against one shared deadline, so all but the first may
-        arrive with nothing left of it) therefore still reads the operation
-        once, without sleeping, before returning it: otherwise a probe which
-        finished long ago would be reported abandoned on the strength of a
-        state it left before anybody looked. An operation the loop has
-        already read is not read a second time at the deadline, because
-        nothing has happened between that read and the deadline check which
-        a second read could see. An API error from that read propagates
-        exactly as one from the loop's reads does.
+        The loop reads before it sleeps, and that order is what the rest of
+        this rests on:
+
+        - An operation handed in already finished is returned as it is,
+          with no read, since nothing can move it on.
+        - One handed in pending is always read at least once, even when the
+          timeout has already run out, so "as last seen" means as read from
+          the server by this call, never only as handed in. The operation a
+          caller passes is usually the one instance_execute() returned, and
+          this plugin's client is built with ASYNC_CONTINUE, so that is the
+          operation in its submission state -- pending, whatever has
+          happened since. health() collects every probe against one shared
+          deadline, so all but the first may arrive with nothing left of
+          it, and returning the operation as handed in would report a probe
+          which finished long ago as abandoned on the strength of a state
+          it left before anybody looked.
+        - An operation which has finished by the time it is first read
+          costs no sleep at all. health() collects its probes one after
+          another, but every one of them is running on the server while an
+          earlier one is waited for, so a probe collected late has usually
+          finished already; with the sleep first, each cost a second
+          whether or not it had, and a healthy cluster of N nodes took
+          about N seconds rather than about one. Read first, health()'s
+          total is about its slowest probe rather than the sum of them.
+        - There is no sleep after the deadline: the read which finds it
+          passed is the last thing this does. A pending operation with a
+          budget of T seconds is read T + 1 times, at 0, 1, ..., T.
+        - An API error from any read propagates. _collect_probe() catches
+          apiclient.APIException around this and reports it, so swallowing
+          one here into a pending state would turn a refusal into an
+          abandonment.
+
+        The callers with no timeout -- reap_execute(), after
+        execute_and_await() has already waited for the instance to be idle
+        -- get the same order, which only ever saves them a second: an
+        operation already finished on its first read is returned without
+        the sleep they used to take before it, and one still pending costs
+        one more read than it used to and no more sleeping.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        looked = False
         while aop['state'] in AGENT_OP_PENDING_STATES:
-            if deadline is not None and time.monotonic() >= deadline:
-                if not looked:
-                    aop = self.client.get_agent_operation(aop['uuid'])
-                return aop
-            time.sleep(1)
             aop = self.client.get_agent_operation(aop['uuid'])
-            looked = True
+            if aop['state'] not in AGENT_OP_PENDING_STATES:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            time.sleep(1)
         return aop
 
     def reap_execute(self, aop):
@@ -1666,12 +1685,19 @@ class Cluster:
         is the agent operation it returned. deadline is a time.monotonic()
         value rather than a budget, so that several probes submitted
         together can share one: each waits only for what is left of it, and
-        one which is collected after the deadline has passed looks once and
-        does not wait at all. Looking once means reading the operation from
-        the server, which await_execute() does even with no time left: aop
-        is the operation as submitted, and so pending however long ago the
-        command finished, and judging it on that would report every probe
-        collected after a slow first one as abandoned.
+        one which is collected after the deadline has passed is read once
+        and does not wait at all. await_execute() reads the operation from
+        the server before it considers sleeping, and does so even with no
+        time left: aop is the operation as submitted, and so pending however
+        long ago the command finished, and judging it on that would report
+        every probe collected after a slow first one as abandoned.
+
+        Collection is one probe after another, but the commands are not:
+        every one was submitted before the first is collected, and runs on
+        its node while an earlier one is waited for. A probe which finished
+        while its turn came round is read once and costs no sleep, so
+        collecting N probes takes about as long as the slowest of them, not
+        the sum, and sleeps no longer than the shared budget in all.
 
         name is how the error messages refer to the command. Left None, they
         quote the command line, which for 'kubectl get nodes' is the clearest
@@ -2975,6 +3001,14 @@ class Cluster:
         probe used up the budget is reported as it finished rather than as
         abandoned.
 
+        The budget is a ceiling rather than a cost. Probes are collected one
+        after another, but each operation is read before the wait considers
+        sleeping, and every command is running on its node while an earlier
+        one is waited for, so a probe which has finished by its turn costs
+        one read and no sleep. A healthy cluster therefore answers in about
+        the time its slowest probe takes -- typically a second or two
+        whatever its size -- rather than a second per node.
+
         The report is::
 
             {
@@ -3120,7 +3154,10 @@ class Cluster:
         # waits overlap rather than queue: the first probe collected waits
         # for whatever is left of the budget, and each one after it only for
         # whatever is left after that, which is what bounds this call at one
-        # budget on a cluster of any size rather than one per node. Taking
+        # budget on a cluster of any size rather than one per node. Within
+        # that bound it costs about the slowest probe, not the sum: each
+        # wait reads its operation before it sleeps, so one which finished
+        # while an earlier probe was waited for costs no sleep. Taking
         # it here starts every probe's clock a little early, by however long
         # the submissions before it take -- a few API calls -- which decision
         # 8 of the cumulative health signals phase 1 plan accepts.
