@@ -791,6 +791,39 @@ class ShapeRangeTestCase(ModuleTestCase):
         self.assertFalse(run.result['changed'])
 
 
+class ReservedNameTestCase(ModuleTestCase):
+    """A name whose metadata key is a release cache's fails the task, not the module.
+
+    Cluster() refuses such a name on every verb, and the module builds its
+    Cluster outside the handler which turns library exceptions into
+    fail_json(). Without its own guard the refusal would reach Ansible as a
+    traceback -- a regression for state: present, which used to be refused
+    (confusingly, as an interrupted cluster) by create() inside that
+    handler.
+    """
+
+    def _assert_refused(self, state):
+        run = self.run_module(base_params(name='k3s_version_cache',
+                                          state=state),
+                              expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertIn("Cluster name 'k3s_version_cache' cannot be used.",
+                      run.msg)
+        self.assertIn('orchestrated_k3s_cluster_k3s_version_cache', run.msg)
+        self.assertIsNone(run.result['health'])
+        # Refused before any verb ran or anything was written.
+        self.assertEqual([], run.diagnostics['cluster_calls'])
+        self.assertEqual([], run.diagnostics['client_calls'])
+
+    def test_present_is_refused(self):
+        self._assert_refused('present')
+
+    def test_absent_is_refused(self):
+        # The path which used to be a bare KeyError from delete().
+        self._assert_refused('absent')
+
+
 class MutationStateTestCase(ModuleTestCase):
     """What the failure paths say, and whether they admit to a change.
 

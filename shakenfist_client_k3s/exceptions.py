@@ -38,7 +38,7 @@ class K3sClusterException(Exception):
 class _ReasonedK3sException(K3sClusterException):
     """Base for the exceptions built through classmethods rather than directly.
 
-    Eight of the classes below describe several distinct failures that read
+    Ten of the classes below describe several distinct failures that read
     the same way to a caller: a manifest cannot be staged, a release
     lookup failed. Each is built through a classmethod per failure, each
     records which one ran in ``reason``, each renders a message its
@@ -51,7 +51,9 @@ class _ReasonedK3sException(K3sClusterException):
     on the default branch while this base class was being written, and is
     why the count in this docstring is worth keeping accurate rather than
     approximate. The eighth, ``ClusterMetadataError``, was written against
-    this base from the start.
+    this base from the start, and so were the ninth and tenth,
+    ``ClusterNameError`` and ``ShapeError``, which refuse an unusable
+    cluster name and an unusable node or address count.
     ``UnsupportedReleaseError`` named its three fields in its own
     ``__init__`` rather than taking ``**fields``; it declares them in
     ``FIELDS`` like the others now.
@@ -646,6 +648,153 @@ class NodeSizeError(K3sClusterException):
     def __str__(self):
         return '%s %s must be a positive integer, not %r' % (
             self.role.replace('_', ' '), self.field, self.value)
+
+
+class ClusterNameError(_ReasonedK3sException):
+    """Raised when a cluster name cannot be used.
+
+    A cluster's name ends up in places whose rules this package does not
+    set: the namespace metadata key the cluster's state is stored under
+    (``METADATA_KEY`` in ``cluster.py``), and every node's Shaken Fist
+    instance name, ``k3s-<name>-node-<serial>``, which k3s in turn
+    lowercases into the Kubernetes node name. A name which breaks those
+    rules is not refused by anything until the first instance create, and
+    by then the name is registered and the node network allocated, so the
+    operator is left with an interrupted cluster to delete.
+    ``validate_cluster_name()`` in ``cluster.py`` checks the first two
+    refusals below before ``Cluster.create()`` asks the API for anything,
+    and ``Cluster.__init__`` makes the third on every verb. Construct via
+    the classmethods below, one per refusal:
+
+    - ``invalid_characters(name)``: the name is not made of ASCII letters,
+      digits and hyphens, starting and ending with a letter or a digit.
+      Shaken Fist refuses an instance name which is not a DNS host name or
+      which contains a dot, so a dot, an underscore or a space in the
+      cluster name fails the first node create. A hyphen at either end is
+      not legal in a DNS label, and one at the end would also run into the
+      ``-node-`` which follows the name, making the join ambiguous. Mixed
+      case is accepted, because Shaken Fist accepts it and k3s lowercases
+      the host name for the node name. The empty string and a value which
+      is not a string at all are refused with this reason too, rather than
+      reasons of their own: neither is a sequence of the characters a name
+      is allowed, and the message, which renders the value with ``repr()``
+      and says what is allowed, reads correctly for both.
+    - ``too_long(name, max_length)``: the name is longer than
+      ``max_length``, which is ``CLUSTER_NAME_MAX_LENGTH`` in
+      ``cluster.py``. Shaken Fist refuses an instance name longer than 63
+      characters, and the arithmetic from the instance name template to
+      the limit is beside that constant.
+    - ``reserved(name, metadata_key)``: the namespace metadata key a
+      cluster of this name would be stored under is one this package
+      already uses for something else, a release version cache. The keys
+      are listed in ``primitives.RESERVED_METADATA_KEYS``. Such a cluster's
+      state and the cache would be the same document: ``create()`` found
+      the cache, saw no ``state`` in it, and called the cluster
+      interrupted; ``delete()`` failed with a bare ``KeyError``; and a
+      library caller's ``set_metadata()`` overwrote the cache. This one is
+      raised by ``Cluster.__init__``, so every verb refuses it and not
+      only ``create()``. That strands nothing, because no cluster of such
+      a name could ever have been created. The other two refusals are
+      ``create()``'s alone, because a cluster which already exists under a
+      name they would refuse has to stay possible to show, repair and
+      delete. Both reserved names contain an underscore, so the full rule
+      would refuse them as well; the constructor runs first, so
+      ``reserved`` is what a caller sees.
+
+    ``name`` is what was passed, unchanged, and every message renders it
+    with ``repr()``, so that an empty name, a trailing space or a control
+    character is visible rather than silently part of the sentence.
+    ``max_length`` is set by ``too_long()`` and ``metadata_key`` by
+    ``reserved()``; both are None otherwise. Which classmethod built an
+    instance is recorded in ``reason``.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
+    FIELDS = ('name', 'max_length', 'metadata_key')
+
+    @classmethod
+    def invalid_characters(cls, name):
+        message = (
+            'Cluster name %r cannot be used. A cluster name must be made of\n'
+            'letters, digits and hyphens, and must start and end with a letter\n'
+            "or a digit, because it becomes part of each node's instance name,\n"
+            'which Shaken Fist requires to be a DNS host name.'
+        ) % (name,)
+        return cls('invalid_characters', message, name=name)
+
+    @classmethod
+    def too_long(cls, name, max_length):
+        message = (
+            'Cluster name %r is %d characters long, and a cluster name can be\n'
+            "at most %d. Each node's instance name is k3s-<name>-node-<serial>,\n"
+            'and Shaken Fist refuses an instance name longer than 63 characters.'
+        ) % (name, len(name), max_length)
+        return cls('too_long', message, name=name, max_length=max_length)
+
+    @classmethod
+    def reserved(cls, name, metadata_key):
+        message = (
+            'Cluster name %r cannot be used. A cluster of that name would be\n'
+            'stored under the namespace metadata key %s,\n'
+            'where shakenfist_client_k3s keeps its own data. Choose another name.'
+        ) % (name, metadata_key)
+        return cls('reserved', message, name=name, metadata_key=metadata_key)
+
+
+class ShapeError(_ReasonedK3sException):
+    """Raised when a node or address count cannot be used.
+
+    A count is how many of something a verb is asked to build:
+    ``Cluster.create()``'s ``control_plane_count``, ``worker_count`` and
+    ``metal_address_count``, ``expand_workers()``'s ``worker_count`` and
+    ``expand_addresses()``'s ``address_count``. ``validate_counts()`` in
+    ``cluster.py`` checks them before the API is asked for anything, for
+    the reason ``NodeSizeError`` gives, and because the failures an
+    unusable count causes otherwise are late and do not name the count: a
+    cluster with no control plane has no API server, and finds out tens of
+    minutes into the create; an expand by zero, or by a negative number,
+    reports success having done nothing. Construct via the classmethods
+    below, one per refusal:
+
+    - ``below_floor(parameter, value, floor)``: the count is an integer
+      below the floor its verb sets: at least one control plane node;
+      zero or more workers and load balancer addresses on create, because
+      a cluster with neither is still a working cluster; and at least one
+      of whatever an expand verb adds, because zero is a request for
+      nothing. ``validate_counts()`` gives the reasoning at more length.
+    - ``not_an_integer(parameter, value, floor)``: the count is not an
+      ``int``, or is a ``bool``. ``True`` is an ``int`` in Python and
+      ``True >= 1`` holds, so without the check a YAML ``yes`` would build
+      one node and say nothing; a float is refused rather than truncated,
+      because rounding a request quietly in either direction is not what
+      was asked for. ``validate_node_sizes()`` makes the same refusals
+      for the same reasons.
+
+    ``parameter`` is the count's keyword argument name as the library
+    spells it, ``value`` is what was passed, unchanged, and ``floor`` is
+    the smallest count the verb accepts. Both classmethods set all three,
+    and the messages render the value with ``repr()`` so that ``'2'`` and
+    ``2`` are told apart. Which classmethod built an instance is recorded
+    in ``reason``.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
+    FIELDS = ('parameter', 'value', 'floor')
+
+    @classmethod
+    def below_floor(cls, parameter, value, floor):
+        message = '%s must be at least %d, not %r.' % (parameter, floor, value)
+        return cls('below_floor', message, parameter=parameter, value=value,
+                   floor=floor)
+
+    @classmethod
+    def not_an_integer(cls, parameter, value, floor):
+        message = '%s must be an integer of at least %d, not %r, which is a %s.' % (
+            parameter, floor, value, type(value).__name__)
+        return cls('not_an_integer', message, parameter=parameter,
+                   value=value, floor=floor)
 
 
 class K3sConfigError(_ReasonedK3sException):

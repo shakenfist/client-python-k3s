@@ -63,6 +63,96 @@ class NodeSizeErrorTestCase(testtools.TestCase):
             "worker cpus must be a positive integer, not '2'", str(e))
 
 
+class ClusterNameErrorTestCase(testtools.TestCase):
+    def test_invalid_characters(self):
+        e = exceptions.ClusterNameError.invalid_characters('my.cluster')
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('invalid_characters', e.reason)
+        self.assertEqual('my.cluster', e.name)
+        self.assertIsNone(e.max_length)
+        self.assertIsNone(e.metadata_key)
+        self.assertEqual(
+            "Cluster name 'my.cluster' cannot be used. A cluster name must be made of\n"
+            'letters, digits and hyphens, and must start and end with a letter\n'
+            "or a digit, because it becomes part of each node's instance name,\n"
+            'which Shaken Fist requires to be a DNS host name.', str(e))
+
+    def test_an_empty_name_is_visible_in_the_message(self):
+        # repr() rather than %s, or the sentence would read "Cluster name
+        # cannot be used" and not say what was wrong with it.
+        e = exceptions.ClusterNameError.invalid_characters('')
+        self.assertIn("Cluster name '' cannot be used.", str(e))
+
+    def test_a_name_which_is_not_a_string_renders(self):
+        # A tuple is the case worth pinning: '%r' % (name) with a tuple
+        # would format its elements, or raise, rather than render it.
+        e = exceptions.ClusterNameError.invalid_characters(('a', 'b'))
+        self.assertIn("Cluster name ('a', 'b') cannot be used.", str(e))
+
+    def test_too_long(self):
+        e = exceptions.ClusterNameError.too_long('a' * 49, 48)
+        self.assertEqual('too_long', e.reason)
+        self.assertEqual('a' * 49, e.name)
+        self.assertEqual(48, e.max_length)
+        self.assertIsNone(e.metadata_key)
+        self.assertEqual(
+            "Cluster name '%s' is 49 characters long, and a cluster name can be\n"
+            "at most 48. Each node's instance name is k3s-<name>-node-<serial>,\n"
+            'and Shaken Fist refuses an instance name longer than 63 characters.'
+            % ('a' * 49), str(e))
+
+    def test_reserved(self):
+        e = exceptions.ClusterNameError.reserved(
+            'k3s_version_cache', 'orchestrated_k3s_cluster_k3s_version_cache')
+        self.assertEqual('reserved', e.reason)
+        self.assertEqual('k3s_version_cache', e.name)
+        self.assertIsNone(e.max_length)
+        self.assertEqual('orchestrated_k3s_cluster_k3s_version_cache',
+                         e.metadata_key)
+        self.assertEqual(
+            "Cluster name 'k3s_version_cache' cannot be used. A cluster of that name would be\n"
+            'stored under the namespace metadata key orchestrated_k3s_cluster_k3s_version_cache,\n'
+            'where shakenfist_client_k3s keeps its own data. Choose another name.', str(e))
+
+
+class ShapeErrorTestCase(testtools.TestCase):
+    def test_below_floor(self):
+        e = exceptions.ShapeError.below_floor('control_plane_count', 0, 1)
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('below_floor', e.reason)
+        self.assertEqual('control_plane_count', e.parameter)
+        self.assertEqual(0, e.value)
+        self.assertEqual(1, e.floor)
+        self.assertEqual('control_plane_count must be at least 1, not 0.',
+                         str(e))
+
+    def test_not_an_integer(self):
+        e = exceptions.ShapeError.not_an_integer('worker_count', True, 0)
+        self.assertEqual('not_an_integer', e.reason)
+        self.assertEqual('worker_count', e.parameter)
+        self.assertIs(True, e.value)
+        self.assertEqual(0, e.floor)
+        self.assertEqual(
+            'worker_count must be an integer of at least 0, not True, which '
+            'is a bool.', str(e))
+
+    def test_the_value_is_rendered_with_repr(self):
+        # So that the string a YAML document or an Ansible variable handed
+        # over is told apart from the integer it looks like.
+        e = exceptions.ShapeError.not_an_integer('address_count', '2', 1)
+        self.assertEqual(
+            "address_count must be an integer of at least 1, not '2', which "
+            'is a str.', str(e))
+
+    def test_a_tuple_value_renders(self):
+        # '%r' % value with a tuple would format its elements rather than
+        # render it; the classmethods must pass a tuple of arguments.
+        e = exceptions.ShapeError.not_an_integer('worker_count', (1, 2), 0)
+        self.assertIn('not (1, 2), which is a tuple.', str(e))
+        e = exceptions.ShapeError.below_floor('worker_count', -1, 0)
+        self.assertEqual('worker_count must be at least 0, not -1.', str(e))
+
+
 class ClusterMetadataErrorTestCase(testtools.TestCase):
     def test_not_an_address(self):
         e = exceptions.ClusterMetadataError.not_an_address(

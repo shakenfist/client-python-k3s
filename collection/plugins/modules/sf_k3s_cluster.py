@@ -698,9 +698,17 @@ def run_module():
                  % (module.params['api_url'] or 'the discovered api_url', e)),
             health=None, log=reporter.lines)
 
-    cluster = sf_cluster.Cluster(
-        client, module.params['name'], module.params['namespace'],
-        reporter=reporter)
+    # Building a Cluster can refuse the name: one whose namespace metadata
+    # key is a release cache's is refused on every verb, by the constructor
+    # (see ClusterNameError). That happens outside the orchestration handler
+    # below, so it is caught here, where no cluster state has been read or
+    # written and there is no change to own up to.
+    try:
+        cluster = sf_cluster.Cluster(
+            client, module.params['name'], module.params['namespace'],
+            reporter=reporter)
+    except sf_exceptions.ClusterNameError as e:
+        module.fail_json(msg=str(e), health=None, log=reporter.lines)
 
     # Every exception the library raises for a cluster-shaped problem
     # derives from K3sClusterException and renders itself as the sentence

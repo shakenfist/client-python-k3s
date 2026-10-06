@@ -854,6 +854,115 @@ def validate_node_sizes(sizes):
                     role, field, value)
 
 
+# The longest cluster name create() accepts. Every node's Shaken Fist
+# instance name is 'k3s-%s-node-%03d' % (name, serial) -- see
+# create_instance() -- and Shaken Fist refuses an instance name longer than
+# 63 characters. The template adds 'k3s-' and '-node-', ten characters, to
+# the name, plus the serial: three digits at first, since %03d pads to
+# three, but as many as the serial needs once it passes 999. The serial
+# counts every node the cluster has ever had, removed ones included, so a
+# long lived cluster with workers coming and going does pass 999. 63 - 10 -
+# 3 = 50 is the true ceiling today; 63 - 10 - 5 = 48 leaves room for
+# serials up to 99999, so that a cluster which was legal to create does not
+# become one that cannot grow.
+CLUSTER_NAME_MAX_LENGTH = 48
+
+# What a cluster name may be made of: ASCII letters, digits and hyphens,
+# starting and ending with a letter or a digit. Explicit ranges rather than
+# \w, which takes underscores and the letters of every other script. \Z
+# rather than $, because $ also matches before a trailing newline, which
+# would let 'banana\n' through.
+CLUSTER_NAME_PATTERN = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\Z')
+
+
+def validate_cluster_name(name):
+    """Refuse a cluster name which cannot become a node's instance name, before anything is built.
+
+    Returns nothing, and raises exceptions.ClusterNameError if the name is
+    unusable: ``invalid_characters`` if it is not a string, is empty, or
+    does not match CLUSTER_NAME_PATTERN, and ``too_long`` if it is longer
+    than CLUSTER_NAME_MAX_LENGTH. Characters are checked before length,
+    because a name with a dot in it can never be made to work by
+    shortening it.
+
+    The rule is Shaken Fist's rule for an instance name, applied to the
+    part of the instance name this package does not choose. Shaken Fist
+    refuses an instance name which is not a DNS host name, which contains
+    a dot, or which is longer than 63 characters, and the cluster name is
+    embedded in every node's instance name. Without this check such a name
+    is refused at the first instance create, by which time create() has
+    registered the name and allocated the node network: the caller is
+    left with an interrupted cluster to delete rather than an error. The
+    first and last characters must be alphanumeric because a DNS label's
+    must be, and because a trailing hyphen would make the join with
+    '-node-' ambiguous.
+
+    Mixed case is accepted on purpose. Shaken Fist accepts it, k3s
+    lowercases the host name for the Kubernetes node name, and
+    docs/usage.md documents a mixed case name working.
+
+    Only create() calls this. Every other verb acts on a cluster which
+    already exists, and a cluster created before this check under a name it
+    refuses has to stay possible to show, repair and delete. The two names
+    no verb may use -- the ones whose metadata key is one of
+    primitives.RESERVED_METADATA_KEYS -- are refused by Cluster.__init__
+    instead, and this rule refuses them as well, because both contain an
+    underscore.
+
+    A pure function, like validate_node_sizes(), so that it can be tested
+    without a client and so that create() can call it before it has
+    talked to the API at all.
+    """
+    if not isinstance(name, str) or not CLUSTER_NAME_PATTERN.match(name):
+        raise exceptions.ClusterNameError.invalid_characters(name)
+    if len(name) > CLUSTER_NAME_MAX_LENGTH:
+        raise exceptions.ClusterNameError.too_long(
+            name, CLUSTER_NAME_MAX_LENGTH)
+
+
+def validate_counts(floor, **counts):
+    """Refuse a count which is not an integer of at least floor, before anything is built.
+
+    counts are keyword arguments named as the calling verb names them --
+    ``validate_counts(1, control_plane_count=control_plane_count)`` -- so
+    that the error can say which count was wrong. Returns nothing, and
+    raises exceptions.ShapeError naming the parameter, the floor and the
+    value for the first count which is not usable, in the order they were
+    passed: ``not_an_integer`` for anything which is not an int, and
+    ``below_floor`` for an int smaller than floor.
+
+    The floor is an argument rather than a table here because it belongs
+    to the verb rather than to the count's name: worker_count is zero or
+    more on create and one or more on expand_workers(). The floors are:
+
+    - control_plane_count on create(): at least 1. A cluster with no
+      control plane has no API server, and the create would otherwise
+      fail tens of minutes in with an error which does not name the count.
+    - worker_count and metal_address_count on create(): at least 0. A
+      cluster with no workers runs its workloads on an untainted control
+      plane, as docs/usage.md describes, and one with no addresses has no
+      load balancer pool until expand_addresses() adds some. Both are
+      clusters a caller can mean to build.
+    - worker_count on expand_workers() and address_count on
+      expand_addresses(): at least 1. Zero is a request for nothing, and
+      the verb would otherwise report success having done nothing; a
+      negative count does the same, because range() of it is empty.
+
+    bool and every non-int are refused for the reasons
+    validate_node_sizes() gives: True is an int and is >= 1, so it would
+    build one node from a YAML ``yes`` and say nothing, and a float is
+    refused rather than truncated because rounding a request quietly is
+    not what the caller asked for.
+
+    A pure function, like validate_node_sizes(), for the same reasons.
+    """
+    for parameter, value in counts.items():
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise exceptions.ShapeError.not_an_integer(parameter, value, floor)
+        if value < floor:
+            raise exceptions.ShapeError.below_floor(parameter, value, floor)
+
+
 def validate_k3s_config(config, role):
     """Refuse k3s configuration which cannot be written onto a node, before anything is built.
 
@@ -1079,9 +1188,26 @@ class Cluster:
     behind ``query-k3s-version`` and ``query-longhorn-version`` -- builds
     no Cluster at all and calls the module level functions in
     ``primitives`` instead.
+
+    Constructing one raises ``exceptions.ClusterNameError`` for a name
+    whose metadata key is one of ``primitives.RESERVED_METADATA_KEYS``,
+    which is the only check on the name made here.
     """
 
     def __init__(self, client, name, namespace, reporter=None):
+        # A name whose metadata key is one this package already uses for
+        # something else is refused here, on every verb, rather than only by
+        # create(): no cluster of such a name can ever have been created, so
+        # nothing is stranded, and every verb reading or writing that key
+        # would otherwise be reading or writing a release cache. This is
+        # deliberately not validate_cluster_name(). That rule is create()'s
+        # alone, so that a cluster which already exists under a name it
+        # would refuse can still be shown, repaired and deleted. See
+        # ClusterNameError.
+        md_key = METADATA_KEY % name
+        if md_key in primitives.RESERVED_METADATA_KEYS:
+            raise exceptions.ClusterNameError.reserved(name, md_key)
+
         self.client = client
         self.name = name
         self.namespace = namespace
