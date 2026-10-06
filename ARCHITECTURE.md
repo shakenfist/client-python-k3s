@@ -164,8 +164,9 @@ constants at the top of `cluster.py`, which is where they are used.
 
 This section is only the shape. `docs/library-api.md` is the reference
 for what a caller sees: the reporter interface, the two output modes,
-the stall note, `health()`'s bounded probe, and which exception each
-ending raises.
+the stall note, `health()`'s bounded probes (`kubectl` plus a per-node
+signals probe, submitted together under one shared deadline), and which
+exception each ending raises.
 
 ## Python Version Compatibility
 

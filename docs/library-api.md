@@ -362,12 +362,16 @@ the node it would run on is not up. Both are reported as
 neither raises. Every probe -- the `kubectl` one and one signals probe
 per healthy node (see "What `signals` reports", below) -- is submitted
 before any is waited for, and all of them are waited for under one
-shared budget, so the bound is one budget on a cluster of any size.
-The budget is a ceiling, not a cost: every command runs on its node
-while earlier ones are waited for, and one which has finished by the
-time it is collected costs a single read, so a healthy cluster answers
-in about the time its slowest probe takes rather than a second per
-node. An abandoned run does leave operations queued until the server's
+shared budget, so the waiting is bounded by one budget on a cluster of
+any size. That bounds the waiting, not the call: on top of it come one
+API round trip per node to read its instance, one per probe to submit
+it, and the reads of each operation, all made one after another, so on
+a slow Shaken Fist API the wall time can exceed the budget. The budget
+is a ceiling, not a cost: every command runs on its node while earlier
+ones are waited for, and one which has finished by the time it is
+collected costs a single read, so a healthy cluster waits for about the
+time its slowest probe takes rather than a second per node. An abandoned
+run does leave operations queued until the server's
 deadline ends them: up to one per probed node, plus the `kubectl` one
 on the control plane node. `api['error']` names the `kubectl`
 operation, and a caller polling `health()` in a loop should know that a
@@ -412,10 +416,10 @@ command, so it lives on that machine's entry.
 |---|---|
 | `probed` | The command ran at all. |
 | `error` | Why it did not, or why it failed: the instance is gone, the node is not up, the probe was abandoned at the deadline, the operation failed, or the command exited non-zero. A node that was not probed says why in the words `api['error']` uses for a skipped probe. `None` when the probe ran cleanly. |
-| `boot_id` | `/proc/sys/kernel/random/boot_id`, which changes at every boot. |
+| `boot_id` | `/proc/sys/kernel/random/boot_id`, which changes at every boot. Only a UUID (8-4-4-4-12 hexadecimal) is reported, in lowercase; anything else the node prints is `None`, so that garbage never reads as a reboot. |
 | `booted_at` | `btime` from `/proc/stat`, in Unix seconds. The same fact as `boot_id`, in a form a person can read. |
 | `k3s_unit` | The systemd unit k3s runs as: `k3s` on control plane nodes and `k3s-agent` on workers. Reported so that a reader does not have to know the installer's naming. |
-| `k3s_state` | That unit's systemd `ActiveState`. |
+| `k3s_state` | That unit's systemd `ActiveState`, such as `active`, `activating` or `failed`. Only lowercase letters and hyphens, at most 32 characters, are reported; anything else is `None`. |
 | `k3s_restarts` | That unit's systemd `NRestarts`. |
 | `oom_kills` | `oom_kill` from `/proc/vmstat`: every kernel OOM kill since boot, including a pod exceeding its own memory limit. |
 | `memory_total_bytes` | `MemTotal` from `/proc/meminfo`, converted from kB to bytes. |

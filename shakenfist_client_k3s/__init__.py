@@ -477,24 +477,36 @@ def _render_signals(out, node):
     def count(reading):
         return str(reading) if is_count(reading) else 'unknown'
 
+    def counted(reading, noun):
+        # Singular for exactly one, and plural for everything else: zero,
+        # other counts, and 'unknown', which reads as "an unknown number
+        # of restarts". is_count() first, so that True is not one.
+        singular = is_count(reading) and reading == 1
+        return '%s %s%s' % (count(reading), noun, '' if singular else 's')
+
     def mib(reading):
         return str(reading // 1048576) if is_count(reading) else 'unknown'
 
     # The type checks mean only an int ever reaches the division, str() or
-    # datetime, whoever built the report. The conversions above cannot then
-    # raise on anything the parser hands over: every reading is None or a
-    # non-negative int, str() of which is only refused past 4300 digits
-    # (Python 3.11 and later), the parser only converts strings of up to
-    # 4300 digits, and the only readings it scales beyond that, the memory
-    # sizes by 1024, reach str() through mib(), whose division by 1048576
-    # takes them back under it. A timestamp is different, because the parser
-    # accepts any count and datetime does not: a btime past the year 9999,
-    # or past what the platform's time_t holds, raises OverflowError,
-    # OSError or ValueError depending on where it overflows. That is a
-    # reading which cannot be shown rather than a reason to lose the whole
-    # report, and the parser's rule is that nothing about a node's output
-    # can raise, so the renderer's has to be too: such a btime is 'unknown',
-    # as one which could not be read is.
+    # datetime, whoever built the report. Nothing the parser produces comes
+    # near what str() refuses -- more than 4300 digits, on Python 3.11 and
+    # later -- because it caps every reading at twenty digits, 2**64 - 1,
+    # and the memory sizes it scales by 1024 gain four more at most. The
+    # int checks, and mib() dividing before it calls str(), exist for the
+    # hand-built report, which can hold anything: a float or a string is
+    # 'unknown' rather than a TypeError or a fractional MiB, and a size is
+    # shortened before it is turned into text rather than after. An int
+    # thousands of digits long is not something health() can return, and
+    # is not defended against beyond that.
+    #
+    # A timestamp is different, because twenty digits is far more than
+    # datetime takes: a btime past the year 9999, or past what the
+    # platform's time_t holds, raises OverflowError, OSError or ValueError
+    # depending on where it overflows. That is a reading which cannot be
+    # shown rather than a reason to lose the whole report, and the parser's
+    # rule is that nothing about a node's output can raise, so the
+    # renderer's has to be too: such a btime is 'unknown', as one which
+    # could not be read is.
     booted_at = signals.get('booted_at')
     booted = 'unknown'
     if is_count(booted_at):
@@ -509,10 +521,10 @@ def _render_signals(out, node):
 
     readings = [
         'booted %s' % booted,
-        '%s %s, %s restarts' % (
+        '%s %s, %s' % (
             text(signals.get('k3s_unit')), text(signals.get('k3s_state')),
-            count(signals.get('k3s_restarts'))),
-        '%s OOM kills' % count(signals.get('oom_kills')),
+            counted(signals.get('k3s_restarts'), 'restart')),
+        counted(signals.get('oom_kills'), 'OOM kill'),
         '%s of %s MiB available' % (
             mib(signals.get('memory_available_bytes')),
             mib(signals.get('memory_total_bytes')))]

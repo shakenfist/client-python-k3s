@@ -3,8 +3,10 @@
 ## Prompt
 
 Before responding to questions or discussion points in this document,
-read `Cluster.health()`, `_node_health()`, `_probe_k3s_api()`,
-`_unprobed()`, `await_execute()` and the agent operation state constants
+read `Cluster.health()`, `_node_health()`, `_probe_k3s_api()` (since
+removed: read `_submit_probe()` and `_collect_probe()`, see *Deviations
+and bugs fixed during this work*), `_unprobed()`, `await_execute()` and
+the agent operation state constants
 in `shakenfist_client_k3s/cluster.py`, the two shell rules above
 `heredoc()` in the same file, `k3s_health()` and `_render_health()` in
 `shakenfist_client_k3s/__init__.py`, `HealthClient` in
@@ -518,6 +520,20 @@ found and fixed:
   a reading at twenty digits, the length of 2**64 - 1, because an uncapped
   garbage reading scaled by 1024 made `json.dumps()` of the report raise
   on Python 3.11 and later, which would break the Ansible module's result.
+  Round 3 applied the same rule to the two string readings: `boot_id`
+  must be a UUID and `k3s_state` a short lowercase systemd state, or
+  they are `None`, because a garbage `boot_id` reads to a caller as a
+  reboot.
+- **The properties this phase defends are in `tools/mutation-check.py`**
+  (review round 3). Rounds 1 and 2 mutation-checked their fixes by hand,
+  which AGENTS.md says not to do; fifteen entries now cover signals never
+  affecting `healthy`, no raw output in the report, the quoted and
+  absolute-only snapshot directory, first-key-wins, the reading caps and
+  shapes, the read past the deadline, read-before-sleep, and the
+  renderer's guards. All 37 mutations in the script are caught.
+- **The "one budget" bound is about waiting only** (review round 3).
+  The serial API calls -- one `get_instance()` per node, one submission
+  per probe, and the reads -- come on top of it, and the docs now say so.
 
 ## Back brief
 

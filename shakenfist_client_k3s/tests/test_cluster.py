@@ -3388,21 +3388,83 @@ class ParseNodeSignalsTestCase(testtools.TestCase):
             cluster_module.parse_node_signals(stdout, 'control_plane'))
 
     def test_a_value_is_split_from_its_key_at_the_first_equals(self):
+        # And kept whole, so a value with a second '=' in it is not a
+        # reading -- no reading contains one -- rather than being cut down
+        # to the part which looks like one. The line still claims its key,
+        # so the first-occurrence rule applies to it as to any other.
         stdout = SERVER_SIGNALS_OUTPUT.replace(
-            'ActiveState=active', 'ActiveState=a=b')
-        self.assertEqual(
-            'a=b',
-            cluster_module.parse_node_signals(
-                stdout, 'control_plane')['k3s_state'])
+            'ActiveState=active', 'ActiveState=active=x').replace(
+            'oom_kills=2', 'oom_kills=2=3')
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+
+        self.assertIsNone(signals['k3s_state'])
+        self.assertIsNone(signals['oom_kills'])
+        self.assertEqual(3, signals['k3s_restarts'])
+
+    def test_a_boot_id_is_a_uuid_or_none(self):
+        # boot_id is what a caller compares to decide whether the node
+        # rebooted, so anything which is not one is None rather than a
+        # string which differs from the baseline and reads as a reboot.
+        uuid = '3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11'
+        for value, expected in (
+                (uuid, uuid),
+                # Either case is accepted and reported in lowercase, so one
+                # boot is always one string.
+                (uuid.upper(), uuid),
+                ('', None),
+                ('abc', None),
+                ('evil', None),
+                (uuid[:-1], None),
+                (uuid + '0', None),
+                (uuid + '-' + uuid, None),
+                (uuid.replace('-', ''), None),
+                ('{%s}' % uuid, None),
+                (uuid.replace('f', 'g'), None),
+                # Non-ASCII digits, which int() would take and a \d would
+                # match.
+                (uuid.replace('3', '\u0663'), None),
+                ('x' * 5000, None)):
+            stdout = SERVER_SIGNALS_OUTPUT.replace(
+                'boot_id=' + uuid, 'boot_id=' + value)
+            signals = cluster_module.parse_node_signals(
+                stdout, 'control_plane')
+            self.assertEqual(expected, signals['boot_id'], value)
+
+    def test_a_k3s_state_is_an_active_state_or_none(self):
+        for value in ('active', 'inactive', 'activating', 'deactivating',
+                      'failed', 'reloading', 'maintenance', 'refreshing',
+                      'some-future-state', 'a' * 32):
+            stdout = SERVER_SIGNALS_OUTPUT.replace(
+                'ActiveState=active', 'ActiveState=' + value)
+            self.assertEqual(
+                value,
+                cluster_module.parse_node_signals(
+                    stdout, 'control_plane')['k3s_state'])
+
+        for value in ('', 'Active', 'ACTIVE', 'active (running)',
+                      'active;rm -rf /', 'active\x00', 'a' * 33, 'x' * 5000,
+                      'act1ve', 'active_state', '\u00e4ctive'):
+            stdout = SERVER_SIGNALS_OUTPUT.replace(
+                'ActiveState=active', 'ActiveState=' + value)
+            signals = cluster_module.parse_node_signals(
+                stdout, 'control_plane')
+            self.assertIsNone(signals['k3s_state'], value)
+            # It voids that reading alone.
+            self.assertEqual(3, signals['k3s_restarts'], value)
 
     def test_the_first_occurrence_of_a_key_wins(self):
         # The snapshot size is printed last and is the one value derived
         # from caller data, so a directory name holding a newline and a
         # line of its own cannot replace a reading printed before it.
-        stdout = SERVER_SIGNALS_OUTPUT + 'boot_id=evil\nNRestarts=0\n'
+        stdout = SERVER_SIGNALS_OUTPUT + (
+            'boot_id=0b5e7d3a-2c41-4f6e-8a90-1d2c3b4a5f60\n'
+            'ActiveState=failed\nNRestarts=0\n')
         signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+        # Valid readings every one, so that it is the order which keeps
+        # them out and not the shape checks.
         self.assertEqual('3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11',
                          signals['boot_id'])
+        self.assertEqual('active', signals['k3s_state'])
         self.assertEqual(3, signals['k3s_restarts'])
 
     def test_no_string_makes_it_raise(self):
@@ -5119,7 +5181,8 @@ class HealthSignalsTestCase(testtools.TestCase):
     def test_a_signals_command_which_exits_non_zero_leaves_the_cluster_healthy(self):
         # And what it did print is still read: each reading stands alone.
         self.client.signals_return_code['inst-w1'] = 2
-        self.client.signals_stdout['inst-w1'] = 'boot_id=abc\noom_kills=5\n'
+        self.client.signals_stdout['inst-w1'] = (
+            'boot_id=0b5e7d3a-2c41-4f6e-8a90-1d2c3b4a5f60\noom_kills=5\n')
 
         report = self.cluster.health()
 
@@ -5127,7 +5190,8 @@ class HealthSignalsTestCase(testtools.TestCase):
         signals = self._node(report, 'inst-w1')['signals']
         self.assertTrue(signals['probed'])
         self.assertEqual('the node signals command exited 2', signals['error'])
-        self.assertEqual('abc', signals['boot_id'])
+        self.assertEqual('0b5e7d3a-2c41-4f6e-8a90-1d2c3b4a5f60',
+                         signals['boot_id'])
         self.assertEqual(5, signals['oom_kills'])
         self.assertIsNone(signals['memory_total_bytes'])
 

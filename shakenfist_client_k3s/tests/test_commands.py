@@ -609,7 +609,8 @@ class HealthCommandTestCase(testtools.TestCase):
         # No memory or etcd lines at all, so those readings are None in
         # the report and the line must keep its shape.
         self.client.signals_stdout['inst-cp1'] = (
-            'boot_id=3f0c3c4e\nbooted_at=1759712345\noom_kills=2\n'
+            'boot_id=3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11\nbooted_at=1759712345\n'
+            'oom_kills=2\n'
             'NRestarts=3\nLoadState=loaded\nActiveState=active\n')
 
         result = self._invoke()
@@ -791,7 +792,7 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
 
         self.assertIn(
             '(inst-cp1, control plane): instance created, agent ready\n'
-            '        booted 2025-10-06T00:59:05Z, k3s active, 1 restarts, '
+            '        booted 2025-10-06T00:59:05Z, k3s active, 1 restart, '
             '0 OOM kills, 3000 of 4000 MiB available, '
             'etcd 64 MiB, snapshots 32 MiB\n', reporter.getvalue())
         self.assertIn(
@@ -816,20 +817,20 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
         self.assertNotIn('None', reporter.getvalue())
 
     def test_a_boot_time_datetime_cannot_hold_renders_unknown(self):
-        # The parser accepts any count of digits as a btime, and datetime
-        # does not: 10**20 seconds is far past the year 9999, and
-        # fromtimestamp() raises for it (OverflowError, OSError or
+        # The parser accepts up to twenty digits as a btime, and datetime
+        # takes far fewer: twenty nines of seconds is far past the year
+        # 9999, and fromtimestamp() raises for it (OverflowError, OSError or
         # ValueError, depending on the platform and where it overflows).
         # That must cost the one reading, not the report: the rest of the
         # line, and the rest of the nodes, are rendered as usual.
         report = copy.deepcopy(self.REPORT)
-        report['nodes'][0]['signals']['booted_at'] = 10 ** 20
+        report['nodes'][0]['signals']['booted_at'] = int('9' * 20)
         reporter = progress.CollectingReporter()
 
         shakenfist_client_k3s._render_health(reporter, report)
 
         self.assertIn(
-            '        booted unknown, k3s active, 1 restarts, '
+            '        booted unknown, k3s active, 1 restart, '
             '0 OOM kills, 3000 of 4000 MiB available, '
             'etcd 64 MiB, snapshots 32 MiB\n', reporter.getvalue())
         self.assertIn('signals: not read (instance is gone)',
@@ -897,7 +898,7 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
         rendered = self._render_with({'k3s_unit': 7, 'k3s_state': True})
 
         self.assertIn('        booted 2025-10-06T00:59:05Z, unknown unknown, '
-                      '1 restarts, ', rendered)
+                      '1 restart, ', rendered)
 
     def test_the_epoch_is_a_boot_time_and_not_unknown(self):
         # The negative of the above: zero is a timestamp datetime can hold,
@@ -912,13 +913,14 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
         self.assertIn('        booted 1970-01-01T00:00:00Z, k3s active, ',
                       reporter.getvalue())
 
-    def test_the_largest_sizes_the_parser_can_make_still_render(self):
+    def test_hand_built_sizes_at_str_s_digit_limit_still_render(self):
         # The other conversions on an int, swept for the same failure:
         # Python 3.11 and later refuse str() of an int past 4300 digits. The
-        # parser caps a reading at twenty digits, so it cannot produce one,
-        # but the renderer also takes reports a caller built, and must not
-        # raise on those either. A size near the limit, scaled by 1024 as
-        # memory is, renders because mib() divides before str() sees it.
+        # parser caps a reading at twenty digits, so nothing it produces
+        # comes near that, but the renderer also takes reports a caller
+        # built, and must not raise on those either. A size at the limit,
+        # scaled by 1024 as memory is, renders because mib() divides before
+        # str() sees it.
         biggest = int('9' * 4300)
         report = copy.deepcopy(self.REPORT)
         report['nodes'][0]['signals'].update({
@@ -932,6 +934,20 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
 
         self.assertIn('k3s API: answered on inst-cp1', reporter.getvalue())
         self.assertIn(' MiB available, etcd ', reporter.getvalue())
+
+    def test_a_count_of_one_is_singular(self):
+        # And only one: zero and every other count are plural, as is a
+        # count which could not be read ('unknown restarts').
+        for restarts, oom_kills, expected in (
+                (1, 1, '1 restart, 1 OOM kill, '),
+                (0, 2, '0 restarts, 2 OOM kills, '),
+                (None, 1, 'unknown restarts, 1 OOM kill, '),
+                (11, None, '11 restarts, unknown OOM kills, ')):
+            rendered = self._render_with(
+                {'k3s_restarts': restarts, 'oom_kills': oom_kills})
+
+            self.assertIn('k3s active, %s3000 of 4000 MiB available' % expected,
+                          rendered)
 
     def test_a_worker_line_has_no_etcd(self):
         report = copy.deepcopy(self.REPORT)

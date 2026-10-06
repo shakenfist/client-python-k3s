@@ -497,8 +497,11 @@ connected is accepted and then never runs. Each of those outcomes is
 reported with the reason, on the `k3s API:` line or on the node's
 signals line, rather than waited on. The budget is only spent when
 something is wrong: the probes run on every node at once, so a
-healthy cluster answers in about as long as its slowest probe takes,
-whatever its size.
+healthy cluster waits for about as long as its slowest probe takes,
+whatever its size. The budget bounds the waiting only: on top of it
+come one Shaken Fist API round trip per node to read its instance, one
+per probe to submit it, and the reads of each probe, so on a slow Shaken
+Fist API the command can take longer than thirty seconds.
 
 An abandoned run leaves operations queued: up to one per probed node,
 plus the `kubectl get nodes` against the control plane node. The

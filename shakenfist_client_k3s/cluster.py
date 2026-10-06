@@ -120,8 +120,12 @@ AGENT_OP_KNOWN_STATES = (AGENT_OP_PENDING_STATES + AGENT_OP_FAILED_STATES
 # How long health()'s read only probes wait for their commands before each
 # one still running is reported as a timeout. It is one budget for the
 # whole call rather than one per probe: health() submits every probe before
-# waiting for any and measures them all against a single deadline, so a
-# cluster of any size is answered within it. The server's own deadline
+# waiting for any and measures them all against a single deadline, so the
+# waiting on a cluster of any size fits within it. It bounds the waiting
+# only: the API round trips around it -- one per node to read its
+# instance, one per probe to submit it, and the reads of each operation --
+# are serial and not bounded by it, so on a slow Shaken Fist API the call
+# as a whole can take longer. The server's own deadline
 # would bound the wait eventually, but ten minutes of silence is not a
 # health check: a 'kubectl get nodes' on a cluster which is answering
 # returns in well under a second, and the node signals command reads a few
@@ -367,6 +371,29 @@ NODE_SIGNAL_KEYS = (
 # module's result would raise on a reading this parser had accepted.
 NODE_SIGNAL_INTEGER_RE = re.compile(r'\A[0-9]{1,20}\Z')
 
+# Match the two readings parse_node_signals() keeps as strings. Without
+# them a string reading is whatever the node printed, and each has a
+# consequence beyond looking odd. boot_id is the reading a caller compares
+# with its baseline to decide whether the node rebooted, so a garbage one --
+# a truncated read, a stray line -- reads as a reboot and voids every
+# counter's baseline; and an unbounded string in either flows on into the
+# Ansible module's result and every log which records it.
+#
+# The kernel prints boot_id as an 8-4-4-4-12 hexadecimal UUID in lowercase.
+# The pattern accepts either case and the parser lowercases what it accepts,
+# so that one boot is always one string to a caller comparing them, however
+# a future kernel or a shim in front of /proc chooses to print it.
+# k3s_state is a systemd ActiveState -- active, inactive, activating,
+# deactivating, failed, reloading, maintenance, refreshing -- all lowercase
+# words joined by hyphens. The pattern admits a state systemd adds later
+# rather than naming today's, and its length cap is well above the longest
+# of them. Anything else is not a reading, and is None like one which could
+# not be taken.
+NODE_SIGNAL_BOOT_ID_RE = re.compile(
+    r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z',
+    re.IGNORECASE)
+NODE_SIGNAL_STATE_RE = re.compile(r'\A[a-z-]{1,32}\Z')
+
 # Every command this module builds is a shell command line, run as root on
 # a cluster node by the in-guest agent. Two rules keep that safe, and they
 # are rules rather than case by case judgements because the next reader
@@ -593,6 +620,20 @@ def _signal_integer(raw, key, scale=1):
     return int(value) * scale
 
 
+def _signal_string(raw, key, pattern):
+    """Return raw[key] if pattern matches it, or None if it is not a reading.
+
+    None for a key the output did not carry, for an empty value, and for
+    anything pattern does not match: NODE_SIGNAL_BOOT_ID_RE or
+    NODE_SIGNAL_STATE_RE, whose comment says why a string reading is held
+    to a shape rather than taken as printed.
+    """
+    value = raw.get(key)
+    if value is None or not pattern.match(value):
+        return None
+    return value
+
+
 def parse_node_signals(stdout, role):
     """Turn node_signals_command()'s output into health()'s readings.
 
@@ -603,15 +644,22 @@ def parse_node_signals(stdout, role):
     baseline to compare them with (decisions 2 and 3 of the cumulative
     health signals phase 1 plan).
 
-    Lines are split on their first '=', so a value may contain one; a line
-    without one, and a key this does not know, are ignored, which is how
-    a stray line of output is survived rather than reported. Keys and
+    Lines are split on their first '=', so a value containing one is kept
+    whole -- and, since no reading contains one, is then not a reading,
+    rather than being cut short into one at its second '='. A line without
+    an '=', and a key this does not know, are ignored, which is how a
+    stray line of output is survived rather than reported. Keys and
     values are stripped, so that a CRLF or trailing space does not make a
     count unparsable. The first occurrence of a key wins: the command
     prints every key this reads before the one value which derives from
     caller data, the snapshot directory's size, so a directory name
     carrying a newline and a 'key=' line of its own cannot replace a
     reading which came before it.
+
+    The two string readings are held to a shape as the counts are: boot_id
+    must be a UUID, which is lowercased, and k3s_state a systemd
+    ActiveState's lowercase-and-hyphens form (NODE_SIGNAL_BOOT_ID_RE and
+    NODE_SIGNAL_STATE_RE). Anything else is None.
 
     The units are made uniform here rather than in the command: memory is
     converted from /proc/meminfo's kB (which are KiB) to bytes, so every
@@ -640,7 +688,8 @@ def parse_node_signals(stdout, role):
 
     signals = dict.fromkeys(NODE_SIGNAL_KEYS)
     signals['k3s_unit'] = unit
-    signals['boot_id'] = raw.get('boot_id') or None
+    boot_id = _signal_string(raw, 'boot_id', NODE_SIGNAL_BOOT_ID_RE)
+    signals['boot_id'] = boot_id.lower() if boot_id else None
     signals['booted_at'] = _signal_integer(raw, 'booted_at')
     signals['oom_kills'] = _signal_integer(raw, 'oom_kills')
     signals['memory_total_bytes'] = _signal_integer(
@@ -649,7 +698,8 @@ def parse_node_signals(stdout, role):
         raw, 'memory_available_kb', scale=1024)
 
     if raw.get('LoadState') == 'loaded':
-        signals['k3s_state'] = raw.get('ActiveState') or None
+        signals['k3s_state'] = _signal_string(
+            raw, 'ActiveState', NODE_SIGNAL_STATE_RE)
         signals['k3s_restarts'] = _signal_integer(raw, 'NRestarts')
 
     if role == 'control_plane':
@@ -1504,7 +1554,8 @@ class Cluster:
           finished already; with the sleep first, each cost a second
           whether or not it had, and a healthy cluster of N nodes took
           about N seconds rather than about one. Read first, health()'s
-          total is about its slowest probe rather than the sum of them.
+          waiting is about its slowest probe rather than the sum of them;
+          its API round trips, one read per probe among them, come on top.
         - There is no sleep after the deadline: the read which finds it
           passed is the last thing this does. A pending operation with a
           budget of T seconds is read T + 1 times, at 0, 1, ..., T.
@@ -1696,8 +1747,10 @@ class Cluster:
         every one was submitted before the first is collected, and runs on
         its node while an earlier one is waited for. A probe which finished
         while its turn came round is read once and costs no sleep, so
-        collecting N probes takes about as long as the slowest of them, not
-        the sum, and sleeps no longer than the shared budget in all.
+        collecting N probes waits about as long as the slowest of them, not
+        the sum, and sleeps no longer than the shared budget in all. The
+        reads themselves are API round trips which that budget does not
+        bound; see health()'s docstring.
 
         name is how the error messages refer to the command. Left None, they
         quote the command line, which for 'kubectl get nodes' is the clearest
@@ -2992,8 +3045,12 @@ class Cluster:
         the cluster this verb exists to describe. Every probe is submitted
         before any is waited for, and every one is waited for against a
         single deadline, HEALTH_PROBE_TIMEOUT_SECONDS from before the first
-        submission, so the bound is one budget on a cluster of any size
-        rather than one per node. A skipped probe and an abandoned one are
+        submission, so the waiting is bounded by one budget on a cluster of
+        any size rather than one per node. That bounds the waiting, not the
+        call: on top of it come one API round trip per node to read its
+        instance, one per probe to submit it, and the reads of each
+        operation, all serial, so on a slow Shaken Fist API the wall time
+        can exceed the budget. A skipped probe and an abandoned one are
         both ``probed`` False with an ``error`` saying which, so a caller
         never has to tell them apart by which keys are present. A probe
         collected after that deadline has passed is still read from the
@@ -3005,9 +3062,10 @@ class Cluster:
         after another, but each operation is read before the wait considers
         sleeping, and every command is running on its node while an earlier
         one is waited for, so a probe which has finished by its turn costs
-        one read and no sleep. A healthy cluster therefore answers in about
+        one read and no sleep. A healthy cluster therefore waits for about
         the time its slowest probe takes -- typically a second or two
-        whatever its size -- rather than a second per node.
+        whatever its size -- rather than a second per node, plus the API
+        round trips above.
 
         The report is::
 
@@ -3073,9 +3131,12 @@ class Cluster:
         whole -- not run, abandoned, failed, or exited non-zero.
         ``k3s_state`` and ``k3s_restarts`` are None when the unit is not
         loaded, because systemd reports a restart count of zero for a unit
-        which does not exist and zero would be a claim. The etcd sizes are
-        always None on a worker, and memory is converted from
-        /proc/meminfo's kB so that every size here is in bytes.
+        which does not exist and zero would be a claim. ``boot_id`` is None
+        unless it is a UUID, and is lowercased, and ``k3s_state`` unless it
+        is lowercase letters and hyphens, so that garbage on a node never
+        reads as a reboot or a state. The etcd sizes are always None on a
+        worker, and memory is converted from /proc/meminfo's kB so that
+        every size here is in bytes.
 
         The readings are raw and cumulative, and health() stores none of
         them: a verb whose contract is that it has no side effects beyond
@@ -3153,14 +3214,19 @@ class Cluster:
         # Everything is submitted before anything is waited for, so the
         # waits overlap rather than queue: the first probe collected waits
         # for whatever is left of the budget, and each one after it only for
-        # whatever is left after that, which is what bounds this call at one
-        # budget on a cluster of any size rather than one per node. Within
-        # that bound it costs about the slowest probe, not the sum: each
-        # wait reads its operation before it sleeps, so one which finished
-        # while an earlier probe was waited for costs no sleep. Taking
-        # it here starts every probe's clock a little early, by however long
-        # the submissions before it take -- a few API calls -- which decision
-        # 8 of the cumulative health signals phase 1 plan accepts.
+        # whatever is left after that, which is what bounds this call's
+        # waiting at one budget on a cluster of any size rather than one per
+        # node. Its waiting, not its wall time: the get_instance() calls
+        # above happen before the deadline is taken, and nothing bounds the
+        # submissions below or the reads of each operation, every one a
+        # serial API round trip, so on a slow Shaken Fist API the call takes
+        # longer than the budget. Within that bound it costs about the
+        # slowest probe, not the sum: each wait reads its operation before
+        # it sleeps, so one which finished while an earlier probe was waited
+        # for costs no sleep. Taking it here starts every probe's clock a
+        # little early, by however long the submissions before it take -- a
+        # few API calls -- which decision 8 of the cumulative health signals
+        # phase 1 plan accepts.
         deadline = time.monotonic() + HEALTH_PROBE_TIMEOUT_SECONDS
 
         # The k3s API is asked through the first control plane node, which an
