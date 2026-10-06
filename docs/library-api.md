@@ -167,7 +167,8 @@ it.
 `create(write_kubeconfig=...)` and `delete(update_kubeconfig=...)`
 govern the only two things either call does to the machine it runs on
 rather than to the cluster: writing and merging `~/.kube/config`, and
-shelling out to `kubectl config unset`. Both default to `False` here,
+shelling out to `kubectl config delete-context`, `delete-user` and
+`delete-cluster`. Both default to `False` here,
 which is the one place a `Cluster` method's default differs from what
 `sf-client k3s` does -- the command line passes `True` unless
 `--no-kubeconfig` was given, so `sf-client k3s` behaves as it always
@@ -190,7 +191,7 @@ free.
 The cluster's kubeconfig is recorded in `md['kubeconfig']` regardless of
 `write_kubeconfig`, and `get_kubeconfig()` serves it either way -- only
 the local file write, the `kubectl config view --flatten` merge, and
-the `kubectl config unset` cleanup are gated, never the credentials
+the `kubectl config delete-*` cleanup are gated, never the credentials
 themselves.
 
 `k3s list`, `query-k3s-version` and `query-longhorn-version` name no
@@ -294,7 +295,7 @@ a correct caller never needs to catch it.
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
-| `KubeconfigError` | a local `~/.kube/config` merge or `kubectl config unset` fails, or a merge is needed and there is no local `kubectl`. A failed write of the file itself is an `OSError` |
+| `KubeconfigError` | a local `~/.kube/config` merge fails, or `delete()`'s cleanup cannot read the kubeconfig or remove an entry from it, or either needs a local `kubectl` and there is none. A failed write of the file itself is an `OSError` |
 
 Each exception's docstring in `shakenfist_client_k3s/exceptions.py`
 names the exact call site and the attributes it carries; several are
@@ -483,13 +484,13 @@ print(reporter.getvalue())
 No call here writes anything to `sys.stdout`; a caller that owns
 stdout for its own output (an Ansible module's JSON result, in
 particular) can run any of them and keep it that way. That includes
-`delete()`, which used to be an exception: its three `kubectl config
-unset` calls ran with no captured output, so the child process
-inherited file descriptor 1 and kubectl's `Property "..." unset.`
-lines reached the real stdout directly, bypassing both `sys.stdout`
-and the reporter. They now capture their output, and what kubectl
-says arrives through the reporter (at debug level) or, on a failure,
-on the `KubeconfigError` it raises.
+`delete()`, which used to be an exception: its kubectl calls ran
+with no captured output, so the child process inherited file
+descriptor 1 and kubectl's own lines reached the real stdout
+directly, bypassing both `sys.stdout` and the reporter. They now
+capture their output, and what kubectl says arrives through the
+reporter (at debug level) or, on a failure, on the `KubeconfigError`
+it raises.
 
 `reporter.getvalue()` holds the same numbered-phase, per-node
 progress text `sf-client k3s create` prints, for example:

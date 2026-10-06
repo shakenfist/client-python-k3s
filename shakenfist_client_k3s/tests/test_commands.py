@@ -326,6 +326,8 @@ class CommandWiringTestCase(testtools.TestCase):
 
         self.subprocess_run = mock.MagicMock()
         self.subprocess_run.return_value.returncode = 0
+        # delete reads the kubeconfig before it removes anything from it.
+        self.subprocess_run.side_effect = fakes.FakeKubectl(['banana.testns'])
         patcher = mock.patch('subprocess.run', self.subprocess_run)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -379,9 +381,10 @@ class CommandWiringTestCase(testtools.TestCase):
 
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual(
-            [['kubectl', 'config', 'unset', 'users.banana.testns'],
-             ['kubectl', 'config', 'unset', 'contexts.banana.testns'],
-             ['kubectl', 'config', 'unset', 'clusters.banana.testns']],
+            [fakes.KUBECTL_CONFIG_VIEW_JSON,
+             ['kubectl', 'config', 'delete-context', 'banana.testns'],
+             ['kubectl', 'config', 'delete-user', 'banana.testns'],
+             ['kubectl', 'config', 'delete-cluster', 'banana.testns']],
             [call[0][0] for call in self.subprocess_run.call_args_list])
 
     def test_delete_with_no_kubeconfig_leaves_it_alone(self):

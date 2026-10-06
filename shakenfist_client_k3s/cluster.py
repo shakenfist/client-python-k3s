@@ -414,10 +414,10 @@ NODE_SIGNAL_STATE_RE = re.compile(r'\A[a-z-]{1,32}\Z')
 #    built by heredoc() below, which refuses such a body.
 #
 # 3. Where a real argument list is available, it is used instead of a
-#    shell command line, so that no shell parses the value at all. Both
-#    local kubectl invocations -- create()'s merge and delete()'s unset
-#    calls -- are argument lists. The agent commands cannot be, because
-#    the agent takes a command line.
+#    shell command line, so that no shell parses the value at all. Every
+#    local kubectl invocation -- create()'s merge and delete()'s cleanup
+#    -- is an argument list. The agent commands cannot be, because the
+#    agent takes a command line.
 
 
 def _is_address(value):
@@ -3079,7 +3079,7 @@ class Cluster:
                     # at the top of this module. Nothing here is
                     # interpolated, so the shell had nothing to find and
                     # this is consistency rather than a fix -- but a reader
-                    # comparing this with delete()'s unset calls should not
+                    # comparing this with delete()'s kubectl calls should not
                     # have to work out for themselves that the difference
                     # does not matter, and spawning a shell to run a
                     # constant buys nothing. The two paths travel as
@@ -3739,57 +3739,81 @@ class Cluster:
         # effect. Everything above this point is the cluster; this is the
         # calling machine's kubectl configuration.
         if update_kubeconfig:
-            fqcn = '%s.%s' % (self.name, self.namespace)
-            for config_elem in ['users.%s' % fqcn,
-                                'contexts.%s' % fqcn,
-                                'clusters.%s' % fqcn]:
-                # An argument list, not a shell string: config_elem
-                # interpolates the cluster name, which arrives from a
-                # click.STRING argument, an Ansible playbook variable or an
-                # API request with no validation anywhere on the path, so a
-                # name containing shell metacharacters would otherwise run
-                # as a command.
-                #
-                # That settles injection and not kubectl's own grammar,
-                # which is a separate question the paragraph above should
-                # not be read as answering. 'kubectl config unset' resolves
-                # its argument as a dot separated path into the config
-                # structure -- 'users' is a map, the next segment is the
-                # key, and a further segment is a field of the result -- so
-                # a cluster name containing a dot produces a path with an
-                # extra segment that kubectl cannot resolve, and the
-                # non-zero exit below becomes a KubeconfigError. By then
-                # the cluster really is gone and delete_metadata() has run,
-                # so re-running the delete raises ClusterNotFoundError and
-                # the stale entries stay in ~/.kube/config. 'my.cluster' is
-                # a name somebody will type. Validating the cluster name on
-                # the way in is what fixes it, and is
-                # shakenfist/client-python-k3s#96.
-                unset = subprocess.run(
-                    ['kubectl', 'config', 'unset', config_elem],
-                    capture_output=True)
+            self._delete_kubeconfig_entries()
 
-                # capture_output is what stops kubectl's three 'Property
-                # "..." unset.' lines going to the process's file descriptor
-                # 1, which the reporter does not own and a caller emitting
-                # JSON there cannot afford. They are not thrown away: the
-                # reporter gets them, at debug level, because they only
-                # confirm something the caller asked for.
-                if unset.stdout:
-                    self.reporter.debug(
-                        unset.stdout.decode('utf-8', errors='replace').rstrip())
+    def _run_local_kubectl(self, argv, fqcn):
+        """Run a local kubectl argument list for delete(), capturing its output.
 
-                if unset.returncode != 0:
-                    # And this is the other half of capturing the output:
-                    # kubectl's explanation of the failure used to reach the
-                    # terminal on its own, so it now has to be carried by
-                    # the exception. Decoded at the raise, matching
-                    # merge_failed() on the create side.
-                    stderr = None
-                    if unset.stderr:
-                        stderr = unset.stderr.decode('utf-8', errors='replace')
-                    raise exceptions.KubeconfigError.unset_failed(
-                        config_elem, stderr)
+        capture_output is what stops kubectl's 'deleted context ...' lines
+        going to the process's file descriptor 1, which the reporter does not
+        own and a caller emitting JSON there cannot afford. They are not
+        thrown away: the reporter gets them, at debug level, because they
+        only confirm something the caller asked for. So does stderr on
+        success, which is where kubectl warns that the context it removed
+        was the current one.
+        """
+        try:
+            result = subprocess.run(argv, capture_output=True)
+        except FileNotFoundError:
+            raise exceptions.KubeconfigError.missing_kubectl_on_delete(fqcn)
+        if result.returncode == 0:
+            for output in (result.stdout, result.stderr):
+                if output:
+                    self.reporter.debug(output.decode('utf-8', errors='replace').rstrip())
+        return result
+
+    def _delete_kubeconfig_entries(self):
+        """Remove the user, context and cluster create() named fqcn from the local kubeconfig.
+
+        kubectl's delete-* subcommands fail on a name which is not there, so
+        the names present are read first and only those are deleted. That
+        keeps a second delete, or one of a cluster created without
+        write_kubeconfig, succeeding without touching anything.
+        """
+        fqcn = '%s.%s' % (self.name, self.namespace)
+
+        # Not --raw: only the names are needed, and without it kubectl
+        # redacts the credentials rather than handing them to this process.
+        view = self._run_local_kubectl(['kubectl', 'config', 'view', '-o', 'json'], fqcn)
+        if view.returncode != 0:
+            # Decoded at the raise, matching merge_failed() on the create side.
+            stderr = None
+            if view.stderr:
+                stderr = view.stderr.decode('utf-8', errors='replace')
+            raise exceptions.KubeconfigError.view_failed(view.returncode, stderr)
+
+        # An empty section is null rather than an empty list in kubectl's
+        # JSON, hence the 'or []'.
+        try:
+            config = json.loads(view.stdout.decode('utf-8'))
+            present = {}
+            for section in ('contexts', 'users', 'clusters'):
+                present[section] = {entry['name'] for entry in config.get(section) or []}
+        except (ValueError, AttributeError, KeyError, TypeError) as e:
+            raise exceptions.KubeconfigError.view_unparseable(str(e))
+
+        # The context first, because it is the entry which refers to the
+        # other two.
+        for command, section in [('delete-context', 'contexts'),
+                                 ('delete-user', 'users'),
+                                 ('delete-cluster', 'clusters')]:
+            if fqcn not in present[section]:
+                continue
+
+            # fqcn is one element of an argument list, so no shell parses
+            # it, and kubectl takes it as a literal name. Both matter: the
+            # property-path grammar 'kubectl config unset' used cannot
+            # express a cluster name containing a dot, or a namespace named
+            # like a kubeconfig field, such as 'cluster' or 'user'.
+            deleted = self._run_local_kubectl(['kubectl', 'config', command, fqcn], fqcn)
+            if deleted.returncode != 0:
+                # The other half of capturing the output: kubectl's
+                # explanation of the failure reaches nobody unless the
+                # exception carries it.
+                stderr = None
+                if deleted.stderr:
+                    stderr = deleted.stderr.decode('utf-8', errors='replace')
+                raise exceptions.KubeconfigError.delete_failed(command, fqcn, stderr)
 
     def expand_workers(self, worker_count):
         """Add worker nodes to this cluster.

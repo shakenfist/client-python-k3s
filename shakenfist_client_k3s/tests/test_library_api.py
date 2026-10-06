@@ -9,6 +9,7 @@ and keep stdout for its own output.
 
 import copy
 import io
+import json
 import os
 import re
 import stat
@@ -104,6 +105,11 @@ class LibraryTestCase(testtools.TestCase):
         # cannot be wrong in the way the real thing can.
         self.subprocess_run.return_value.stdout = b''
         self.subprocess_run.return_value.stderr = b''
+        # delete()'s cleanup reads the kubeconfig before it deletes from
+        # it, so the read needs an answer; the entries create() would have
+        # written for this cluster are present unless a test says otherwise.
+        self.kubectl = fakes.FakeKubectl(['banana.testns'])
+        self.subprocess_run.side_effect = self.kubectl
         patcher = mock.patch('subprocess.run', self.subprocess_run)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -212,42 +218,46 @@ class ClusterLifecycleTestCase(LibraryTestCase):
         c.create(1, 1, 1)
         self.assertTrue(c.show()['plugin_version'])
 
-    # Writing ~/.kube/config in create and unsetting it in delete used to
+    # Writing ~/.kube/config in create and removing it in delete used to
     # be pinned here as mandatory behaviour. Step 3e made both optional, so
     # they moved to OptionalKubeconfigTestCase, which asserts each of them
     # in both directions rather than only the one this class could.
 
-    def test_delete_does_not_run_the_unsets_through_a_shell(self):
+    def test_delete_does_not_run_the_kubectl_calls_through_a_shell(self):
         # A cluster name is a bare click.STRING on the CLI, and an Ansible
         # variable or an API request field to the library callers this phase
-        # exists for, with no validation on any of those paths. Built into a
-        # shell command line, a name like 'foo; rm -rf ~' would execute. The
-        # calls must therefore stay a list of arguments with shell unset.
+        # exists for, and only create() validates it. Built into a shell
+        # command line, a name like 'foo; touch /tmp/pwned' would execute.
+        # The calls must therefore stay a list of arguments with shell unset.
         c = Cluster(self.client, 'foo; touch /tmp/pwned', 'testns',
                     reporter=self.reporter)
         self.client.metadata[cluster_module.METADATA_KEY
                              % 'foo; touch /tmp/pwned'] = copy.deepcopy(DELETABLE_MD)
         self.client.metadata[primitives.CLUSTER_LIST] = [
             'foo; touch /tmp/pwned']
-        # update_kubeconfig, or the loop under test does not run at all and
-        # the assertions below iterate over nothing.
+        # Present in the kubeconfig, or the delete commands under test are
+        # never run and the assertions below iterate over the read alone.
+        self.kubectl.names = ['foo; touch /tmp/pwned.testns']
+        # update_kubeconfig, or the cleanup under test does not run at all.
         c.delete(update_kubeconfig=True)
 
+        self.assertEqual(4, len(self.subprocess_run.call_args_list))
         for call in self.subprocess_run.call_args_list:
             self.assertIsInstance(call[0][0], list)
             self.assertNotIn('shell', call[1])
         self.assertEqual(
-            'clusters.foo; touch /tmp/pwned.testns',
-            self.subprocess_run.call_args_list[-1][0][0][-1])
+            ['kubectl', 'config', 'delete-cluster', 'foo; touch /tmp/pwned.testns'],
+            self.subprocess_run.call_args_list[-1][0][0])
 
-    def test_delete_raises_when_kubectl_unset_fails(self):
+    def test_delete_raises_when_a_kubectl_delete_fails(self):
         c = self._cluster()
         c.create(1, 1, 1)
         self.subprocess_run.return_value.returncode = 1
 
         e = self.assertRaises(exceptions.KubeconfigError, c.delete,
                               update_kubeconfig=True)
-        self.assertEqual('users.banana.testns', e.config_elem)
+        self.assertEqual('delete_failed', e.reason)
+        self.assertEqual('banana.testns', e.entry_name)
 
     def test_delete_leaves_a_network_it_was_given(self):
         # shakenfist/client-python-k3s#41: a network handed to
@@ -977,28 +987,37 @@ class LocalKubeconfigFailureTestCase(LibraryTestCase):
             self.assertEqual('other', yaml.safe_load(f)['current-context'])
 
 
-def _is_kubectl_unset(command):
-    """Is this subprocess.run() first argument a 'kubectl config unset'?
+def _is_kubectl_delete(command):
+    """Is this subprocess.run() first argument a 'kubectl config delete-*'?
 
     The argument is a list rather than a shell string, so a prefix match on
     a string does not work here. Matching on the list's leading elements
     keeps this working whichever way a future change spells the call.
     """
     if isinstance(command, str):
-        return command.startswith('kubectl config unset')
-    return list(command[:3]) == ['kubectl', 'config', 'unset']
+        return command.startswith('kubectl config delete-')
+    return (list(command[:2]) == ['kubectl', 'config']
+            and len(command) > 2 and command[2].startswith('delete-'))
 
 
 def _is_kubectl_config_view(command):
-    """Is this subprocess.run() first argument create's merge command?
+    """Is this subprocess.run() first argument a 'kubectl config view'?
 
-    An argument list, like the unset calls. The string form is still
-    recognised so that this helper describes the call rather than the
+    That is create's merge, and the read delete() makes before it removes
+    anything. An argument list, like the delete calls. The string form is
+    still recognised so that this helper describes the call rather than the
     spelling of the day.
     """
     if isinstance(command, str):
         return command.startswith('kubectl config view')
     return list(command[:3]) == ['kubectl', 'config', 'view']
+
+
+def _is_kubectl(command):
+    """Is this subprocess.run() first argument any kubectl command at all?"""
+    if isinstance(command, str):
+        return command.startswith('kubectl')
+    return list(command[:1]) == ['kubectl']
 
 
 class OptionalKubeconfigTestCase(LibraryTestCase):
@@ -1117,66 +1136,73 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
                          [c['name'] for c in merged['clusters']])
         self.assertEqual('banana.testns', merged['current-context'])
 
-    def test_delete_unsets_nothing_by_default(self):
+    def test_delete_touches_no_kubeconfig_by_default(self):
         c = self._cluster()
         c.create(1, 1, 1, write_kubeconfig=True)
         c.delete()
 
-        self.assertEqual([], self._kubectl_calls(_is_kubectl_unset))
+        # Not even the read: "off" means no kubectl at all.
+        self.assertEqual([], self._kubectl_calls(_is_kubectl))
 
         # And the file create() wrote is still there, which is the cost of
         # the asymmetry rather than a bug: a caller which asked for the
         # write asks for the cleanup too.
         self.assertTrue(os.path.exists(self._kubeconfig_path()))
 
-    def test_delete_unsets_all_three_elements_when_asked(self):
+    def test_delete_removes_all_three_entries_when_asked(self):
         c = self._cluster()
         c.create(1, 1, 1)
         c.delete(update_kubeconfig=True)
 
         self.assertEqual(
-            [['kubectl', 'config', 'unset', 'users.banana.testns'],
-             ['kubectl', 'config', 'unset', 'contexts.banana.testns'],
-             ['kubectl', 'config', 'unset', 'clusters.banana.testns']],
-            [call.args[0] for call in self._kubectl_calls(_is_kubectl_unset)])
+            [fakes.KUBECTL_CONFIG_VIEW_JSON,
+             ['kubectl', 'config', 'delete-context', 'banana.testns'],
+             ['kubectl', 'config', 'delete-user', 'banana.testns'],
+             ['kubectl', 'config', 'delete-cluster', 'banana.testns']],
+            [call.args[0] for call in self._kubectl_calls(_is_kubectl)])
 
-        # Argument lists rather than shell strings, because the cluster name
-        # interpolated into each element is caller supplied and unvalidated;
-        # and nothing else shelled out, since this create declined the write.
-        self.assertEqual(3, len(self.subprocess_run.call_args_list))
+        # Nothing else shelled out, since this create declined the write.
+        self.assertEqual(4, len(self.subprocess_run.call_args_list))
 
-    def test_the_unset_calls_capture_their_output(self):
+    def test_the_kubectl_calls_capture_their_output(self):
         # What KubectlUnsetLeakTestCase used to pin, inverted. sys.stdout is
         # a Python object and these calls are child processes, so without
-        # capture_output kubectl's three 'Property "..." unset.' lines went
-        # to the process's file descriptor 1 whatever the reporter was doing
-        # -- which an Ansible module emitting JSON there cannot afford.
+        # capture_output kubectl's 'deleted context ...' lines go to the
+        # process's file descriptor 1 whatever the reporter is doing --
+        # which an Ansible module emitting JSON there cannot afford. The
+        # read is included: its output is the whole kubeconfig.
         c = self._cluster()
         c.create(1, 1, 1)
         c.delete(update_kubeconfig=True)
 
-        calls = self._kubectl_calls(_is_kubectl_unset)
-        self.assertEqual(3, len(calls))
+        calls = self._kubectl_calls(_is_kubectl)
+        self.assertEqual(4, len(calls))
         for call in calls:
             self.assertEqual(
                 True, call.kwargs.get('capture_output'),
-                'This kubectl config unset inherits file descriptor 1, so '
-                "its 'Property \"...\" unset.' line bypasses the reporter "
-                'and lands on the caller\'s stdout: %r' % (call,))
+                'This kubectl call inherits file descriptor 1, so its '
+                'output bypasses the reporter and lands on the caller\'s '
+                'stdout: %r' % (call,))
 
-    def test_the_captured_stdout_reaches_the_reporter(self):
+    def test_the_captured_output_reaches_the_reporter(self):
         # Captured is not discarded: the lines go where every other line
-        # delete() emits goes, at debug level.
+        # delete() emits goes, at debug level. stderr too, on success,
+        # because that is where kubectl warns that the context it removed
+        # was the current one.
         c = self._cluster()
         c.create(1, 1, 1)
         self.subprocess_run.return_value.stdout = (
-            b'Property "users.banana.testns" unset.\n')
+            b'deleted context banana.testns from /home/u/.kube/config\n')
+        self.subprocess_run.return_value.stderr = (
+            b'warning: this removed your active context\n')
 
         verbose = progress.CollectingReporter(verbose=True)
         Cluster(self.client, 'banana', 'testns',
                 reporter=verbose).delete(update_kubeconfig=True)
 
-        self.assertIn('Property "users.banana.testns" unset.',
+        self.assertIn('deleted context banana.testns from /home/u/.kube/config',
+                      verbose.getvalue())
+        self.assertIn('warning: this removed your active context',
                       verbose.getvalue())
 
     def test_the_captured_stderr_is_carried_by_the_failure(self):
@@ -1191,13 +1217,139 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         e = self.assertRaises(exceptions.KubeconfigError, c.delete,
                               update_kubeconfig=True)
 
-        self.assertEqual('unset_failed', e.reason)
-        self.assertEqual('users.banana.testns', e.config_elem)
+        # The context is the first entry removed, so its failure is the one
+        # which surfaces.
+        self.assertEqual('delete_failed', e.reason)
+        self.assertEqual('delete-context', e.command)
+        self.assertEqual('banana.testns', e.entry_name)
         self.assertEqual('error: unable to parse /home/u/.kube/config\n',
                          e.stderr)
         self.assertEqual(
-            'Could not unset kubectl config element users.banana.testns\n'
+            "Could not remove banana.testns from the local kubeconfig with "
+            "'kubectl config delete-context'\n"
             'error: unable to parse /home/u/.kube/config\n', str(e))
+
+
+class KubeconfigCleanupTestCase(LibraryTestCase):
+    """delete() removes kubeconfig entries by name, for every name that exists.
+
+    It used to run 'kubectl config unset users.<name>.<namespace>', and
+    unset takes a property path: after the first segment of the key,
+    kubectl reads each further segment as a possible field name of the
+    entry and stops the key at the first that matches. So a dotted cluster
+    name, or a perfectly valid one in a namespace called 'cluster', 'user'
+    or another kubeconfig field, failed -- after the cluster had been
+    destroyed, leaving stale entries that a re-run could no longer reach.
+    The delete-* commands take the name as one literal argument, which is
+    what the first two tests pin.
+
+    These are unit tests against a fake kubectl. The real kubectl is
+    exercised by the merge tier of CI, which deletes a live cluster with
+    the kubeconfig cleanup on.
+    """
+
+    def _delete(self, name, namespace):
+        self.client.metadata[cluster_module.METADATA_KEY % name] = (
+            copy.deepcopy(DELETABLE_MD))
+        self.client.metadata[primitives.CLUSTER_LIST] = [name]
+        Cluster(self.client, name, namespace,
+                reporter=self.reporter).delete(update_kubeconfig=True)
+
+    def _deletes(self):
+        return [call.args[0] for call in self._kubectl_calls(_is_kubectl_delete)]
+
+    def test_a_namespace_named_like_a_kubeconfig_field(self):
+        self.kubectl.names = ['banana.cluster']
+        self._delete('banana', 'cluster')
+
+        self.assertEqual(
+            [['kubectl', 'config', 'delete-context', 'banana.cluster'],
+             ['kubectl', 'config', 'delete-user', 'banana.cluster'],
+             ['kubectl', 'config', 'delete-cluster', 'banana.cluster']],
+            self._deletes())
+
+    def test_a_dotted_name_from_before_names_were_validated(self):
+        # create() refuses this name now, but clusters made before it did
+        # still have to be deletable, kubeconfig entries and all.
+        self.kubectl.names = ['my.cluster.testns']
+        self._delete('my.cluster', 'testns')
+
+        self.assertEqual(
+            [['kubectl', 'config', 'delete-context', 'my.cluster.testns'],
+             ['kubectl', 'config', 'delete-user', 'my.cluster.testns'],
+             ['kubectl', 'config', 'delete-cluster', 'my.cluster.testns']],
+            self._deletes())
+
+    def test_entries_already_gone_are_not_deleted_again(self):
+        # delete-* fails on a name which is not there, where unset exited
+        # zero. A cluster created without write_kubeconfig, or a second
+        # cleanup after a first which got some way, has to succeed without
+        # running any of them -- and an unrelated entry is left alone.
+        self.kubectl.names = ['other']
+        self._delete('banana', 'testns')
+
+        self.assertEqual([], self._deletes())
+        self.assertEqual([fakes.KUBECTL_CONFIG_VIEW_JSON],
+                         [call.args[0] for call in self._kubectl_calls(_is_kubectl)])
+
+    def test_an_empty_kubeconfig_needs_no_deletes(self):
+        # kubectl reports an empty section as null rather than [].
+        self.kubectl.names = []
+        self._delete('banana', 'testns')
+
+        self.assertEqual([], self._deletes())
+
+    def test_only_the_entries_present_are_deleted(self):
+        # A partial earlier cleanup can leave any subset behind; this one
+        # left only the cluster.
+        self.kubectl.view_stdout = json.dumps({
+            'kind': 'Config', 'apiVersion': 'v1',
+            'clusters': [{'name': 'banana.testns', 'cluster': {}}],
+            'users': None, 'contexts': None,
+            'current-context': ''}).encode('utf-8')
+        self._delete('banana', 'testns')
+
+        self.assertEqual(
+            [['kubectl', 'config', 'delete-cluster', 'banana.testns']],
+            self._deletes())
+
+    def test_a_failed_read_raises_and_deletes_nothing(self):
+        self.kubectl.view_returncode = 1
+        self.kubectl.view_stderr = b'error: unable to parse /home/u/.kube/config\n'
+
+        e = self.assertRaises(exceptions.KubeconfigError, self._delete,
+                              'banana', 'testns')
+
+        self.assertEqual('view_failed', e.reason)
+        self.assertEqual(1, e.returncode)
+        self.assertEqual('error: unable to parse /home/u/.kube/config\n',
+                         e.stderr)
+        self.assertEqual([], self._deletes())
+
+    def test_an_unparseable_read_raises_and_deletes_nothing(self):
+        for stdout in [b'not json', b'[]', b'{"users": [{"user": {}}]}']:
+            self.kubectl.view_stdout = stdout
+            self.subprocess_run.reset_mock()
+
+            e = self.assertRaises(exceptions.KubeconfigError, self._delete,
+                                  'banana', 'testns')
+
+            self.assertEqual('view_unparseable', e.reason, stdout)
+            self.assertTrue(e.detail, stdout)
+            self.assertEqual([], self._deletes())
+
+    def test_no_local_kubectl_is_a_reasoned_error(self):
+        # A machine which created its first cluster needed no kubectl,
+        # because there was nothing to merge into. Its delete used to end in
+        # a FileNotFoundError traceback, after the cluster had gone.
+        self.subprocess_run.side_effect = FileNotFoundError(2, 'No such file', 'kubectl')
+
+        e = self.assertRaises(exceptions.KubeconfigError, self._delete,
+                              'banana', 'testns')
+
+        self.assertEqual('missing_kubectl_on_delete', e.reason)
+        self.assertEqual('banana.testns', e.entry_name)
+        self.assertNotIn(MD_KEY, self.client.metadata)
 
 
 class ManifestStagingTestCase(LibraryTestCase):

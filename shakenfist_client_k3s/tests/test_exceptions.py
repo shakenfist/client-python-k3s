@@ -321,28 +321,64 @@ class KubeconfigErrorTestCase(testtools.TestCase):
         self.assertEqual(
             'Failed to update /home/u/.kube/config, return code 1', str(e))
 
-    def test_unset_failed(self):
-        e = exceptions.KubeconfigError.unset_failed('users.banana.testns')
-        self.assertEqual('users.banana.testns', e.config_elem)
+    def test_delete_failed(self):
+        e = exceptions.KubeconfigError.delete_failed('delete-user', 'banana.testns')
+        self.assertEqual('delete_failed', e.reason)
+        self.assertEqual('delete-user', e.command)
+        self.assertEqual('banana.testns', e.entry_name)
         self.assertEqual(
-            'Could not unset kubectl config element users.banana.testns', str(e))
+            "Could not remove banana.testns from the local kubeconfig with "
+            "'kubectl config delete-user'", str(e))
 
-    def test_unset_failed_with_stderr(self):
+    def test_delete_failed_with_stderr(self):
         # Cluster.delete() captures the child's output, so this is the only
         # place kubectl's account of the failure can still be seen.
-        e = exceptions.KubeconfigError.unset_failed(
-            'users.banana.testns', 'error: unable to parse config\n')
+        e = exceptions.KubeconfigError.delete_failed(
+            'delete-user', 'banana.testns', 'error: unable to parse config\n')
         self.assertEqual('error: unable to parse config\n', e.stderr)
         self.assertEqual(
-            'Could not unset kubectl config element users.banana.testns\n'
+            "Could not remove banana.testns from the local kubeconfig with "
+            "'kubectl config delete-user'\n"
             'error: unable to parse config\n', str(e))
 
-    def test_unset_failed_with_empty_stderr(self):
-        # A silent kubectl renders as it always did, rather than gaining a
-        # blank second line.
-        e = exceptions.KubeconfigError.unset_failed('users.banana.testns', '')
+    def test_delete_failed_with_empty_stderr(self):
+        # A silent kubectl renders as one line, rather than gaining a blank
+        # second one.
+        e = exceptions.KubeconfigError.delete_failed('delete-user', 'banana.testns', '')
         self.assertEqual(
-            'Could not unset kubectl config element users.banana.testns', str(e))
+            "Could not remove banana.testns from the local kubeconfig with "
+            "'kubectl config delete-user'", str(e))
+
+    def test_view_failed(self):
+        e = exceptions.KubeconfigError.view_failed(1, 'error: bad config\n')
+        self.assertEqual('view_failed', e.reason)
+        self.assertEqual(1, e.returncode)
+        self.assertEqual(
+            'Could not read the local kubeconfig, return code 1\n'
+            'error: bad config\n', str(e))
+
+    def test_view_failed_without_stderr(self):
+        e = exceptions.KubeconfigError.view_failed(1, '')
+        self.assertEqual(
+            'Could not read the local kubeconfig, return code 1', str(e))
+
+    def test_view_unparseable(self):
+        e = exceptions.KubeconfigError.view_unparseable('Expecting value')
+        self.assertEqual('view_unparseable', e.reason)
+        self.assertEqual('Expecting value', e.detail)
+        self.assertEqual(
+            'Could not parse the local kubeconfig as kubectl reported it: '
+            'Expecting value', str(e))
+
+    def test_missing_kubectl_on_delete(self):
+        e = exceptions.KubeconfigError.missing_kubectl_on_delete('banana.testns')
+        self.assertEqual('missing_kubectl_on_delete', e.reason)
+        self.assertEqual('banana.testns', e.entry_name)
+        self.assertEqual(
+            'A local kubectl binary is required to remove the cluster from\n'
+            'the local kubeconfig, but none was found. The cluster has been\n'
+            'deleted, and any user, context or cluster entry named banana.testns is\n'
+            'still there.', str(e))
 
 
 class TotalAttributesTestCase(testtools.TestCase):
@@ -408,8 +444,8 @@ class TotalAttributesTestCase(testtools.TestCase):
             self.assertIsNone(getattr(e, field))
 
     def test_kubeconfig_fields_are_all_present(self):
-        e = exceptions.KubeconfigError.unset_failed('users.banana.testns')
-        self.assertEqual('users.banana.testns', e.config_elem)
+        e = exceptions.KubeconfigError.delete_failed('delete-user', 'banana.testns')
+        self.assertEqual('banana.testns', e.entry_name)
 
         # Fields belonging to missing_kubectl() and merge_failed().
         self.assertIsNone(e.main_config_path)
@@ -421,5 +457,7 @@ class TotalAttributesTestCase(testtools.TestCase):
         e = exceptions.KubeconfigError.missing_kubectl(
             '/home/u/.kube/config', 'banana')
         self.assertEqual('banana', e.name)
-        self.assertIsNone(e.config_elem)
+        self.assertIsNone(e.command)
+        self.assertIsNone(e.entry_name)
+        self.assertIsNone(e.detail)
         self.assertIsNone(e.returncode)

@@ -728,6 +728,17 @@ while planning it.
   `IntRange` would have exposed sizes, names and counts in the same way.
   Fixed by `validate_create_arguments()`, which the CLI calls before it
   creates the namespace.
+* `delete()` on a machine with no local kubectl raised a bare
+  `FileNotFoundError` traceback after the cluster was destroyed, because
+  `create()` skips kubectl when there is no kubeconfig to merge into but
+  `delete()` always ran it. Found in step 1c, and now a reasoned
+  `KubeconfigError` naming the entries that remain.
+* The merge tier's `delete --no-kubeconfig` check compared
+  `~/.kube/config`, which the cleanup never reads while the script has
+  `KUBECONFIG` pointing at getconfig's copy, so it could not have caught
+  a delete that ignored the flag. Step 1c replaced it with checks that
+  the entries are present before and after that delete, and absent after
+  the main delete.
 
 ### Back brief
 

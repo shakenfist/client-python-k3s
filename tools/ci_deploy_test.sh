@@ -148,6 +148,39 @@ pod_names() {
     echo "${pods}" | awk '{print $1 "/" $2}'
 }
 
+kubeconfig_fqcn() {
+    # The name create gives the cluster's kubeconfig user, context and
+    # cluster, <name>.<namespace>. k3s show prints: namespace = ns, and is
+    # captured first for the reason count_routed_addresses() gives above.
+    local show_output namespace
+    show_output=$(sf-client k3s show "$1") || return 1
+    namespace=$(echo "${show_output}" | sed -n 's/^    namespace = //p')
+    [ -n "${namespace}" ] || return 1
+    echo "$1.${namespace}"
+}
+
+assert_kubeconfig_entries() {
+    # $1 is present or absent, $2 the entry name, in the file KUBECONFIG
+    # names. Asked of kubectl rather than grepped from the file, because
+    # delete leaves current-context naming the context it removed.
+    local kind names found
+    for kind in context user cluster; do
+        case "${kind}" in
+            context) names=$(kubectl config get-contexts -o name) || return 1 ;;
+            user) names=$(kubectl config get-users) || return 1 ;;
+            cluster) names=$(kubectl config get-clusters) || return 1 ;;
+        esac
+        found=absent
+        if echo "${names}" | grep -qFx "$2"; then
+            found=present
+        fi
+        if [ "${found}" != "$1" ]; then
+            echo "Expected kubeconfig ${kind} $2 to be $1 in ${KUBECONFIG}, but it is ${found}"
+            exit 1
+        fi
+    done
+}
+
 assert_node_sizes() {
     # k3s show prints node_sizes = {...} as a Python repr, which
     # ast.literal_eval reads back; the comparison is between dicts, so key
@@ -524,11 +557,18 @@ if [ "${after}" -ne $((before + 1)) ]; then
 fi
 
 status 'Delete the cluster'
+# The delete's kubeconfig cleanup acts on the file KUBECONFIG names, which
+# here is getconfig's copy rather than ~/.kube/config. That copy holds the
+# entries create named, so it is the real kubectl's delete-* calls that
+# empty it. Present first, so the absence below is not vacuous.
+cluster_fqcn=$(kubeconfig_fqcn "${CLUSTER}")
+assert_kubeconfig_entries present "${cluster_fqcn}"
 sf-client k3s delete "${CLUSTER}"
 if sf-client k3s list | grep -q "^${CLUSTER}$"; then
     echo 'The cluster is still listed after deletion'
     exit 1
 fi
+assert_kubeconfig_entries absent "${cluster_fqcn}"
 # --all includes error state instances, which the default listing hides:
 # a node the delete failed to remove must not pass this check just
 # because it fell into the error state.
@@ -562,11 +602,10 @@ status 'Create a cluster with none of the optional components'
 # leaves ~/.kube/config alone, not the absence of a home directory.
 #
 # Compared rather than asserted absent: the first create wrote
-# ~/.kube/config (asserted above) and the delete which followed rewrote it
-# with kubectl config unset rather than removing it, so the file exists
-# whatever this create does. What --no-kubeconfig promises is that this
-# create does not touch it, and only a before-and-after comparison says
-# that. An earlier version of this script asserted the file did not exist,
+# ~/.kube/config (asserted above) and nothing since has removed it, so the
+# file exists whatever this create does. What --no-kubeconfig promises is
+# that this create does not touch it, and only a before-and-after
+# comparison says that. An earlier version of this script asserted the file did not exist,
 # which could never pass.
 kubeconfig_before=$(sha256sum "${HOME}/.kube/config")
 
@@ -682,21 +721,20 @@ if ! grep -qi 'metallb' /tmp/k3s-ci-expand-refusal; then
 fi
 
 status 'Delete the minimal cluster'
-kubeconfig_before=$(sha256sum "${HOME}/.kube/config")
+# delete --no-kubeconfig skips the kubeconfig cleanup, which is the half of
+# the flag create cannot exercise. KUBECONFIG names getconfig's copy of
+# this cluster's kubeconfig, which holds the entries create named and is
+# the file the cleanup would act on, so they have to survive the delete.
+# Nothing needs planting, and a ~/.kube/config comparison would prove
+# nothing: the cleanup never reads that file while KUBECONFIG is set.
+minimal_fqcn=$(kubeconfig_fqcn "${MINIMAL_CLUSTER}")
+assert_kubeconfig_entries present "${minimal_fqcn}"
 sf-client k3s delete "${MINIMAL_CLUSTER}" --no-kubeconfig
 if sf-client k3s list | grep -q "^${MINIMAL_CLUSTER}$"; then
     echo 'The minimal cluster is still listed after deletion'
     exit 1
 fi
-# delete --no-kubeconfig skips the kubectl config unset loop, which is the
-# half of the flag create cannot exercise: there was nothing of this
-# cluster's in the file to unset, so a delete which ran the loop anyway
-# would still rewrite the file.
-kubeconfig_after=$(sha256sum "${HOME}/.kube/config")
-if [ "${kubeconfig_before}" != "${kubeconfig_after}" ]; then
-    echo "delete --no-kubeconfig changed ${HOME}/.kube/config anyway"
-    exit 1
-fi
+assert_kubeconfig_entries present "${minimal_fqcn}"
 
 status 'Verify the minimal cluster left the network it borrowed'
 # The state rather than the lookup succeeding, because a network Shaken

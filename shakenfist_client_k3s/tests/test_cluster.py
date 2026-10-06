@@ -1028,10 +1028,11 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
     Reading the code found that it already does work, and that the three
     things which looked like they would break do not: md['kubeconfig'] is
     only ever written by delete, never read; an empty control_plane_nodes
-    makes the instance loop a no-op rather than an IndexError; and
-    'kubectl config unset' on an entry which was never written exits zero.
-    These tests exist so that stays true, because it is true by accident
-    rather than by design.
+    makes the instance loop a no-op rather than an IndexError; and the
+    kubeconfig cleanup deletes only the entries kubectl reports as present,
+    so one which was never written is skipped rather than failed on.
+    These tests exist so that stays true, because most of it is true by
+    accident rather than by design.
     """
 
     def setUp(self):
@@ -1043,7 +1044,7 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # delete() only runs its three 'kubectl config unset' calls when
+        # delete() only runs its kubeconfig cleanup's kubectl calls when
         # asked, which these tests do not do; the mock stays so that a
         # regression there fails rather than edits the operator's own
         # ~/.kube/config.

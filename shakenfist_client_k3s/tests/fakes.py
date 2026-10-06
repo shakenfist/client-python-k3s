@@ -12,7 +12,10 @@ the health verb both drive.
 """
 
 import io
+import json
+import subprocess
 
+import mock
 from shakenfist_client import apiclient
 
 
@@ -55,6 +58,56 @@ users:
   user:
     token: banana
 """
+
+
+# What Cluster.delete() runs to learn which kubeconfig entries are present.
+KUBECTL_CONFIG_VIEW_JSON = ['kubectl', 'config', 'view', '-o', 'json']
+
+
+class FakeKubectl:
+    """The read half of a local kubectl, as a subprocess.run() side effect.
+
+    delete() reads the entry names present with ``kubectl config view -o
+    json`` and then runs a ``delete-*`` command only for those, so a fake
+    which answered every command with the same empty bytes would make the
+    cleanup do nothing and every test of it pass for the wrong reason. This
+    answers the read with the document kubectl prints for a kubeconfig
+    holding a user, context and cluster for each of ``names`` -- including
+    kubectl's null, rather than an empty list, for an empty section -- and
+    returns ``mock.DEFAULT`` for every other command, so the patched mock's
+    own ``return_value`` still decides how the delete commands and create's
+    merge behave.
+
+    It does not remove names as they are deleted: a test which wants the
+    entries gone says so by setting ``names``.
+    """
+
+    def __init__(self, names=()):
+        self.names = list(names)
+        self.view_returncode = 0
+        self.view_stdout = None
+        self.view_stderr = b''
+
+    def view_json(self):
+        def section(kind):
+            return [{'name': name, kind: {}} for name in self.names] or None
+
+        return json.dumps({
+            'kind': 'Config', 'apiVersion': 'v1',
+            'clusters': section('cluster'),
+            'users': section('user'),
+            'contexts': section('context'),
+            'current-context': self.names[0] if self.names else '',
+        }).encode('utf-8')
+
+    def __call__(self, args, **kwargs):
+        if list(args) != KUBECTL_CONFIG_VIEW_JSON:
+            return mock.DEFAULT
+        stdout = self.view_stdout
+        if stdout is None:
+            stdout = self.view_json()
+        return subprocess.CompletedProcess(
+            args, self.view_returncode, stdout, self.view_stderr)
 
 
 class FakeClusterClient:

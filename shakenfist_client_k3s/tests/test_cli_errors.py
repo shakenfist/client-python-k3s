@@ -40,6 +40,7 @@ import shakenfist_client_k3s
 from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
+from shakenfist_client_k3s.tests import fakes
 
 
 MD_KEY = cluster_module.METADATA_KEY % 'banana'
@@ -204,23 +205,25 @@ class CommandExceptionTestCase(ClientTestCase):
             exceptions.ClusterNotFoundError, {})
         self.assertEqual('not_found', e.reason)
 
-    def test_delete_kubectl_unset_failure(self):
-        # stdout and stderr are bytes because the loop captures them, which
+    def test_delete_kubectl_delete_failure(self):
+        # stdout and stderr are bytes because the calls capture them, which
         # is also why the exception has to carry the explanation: nothing
         # else would ever show the operator kubectl's own account of this.
+        # The read succeeds and finds the entries; the first delete fails.
         completed = mock.MagicMock()
         completed.returncode = 1
         completed.stdout = b''
         completed.stderr = b'error: unable to parse /home/u/.kube/config\n'
-        with mock.patch('subprocess.run',
-                        return_value=completed):
+        with mock.patch('subprocess.run', return_value=completed,
+                        side_effect=fakes.FakeKubectl(['banana.clientns'])):
             e = self._assert_raises(
                 shakenfist_client_k3s.k3s_delete, ['banana'],
                 exceptions.KubeconfigError,
                 {CLUSTER_LIST: ['banana'], MD_KEY: copy.deepcopy(DELETABLE_MD)})
 
-        self.assertEqual('unset_failed', e.reason)
-        self.assertEqual('users.banana.clientns', e.config_elem)
+        self.assertEqual('delete_failed', e.reason)
+        self.assertEqual('delete-context', e.command)
+        self.assertEqual('banana.clientns', e.entry_name)
         self.assertEqual('error: unable to parse /home/u/.kube/config\n',
                          e.stderr)
 
@@ -320,19 +323,20 @@ class GroupHandlerTestCase(ClientTestCase):
             ['create', 'banana', '--network', 'nosuch'],
             'Specified network does not exist\n', dict(_version_cache()))
 
-    def test_delete_kubectl_unset_failure(self):
+    def test_delete_kubectl_delete_failure(self):
         completed = mock.MagicMock()
         completed.returncode = 1
         completed.stdout = b''
         completed.stderr = b'error: unable to parse /home/u/.kube/config\n'
-        with mock.patch('subprocess.run',
-                        return_value=completed):
+        with mock.patch('subprocess.run', return_value=completed,
+                        side_effect=fakes.FakeKubectl(['banana.clientns'])):
             self._assert_cli_failure(
                 ['delete', 'banana'],
                 # kubectl's stderr keeps its own trailing newline, exactly
                 # as the create side's merge_failed renders it, so the
                 # handler's newline lands after it as a blank line.
-                'Could not unset kubectl config element users.banana.clientns\n'
+                "Could not remove banana.clientns from the local kubeconfig with "
+                "'kubectl config delete-context'\n"
                 'error: unable to parse /home/u/.kube/config\n\n',
                 {CLUSTER_LIST: ['banana'], MD_KEY: copy.deepcopy(DELETABLE_MD)})
 
