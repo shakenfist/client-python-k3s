@@ -129,6 +129,12 @@ class CreateNamespaceNoticeTestCase(testtools.TestCase):
                 'updated': time.time(),
                 'releases': {'stable': 'v1.33.4+k3s1'}
             },
+            # Both lookups come before the name check, so both caches are
+            # needed for create to reach it without the network.
+            primitives.LONGHORN_VERSION_CACHE_KEY: {
+                'updated': time.time(),
+                'charts': {'1.12.1': '>=1.25.0-0'}
+            },
             # The name is already registered, so create fails fast right
             # after the namespace-created notice, before touching instances.
             primitives.CLUSTER_LIST: ['banana'],

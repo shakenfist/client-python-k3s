@@ -2636,28 +2636,23 @@ class ShellQuotingTestCase(testtools.TestCase):
 
     def test_the_longhorn_version_is_quoted(self):
         # This one comes from the Longhorn chart index rather than from
-        # anything this module wrote, which is the same trust position as
-        # the k3s channel above.
+        # anything this module wrote, by way of the metadata create()
+        # recorded it in, which namespace credentials can write. That is
+        # the same trust position as the k3s channel above.
         client = mock.MagicMock()
         client.get_namespace_metadata.return_value = {MD_KEY: {
             'name': 'banana', 'namespace': 'testns', 'state': 'created',
-            'k3s_version': 'v1.33.4+k3s1',
+            'longhorn_version': 'v1.9.0; touch /pwned',
             'control_plane_nodes': ['inst-cp1'], 'worker_nodes': []}}
         cluster = Cluster(client, 'banana', 'testns',
                           reporter=progress.CollectingReporter())
 
-        with mock.patch.object(cluster_module.primitives,
-                               'get_longhorn_release',
-                               return_value='v1.9.0; touch /pwned') as lookup, \
-                mock.patch.object(Cluster, 'execute_and_await') as ea:
+        with mock.patch.object(Cluster, 'execute_and_await') as ea:
             cluster.setup_longhorn()
 
         installs = [c for c in ea.call_args[0][1] if 'longhorn/longhorn' in c]
         self.assertEqual(1, len(installs), ea.call_args[0][1])
         self.assertIn("--version 'v1.9.0; touch /pwned'", installs[0])
-
-        # And the chart was chosen for this cluster's k3s (#118).
-        self.assertEqual('v1.33.4+k3s1', lookup.call_args.kwargs['k3s_version'])
 
     def test_the_quoted_install_runs_no_second_command(self):
         # Asserting the quoting through a shell rather than against a

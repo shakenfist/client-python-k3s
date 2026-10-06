@@ -626,6 +626,45 @@ class K3sConfigTestCase(LibraryTestCase):
         self.assertEqual('v1.20.15+k3s1', e.release)
         self.assertEqual('v1.20', e.channel)
 
+    def test_a_failed_longhorn_lookup_registers_nothing(self):
+        # #119: the Longhorn lookup used to run at the Longhorn phase,
+        # after every instance existed, so a failure there left a cluster
+        # create could not resume. It now fails with nothing built.
+        with mock.patch(
+                'shakenfist_client_k3s.primitives.get_longhorn_release',
+                side_effect=exceptions.ReleaseLookupError.
+                no_compatible_longhorn_release('v1.33.4+k3s1')):
+            e = self._assert_refused_before_anything_is_built(
+                exceptions.ReleaseLookupError)
+        self.assertEqual('no_compatible_longhorn_release', e.reason)
+
+    def test_the_longhorn_lookup_is_for_the_resolved_release(self):
+        # #118 and #119 together: the chart is chosen for the k3s release
+        # this create resolved, once, at the start, with the refresh flag
+        # the caller passed; and setup_longhorn() installs what was
+        # recorded rather than looking again.
+        with mock.patch(
+                'shakenfist_client_k3s.primitives.get_longhorn_release',
+                return_value='1.12.1') as lookup:
+            self._cluster().create(1, 1, 1, refresh_version_cache=True)
+
+        lookup.assert_called_once()
+        self.assertEqual('v1.33.4+k3s1', lookup.call_args.kwargs['k3s_version'])
+        self.assertTrue(lookup.call_args.kwargs['force_cache_update'])
+        self.assertEqual('1.12.1', self._stored()['longhorn_version'])
+        self.assertTrue(any('--version 1.12.1' in command
+                            for _, command in self.client.executed),
+                        self.client.executed)
+
+    def test_no_longhorn_means_no_longhorn_lookup(self):
+        with mock.patch(
+                'shakenfist_client_k3s.primitives.get_longhorn_release',
+                side_effect=AssertionError('looked up')):
+            self._cluster().create(1, 1, 1, install_longhorn=False)
+
+        self.assertEqual('created', self._stored()['state'])
+        self.assertIsNone(self._stored()['longhorn_version'])
+
     def test_both_configs_are_recorded(self):
         self._cluster().create(1, 1, 1, server_config=self.SERVER,
                                agent_config=self.AGENT)
