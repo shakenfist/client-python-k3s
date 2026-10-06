@@ -243,7 +243,39 @@ itself out in that pull request and records no `Merged` cell.
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
 | 1. Argument validation | This file, steps below | Complete | |
-| 2. Push audit | `PUSH-AUDIT.md` over phase 1's diff against `develop`, before push | Not started | |
+| 2. Push audit | `PUSH-AUDIT.md` over phase 1's diff against `develop`, before push | Complete | |
+
+### Push audit result
+
+Run on 2026-10-07 over `b615aa3..d08f34a`, the whole of phase 1. It
+found ten things. All were fixed on this branch before the push, in
+`3cb00f0..591e0a9`:
+
+* **Security.** The cleanup's `kubectl config view -o json` output went
+  to the verbose reporter. Without `--raw`, kubectl redacts tokens,
+  passwords and certificate data, but it does not redact auth-provider
+  tokens or exec `env` values. So `sf-client -v k3s delete` printed
+  other clusters' credentials. The view is no longer logged, a test
+  pins that, and a mutation check guards the test.
+* **Wrong file.** `create()` always writes `~/.kube/config`, but the
+  cleanup honoured the caller's `KUBECONFIG`. That asymmetry was already
+  on `develop`. Both now use `_local_kubeconfig_path()`, and the merge
+  tier asserts on the file create wrote.
+* **Cleanup error messages.** They now say the cluster has been deleted,
+  and give the exact `kubectl --kubeconfig ... config delete-*` commands
+  for the entries that remain. A re-run of `delete` cannot reach the
+  cleanup, so the commit message of `f057e81` is wrong to say "A second
+  delete still succeeds".
+* **Live coverage.** The merge tier now checks that a dotted name is
+  refused without creating its namespace, and that `expand-workers`
+  refuses a count of 0.
+* **Module advice.** An argument refusal on the module's create path
+  now tells the play to correct its parameters, where it used to say
+  the task could simply be run again. A grandfathered `my.cluster` is
+  shown to delete through the module.
+* **Prose.** Stale docstrings and history in the user docs were fixed,
+  and the rationale for each rule now lives in one docstring, with
+  pointers from the others.
 
 ### Phase 1 steps
 
