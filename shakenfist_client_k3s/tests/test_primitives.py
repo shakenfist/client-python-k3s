@@ -255,9 +255,9 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         self.assertNotIn(body, str(e))
 
 
-def _chart(version, **extra):
+def _chart(version, kube_version='>=1.21.0-0', **extra):
     chart = {'apiVersion': 'v1', 'name': 'longhorn', 'version': version,
-             'appVersion': 'v%s' % version,
+             'appVersion': 'v%s' % version, 'kubeVersion': kube_version,
              'urls': ['https://example.com/longhorn-%s.tgz' % version]}
     chart.update(extra)
     return chart
@@ -305,8 +305,8 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
                          mock_request.call_args.kwargs['timeout'])
 
         cache = client.set_namespace_metadata_item.call_args.args[2]
-        self.assertEqual('1.6.0', cache['latest'])
-        self.assertEqual(['1.6.0', '1.5.1'], cache['releases'])
+        self.assertEqual({'1.6.0': '>=1.21.0-0', '1.5.1': '>=1.21.0-0'},
+                         cache['charts'])
 
     def test_no_valid_releases_raises(self):
         client = mock.MagicMock()
@@ -375,44 +375,42 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
         self.assertEqual('unreadable_response', e.reason)
 
     def test_fresh_cache_avoids_fetch(self):
-        # Includes a cache written by the old GitHub releases lookup, whose
-        # 'releases' was a dict of tarball URLs: 'latest' is still a chart
-        # version, so it stays good until it expires.
         client = mock.MagicMock()
         client.get_namespace_metadata.return_value = {
             primitives.LONGHORN_VERSION_CACHE_KEY: {
                 'updated': time.time(),
-                'latest': '1.5.1',
-                'releases': {'1.5.1': 'https://example.com/tarball/v1.5.1'}
+                'charts': {'1.5.1': '>=1.21.0-0'}
             }
         }
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request') as mock_request:
             release = primitives.get_longhorn_release(
-                client, NAMESPACE, _reporter())
+                client, NAMESPACE, _reporter(), k3s_version='v1.33.4+k3s1')
 
         self.assertEqual('1.5.1', release)
         mock_request.assert_not_called()
 
-    def test_cache_missing_latest_is_refreshed(self):
-        # Caches written before the 'latest' key existed have a fresh
-        # timestamp and a 'releases' dict but no 'latest'. They must be
-        # refreshed rather than raising KeyError.
+    def test_caches_which_cannot_answer_compatibility_are_refreshed(self):
+        # The first two are the formats earlier lookups wrote: GitHub's
+        # tarball URLs with no 'latest', then with one. Neither records a
+        # chart's kubeVersion, so neither can answer for a k3s release.
         client = mock.MagicMock()
-        client.get_namespace_metadata.return_value = {
-            primitives.LONGHORN_VERSION_CACHE_KEY: {
-                'updated': time.time(),
-                'releases': {'1.5.1': 'https://example.com/tarball/v1.5.1'}
-            }
-        }
 
-        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
-                        return_value=_index_response()) as mock_request:
-            release = primitives.get_longhorn_release(
-                client, NAMESPACE, _reporter())
+        for cache in [{'updated': time.time(),
+                       'releases': {'1.5.1': 'https://example.com/tarball/v1.5.1'}},
+                      {'updated': time.time(), 'latest': '1.5.1',
+                       'releases': ['1.5.1']},
+                      {'updated': time.time(), 'charts': ['1.5.1']},
+                      'not a dict']:
+            client.get_namespace_metadata.return_value = {
+                primitives.LONGHORN_VERSION_CACHE_KEY: cache}
+            with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                            return_value=_index_response()) as mock_request:
+                release = primitives.get_longhorn_release(
+                    client, NAMESPACE, _reporter())
 
-        self.assertEqual('1.6.0', release)
-        mock_request.assert_called()
+            self.assertEqual('1.6.0', release, cache)
+            mock_request.assert_called_once()
 
     def test_http_error_raises(self):
         client = mock.MagicMock()
@@ -447,6 +445,142 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
         self.assertEqual(primitives.RESPONSE_SNIPPET_BYTES,
                          len(e.response_text))
         self.assertNotIn(body, str(e))
+
+
+class LonghornCompatibilityTestCase(testtools.TestCase):
+    """The Longhorn chart chosen is one the cluster's k3s can run (#118).
+
+    The index below is the shape of the real one in October 2026: the
+    newest chart narrowed its kubeVersion, so the newest chart is the
+    wrong answer for any k3s older than 1.34.
+    """
+
+    INDEX = {
+        'apiVersion': 'v1',
+        'entries': {
+            'longhorn': [
+                _chart('1.13.0', '>=1.34.0-0'),
+                _chart('1.12.1', '>=1.25.0-0'),
+                _chart('1.4.0', '>=1.21.0-0'),
+                _chart('1.3.3', '>=1.18.0-0 <1.25.0-0'),
+                _chart('1.1.3', '>= v1.16.0-0, < v1.22.0-0'),
+            ],
+        },
+    }
+
+    def _lookup(self, k3s_version, index=None, reporter=None):
+        client = mock.MagicMock()
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_index_response(index or self.INDEX)):
+            return primitives.get_longhorn_release(
+                client, NAMESPACE, reporter or _reporter(),
+                force_cache_update=True, k3s_version=k3s_version)
+
+    def test_the_newest_chart_the_release_admits_is_chosen(self):
+        for k3s_version, expected in [
+                ('v1.36.5+k3s1', '1.13.0'),
+                ('v1.34.0+k3s1', '1.13.0'),
+                ('v1.33.4+k3s1', '1.12.1'),
+                ('v1.25.0+k3s1', '1.12.1'),
+                ('v1.24.17+k3s1', '1.4.0'),
+                ('v1.20.15+k3s1', '1.3.3'),
+                ('v1.17.0+k3s1', '1.1.3'),
+                ('v1.33.0-rc1+k3s1', '1.12.1')]:
+            self.assertEqual(expected, self._lookup(k3s_version), k3s_version)
+
+    def test_without_a_k3s_version_the_newest_chart_is_chosen(self):
+        self.assertEqual('1.13.0', self._lookup(None))
+
+    def test_no_compatible_chart_raises(self):
+        e = self.assertRaises(exceptions.ReleaseLookupError,
+                              self._lookup, 'v1.15.0+k3s1')
+        self.assertEqual('no_compatible_longhorn_release', e.reason)
+        self.assertEqual('v1.15.0+k3s1', e.k3s_version)
+
+    def test_a_chart_with_no_kube_version_fits_anything(self):
+        index = {'entries': {'longhorn': [
+            _chart('1.2.0', '>=1.30.0'),
+            {'version': '1.1.0'}]}}
+        self.assertEqual('1.1.0', self._lookup('v1.15.0+k3s1', index))
+
+    def test_a_constraint_which_cannot_be_read_is_skipped_not_guessed(self):
+        # A newer chart with a range this does not parse loses to an older
+        # one it can prove fits, and the skip is said in debug output.
+        index = {'entries': {'longhorn': [
+            _chart('1.9.0', '~1.30'),
+            _chart('1.8.0', ['>=1.25']),
+            _chart('1.7.0', '>=1.25.0-0')]}}
+        reporter = progress.CollectingReporter(verbose=True)
+        self.assertEqual('1.7.0', self._lookup('v1.30.2+k3s1', index, reporter))
+        self.assertIn("Skipping Longhorn 1.9.0: cannot read its kubeVersion '~1.30'",
+                      reporter.getvalue())
+
+    def test_a_tampered_cache_is_revalidated(self):
+        # The cache lives in namespace metadata, which anything holding the
+        # namespace's credentials can write. Junk in it is skipped, not
+        # trusted and not a traceback.
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {
+            primitives.LONGHORN_VERSION_CACHE_KEY: {
+                'updated': time.time(),
+                'charts': {'9.9.9-rc1': '', 'banana': '', '2.0.0': 7,
+                           '1.5.1': '>=1.21.0-0'}
+            }
+        }
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request') as mock_request:
+            release = primitives.get_longhorn_release(
+                client, NAMESPACE, _reporter(), k3s_version='v1.33.4+k3s1')
+
+        self.assertEqual('1.5.1', release)
+        mock_request.assert_not_called()
+
+
+class KubeVersionTestCase(testtools.TestCase):
+    def test_parse_kube_version(self):
+        for text, expected in [
+                ('v1.36.5+k3s1', (1, 36, 5)),
+                ('1.25.0-0', (1, 25, 0)),
+                ('v1.16.0-r0', (1, 16, 0)),
+                ('1.25', (1, 25, 0)),
+                ('1', (1, 0, 0)),
+                ('v1.18.2-rc3+k3s1', (1, 18, 2)),
+                ('', None),
+                ('1.2.3.4', None),
+                ('1.2.3; touch /pwned', None),
+                ('\u0661.2.3', None),
+                ('1' * 10 + '.0.0', None),
+                (None, None),
+                (1.25, None)]:
+            self.assertEqual(expected, primitives.parse_kube_version(text), text)
+
+    def test_kube_version_satisfies(self):
+        for constraint, version, expected in [
+                ('>=1.34.0-0', (1, 34, 0), True),
+                ('>=1.34.0-0', (1, 33, 9), False),
+                ('>=1.18.0-0 <1.25.0-0', (1, 24, 17), True),
+                ('>=1.18.0-0 <1.25.0-0', (1, 25, 0), False),
+                ('>= v1.16.0-0, < v1.22.0-0', (1, 21, 0), True),
+                ('>= v1.16.0-0, < v1.22.0-0', (1, 22, 0), False),
+                ('>=v1.16.0-r0', (1, 16, 0), True),
+                ('<=1.30', (1, 30, 0), True),
+                ('>1.30', (1, 30, 0), False),
+                ('1.30.1', (1, 30, 1), True),
+                ('=1.30.1', (1, 30, 2), False),
+                ('!=1.30.1', (1, 30, 2), True),
+                ('<1.20 || >=1.30', (1, 31, 0), True),
+                ('<1.20 || >=1.30', (1, 25, 0), False),
+                ('~1.30', (1, 30, 0), None),
+                ('^1.30', (1, 30, 0), None),
+                ('1.30.x', (1, 30, 0), None),
+                ('1.20 - 1.30', (1, 25, 0), None),
+                ('>=1.20 ||', (1, 25, 0), None),
+                ('', (1, 25, 0), None),
+                (None, (1, 25, 0), None)]:
+            self.assertEqual(
+                expected,
+                primitives.kube_version_satisfies(constraint, version),
+                (constraint, version))
 
 
 class FetchFailureTestCase(testtools.TestCase):
