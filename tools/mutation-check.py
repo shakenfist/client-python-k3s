@@ -460,8 +460,8 @@ MUTATIONS = [
     (
         'the Ansible module refuses a bad name when it would create the cluster',
         'collection/plugins/modules/sf_k3s_cluster.py',
-        '        sf_cluster.validate_create_arguments(cluster.name, **shape)\n',
-        '',
+        '            sf_cluster.validate_create_arguments(cluster.name, **shape)\n',
+        '            pass\n',
         PKG + '.tests.test_ansible_module.NameRuleTestCase',
         'tox',
     ),

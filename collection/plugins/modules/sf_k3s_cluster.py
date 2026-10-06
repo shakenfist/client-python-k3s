@@ -400,12 +400,22 @@ class _Mutation:
 
     def __init__(self):
         self.started = None
+        self.arguments_refused = False
 
     def creating(self):
         self.started = 'create'
 
     def deleting(self):
         self.started = 'delete'
+
+    def refusing_arguments(self):
+        """Record that the library refused the task's arguments before any change.
+
+        Not a mutation, and changed stays false. It exists for advice(): a
+        refused argument fails the same way on every run, so "run it again"
+        is the one thing the operator must not be told.
+        """
+        self.arguments_refused = True
 
     @property
     def changed(self):
@@ -427,6 +437,9 @@ class _Mutation:
             return ('The delete was interrupted, so the cluster may be '
                     'partly removed; run again with "state: absent" to '
                     'finish it.')
+        if self.arguments_refused:
+            return ("Nothing was changed. Correct the task's parameters "
+                    'before running it again.')
         return 'Nothing was changed, so the task can simply be run again.'
 
 
@@ -501,7 +514,16 @@ def _present(module, cluster, reporter, mutation):
         # a create. Only on this path: the name rule is create()'s alone, so
         # that a cluster which already exists under such a name is still
         # present.
-        sf_cluster.validate_create_arguments(cluster.name, **shape)
+        #
+        # Everything validate_create_arguments() raises is a refusal of an
+        # argument -- ClusterNameError, ShapeError, NodeSizeError,
+        # K3sConfigError, ManifestError -- so the base class is caught here,
+        # and a validator added to it later is covered without a change.
+        try:
+            sf_cluster.validate_create_arguments(cluster.name, **shape)
+        except sf_exceptions.K3sClusterException:
+            mutation.refusing_arguments()
+            raise
 
         if module.check_mode:
             # Nothing above this point mutated anything, and nothing below

@@ -816,8 +816,10 @@ class NameRuleTestCase(ModuleTestCase):
         run = self.run_module(base_params(name=self.NAME),
                               cluster_exists=False, expect_failure=True)
 
+        # Not "run it again": a refused name is refused on every run.
         self.assertEqual(
-            '%s Nothing was changed, so the task can simply be run again.'
+            "%s Nothing was changed. Correct the task's parameters before "
+            'running it again.'
             % sf_exceptions.ClusterNameError.invalid_characters(self.NAME),
             run.msg)
         self.assertIs(False, run.result['changed'])
@@ -841,6 +843,21 @@ class NameRuleTestCase(ModuleTestCase):
         self.assertFalse(run.failed)
         self.assertFalse(run.changed)
         self.assertNothingMutated(run)
+
+    def test_absent_deletes_an_existing_cluster(self):
+        """A cluster created before the rule existed can still be removed.
+
+        The partner of test_absent_is_not_refused below, which finds no
+        cluster: here one exists under the refused name, and the module
+        has to delete it rather than merely not refuse.
+        """
+        run = self.run_module(base_params(name=self.NAME, state='absent'),
+                              cluster_exists=True, instance_state='deleted')
+
+        self.assertFalse(run.failed)
+        self.assertIs(True, run.result['changed'])
+        self.assertIn('delete', run.cluster_calls)
+        self.assertIn('delete_instance', run.client_calls)
 
     def test_absent_is_not_refused(self):
         """absent on such a name reaches the library's delete path.
