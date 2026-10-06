@@ -159,8 +159,8 @@ canonical copy lives in shakenfist/development at
 
  * Is there unit test coverage for the changes? This should
    include normal and adversarial cases, especially around
-   external API responses (the k3s update API, the GitHub
-   releases API, agent operation payloads) which can change
+   external API responses (the k3s update API, the Longhorn
+   chart index, agent operation payloads) which can change
    shape over time.
  * All tests should pass. We need to fix any failing tests now
    before we push. Run `tox -epy3`.
@@ -318,8 +318,8 @@ copy lives in shakenfist/development at
  * Review these changes as both a security reviewer and an
    experienced developer and correct any errors you find.
  * Are any user- or upstream-controlled values (cluster names,
-   release channel data from the k3s update API, tag names from
-   the GitHub releases API, namespace metadata) interpolated into
+   release channel data from the k3s update API, chart versions
+   from the Longhorn chart index, namespace metadata) interpolated into
    agent command lines, file paths, or YAML written to guests
    without sanitization? Agent execute commands run through a
    shell on the guest.

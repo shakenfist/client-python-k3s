@@ -101,13 +101,37 @@ class ReleaseLookupErrorTestCase(testtools.TestCase):
 
     def test_http_status_longhorn(self):
         e = exceptions.ReleaseLookupError.http_status(
-            'Longhorn', 'https://api.github.com/repos/longhorn/longhorn/releases?page=0',
+            'Longhorn', 'https://charts.longhorn.io/index.yaml',
             404, 'not found')
         self.assertEqual(
             "Unable to determine latest Longhorn release version\n"
-            "    GET https://api.github.com/repos/longhorn/longhorn/releases?page=0\n"
+            "    GET https://charts.longhorn.io/index.yaml\n"
             "    returned HTTP status code 404 with text:\n"
             "    not found",
+            str(e))
+
+    def test_request_failed(self):
+        e = exceptions.ReleaseLookupError.request_failed(
+            'Longhorn', 'https://charts.longhorn.io/index.yaml',
+            'Read timed out. (read timeout=30)')
+        self.assertEqual('request_failed', e.reason)
+        self.assertEqual('Read timed out. (read timeout=30)', e.error)
+        self.assertEqual(
+            "Unable to determine latest Longhorn release version\n"
+            "    GET https://charts.longhorn.io/index.yaml\n"
+            "    failed: Read timed out. (read timeout=30)",
+            str(e))
+
+    def test_unreadable_response(self):
+        e = exceptions.ReleaseLookupError.unreadable_response(
+            'k3s', 'https://update.k3s.io/v1-release/channels', '<html>')
+        self.assertEqual('unreadable_response', e.reason)
+        self.assertEqual('<html>', e.response_snippet)
+        self.assertEqual(
+            "Unable to determine latest k3s release version\n"
+            "    GET https://update.k3s.io/v1-release/channels\n"
+            "    returned a response which could not be parsed:\n"
+            "    <html>",
             str(e))
 
     def test_no_usable_k3s_channels(self):
@@ -271,7 +295,8 @@ class TotalAttributesTestCase(testtools.TestCase):
         e = exceptions.ReleaseLookupError.unknown_channel('v1.26')
         self.assertEqual('v1.26', e.release_channel)
 
-        # Fields belonging to the other three constructors.
+        # Fields belonging to the other constructors.
+        self.assertIsNone(e.error)
         self.assertIsNone(e.status_code)
         self.assertIsNone(e.product)
         self.assertIsNone(e.url)

@@ -452,7 +452,7 @@ scripted fake client (`tests/fakes.py`) with `subprocess.run` and
 `requests.request` alone is not enough to reproduce this: those two
 release lookups are called as plain functions in the test, so
 patching them is what keeps the lookup from reaching the real k3s
-update API and GitHub releases API; `requests.request` itself is
+update API and the Longhorn chart index; `requests.request` itself is
 never touched. Running the sequence against a real Shaken Fist
 namespace needs nothing more than the real client `make_client()`
 returns, as shown above; there is no other setup and no Click

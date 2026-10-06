@@ -6,7 +6,9 @@ import time
 # tests use call_args.args, which the stdlib version only gained in
 # Python 3.8, and the project supports Python >= 3.7.
 import mock
+import requests
 import testtools
+import yaml
 
 from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
@@ -27,7 +29,10 @@ def _reporter():
 def _fake_response(payload, status_code=200, text=None):
     resp = mock.MagicMock()
     resp.status_code = status_code
-    resp.json.return_value = payload
+    if isinstance(payload, Exception):
+        resp.json.side_effect = payload
+    else:
+        resp.json.return_value = payload
     # A real string, not the MagicMock attribute, whenever a test cares:
     # slicing a MagicMock yields another MagicMock, so a truncation
     # assertion against the default would pass without any truncation.
@@ -187,6 +192,44 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         # '{url}' from a missing f-string prefix.
         self.assertIn('GET https://update.k3s.io/v1-release/channels', str(e))
 
+    def test_a_body_which_is_not_json_raises(self):
+        # A 200 carrying HTML -- a captive portal, a proxy error page --
+        # is a lookup failure, not a JSONDecodeError traceback.
+        client = mock.MagicMock()
+        body = '<html>' + 'z' * (primitives.RESPONSE_SNIPPET_BYTES * 3)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(
+                            ValueError('Expecting value'), text=body)):
+            e = self.assertRaises(
+                exceptions.ReleaseLookupError, primitives.get_k3s_release,
+                client, NAMESPACE, _reporter(), force_cache_update=True,
+                release_channel='stable')
+
+        self.assertEqual('unreadable_response', e.reason)
+        self.assertEqual('k3s', e.product)
+        self.assertEqual(primitives.K3S_CHANNELS_URL, e.url)
+        self.assertEqual(primitives.RESPONSE_SNIPPET_BYTES,
+                         len(e.response_snippet))
+        client.set_namespace_metadata_item.assert_not_called()
+
+    def test_documents_of_the_wrong_shape_raise(self):
+        # Neither a top level list nor a channel which is not a dict may
+        # reach a subscript or a .get().
+        client = mock.MagicMock()
+
+        for payload in [['stable'], {'data': 'stable'},
+                        {'data': ['name latest']}]:
+            with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                            return_value=_fake_response(payload)):
+                e = self.assertRaises(
+                    exceptions.ReleaseLookupError, primitives.get_k3s_release,
+                    client, NAMESPACE, _reporter(), force_cache_update=True,
+                    release_channel='stable')
+            self.assertEqual('no_usable_k3s_channels', e.reason, payload)
+
+        client.set_namespace_metadata_item.assert_not_called()
+
     def test_the_quoted_response_body_is_bounded(self):
         """Whoever serves the error does not get to choose its length.
 
@@ -212,43 +255,144 @@ class GetK3sReleaseTestCase(testtools.TestCase):
         self.assertNotIn(body, str(e))
 
 
-# A cut down version of real data from the GitHub releases API for
-# longhorn/longhorn. Prereleases and tags which are not valid PEP 440
-# versions should both be handled gracefully.
-LONGHORN_RELEASES = [
-    {'prerelease': False, 'tag_name': 'v1.5.1',
-     'tarball_url': 'https://example.com/tarball/v1.5.1'},
-    {'prerelease': True, 'tag_name': 'v1.7.0-rc1',
-     'tarball_url': 'https://example.com/tarball/v1.7.0-rc1'},
-    {'prerelease': False, 'tag_name': 'v1.4.0-hotfix1',
-     'tarball_url': 'https://example.com/tarball/v1.4.0-hotfix1'},
-    {'prerelease': False, 'tag_name': 'v1.6.0',
-     'tarball_url': 'https://example.com/tarball/v1.6.0'},
-]
+def _chart(version, **extra):
+    chart = {'apiVersion': 'v1', 'name': 'longhorn', 'version': version,
+             'appVersion': 'v%s' % version,
+             'urls': ['https://example.com/longhorn-%s.tgz' % version]}
+    chart.update(extra)
+    return chart
+
+
+# A cut down version of real data from https://charts.longhorn.io/index.yaml,
+# plus the entries which must be skipped: a prerelease, a version PEP 440
+# cannot parse, a deprecated chart, and a version YAML reads as a float.
+LONGHORN_INDEX = {
+    'apiVersion': 'v1',
+    'entries': {
+        'longhorn': [
+            _chart('1.7.0-rc1'),
+            _chart('1.6.0'),
+            _chart('1.4.0-hotfix1'),
+            _chart('1.9.0', deprecated=True),
+            _chart(1.8),
+            _chart('1.5.1'),
+        ],
+    },
+    'generated': '2026-09-29T09:48:33Z',
+}
+
+
+def _index_response(index=LONGHORN_INDEX, **kwargs):
+    return _fake_response(None, text=yaml.safe_dump(index), **kwargs)
 
 
 class GetLonghornReleaseTestCase(testtools.TestCase):
-    def test_prereleases_and_unparsable_tags_are_skipped(self):
+    def test_the_newest_final_chart_version_is_chosen(self):
         client = mock.MagicMock()
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
-                        return_value=_fake_response(LONGHORN_RELEASES)):
+                        return_value=_index_response()) as mock_request:
             release = primitives.get_longhorn_release(
                 client, NAMESPACE, _reporter(), force_cache_update=True)
 
         self.assertEqual('1.6.0', release)
 
+        # One request, to the chart index, never the GitHub API (#97).
+        mock_request.assert_called_once()
+        self.assertEqual(('GET', primitives.LONGHORN_CHART_INDEX_URL),
+                         mock_request.call_args.args)
+        self.assertEqual(primitives.RELEASE_LOOKUP_TIMEOUT,
+                         mock_request.call_args.kwargs['timeout'])
+
+        cache = client.set_namespace_metadata_item.call_args.args[2]
+        self.assertEqual('1.6.0', cache['latest'])
+        self.assertEqual(['1.6.0', '1.5.1'], cache['releases'])
+
     def test_no_valid_releases_raises(self):
         client = mock.MagicMock()
+        index = {'apiVersion': 'v1',
+                 'entries': {'longhorn': [_chart('1.7.0-rc1')]}}
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
-                        return_value=_fake_response([])):
+                        return_value=_index_response(index)):
             e = self.assertRaises(
                 exceptions.ReleaseLookupError, primitives.get_longhorn_release,
                 client, NAMESPACE, _reporter(), force_cache_update=True)
 
         self.assertEqual('no_parsable_longhorn_release', e.reason)
         self.assertEqual('Unable to determine the latest Longhorn release', str(e))
+        client.set_namespace_metadata_item.assert_not_called()
+
+    def test_documents_of_the_wrong_shape_raise(self):
+        # Each of these parses as YAML, so none is unreadable: they are
+        # indexes with nothing usable in them, and must neither raise a
+        # TypeError nor be cached.
+        client = mock.MagicMock()
+
+        for index in ['an error page which is a YAML string',
+                      ['entries'],
+                      {'entries': ['longhorn']},
+                      {'entries': {'longhorn': 'all of them'}},
+                      {'entries': {'longhorn': ['1.6.0']}},
+                      {'entries': {'not-longhorn': [_chart('1.6.0')]}}]:
+            with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                            return_value=_index_response(index)):
+                e = self.assertRaises(
+                    exceptions.ReleaseLookupError,
+                    primitives.get_longhorn_release,
+                    client, NAMESPACE, _reporter(), force_cache_update=True)
+            self.assertEqual('no_parsable_longhorn_release', e.reason, index)
+
+        client.set_namespace_metadata_item.assert_not_called()
+
+    def test_a_body_which_is_not_yaml_raises(self):
+        client = mock.MagicMock()
+        body = 'key: [unterminated\n' + 'w' * (primitives.RESPONSE_SNIPPET_BYTES * 3)
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(None, text=body)):
+            e = self.assertRaises(
+                exceptions.ReleaseLookupError, primitives.get_longhorn_release,
+                client, NAMESPACE, _reporter(), force_cache_update=True)
+
+        self.assertEqual('unreadable_response', e.reason)
+        self.assertEqual('Longhorn', e.product)
+        self.assertEqual(primitives.LONGHORN_CHART_INDEX_URL, e.url)
+        self.assertEqual(primitives.RESPONSE_SNIPPET_BYTES,
+                         len(e.response_snippet))
+
+    def test_the_index_cannot_construct_objects(self):
+        # safe_load, not load: a python/object tag is a parse failure.
+        client = mock.MagicMock()
+        body = '!!python/object/apply:os.system ["true"]\n'
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(None, text=body)):
+            e = self.assertRaises(
+                exceptions.ReleaseLookupError, primitives.get_longhorn_release,
+                client, NAMESPACE, _reporter(), force_cache_update=True)
+
+        self.assertEqual('unreadable_response', e.reason)
+
+    def test_fresh_cache_avoids_fetch(self):
+        # Includes a cache written by the old GitHub releases lookup, whose
+        # 'releases' was a dict of tarball URLs: 'latest' is still a chart
+        # version, so it stays good until it expires.
+        client = mock.MagicMock()
+        client.get_namespace_metadata.return_value = {
+            primitives.LONGHORN_VERSION_CACHE_KEY: {
+                'updated': time.time(),
+                'latest': '1.5.1',
+                'releases': {'1.5.1': 'https://example.com/tarball/v1.5.1'}
+            }
+        }
+
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request') as mock_request:
+            release = primitives.get_longhorn_release(
+                client, NAMESPACE, _reporter())
+
+        self.assertEqual('1.5.1', release)
+        mock_request.assert_not_called()
 
     def test_cache_missing_latest_is_refreshed(self):
         # Caches written before the 'latest' key existed have a fresh
@@ -263,7 +407,7 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
         }
 
         with mock.patch('shakenfist_client_k3s.primitives.requests.request',
-                        return_value=_fake_response(LONGHORN_RELEASES)) as mock_request:
+                        return_value=_index_response()) as mock_request:
             release = primitives.get_longhorn_release(
                 client, NAMESPACE, _reporter())
 
@@ -286,8 +430,7 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
 
         # The error must blame Longhorn, not k3s, and name the fetched URL.
         self.assertIn('Unable to determine latest Longhorn release version', str(e))
-        self.assertIn('GET https://api.github.com/repos/longhorn/longhorn/releases',
-                      str(e))
+        self.assertIn('GET https://charts.longhorn.io/index.yaml', str(e))
 
     def test_the_quoted_response_body_is_bounded(self):
         client = mock.MagicMock()
@@ -304,6 +447,44 @@ class GetLonghornReleaseTestCase(testtools.TestCase):
         self.assertEqual(primitives.RESPONSE_SNIPPET_BYTES,
                          len(e.response_text))
         self.assertNotIn(body, str(e))
+
+
+class FetchFailureTestCase(testtools.TestCase):
+    """A fetch which fails outright is a ReleaseLookupError, not a traceback.
+
+    Both lookups share the fetch, so both are driven here: a timeout is
+    the case RELEASE_LOOKUP_TIMEOUT exists to produce, and a connection
+    failure is the commoner one.
+    """
+
+    def _lookups(self, client):
+        return [
+            ('k3s', lambda: primitives.get_k3s_release(
+                client, NAMESPACE, _reporter(), force_cache_update=True,
+                release_channel='stable')),
+            ('Longhorn', lambda: primitives.get_longhorn_release(
+                client, NAMESPACE, _reporter(), force_cache_update=True)),
+        ]
+
+    def test_a_failed_request_raises(self):
+        client = mock.MagicMock()
+
+        for failure in [requests.Timeout('Read timed out. (read timeout=30)'),
+                        requests.ConnectionError('Name or service not known')]:
+            for product, lookup in self._lookups(client):
+                with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                                side_effect=failure) as mock_request:
+                    e = self.assertRaises(exceptions.ReleaseLookupError, lookup)
+
+                self.assertEqual('request_failed', e.reason)
+                self.assertEqual(product, e.product)
+                self.assertEqual(str(failure), e.error)
+                self.assertIn('Unable to determine latest %s release version'
+                              % product, str(e))
+                self.assertEqual(primitives.RELEASE_LOOKUP_TIMEOUT,
+                                 mock_request.call_args.kwargs['timeout'])
+
+        client.set_namespace_metadata_item.assert_not_called()
 
 
 class DebugRoutingTestCase(testtools.TestCase):
