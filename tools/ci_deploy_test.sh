@@ -148,15 +148,40 @@ pod_names() {
     echo "${pods}" | awk '{print $1 "/" $2}'
 }
 
-kubeconfig_fqcn() {
-    # The name create gives the cluster's kubeconfig user, context and
-    # cluster, <name>.<namespace>. k3s show prints: namespace = ns, and is
-    # captured first for the reason count_routed_addresses() gives above.
+cluster_namespace() {
+    # The Shaken Fist namespace cluster $1 lives in. k3s show prints:
+    # namespace = ns, and is captured first for the reason
+    # count_routed_addresses() gives above.
     local show_output namespace
     show_output=$(sf-client k3s show "$1") || return 1
     namespace=$(echo "${show_output}" | sed -n 's/^    namespace = //p')
     [ -n "${namespace}" ] || return 1
+    echo "${namespace}"
+}
+
+kubeconfig_fqcn() {
+    # The name create gives the cluster's kubeconfig user, context and
+    # cluster, <name>.<namespace>.
+    local namespace
+    namespace=$(cluster_namespace "$1") || return 1
     echo "$1.${namespace}"
+}
+
+assert_refused() {
+    # Run the command after $1 and require it to fail with output
+    # containing the fixed string $1.
+    local expected=$1 output=/tmp/k3s-ci-refusal
+    shift
+    if "$@" > "${output}" 2>&1; then
+        echo "$* succeeded; it should have been refused"
+        cat "${output}"
+        exit 1
+    fi
+    if ! grep -qF "${expected}" "${output}"; then
+        echo "$* failed, but its output does not mention ${expected}:"
+        cat "${output}"
+        exit 1
+    fi
 }
 
 assert_kubeconfig_entries() {
@@ -724,6 +749,26 @@ if ! grep -qi 'metallb' /tmp/k3s-ci-expand-refusal; then
     cat /tmp/k3s-ci-expand-refusal
     exit 1
 fi
+
+status 'Verify bad names and counts are refused before any API call'
+# The library refuses these before it asks the API for anything, so they
+# cost seconds. create makes a missing namespace named by --namespace, and
+# a refused create must not leave one behind; this one is derived from
+# the job's own namespace, so it is unique per run. 'namespace show'
+# succeeding is the failure. It fails for a namespace these credentials
+# cannot see as well as for a missing one, so on a runner without admin
+# the check is as strong as the credentials allow, and no stronger.
+refused_namespace="$(cluster_namespace "${MINIMAL_CLUSTER}")-refused"
+assert_refused "Cluster name 'my.cluster' cannot be used" \
+    sf-client k3s create my.cluster --namespace "${refused_namespace}"
+if sf-client namespace show "${refused_namespace}" > /dev/null 2>&1; then
+    echo "The refused create made namespace ${refused_namespace} anyway"
+    exit 1
+fi
+# The minimal cluster, which still exists, so the count is the only thing
+# wrong with the request.
+assert_refused worker_count \
+    sf-client k3s expand-workers "${MINIMAL_CLUSTER}" --worker-count 0
 
 status 'Delete the minimal cluster'
 # delete --no-kubeconfig skips the kubeconfig cleanup, which is the half of
