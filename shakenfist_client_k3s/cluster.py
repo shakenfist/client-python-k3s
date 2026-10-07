@@ -3919,14 +3919,13 @@ class Cluster:
 
         Nor does it hang. Each probe -- the k3s API probe and the Kubernetes
         probe on the first control plane node, and a signals probe on every
-        node -- is only
-        attempted when the node it would be run on looks able to answer --
-        the node entry this method has just built says whether the instance
-        exists, is created and has a ready agent -- and they share one wall
-        clock timeout even then. An agent operation queued against an
-        instance whose agent is not connected never leaves its queued
-        state, so a probe which is attempted anyway waits forever on exactly
-        the cluster this verb exists to describe. Every probe is submitted
+        node -- is only attempted when the node it would be run on looks
+        able to answer -- the node entry this method has just built says
+        whether the instance exists, is created and has a ready agent -- and
+        they share one wall clock timeout even then. An agent operation
+        queued against an instance whose agent is not connected never leaves
+        its queued state, so a probe which is attempted anyway waits forever
+        on exactly the cluster this verb exists to describe. Every probe is submitted
         before any is waited for, and every one is waited for against a
         single deadline, HEALTH_PROBE_TIMEOUT_SECONDS from before the first
         submission, so the waiting is bounded by one budget on a cluster of

@@ -706,6 +706,121 @@ class HealthCommandTestCase(testtools.TestCase):
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual(self._invoke().output, result.output)
 
+    def test_a_healthy_cluster_renders_each_nodes_kubernetes_readings(self):
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+
+        # The kubernetes line follows the signals line it sits beside, and
+        # an OOM kill is a further indented line under the node it ran on.
+        self.assertIn(
+            'booted 2025-10-06T00:59:05Z, k3s active, 3 restarts, '
+            '2 OOM kills, 2809 of 3927 MiB available, '
+            'etcd 65 MiB, snapshots 40 MiB\n'
+            '        kubernetes: Ready since 2026-10-05T08:12:25Z, no pressure\n'
+            '    [ok] k3s-banana-node-002', result.output)
+        self.assertIn(
+            '        kubernetes: Ready since 2026-10-05T08:13:02Z, no pressure\n'
+            '            OOM killed: default/memory-hog-7d9f8b6c5-x2x7k hog '
+            'at 2026-10-06T21:40:11Z, 2 restarts\n'
+            '    [ok] k3s-banana-node-003', result.output)
+        self.assertEqual(1, result.output.count('OOM killed:'))
+        self.assertNotIn('unmatched', result.output)
+        self.assertNotIn('Kubernetes probe', result.output)
+        self.assertNotIn('None', result.output)
+
+    def test_a_cluster_whose_kubernetes_probe_did_not_answer_says_so(self):
+        self.client.kubernetes_return_code = 1
+        self.client.kubernetes_stdout = ''
+        self.client.kubernetes_stderr = 'error: the server doesn\'t have a resource\n'
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn('Cluster banana in namespace testns is NOT healthy',
+                      result.output)
+        self.assertEqual(3, result.output.count('kubernetes: not read ('))
+        self.assertIn('  Kubernetes probe: did not answer (', result.output)
+        self.assertNotIn('OOM killed', result.output)
+        self.assertNotIn('None', result.output)
+
+    def test_a_node_which_is_not_ready_is_reported_and_not_hidden(self):
+        self.client.kubernetes_stdout = (
+            'node\tk3s-banana-node-001\tTrue\tFalse\tFalse\tFalse\t'
+            '2026-10-05T08:12:25Z\n'
+            'node\tk3s-banana-node-002\tFalse\tTrue\tFalse\tTrue\t'
+            '2026-10-06T08:13:02Z\n'
+            'node\tk3s-banana-node-003\tUnknown\tFalse\tFalse\tFalse\t'
+            '2026-10-06T09:13:09Z\n')
+
+        result = self._invoke('--strict')
+
+        self.assertEqual(1, result.exit_code, result.output)
+        self.assertIn(
+            '        kubernetes: NotReady (False) since 2026-10-06T08:13:02Z, '
+            'MemoryPressure, PIDPressure\n', result.output)
+        self.assertIn(
+            '        kubernetes: NotReady (Unknown) since 2026-10-06T09:13:09Z, '
+            'no pressure\n', result.output)
+        self.assertNotIn('OOM killed', result.output)
+
+    def test_a_node_kubernetes_does_not_know_and_a_stale_node_render(self):
+        # k3s-banana-node-003 never registered, and a node object with no
+        # instance is left behind.
+        self.client.kubernetes_stdout = (
+            'node\tk3s-banana-node-001\tTrue\tFalse\tFalse\tFalse\t'
+            '2026-10-05T08:12:25Z\n'
+            'node\tk3s-banana-node-002\tTrue\tFalse\tFalse\tFalse\t'
+            '2026-10-05T08:13:02Z\n'
+            'node\tzombie-b\tTrue\tFalse\tFalse\tFalse\t'
+            '2026-10-05T08:13:09Z\n'
+            'node\tzombie-a\tTrue\tFalse\tFalse\tFalse\t'
+            '2026-10-05T08:13:09Z\n')
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn('        kubernetes: not registered\n', result.output)
+        self.assertIn('  Kubernetes: unmatched nodes zombie-a, zombie-b\n',
+                      result.output)
+
+    def test_a_node_unread_for_its_own_reason_is_not_blamed_on_the_probe(self):
+        # An instance which is gone has no name to match, and the probe
+        # answered, so the line must not read as though it had not.
+        del self.client.instances['inst-w2']
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn(
+            'this instance no longer exists\n'
+            '        signals: not read (', result.output)
+        self.assertIn(
+            '        kubernetes: not read (no instance name to match)\n',
+            result.output)
+        self.assertNotIn('Kubernetes probe: did not answer', result.output)
+
+    def test_nodes_sharing_a_name_are_unread_and_say_why(self):
+        self.client.instances['inst-w2']['name'] = 'K3S-BANANA-NODE-002'
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(
+            2, result.output.count(
+                'kubernetes: not read (another node has the same name)'))
+
+        # The Kubernetes node the two share is not one no instance accounts
+        # for. node-003's was renamed away from, so it is the only stale one.
+        self.assertIn('  Kubernetes: unmatched nodes k3s-banana-node-003\n',
+                      result.output)
+
+    def test_kubernetes_readings_never_change_the_exit_code_without_strict(self):
+        self.client.kubernetes_return_code = 1
+
+        self.assertEqual(0, self._invoke().exit_code)
+        self.assertEqual(1, self._invoke('--strict').exit_code)
+
     def test_an_unknown_cluster_fails_the_command(self):
         client = fakes.HealthClient()
         result = self.runner.invoke(
@@ -986,6 +1101,203 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
 
         self.assertNotIn('booted', reporter.getvalue())
         self.assertNotIn('signals:', reporter.getvalue())
+
+    # A report with a Kubernetes reading for each node of REPORT, and the
+    # probe's own outcome, in the shape Cluster.health() returns.
+    KUBERNETES_REPORT = {
+        'probed': True, 'answered': True, 'error': None,
+        'unmatched_nodes': []}
+
+    def _kubernetes_report(self, first=None, second=None, probe=None):
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['kubernetes'] = {
+            'registered': True, 'ready': 'True', 'ready_since': 1791187945,
+            'memory_pressure': 'False', 'disk_pressure': 'False',
+            'pid_pressure': 'False', 'oom_killed': []}
+        report['nodes'][1]['kubernetes'] = {
+            'registered': None, 'ready': None, 'ready_since': None,
+            'memory_pressure': None, 'disk_pressure': None,
+            'pid_pressure': None, 'oom_killed': None}
+        report['kubernetes'] = dict(self.KUBERNETES_REPORT)
+        report['nodes'][0]['kubernetes'].update(first or {})
+        report['nodes'][1]['kubernetes'].update(second or {})
+        report['kubernetes'].update(probe or {})
+        return report
+
+    def _render_kubernetes(self, report):
+        reporter = progress.CollectingReporter()
+        shakenfist_client_k3s._render_health(reporter, report)
+        return reporter.getvalue()
+
+    def test_kubernetes_renders_under_the_signals_of_each_node(self):
+        rendered = self._render_kubernetes(self._kubernetes_report())
+
+        self.assertIn(
+            'etcd 64 MiB, snapshots 32 MiB\n'
+            '        kubernetes: Ready since 2026-10-05T08:12:25Z, no pressure\n'
+            '    [!!] inst-w1 (worker): this instance no longer exists\n'
+            '        signals: not read (instance is gone)\n'
+            '        kubernetes: not read (no instance name to match)\n',
+            rendered)
+        self.assertNotIn('None', rendered)
+
+    def test_each_ready_status_and_pressure_renders(self):
+        for ready, expected in (('True', 'Ready since'),
+                                ('False', 'NotReady (False) since'),
+                                ('Unknown', 'NotReady (Unknown) since')):
+            rendered = self._render_kubernetes(self._kubernetes_report(
+                first={'ready': ready, 'disk_pressure': 'True'}))
+
+            self.assertIn('        kubernetes: %s 2026-10-05T08:12:25Z, '
+                          'DiskPressure\n' % expected, rendered)
+            self.assertNotIn('no pressure', rendered)
+
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            first={'memory_pressure': 'True', 'disk_pressure': 'True',
+                   'pid_pressure': 'True'}))
+        self.assertIn(', MemoryPressure, DiskPressure, PIDPressure\n', rendered)
+
+    def test_a_pressure_condition_which_was_not_read_is_not_no_pressure(self):
+        # 'Unknown' is the node controller having lost the kubelet, and a
+        # condition the node did not report is None. Neither is evidence
+        # of there being no pressure.
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            first={'memory_pressure': 'Unknown', 'disk_pressure': None}))
+
+        self.assertIn(', MemoryPressure unknown, DiskPressure unknown\n', rendered)
+        self.assertNotIn('no pressure', rendered)
+        self.assertNotIn('None', rendered)
+
+    def test_a_ready_node_with_no_time_has_no_since(self):
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            first={'ready_since': None}))
+
+        self.assertIn('        kubernetes: Ready, no pressure\n', rendered)
+
+    def test_a_ready_time_which_cannot_be_shown_is_unknown(self):
+        for since in ('1759712345', 1759712345.0, True, int('9' * 20)):
+            rendered = self._render_kubernetes(self._kubernetes_report(
+                first={'ready_since': since}))
+
+            self.assertIn('        kubernetes: Ready since unknown, no pressure\n',
+                          rendered, since)
+
+    def test_a_ready_status_which_is_not_a_status_is_unknown(self):
+        for ready in (None, 7, True, 'Banana'):
+            rendered = self._render_kubernetes(self._kubernetes_report(
+                first={'ready': ready}))
+
+            self.assertIn('        kubernetes: readiness unknown since ',
+                          rendered, ready)
+            self.assertNotIn('None', rendered)
+
+    def test_an_unregistered_node_says_so(self):
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            first={'registered': False, 'ready': None, 'ready_since': None,
+                   'memory_pressure': None, 'disk_pressure': None,
+                   'pid_pressure': None, 'oom_killed': []}))
+
+        self.assertIn('        kubernetes: not registered\n', rendered)
+        self.assertNotIn('since', rendered)
+        self.assertNotIn('pressure', rendered)
+        self.assertNotIn('None', rendered)
+
+    OOM_KILLS = [
+        {'namespace': 'default', 'pod': 'hog-1', 'container': 'hog',
+         'restarts': 1, 'finished_at': 1791322811},
+        {'namespace': 'kube-system', 'pod': 'dns-0', 'container': 'dns',
+         'restarts': 0, 'finished_at': 1791322900}]
+
+    def test_each_oom_kill_is_a_line_under_its_node(self):
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            first={'oom_killed': self.OOM_KILLS}))
+
+        self.assertIn(
+            'no pressure\n'
+            '            OOM killed: default/hog-1 hog at 2026-10-06T21:40:11Z, '
+            '1 restart\n'
+            '            OOM killed: kube-system/dns-0 dns at '
+            '2026-10-06T21:41:40Z, 0 restarts\n', rendered)
+
+    def test_oom_kills_on_an_unregistered_node_are_still_shown(self):
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            first={'registered': False, 'oom_killed': self.OOM_KILLS[:1]}))
+
+        self.assertIn('kubernetes: not registered\n'
+                      '            OOM killed: default/hog-1 hog at ', rendered)
+
+    def test_oom_kill_values_of_the_wrong_type_render_unknown(self):
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            first={'oom_killed': [
+                {'namespace': 7, 'pod': None, 'container': True,
+                 'restarts': '3', 'finished_at': 1.5},
+                {'namespace': 'a', 'pod': 'b', 'container': 'c',
+                 'restarts': True, 'finished_at': int('9' * 20)},
+                'not a dict', {}]}))
+
+        self.assertIn('OOM killed: unknown/unknown unknown at unknown, '
+                      'unknown restarts\n', rendered)
+        self.assertIn('OOM killed: a/b c at unknown, unknown restarts\n',
+                      rendered)
+        self.assertEqual(4, rendered.count('OOM killed:'))
+        self.assertNotIn('None', rendered)
+        self.assertNotIn('True', rendered)
+        self.assertIn('k3s API: answered on inst-cp1', rendered)
+
+    def test_a_named_node_unread_under_an_answering_probe_shares_its_name(self):
+        report = self._kubernetes_report()
+        report['nodes'][1].update({'name': 'k3s-banana-node-001', 'exists': True,
+                                   'state': 'created', 'agent_state': 'ready'})
+
+        rendered = self._render_kubernetes(report)
+
+        self.assertIn(
+            '        kubernetes: not read (another node has the same name)\n',
+            rendered)
+        self.assertNotIn('no instance name', rendered)
+
+    def test_a_probe_which_did_not_answer_is_the_reason_nodes_are_unread(self):
+        unread = {'registered': None, 'ready': None, 'ready_since': None,
+                  'memory_pressure': None, 'disk_pressure': None,
+                  'pid_pressure': None, 'oom_killed': None}
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            first=unread,
+            probe={'probed': True, 'answered': False,
+                   'error': 'the command exited 1', 'unmatched_nodes': None}))
+
+        self.assertEqual(2, rendered.count(
+            'kubernetes: not read (the command exited 1)\n'))
+        self.assertIn('  Kubernetes probe: did not answer (the command exited 1)\n',
+                      rendered)
+        self.assertNotIn('unmatched', rendered)
+        self.assertNotIn('None', rendered)
+
+    def test_a_probe_error_which_is_missing_renders_unknown(self):
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            probe={'answered': False, 'error': None}, first={'registered': None}))
+
+        self.assertIn('kubernetes: not read (unknown)\n', rendered)
+        self.assertIn('  Kubernetes probe: did not answer (unknown)\n', rendered)
+
+    def test_unmatched_nodes_are_listed_after_the_api_lines(self):
+        rendered = self._render_kubernetes(self._kubernetes_report(
+            probe={'unmatched_nodes': ['old-a', 'old-b']}))
+
+        self.assertIn('k3s-banana-node-001   Ready\n'
+                      '  Kubernetes: unmatched nodes old-a, old-b\n', rendered)
+
+    def test_no_unmatched_nodes_says_nothing(self):
+        rendered = self._render_kubernetes(self._kubernetes_report())
+
+        self.assertNotIn('unmatched', rendered)
+        self.assertNotIn('Kubernetes probe', rendered)
+
+    def test_a_report_with_no_kubernetes_at_all_is_skipped(self):
+        # From an older library, or built by hand.
+        rendered = self._render_kubernetes(copy.deepcopy(self.REPORT))
+
+        self.assertNotIn('kubernetes:', rendered)
+        self.assertNotIn('Kubernetes', rendered)
 
     def test_the_report_goes_to_the_reporter_and_not_to_stdout(self):
         reporter = progress.CollectingReporter()

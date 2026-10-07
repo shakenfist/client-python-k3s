@@ -403,6 +403,7 @@ def _render_health(out, report):
             out.write('    [%s] %s (%s): this instance no longer exists\n'
                       % (marker, node['uuid'], role))
             _render_signals(out, node)
+            _render_kubernetes(out, node, report.get('kubernetes'))
             continue
         # 'or' on the name for the same reason as on the agent state:
         # _node_health() reads every field with .get() so that a health
@@ -412,6 +413,7 @@ def _render_health(out, report):
             marker, node['name'] or '(unnamed)', node['uuid'], role,
             node['state'], node['agent_state'] or 'not yet contactable'))
         _render_signals(out, node)
+        _render_kubernetes(out, node, report.get('kubernetes'))
 
     api = report['api']
     if api['answered']:
@@ -426,6 +428,22 @@ def _render_health(out, report):
         for line in (api.get(stream) or '').rstrip().split('\n'):
             if line:
                 out.write('    %s\n' % line)
+
+    # What the Kubernetes probe said about the cluster as a whole. Each
+    # node's own readings are on its lines above; these two are the facts
+    # which belong to no node. Neither is a judgement: a stale node object
+    # is reported so that it cannot hide, and a probe which did not answer
+    # is why every node above says 'not read'.
+    kubernetes = report.get('kubernetes')
+    if isinstance(kubernetes, dict):
+        if not kubernetes.get('answered'):
+            out.write('  Kubernetes probe: did not answer (%s)\n'
+                      % (kubernetes.get('error') or 'unknown'))
+        else:
+            unmatched = kubernetes.get('unmatched_nodes')
+            if isinstance(unmatched, list) and unmatched:
+                out.write('  Kubernetes: unmatched nodes %s\n'
+                          % ', '.join(_text(name) for name in unmatched))
     out.flush()
 
 
@@ -468,24 +486,15 @@ def _render_signals(out, node):
                   % (signals.get('error') or 'unknown'))
         return
 
-    def is_count(reading):
-        return isinstance(reading, int) and not isinstance(reading, bool)
-
-    def text(reading):
-        return reading if isinstance(reading, str) else 'unknown'
-
-    def count(reading):
-        return str(reading) if is_count(reading) else 'unknown'
-
     def counted(reading, noun):
         # Singular for exactly one, and plural for everything else: zero,
         # other counts, and 'unknown', which reads as "an unknown number
-        # of restarts". is_count() first, so that True is not one.
-        singular = is_count(reading) and reading == 1
-        return '%s %s%s' % (count(reading), noun, '' if singular else 's')
+        # of restarts". _is_count() first, so that True is not one.
+        singular = _is_count(reading) and reading == 1
+        return '%s %s%s' % (_count(reading), noun, '' if singular else 's')
 
     def mib(reading):
-        return str(reading // 1048576) if is_count(reading) else 'unknown'
+        return str(reading // 1048576) if _is_count(reading) else 'unknown'
 
     # The type checks mean only an int ever reaches the division, str() or
     # datetime, whoever built the report. Nothing the parser produces comes
@@ -507,22 +516,12 @@ def _render_signals(out, node):
     # rule is that nothing about a node's output can raise, so the
     # renderer's has to be too: such a btime is 'unknown', as one which
     # could not be read is.
-    booted_at = signals.get('booted_at')
-    booted = 'unknown'
-    if is_count(booted_at):
-        try:
-            # Explicitly UTC: the operator and the node are rarely in the
-            # same timezone and a bare local time would be wrong for one of
-            # them.
-            booted = datetime.fromtimestamp(booted_at, timezone.utc).strftime(
-                '%Y-%m-%dT%H:%M:%SZ')
-        except (OverflowError, OSError, ValueError):
-            booted = 'unknown'
+    booted = _utc_iso(signals.get('booted_at'))
 
     readings = [
         'booted %s' % booted,
         '%s %s, %s' % (
-            text(signals.get('k3s_unit')), text(signals.get('k3s_state')),
+            _text(signals.get('k3s_unit')), _text(signals.get('k3s_state')),
             counted(signals.get('k3s_restarts'), 'restart')),
         counted(signals.get('oom_kills'), 'OOM kill'),
         '%s of %s MiB available' % (
@@ -540,6 +539,135 @@ def _render_signals(out, node):
     if signals.get('error'):
         line += ' (%s)' % signals['error']
     out.write('        %s\n' % line)
+
+
+def _is_count(reading):
+    """Whether a reading is an int, which a bool is not."""
+    return isinstance(reading, int) and not isinstance(reading, bool)
+
+
+def _text(reading):
+    """A reading which is a string as itself, and anything else as 'unknown'."""
+    return reading if isinstance(reading, str) else 'unknown'
+
+
+def _count(reading):
+    return str(reading) if _is_count(reading) else 'unknown'
+
+
+def _utc_iso(reading):
+    """Unix seconds as a UTC ISO 8601 time, or 'unknown' for anything which is not one datetime can hold.
+
+    Explicitly UTC: the operator and the node are rarely in the same
+    timezone and a bare local time would be wrong for one of them. A
+    timestamp can be an int far past what datetime takes (the parsers
+    accept twenty digits), which raises OverflowError, OSError or
+    ValueError depending on the platform and where it overflows. That is a
+    reading which cannot be shown rather than a reason to lose the whole
+    report, so it is 'unknown', as one which could not be read is.
+    """
+    if not _is_count(reading):
+        return 'unknown'
+    try:
+        return datetime.fromtimestamp(reading, timezone.utc).strftime(
+            '%Y-%m-%dT%H:%M:%SZ')
+    except (OverflowError, OSError, ValueError):
+        return 'unknown'
+
+
+def _render_kubernetes(out, node, probe):
+    """Write the lines saying what Kubernetes reports of a node, if its entry has any.
+
+    probe is the report's top level ``kubernetes``, which is where the
+    reason a node was not read lives when the probe did not answer.
+
+    This is written in the style of _render_signals(), and with the same
+    rules: the lines are indented under the node's line, they state what
+    was read and nothing is judged. A pressure condition is named when it
+    is True and there are no thresholds, because whether a node under disk
+    pressure matters depends on what the cluster is for. A value which is
+    not the type health() documents is 'unknown', and the literal string
+    None never appears. A report without 'kubernetes' on a node (from an
+    older library, or a hand-built dict) is skipped, as nothing was probed
+    and nothing is being claimed.
+
+    A node can be unread for two different reasons, and the line says
+    which, because "the probe did not answer" and "this node could not be
+    matched" call for different next steps. When the probe did not answer
+    the reason is the probe's own error. When it did, every other node
+    has readings, so this node's are None because it has no name to match
+    (its instance is gone), or because another node's name is the same once
+    lowercased and nothing can say which kubelet the one Kubernetes node
+    object belongs to. The renderer has only the report, so it tells the
+    two apart by whether the entry has a name: health() gives no other way
+    for a node to be unread under an answered probe.
+
+    A pressure condition which is not 'True' or 'False' is not 'no
+    pressure': 'Unknown' is the node controller having stopped hearing from
+    the kubelet, and a condition the node does not report at all is None,
+    and saying "no pressure" for either would be a claim. Each is named
+    with 'unknown' beside it.
+    """
+    kubernetes = node.get('kubernetes')
+    if not isinstance(kubernetes, dict):
+        return
+
+    if kubernetes.get('registered') is None:
+        if isinstance(probe, dict) and probe.get('answered'):
+            if not node.get('name'):
+                reason = 'no instance name to match'
+            else:
+                reason = 'another node has the same name'
+        else:
+            reason = (probe.get('error') if isinstance(probe, dict) else None) or 'unknown'
+        out.write('        kubernetes: not read (%s)\n' % reason)
+        return
+
+    if kubernetes['registered'] is not True:
+        line = 'not registered'
+    else:
+        ready = kubernetes.get('ready')
+        if ready == 'True':
+            line = 'Ready'
+        elif ready in ('False', 'Unknown'):
+            line = 'NotReady (%s)' % ready
+        else:
+            line = 'readiness unknown'
+
+        # No "since" for a Ready which has no time, and one for a time
+        # which is there but cannot be shown.
+        if kubernetes.get('ready_since') is not None:
+            line += ' since %s' % _utc_iso(kubernetes['ready_since'])
+
+        pressures = []
+        for key, condition in (('memory_pressure', 'MemoryPressure'),
+                               ('disk_pressure', 'DiskPressure'),
+                               ('pid_pressure', 'PIDPressure')):
+            status = kubernetes.get(key)
+            if status == 'True':
+                pressures.append(condition)
+            elif status != 'False':
+                pressures.append('%s unknown' % condition)
+        line += ', ' + (', '.join(pressures) if pressures else 'no pressure')
+
+    out.write('        kubernetes: %s\n' % line)
+
+    # One line for each container whose latest termination was an OOM kill.
+    # A node which is not registered can still have them, since pods are
+    # filed under the node name they ran on, so these are not conditional
+    # on the line above.
+    oom_killed = kubernetes.get('oom_killed')
+    if not isinstance(oom_killed, list):
+        return
+    for kill in oom_killed:
+        if not isinstance(kill, dict):
+            kill = {}
+        restarts = kill.get('restarts')
+        out.write('            OOM killed: %s/%s %s at %s, %s %s\n' % (
+            _text(kill.get('namespace')), _text(kill.get('pod')),
+            _text(kill.get('container')), _utc_iso(kill.get('finished_at')),
+            _count(restarts),
+            'restart' if _is_count(restarts) and restarts == 1 else 'restarts'))
 
 
 @k3s.command(name='delete', help='Destroy a k3s cluster')

@@ -472,9 +472,10 @@ report.
 
 Reports the state of the cluster and of every node in it: for each
 control plane node and worker, whether the Shaken Fist instance still
-exists and its instance and agent state; and whether the k3s API
-answers, by running `kubectl get nodes` through the first control
-plane node. It repairs nothing -- this is a report, not a fix -- and
+exists and its instance and agent state; what Kubernetes says of the
+node (registered, `Ready`, pressure, OOM-killed containers); and
+whether the k3s API answers, by running `kubectl get nodes` through the
+first control plane node. It repairs nothing -- this is a report, not a fix -- and
 by default exits 0 whatever it found, because producing the report is
 what was asked for and it succeeded:
 
@@ -485,8 +486,11 @@ Cluster mycluster in namespace default is healthy
   nodes:
     [ok] k3s-mycluster-node-001 (3fa85f64-5717-4562-b3fc-2c963f66afa6, control plane): instance created, agent ready
         booted 2026-10-06T06:47:11Z, k3s active, 0 restarts, 0 OOM kills, 2702 of 3914 MiB available, etcd 138 MiB, snapshots 0 MiB
+        kubernetes: Ready since 2026-10-06T06:48:02Z, no pressure
     [ok] k3s-mycluster-node-002 (7c9e6679-7425-40de-944b-e07fc1f90ae7, worker): instance created, agent ready
         booted 2026-10-06T06:50:41Z, k3s-agent active, 0 restarts, 0 OOM kills, 2173 of 2971 MiB available
+        kubernetes: Ready since 2026-10-06T06:51:20Z, no pressure
+            OOM killed: default/memory-hog-7d9f8b6c5-x2x7k hog at 2026-10-06T21:40:11Z, 2 restarts
   k3s API: answered on 3fa85f64-5717-4562-b3fc-2c963f66afa6
     NAME                     STATUS   ROLES                  AGE   VERSION
     k3s-mycluster-node-001   Ready    control-plane,master   10m   v1.30.2+k3s1
@@ -506,6 +510,25 @@ since boot, so compare against an earlier report to see what changed;
 see [What `signals` reports](library-api.md#what-signals-reports) for
 what each reading is and how to diff it.
 
+The `kubernetes:` line beneath it is what Kubernetes says of that node,
+read once through the first control plane node: `Ready since <time>`
+(or `NotReady (False)` / `NotReady (Unknown)`), then each pressure
+condition that is true -- `MemoryPressure`, `DiskPressure`,
+`PIDPressure` -- or `no pressure`. Each container whose latest
+termination was an OOM kill is a further indented `OOM killed:` line
+naming the pod, container, time and the pod's restart count. A node
+Kubernetes has no record of says `kubernetes: not registered`. One that
+could not be read says `kubernetes: not read` and why: the probe did not
+answer, the instance no longer exists so there is no name to match, or
+another node has the same name. After the `k3s API:` lines,
+`Kubernetes: unmatched nodes a, b` names any Kubernetes node no
+instance accounts for, and `Kubernetes probe: did not answer (...)`
+says why every node was unread. As with signals, nothing is judged on
+these lines apart from readiness (below), and the `OOM killed:` lines
+are the latest termination of containers that still exist, not a count;
+[What `kubernetes` reports](library-api.md#what-kubernetes-reports)
+says how to tell a new kill from one already seen.
+
 A cluster that never finished being built is reported here too, rather
 than refused -- reporting on a broken cluster is what this command is
 for -- so its `state` line names the state it was interrupted in
@@ -513,14 +536,14 @@ instead of `created`, and an instance the metadata names but which no
 longer exists is reported as gone rather than failing the command.
 
 The command never hangs, which matters most on exactly the clusters
-it is for. The `kubectl get nodes` probe, and the signals read on
-each node, are only attempted when the node they would run on looks
+it is for. The `kubectl get nodes` probe, the Kubernetes probe beside
+it, and the signals read on each node, are only attempted when the node they would run on looks
 able to answer -- the report has already read that node's instance and
 agent state -- and they share a thirty second budget even then,
 because a command queued against an instance whose agent is not
 connected is accepted and then never runs. Each of those outcomes is
-reported with the reason, on the `k3s API:` line or on the node's
-signals line, rather than waited on. The budget is only spent when
+reported with the reason, on the `k3s API:` line, the `Kubernetes probe:`
+line or the node's signals line, rather than waited on. The budget is only spent when
 something is wrong: the probes run on every node at once, so a
 healthy cluster waits for about as long as its slowest probe takes,
 whatever its size. The budget bounds the waiting only: on top of it
@@ -529,9 +552,9 @@ per probe to submit it, and the reads of each probe, so on a slow Shaken
 Fist API the command can take longer than thirty seconds.
 
 An abandoned run leaves operations queued: up to one per probed node,
-plus the `kubectl get nodes` against the control plane node. The
-reason on the `k3s API:` line names that agent operation so it can be
-recognised later: until Shaken Fist's own deadline ends it, a
+plus the two `kubectl` reads against the control plane node. The
+reason on the `k3s API:` or `Kubernetes probe:` line, or the node's
+signals line, names that agent operation so it can be recognised later: until Shaken Fist's own deadline ends it, a
 subsequent `expand-workers` or `update-os` waits for it along with
 everything else. That is a delay in a later command,
 not a failure of it -- those commands wait for every agent operation on
@@ -551,18 +574,24 @@ The report is printed identically either way -- only the exit code
 changes -- so one run gives both the text and the branch, and nothing
 has to parse the output.
 
-Be precise about what "healthy" means here, because it is narrower than
-it sounds: the cluster finished being built, every instance the metadata
-names exists and has a ready agent, and `kubectl get nodes` on the first
-control plane node exited zero. The node terms are Shaken Fist's view of
-the machines, not Kubernetes' view of the kubelets, so a cluster whose
-nodes are all `NotReady` still reports healthy -- the k3s API answered,
-which is all the last term asks. `--strict` is therefore a good gate for
-"did this cluster come up and is its control plane reachable" and not a
-substitute for waiting on workload readiness; this repo's own functional
-test uses both, `health --strict` and a separate `kubectl wait`. Folding
-Kubernetes node readiness into the report is
-[shakenfist/client-python-k3s#76](https://github.com/shakenfist/client-python-k3s/issues/76).
+Be precise about what "healthy" means here. It is true when the cluster
+finished being built, every instance the metadata names exists and has a
+ready agent, `kubectl get nodes` on the first control plane node exited
+zero, and Kubernetes reports every node `Ready`. A `NotReady` node, an
+`Unknown` one, a node that has not registered, and a Kubernetes read that
+did not answer therefore all make the cluster not healthy, which
+`--strict` turns into exit 1. The `[ok]` marker beside each node is
+still only Shaken Fist's view of the machine, so a cluster can be NOT
+healthy with every node marked `[ok]`: look at the `kubernetes:` lines
+for the reason. Pressure, OOM-killed containers and unmatched Kubernetes
+nodes are reported and do not affect it, because whether they matter
+depends on the workload. `create` and `expand-workers` wait for the
+nodes they add to be `Ready` before returning, so `create` followed by
+`health --strict` does not race the last node's registration. This
+changed in the release after v0.2.0, which ignored readiness
+([shakenfist/client-python-k3s#76](https://github.com/shakenfist/client-python-k3s/issues/76));
+[What `healthy` requires](library-api.md#what-healthy-requires) is the
+full list.
 
 The default stays at "always 0" because "the cluster is unwell" and
 "the health check could not run" are different answers, and a command
