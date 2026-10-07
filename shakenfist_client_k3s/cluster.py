@@ -22,7 +22,9 @@ carried, for the same reason (``importlib.metadata`` is only in the
 standard library from Python 3.8, and this package supports 3.7).
 """
 
+import calendar
 import copy
+import datetime
 import ipaddress
 import json
 import os
@@ -708,6 +710,436 @@ def parse_node_signals(stdout, role):
             raw, 'etcd_snapshot_bytes')
 
     return signals
+
+
+# The separators the Kubernetes probe's go-templates print between fields
+# and after each record. Written as Go string literals inside an action
+# rather than as a literal tab and newline in the template text, so that
+# the command stays one line with nothing in it a shell or the agent
+# operation log treats as whitespace to collapse or a line to split. The
+# backslashes are Go's, for the template engine to interpret; the shell
+# never sees them as anything but characters inside single quotes.
+_KUBERNETES_TAB = '{{"\\t"}}'
+_KUBERNETES_NEWLINE = '{{"\\n"}}'
+
+
+def _node_condition_template(condition, field):
+    """Build the go-template fragment which prints one field of one node condition.
+
+    A node's .status.conditions is a list of {type, status,
+    lastTransitionTime, ...} maps in no promised order, so the column for
+    one condition is found by ranging over the whole list and testing each
+    entry's type. A condition the list does not carry prints nothing,
+    which is the empty field parse_kubernetes_readings() reads as None.
+
+    Two kinds of guard, both needed on the oldest kubectl this plugin
+    supports (k3s v1.21.1, whose kubectl is built with Go 1.16). Every
+    field is tested with 'if' before anything below it is read, so a
+    missing map prints an empty field rather than kubectl's '<no value>'.
+    And .type is tested before 'eq' compares it, because that kubectl's eq
+    fails the whole template -- and so the probe -- on a missing value
+    ('incompatible types for comparison'), where a newer one returns
+    false. The outer .status is the node's, the inner one the
+    condition's: range moves the dot onto each condition.
+
+    condition and field are this module's literals, so nothing here is
+    caller data.
+    """
+    return ('{{if .status}}{{range .status.conditions}}'
+            '{{if .type}}{{if eq .type "%(condition)s"}}'
+            '{{if .%(field)s}}{{.%(field)s}}{{end}}'
+            '{{end}}{{end}}'
+            '{{end}}{{end}}' % {'condition': condition, 'field': field})
+
+
+# The go-template 'kubectl get nodes' renders with: one line per Kubernetes
+# node, 'node', then its name, the status of its Ready, MemoryPressure,
+# DiskPressure and PIDPressure conditions, and when Ready last changed, all
+# tab separated. The statuses are Kubernetes' own strings -- 'True',
+# 'False' or 'Unknown' -- and the time is the API's RFC 3339 UTC form.
+# parse_kubernetes_readings() reads these lines as 'node' records.
+KUBERNETES_NODES_TEMPLATE = (
+    '{{range .items}}'
+    'node' + _KUBERNETES_TAB +
+    # The node's name, from .metadata.name. Kubelet registers the node
+    # under the guest's hostname, lowercased, which is how health() matches
+    # it with an instance (see remove_worker()).
+    '{{if .metadata}}{{if .metadata.name}}{{.metadata.name}}{{end}}{{end}}' +
+    _KUBERNETES_TAB +
+    # The four conditions' .status, in a fixed column order.
+    _node_condition_template('Ready', 'status') + _KUBERNETES_TAB +
+    _node_condition_template('MemoryPressure', 'status') + _KUBERNETES_TAB +
+    _node_condition_template('DiskPressure', 'status') + _KUBERNETES_TAB +
+    _node_condition_template('PIDPressure', 'status') + _KUBERNETES_TAB +
+    # The Ready condition's .lastTransitionTime: when it last changed
+    # status, which is when the node became Ready, or stopped being.
+    _node_condition_template('Ready', 'lastTransitionTime') +
+    _KUBERNETES_NEWLINE +
+    '{{end}}')
+
+
+def _oom_line_template(state):
+    """Build the go-template fragment which prints an 'oom' line from one termination.
+
+    The dot is a container's status (an element of a pod's
+    .status.containerStatuses or .status.initContainerStatuses) and $pod is
+    the pod it belongs to. state is 'state' or 'lastState', the two places
+    a container's termination is reported: the one it is in now, and the
+    one before that. The line is 'oom', the node the pod was scheduled on,
+    the pod's namespace and name, the container's name, its restart count,
+    and when the termination finished. The last field is the only one
+    which differs between the two states, which is why this takes one.
+
+    Every map is tested before a field below it is read, for the reasons
+    _node_condition_template() gives. restartCount is the exception, and
+    is tested with kubectl's exists rather than 'if': it is a number, and
+    'if' is false for 0, which is the count of a container killed for the
+    first time and not yet restarted. A missing one, or any other missing
+    field, prints an empty field, and parse_kubernetes_readings() drops a
+    line with one.
+
+    The caller has already established that .<state>.terminated exists,
+    and tests it again here only so that every nested read sits inside a
+    test of its parent, which is the rule a reader can check by eye.
+    """
+    # When the termination finished, from its .finishedAt.
+    finished_at = ('{{if .%(state)s}}{{if .%(state)s.terminated}}'
+                   '{{if .%(state)s.terminated.finishedAt}}'
+                   '{{.%(state)s.terminated.finishedAt}}'
+                   '{{end}}{{end}}{{end}}' % {'state': state})
+    return (
+        'oom' + _KUBERNETES_TAB +
+        # The node the pod was scheduled on, from the pod's .spec.nodeName.
+        '{{if $pod.spec}}{{if $pod.spec.nodeName}}{{$pod.spec.nodeName}}'
+        '{{end}}{{end}}' + _KUBERNETES_TAB +
+        # The pod's namespace and name, from its .metadata.
+        '{{if $pod.metadata}}{{if $pod.metadata.namespace}}'
+        '{{$pod.metadata.namespace}}{{end}}{{end}}' + _KUBERNETES_TAB +
+        '{{if $pod.metadata}}{{if $pod.metadata.name}}'
+        '{{$pod.metadata.name}}{{end}}{{end}}' + _KUBERNETES_TAB +
+        # The container's name and restart count, from its status.
+        '{{if .name}}{{.name}}{{end}}' + _KUBERNETES_TAB +
+        '{{if exists . "restartCount"}}{{.restartCount}}{{end}}' +
+        _KUBERNETES_TAB + finished_at + _KUBERNETES_NEWLINE)
+
+
+def _oom_terminated_template(state):
+    """Build the go-template test for whether .<state>.terminated was an OOM kill.
+
+    Opens three nested ifs and an eq, and leaves them open: the caller
+    puts what to do in that case after it, and closes it with
+    _KUBERNETES_OOM_TEST_END. Each level is tested before the one below it
+    is read, and .reason before eq compares it, for the reasons
+    _node_condition_template() gives.
+    """
+    return ('{{if .%(state)s}}{{if .%(state)s.terminated}}'
+            '{{if .%(state)s.terminated.reason}}'
+            '{{if eq .%(state)s.terminated.reason "OOMKilled"}}'
+            % {'state': state})
+
+
+_KUBERNETES_OOM_TEST_END = '{{end}}{{end}}{{end}}{{end}}'
+
+# What the pods template prints for one container status: an 'oom' line if
+# the container's current state, or failing that its last one, is a
+# termination whose reason is OOMKilled, and nothing otherwise.
+#
+# A container which has been killed and not yet restarted has the kill in
+# .state; one which has been restarted since, or is in CrashLoopBackOff
+# waiting to be, has it in .lastState. Both are read (survey finding 3 of
+# the cumulative health signals phase 2 plan). When both are OOM kills the
+# container has been killed twice running, and .state's is reported because
+# it is the newer of the two: a caller tells a new kill from one it has
+# already seen by its finished_at, and the older one's would read as no
+# change. $reported is how the second test knows the first printed;
+# assigning to a variable declared outside the if is Go 1.11 template
+# syntax, which every kubectl this plugin supports has.
+_OOM_CONTAINER_TEMPLATE = (
+    '{{$reported := false}}' +
+    _oom_terminated_template('state') +
+    '{{$reported = true}}' + _oom_line_template('state') +
+    _KUBERNETES_OOM_TEST_END +
+    '{{if not $reported}}' +
+    _oom_terminated_template('lastState') +
+    _oom_line_template('lastState') +
+    _KUBERNETES_OOM_TEST_END +
+    '{{end}}')
+
+# The go-template 'kubectl get pods -A' renders with: one 'oom' line per
+# container, init containers included, whose current or most recent
+# termination was an OOM kill, and nothing for any other container. That
+# is what keeps the output proportional to what it reports rather than to
+# the number of pods, which matters because nothing between the node and
+# this parser is known to bound a command's output (survey finding 9).
+# $pod keeps the pod in reach from inside the ranges over its containers,
+# which move the dot onto each container's status in turn.
+KUBERNETES_PODS_TEMPLATE = (
+    '{{range .items}}{{$pod := .}}{{if .status}}'
+    '{{range .status.containerStatuses}}' + _OOM_CONTAINER_TEMPLATE +
+    '{{end}}'
+    '{{range .status.initContainerStatuses}}' + _OOM_CONTAINER_TEMPLATE +
+    '{{end}}'
+    '{{end}}{{end}}')
+
+# The command health() runs on the first control plane node to read every
+# Kubernetes node's conditions and every container's latest OOM kill from
+# the Kubernetes API (decision 9 of the cumulative health signals phase 2
+# plan). A constant: no caller data enters it, so rule 1 above has nothing
+# to quote. Each template is passed through shlex.quote() all the same,
+# because the templates are full of $, double quotes and braces which the
+# shell must not touch, and quote() single quotes them; that the templates
+# contain no single quote of their own keeps the result readable in the
+# agent operation log rather than full of quote() escapes.
+#
+# The two reads are joined with '&&' so that the command exits non-zero if
+# either fails, and the pods are not read at all if the nodes cannot be.
+# Unlike a node's signals, which are independent readings, half of this
+# would be wrong rather than incomplete: a node list without the pod list
+# reads as "no container was killed".
+#
+# --kubeconfig explicitly, as K3S_API_PROBE_COMMAND does and for the same
+# reason.
+K3S_KUBERNETES_PROBE_COMMAND = (
+    'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'
+    ' -o go-template=%s'
+    ' && kubectl get pods -A --kubeconfig /etc/rancher/k3s/k3s.yaml'
+    ' -o go-template=%s'
+    % (shlex.quote(KUBERNETES_NODES_TEMPLATE),
+       shlex.quote(KUBERNETES_PODS_TEMPLATE)))
+
+# The names parse_kubernetes_readings() will believe. Kubernetes names a
+# node or a pod with a DNS subdomain as RFC 1123 defines it, in lowercase:
+# dot separated labels of lowercase letters, digits and hyphens, each
+# beginning and ending with a letter or digit, at most 253 characters in
+# all. A namespace or a container is named with a single such label, at
+# most 63 characters. These are Kubernetes' own rules
+# (IsDNS1123Subdomain and IsDNS1123Label in apimachinery), so the API
+# cannot hold a name either refuses, and a line carrying one is not
+# something the API printed.
+#
+# The caps matter beyond tidiness. A name is a key a caller looks up and
+# a string that flows on into the Ansible module's result and every log
+# that records it, so an unbounded one from a garbage line would travel a
+# long way. The subdomain's cap is a lookahead, tested before the label
+# pattern runs, so a long garbage line fails after reading 254 characters
+# rather than after backtracking through all of them. Character classes
+# rather than \d or \w, which would match non-ASCII digits and letters.
+KUBERNETES_NAME_RE = re.compile(
+    r'\A(?=.{1,253}\Z)'
+    r'[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\Z')
+KUBERNETES_LABEL_RE = re.compile(r'\A[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\Z')
+
+# The values a node condition's status can have. They are Kubernetes'
+# strings and are reported as they are rather than as bools, because
+# 'Unknown' -- the node controller has stopped hearing from the kubelet --
+# is a third answer a bool would have to lie about (decision 3 of the
+# cumulative health signals phase 2 plan).
+KUBERNETES_CONDITION_STATUSES = frozenset(('True', 'False', 'Unknown'))
+
+# The form the Kubernetes API writes a timestamp in: RFC 3339, in UTC,
+# to the second. metav1.Time is marshalled with exactly this layout, so
+# a fractional second or an offset other than Z is not something the API
+# printed for the fields the probe reads.
+KUBERNETES_TIMESTAMP_RE = re.compile(
+    r'\A([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z\Z')
+
+# What a field validator below returns for a field which is not a reading.
+# A sentinel rather than None, because None is itself a reading: it is what
+# an empty condition status or Ready time becomes.
+_NOT_A_READING = object()
+
+
+def _kubernetes_name(value):
+    """Return value if it is a node or pod name, or _NOT_A_READING."""
+    if not KUBERNETES_NAME_RE.match(value):
+        return _NOT_A_READING
+    return value
+
+
+def _kubernetes_label(value):
+    """Return value if it is a namespace or container name, or _NOT_A_READING."""
+    if not KUBERNETES_LABEL_RE.match(value):
+        return _NOT_A_READING
+    return value
+
+
+def _kubernetes_status(value):
+    """Return a condition's status, None if the field is empty, or _NOT_A_READING.
+
+    Empty is what the nodes template prints for a condition the node does
+    not report, which is a fact about the node rather than a fault in the
+    line.
+    """
+    if not value:
+        return None
+    if value not in KUBERNETES_CONDITION_STATUSES:
+        return _NOT_A_READING
+    return value
+
+
+def _kubernetes_time(value):
+    """Return an RFC 3339 UTC timestamp as Unix seconds, or _NOT_A_READING.
+
+    The pattern checks the shape; datetime checks the values, so that the
+    thirtieth of February or a sixty-first second is not a reading rather
+    than being carried by calendar.timegm()'s arithmetic into a different
+    day or minute. calendar.timegm() rather than time.mktime() because the
+    time is UTC and mktime() would read it in the local timezone of
+    whoever runs this.
+    """
+    match = KUBERNETES_TIMESTAMP_RE.match(value)
+    if not match:
+        return _NOT_A_READING
+    try:
+        moment = datetime.datetime(*(int(part) for part in match.groups()))
+    except ValueError:
+        return _NOT_A_READING
+    return calendar.timegm(moment.timetuple())
+
+
+def _kubernetes_optional_time(value):
+    """As _kubernetes_time(), except that an empty field is None.
+
+    For the Ready condition's time, which is empty exactly when the node
+    reports no Ready condition at all, and so has no time to report.
+    """
+    if not value:
+        return None
+    return _kubernetes_time(value)
+
+
+def _kubernetes_integer(value):
+    """Return value as an int, or _NOT_A_READING.
+
+    NODE_SIGNAL_INTEGER_RE, whose comment says why a count is held to
+    twenty ASCII digits rather than to whatever int() accepts.
+    """
+    if not NODE_SIGNAL_INTEGER_RE.match(value):
+        return _NOT_A_READING
+    return int(value)
+
+
+# The records parse_kubernetes_readings() reads: for each record type, the
+# keys its fields are reported under and the validator each field must
+# pass, in the order the templates print them.
+_KUBERNETES_RECORDS = {
+    # From KUBERNETES_NODES_TEMPLATE. The name is the key the reading is
+    # filed under, and the rest are the reading.
+    'node': (
+        ('name', _kubernetes_name),
+        ('ready', _kubernetes_status),
+        ('memory_pressure', _kubernetes_status),
+        ('disk_pressure', _kubernetes_status),
+        ('pid_pressure', _kubernetes_status),
+        ('ready_since', _kubernetes_optional_time),
+    ),
+    # From KUBERNETES_PODS_TEMPLATE, by way of _oom_line_template(). The
+    # node is the key the entry is filed under, and the rest are the entry.
+    'oom': (
+        ('node', _kubernetes_name),
+        ('namespace', _kubernetes_label),
+        ('pod', _kubernetes_name),
+        ('container', _kubernetes_label),
+        ('restarts', _kubernetes_integer),
+        ('finished_at', _kubernetes_time),
+    ),
+}
+
+
+def _kubernetes_record(fields):
+    """Validate one line's fields, and return them as a dict, or None.
+
+    fields is the line split on tabs, record type first. None for a type
+    _KUBERNETES_RECORDS does not know, for the wrong number of fields, and
+    for a line any one of whose fields is not a reading: one bad field
+    drops the whole record rather than only itself. A record is a set of
+    facts about one thing, and a line with one field mangled is a line
+    nobody can vouch for the rest of, least of all which node or container
+    it is about.
+    """
+    record = _KUBERNETES_RECORDS.get(fields[0])
+    if record is None or len(fields) != len(record) + 1:
+        return None
+
+    values = {}
+    for (key, validator), field in zip(record, fields[1:]):
+        value = validator(field)
+        if value is _NOT_A_READING:
+            return None
+        values[key] = value
+    return values
+
+
+def parse_kubernetes_readings(stdout):
+    """Turn K3S_KUBERNETES_PROBE_COMMAND's output into health()'s readings.
+
+    Returns a dict with two keys, whatever stdout holds:
+
+        {
+            'nodes': {
+                <node name>: {
+                    'ready': str or None,
+                    'ready_since': int or None,
+                    'memory_pressure': str or None,
+                    'disk_pressure': str or None,
+                    'pid_pressure': str or None,
+                },
+            },
+            'oom_killed': {
+                <node name>: [
+                    {
+                        'namespace': str,
+                        'pod': str,
+                        'container': str,
+                        'restarts': int,
+                        'finished_at': int,
+                    },
+                ],
+            },
+        }
+
+    A condition's status is 'True', 'False' or 'Unknown', and None for a
+    condition the node does not report. ready_since is when Ready last
+    changed, and finished_at when the OOM kill's termination finished, both
+    as Unix seconds; ready_since is None when there is no Ready condition.
+    restarts is the container's restartCount, which is for the pod's
+    lifetime. oom_killed holds each node's entries in the order kubectl
+    printed them, and has no key for a node with none. These are the
+    readings decisions 3 and 5 of the cumulative health signals phase 2
+    plan describe; matching them with instances is health()'s job, so an
+    entry for a node with no 'node' line is kept rather than judged here.
+
+    The output comes from the Kubernetes API by way of kubectl and a node
+    which may be unwell, so it is validated rather than trusted (decision
+    9 of that plan). Lines are split on tabs and each field is stripped,
+    so a CRLF or a trailing space does not make a reading unparsable. A
+    line whose type is neither 'node' nor 'oom' is ignored, which is how a
+    stray line is survived. A line any field of which fails validation is
+    dropped whole (see _kubernetes_record()). Names must be Kubernetes
+    names (KUBERNETES_NAME_RE and KUBERNETES_LABEL_RE), statuses one of
+    KUBERNETES_CONDITION_STATUSES, times RFC 3339 UTC to the second, and
+    counts NODE_SIGNAL_INTEGER_RE's. For a node named twice, the first
+    record wins, as the first occurrence of a key does in
+    parse_node_signals(): the API does not let two nodes share a name, so
+    a second line is not the API's, and the first was printed before it.
+
+    stdout of None is read as empty. Nothing here raises for any string.
+    """
+    nodes = {}
+    oom_killed = {}
+
+    for line in (stdout or '').splitlines():
+        fields = [field.strip() for field in line.split('\t')]
+        values = _kubernetes_record(fields)
+        if values is None:
+            continue
+
+        if fields[0] == 'node':
+            nodes.setdefault(values.pop('name'), values)
+        else:
+            oom_killed.setdefault(values.pop('node'), []).append(values)
+
+    return {'nodes': nodes, 'oom_killed': oom_killed}
 
 
 def read_manifests(paths):

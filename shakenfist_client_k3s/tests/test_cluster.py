@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 # The PyPI mock backport is used for consistency with the other tests in
 # this package, which support Python >= 3.7.
@@ -3658,6 +3659,648 @@ class NodeSignalsCommandRunsTestCase(testtools.TestCase):
         self.assertIn('etcd_snapshot_bytes=\n', result.stdout)
         self.assertIsNone(cluster_module.parse_node_signals(
             result.stdout, 'control_plane')['etcd_snapshot_bytes'])
+
+
+KUBECONFIG_PATH = '/etc/rancher/k3s/k3s.yaml'
+
+# A go-template action: everything between '{{' and '}}'. Neither template
+# holds a '}}' inside a string literal, so a non-greedy match finds each.
+GO_TEMPLATE_ACTION_RE = re.compile(r'{{(.*?)}}')
+GO_TEMPLATE_STRING_RE = re.compile(r'"[^"]*"')
+
+
+def _go_template_path(token):
+    """(root, [fields]) if token reads a field path, else None.
+
+    root is '' for a path from the dot, or the variable it starts from.
+    """
+    if token.startswith('.') and token != '.':
+        return '', token[1:].split('.')
+    if token.startswith('$') and '.' in token:
+        root, rest = token.split('.', 1)
+        return root, rest.split('.')
+    return None
+
+
+def _go_template_unguarded_reads(template):
+    """List every read in template which a missing field could break.
+
+    Three rules, each one kubectl's template engine needs for the probe to
+    survive an object which lacks a field (see _node_condition_template()
+    in cluster.py):
+
+    - a path two or more fields deep sits inside an 'if' on its parent,
+      in the same dot, so the parent is known to exist;
+    - 'eq' compares only a value an enclosing 'if' has tested, because
+      the oldest supported kubectl's eq fails on a missing one;
+    - a field printed on its own sits inside an 'if' on itself, or
+      kubectl's 'exists' for it, so a missing one prints an empty field
+      rather than '<no value>'.
+
+    Also reports blocks which do not balance. This is a check of the
+    template's shape, written because no Go template engine can be relied
+    on where the unit tests run; it is not a template engine, and step 2e
+    of the cumulative health signals phase 2 plan runs the real one.
+    """
+    problems = []
+    # (keyword, its argument as written), innermost last.
+    stack = []
+
+    def guarded(root, condition, also=None):
+        for keyword, argument in reversed(stack):
+            if keyword == 'if' and argument in (condition, also):
+                return True
+            # range and with move the dot, so an 'if' outside them tested
+            # some other object's field. A variable keeps its value.
+            if keyword in ('range', 'with') and root == '':
+                return False
+        return False
+
+    for match in GO_TEMPLATE_ACTION_RE.finditer(template):
+        action = match.group(1).strip()
+        tokens = GO_TEMPLATE_STRING_RE.sub('""', action).split()
+        keyword = tokens[0] if tokens[0] in ('if', 'range', 'with', 'end',
+                                             'else') else None
+
+        if keyword == 'end':
+            if not stack:
+                problems.append('an {{end}} closes nothing')
+            else:
+                stack.pop()
+            continue
+        if keyword == 'else':
+            problems.append('{{%s}} is not checked by this test' % action)
+            continue
+
+        for token in tokens:
+            path = _go_template_path(token)
+            if path and len(path[1]) > 1:
+                root, fields = path
+                parent = root + '.' + '.'.join(fields[:-1])
+                if not guarded(root, parent):
+                    problems.append('%s is read without testing %s'
+                                    % (token, parent))
+
+        if 'eq' in tokens:
+            operand = tokens[tokens.index('eq') + 1]
+            path = _go_template_path(operand)
+            if not path or not guarded(path[0], operand):
+                problems.append('eq compares %s without testing it'
+                                % operand)
+
+        path = _go_template_path(tokens[0])
+        if keyword is None and len(tokens) == 1 and path:
+            exists = None
+            if path[0] == '' and len(path[1]) == 1:
+                exists = 'exists . "%s"' % path[1][0]
+            if not guarded(path[0], tokens[0], exists):
+                problems.append('%s is printed without testing it'
+                                % tokens[0])
+
+        if keyword is not None:
+            stack.append((keyword, action[len(keyword):].strip()))
+
+    if stack:
+        problems.append('%d blocks are never closed' % len(stack))
+    return problems
+
+
+class KubernetesProbeCommandTestCase(testtools.TestCase):
+    """The command health() will run to read Kubernetes about every node.
+
+    Decision 9 of the cumulative health signals phase 2 plan: two kubectl
+    reads, each rendered by a go-template into one short line per fact,
+    joined so that either failing fails the command. No Go template engine
+    is available where these tests run, so the templates are checked for
+    the shape kubectl needs rather than rendered; they were rendered by
+    kubectl v1.21.1+k3s1 and v1.31.4+k3s1 when written, and step 2e of that
+    plan renders them on a real cluster.
+    """
+
+    def test_the_command_reads_nodes_then_pods(self):
+        self.assertEqual(
+            ['kubectl', 'get', 'nodes', '--kubeconfig', KUBECONFIG_PATH,
+             '-o', 'go-template=' + cluster_module.KUBERNETES_NODES_TEMPLATE,
+             '&&',
+             'kubectl', 'get', 'pods', '-A', '--kubeconfig', KUBECONFIG_PATH,
+             '-o', 'go-template=' + cluster_module.KUBERNETES_PODS_TEMPLATE],
+            shlex.split(cluster_module.K3S_KUBERNETES_PROBE_COMMAND))
+
+    def test_the_command_is_one_line(self):
+        # The agent takes one command line. The separators are Go string
+        # escapes, a backslash and a letter, for the template engine.
+        for character in ('\n', '\t', '\r'):
+            self.assertNotIn(
+                character, cluster_module.K3S_KUBERNETES_PROBE_COMMAND)
+
+    def test_each_template_is_one_single_quoted_word(self):
+        # Single quotes, because the templates are full of $ and double
+        # quotes; and no single quote inside either, so that shlex.quote()
+        # has nothing to escape and the operation log shows each template
+        # as it is.
+        for template in (cluster_module.KUBERNETES_NODES_TEMPLATE,
+                         cluster_module.KUBERNETES_PODS_TEMPLATE):
+            self.assertNotIn("'", template)
+            self.assertIn(" -o go-template='%s'" % template,
+                          cluster_module.K3S_KUBERNETES_PROBE_COMMAND)
+
+    def test_no_field_a_missing_one_could_break_is_read_unguarded(self):
+        for template in (cluster_module.KUBERNETES_NODES_TEMPLATE,
+                         cluster_module.KUBERNETES_PODS_TEMPLATE):
+            self.assertEqual([], _go_template_unguarded_reads(template))
+
+    def test_the_guard_check_finds_unguarded_reads(self):
+        # The check above passing is only worth something if it can fail.
+        for template in (
+                '{{.a.b}}',
+                '{{if .a}}{{end}}{{.a.b}}',
+                '{{if .a}}{{range .items}}{{.a.b}}{{end}}{{end}}',
+                '{{if eq .type "Ready"}}{{end}}',
+                '{{range .items}}{{.name}}{{end}}',
+                '{{if $pod}}{{$pod.spec.nodeName}}{{end}}',
+                '{{if .a}}',
+                '{{end}}'):
+            self.assertNotEqual(
+                [], _go_template_unguarded_reads(template), template)
+        # And a variable keeps its value inside a range.
+        self.assertEqual([], _go_template_unguarded_reads(
+            '{{if $pod.spec}}{{range .items}}{{if $pod.spec.nodeName}}'
+            '{{$pod.spec.nodeName}}{{end}}{{end}}{{end}}'))
+
+    def test_the_only_text_is_the_record_types(self):
+        # Everything else -- every separator and every value -- comes from
+        # an action, so the only literal text is each line's type.
+        self.assertEqual('node', GO_TEMPLATE_ACTION_RE.sub(
+            '', cluster_module.KUBERNETES_NODES_TEMPLATE))
+        # Two kinds of status, and two places a kill is reported in each.
+        self.assertEqual('oom' * 4, GO_TEMPLATE_ACTION_RE.sub(
+            '', cluster_module.KUBERNETES_PODS_TEMPLATE))
+
+    def test_each_line_has_its_records_fields(self):
+        # One tab fewer than the parser's field count for the type, the
+        # type itself being a field, and one newline.
+        nodes = cluster_module.KUBERNETES_NODES_TEMPLATE
+        self.assertEqual(6, nodes.count('{{"\\t"}}'))
+        self.assertEqual(1, nodes.count('{{"\\n"}}'))
+        pods = cluster_module.KUBERNETES_PODS_TEMPLATE
+        self.assertEqual(4 * 6, pods.count('{{"\\t"}}'))
+        self.assertEqual(4, pods.count('{{"\\n"}}'))
+
+    def test_every_condition_is_read(self):
+        nodes = cluster_module.KUBERNETES_NODES_TEMPLATE
+        for condition, count in (('Ready', 2), ('MemoryPressure', 1),
+                                 ('DiskPressure', 1), ('PIDPressure', 1)):
+            self.assertEqual(
+                count, nodes.count('{{if eq .type "%s"}}' % condition))
+        self.assertIn('{{.lastTransitionTime}}', nodes)
+
+    def test_both_states_of_every_container_are_read(self):
+        # Init containers too: one killed for OOM holds its pod in
+        # Init:CrashLoopBackOff, which is worth seeing.
+        pods = cluster_module.KUBERNETES_PODS_TEMPLATE
+        self.assertEqual(1, pods.count('{{range .status.containerStatuses}}'))
+        self.assertEqual(
+            1, pods.count('{{range .status.initContainerStatuses}}'))
+        for state in ('state', 'lastState'):
+            self.assertEqual(
+                2,
+                pods.count('{{if eq .%s.terminated.reason "OOMKilled"}}'
+                           % state))
+            self.assertEqual(
+                2, pods.count('{{.%s.terminated.finishedAt}}' % state))
+
+    def test_a_restart_count_of_zero_is_printed(self):
+        # 'if' is false for 0, which is the count of a container killed for
+        # the first time and not yet restarted, so the count is tested with
+        # kubectl's exists rather than for truth.
+        pods = cluster_module.KUBERNETES_PODS_TEMPLATE
+        self.assertEqual(
+            4, pods.count('{{if exists . "restartCount"}}'
+                          '{{.restartCount}}{{end}}'))
+        self.assertNotIn('{{if .restartCount}}', pods)
+
+    def test_a_container_killed_twice_is_reported_once_from_its_state(self):
+        # The second test runs only if the first did not print, so the
+        # newer of two kills is the one reported.
+        pods = cluster_module.KUBERNETES_PODS_TEMPLATE
+        state = ('{{if eq .state.terminated.reason "OOMKilled"}}'
+                 '{{$reported = true}}')
+        last = '{{if not $reported}}{{if .lastState}}'
+        for container in ('{{range .status.containerStatuses}}',
+                          '{{range .status.initContainerStatuses}}'):
+            body = pods[pods.index(container):]
+            self.assertIn(state, body)
+            self.assertIn(last, body)
+            self.assertLess(body.index(state), body.index(last))
+
+
+# What K3S_KUBERNETES_PROBE_COMMAND prints for a two node cluster on which
+# one container has been killed for running out of memory: a 'node' line per
+# node, then an 'oom' line for the container, in the shape kubectl rendered
+# the templates in when they were written. Unix seconds for each time are
+# given beside it, worked out with 'date -u' rather than with the code
+# under test.
+KUBERNETES_PROBE_OUTPUT = (
+    'node\tk3s-banana-node-001\tTrue\tFalse\tFalse\tFalse\t'
+    '2026-10-05T08:12:25Z\n'
+    'node\tk3s-banana-node-002\tTrue\tFalse\tFalse\tFalse\t'
+    '2026-10-05T08:13:02Z\n'
+    'oom\tk3s-banana-node-002\tdefault\tmemory-hog-7d9f8b6c5-x2x7k\thog\t2\t'
+    '2026-10-06T21:40:11Z\n')
+KUBERNETES_PROBE_READINGS = {
+    'nodes': {
+        'k3s-banana-node-001': {
+            'ready': 'True',
+            'ready_since': 1791187945,
+            'memory_pressure': 'False',
+            'disk_pressure': 'False',
+            'pid_pressure': 'False',
+        },
+        'k3s-banana-node-002': {
+            'ready': 'True',
+            'ready_since': 1791187982,
+            'memory_pressure': 'False',
+            'disk_pressure': 'False',
+            'pid_pressure': 'False',
+        },
+    },
+    'oom_killed': {
+        'k3s-banana-node-002': [
+            {
+                'namespace': 'default',
+                'pod': 'memory-hog-7d9f8b6c5-x2x7k',
+                'container': 'hog',
+                'restarts': 2,
+                'finished_at': 1791322811,
+            },
+        ],
+    },
+}
+NODE_LINE = KUBERNETES_PROBE_OUTPUT.splitlines()[0]
+OOM_LINE = KUBERNETES_PROBE_OUTPUT.splitlines()[2]
+
+
+def _with_field(line, index, value):
+    """line with its tab separated field index replaced by value."""
+    fields = line.split('\t')
+    fields[index] = value
+    return '\t'.join(fields)
+
+
+class KubernetesProbeCommandRunsTestCase(testtools.TestCase):
+    """The command parses as shell, and its templates reach kubectl intact.
+
+    The tests above compare the command with strings, which cannot tell
+    whether the shell hands each template to kubectl byte for byte, or
+    what '&&' does when a read fails. This runs it with the local /bin/sh
+    and a kubectl on PATH which records its arguments, prints what the
+    test gives it, and exits as the test says.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if not os.path.exists('/bin/sh'):
+            self.skipTest('/bin/sh does not exist')
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.log = os.path.join(tmp.name, 'calls')
+        bin_dir = os.path.join(tmp.name, 'bin')
+        os.mkdir(bin_dir)
+        kubectl = os.path.join(bin_dir, 'kubectl')
+        with open(kubectl, 'w', encoding='utf-8') as f:
+            f.write(
+                '#!%s\n'
+                'import json, os, sys\n'
+                'resource = sys.argv[2]\n'
+                "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as f:\n"
+                '    f.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                "sys.stdout.write(os.environ.get('FAKE_STDOUT_' + resource, ''))\n"
+                "sys.exit(int(os.environ.get('FAKE_EXIT_' + resource, '0')))\n"
+                % sys.executable)
+        os.chmod(kubectl, 0o755)
+
+        self.env = dict(os.environ)
+        self.env['PATH'] = '%s:%s' % (bin_dir,
+                                      self.env.get('PATH', '/usr/bin:/bin'))
+        self.env['FAKE_KUBECTL_LOG'] = self.log
+
+    def _run(self, **env):
+        self.env.update(env)
+        return subprocess.run(
+            ['/bin/sh', '-c', cluster_module.K3S_KUBERNETES_PROBE_COMMAND],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, env=self.env)
+
+    def _calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log, encoding='utf-8') as f:
+            return [json.loads(line) for line in f]
+
+    def test_both_reads_run_and_their_output_is_parsed(self):
+        nodes, pods = KUBERNETES_PROBE_OUTPUT.split('oom\t', 1)
+        result = self._run(FAKE_STDOUT_nodes=nodes,
+                           FAKE_STDOUT_pods='oom\t' + pods)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            [['get', 'nodes', '--kubeconfig', KUBECONFIG_PATH, '-o',
+              'go-template=' + cluster_module.KUBERNETES_NODES_TEMPLATE],
+             ['get', 'pods', '-A', '--kubeconfig', KUBECONFIG_PATH, '-o',
+              'go-template=' + cluster_module.KUBERNETES_PODS_TEMPLATE]],
+            self._calls())
+        self.assertEqual(
+            cluster_module.parse_kubernetes_readings(KUBERNETES_PROBE_OUTPUT),
+            cluster_module.parse_kubernetes_readings(result.stdout))
+
+    def test_a_failed_node_read_fails_the_command_and_reads_no_pods(self):
+        # A node list with no pod list would read as no OOM kills, and the
+        # other way round is no nodes at all, so neither half alone is an
+        # answer.
+        result = self._run(FAKE_EXIT_nodes='1')
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(['nodes'], [call[1] for call in self._calls()])
+
+    def test_a_failed_pod_read_fails_the_command(self):
+        result = self._run(FAKE_EXIT_pods='1')
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(['nodes', 'pods'],
+                         [call[1] for call in self._calls()])
+
+
+class ParseKubernetesReadingsTestCase(testtools.TestCase):
+    """What the Kubernetes probe's output becomes in health()'s report.
+
+    Decision 9 of the cumulative health signals phase 2 plan: every field
+    is validated, a record with any field which fails is dropped whole,
+    the first record for a node wins, and nothing the output holds may
+    make this raise.
+    """
+
+    def parse(self, stdout):
+        return cluster_module.parse_kubernetes_readings(stdout)
+
+    def assertReadsNothing(self, line):
+        self.assertEqual({'nodes': {}, 'oom_killed': {}}, self.parse(line),
+                         line)
+
+    def test_a_realistic_two_node_cluster(self):
+        self.assertEqual(KUBERNETES_PROBE_READINGS,
+                         self.parse(KUBERNETES_PROBE_OUTPUT))
+
+    def test_what_kubectl_printed(self):
+        # Lines kubectl v1.21.1+k3s1 printed with these templates, for a
+        # real node, a node object with no status, and a node object whose
+        # status was written to report Ready Unknown, MemoryPressure and no
+        # PIDPressure condition at all; and containers killed in each of
+        # the places a kill is reported, one with no finishedAt.
+        stdout = (
+            'node\t353896f35a22\tTrue\tFalse\tFalse\tFalse\t'
+            '2026-10-07T08:01:13Z\n'
+            'node\tempty-node\t\t\t\t\t\n'
+            'node\tghost-node.example\tUnknown\tTrue\tFalse\t\t'
+            '2026-10-05T08:12:25Z\n'
+            'oom\tghost-node.example\tdefault\toom-state\tc\t0\t'
+            '2026-10-05T08:12:25Z\n'
+            'oom\tghost-node.example\tkube-system\toom-last\tc\t5\t'
+            '2026-10-05T08:00:00Z\n'
+            'oom\tghost-node.example\tdefault\toom-init\tsidecar\t1000000\t'
+            '2026-10-05T07:45:00Z\n'
+            'oom\tghost-node.example\tdefault\toom-no-finish\tc\t1\t\n')
+        readings = self.parse(stdout)
+
+        self.assertEqual(
+            {
+                '353896f35a22': {
+                    'ready': 'True', 'ready_since': 1791360073,
+                    'memory_pressure': 'False', 'disk_pressure': 'False',
+                    'pid_pressure': 'False'},
+                'empty-node': {
+                    'ready': None, 'ready_since': None,
+                    'memory_pressure': None, 'disk_pressure': None,
+                    'pid_pressure': None},
+                'ghost-node.example': {
+                    'ready': 'Unknown', 'ready_since': 1791187945,
+                    'memory_pressure': 'True', 'disk_pressure': 'False',
+                    'pid_pressure': None},
+            },
+            readings['nodes'])
+        # The kill with no finishedAt is dropped: finished_at is how a
+        # caller tells a new kill from one it has seen, and decision 5
+        # promises it is always an int.
+        self.assertEqual(
+            [('default', 'oom-state', 'c', 0, 1791187945),
+             ('kube-system', 'oom-last', 'c', 5, 1791187200),
+             ('default', 'oom-init', 'sidecar', 1000000, 1791186300)],
+            [(entry['namespace'], entry['pod'], entry['container'],
+              entry['restarts'], entry['finished_at'])
+             for entry in readings['oom_killed']['ghost-node.example']])
+
+    def test_a_missing_condition_is_none_on_its_own(self):
+        for index, key in ((2, 'ready'), (3, 'memory_pressure'),
+                           (4, 'disk_pressure'), (5, 'pid_pressure'),
+                           (6, 'ready_since')):
+            node = self.parse(_with_field(NODE_LINE, index, ''))[
+                'nodes']['k3s-banana-node-001']
+            expected = dict(
+                KUBERNETES_PROBE_READINGS['nodes']['k3s-banana-node-001'])
+            expected[key] = None
+            self.assertEqual(expected, node, key)
+
+    def test_unknown_is_a_status(self):
+        # What the node controller reports when it has stopped hearing
+        # from the kubelet. A third value, not a False.
+        for index, key in ((2, 'ready'), (3, 'memory_pressure'),
+                           (4, 'disk_pressure'), (5, 'pid_pressure')):
+            node = self.parse(_with_field(NODE_LINE, index, 'Unknown'))[
+                'nodes']['k3s-banana-node-001']
+            self.assertEqual('Unknown', node[key])
+
+    def test_a_status_which_is_not_one_drops_the_node(self):
+        for value in ('true', 'TRUE', 'false', 'Maybe', 'True ish', '1',
+                      '<no value>', 'TrueTrue', 'Unknown\x00'):
+            for index in (2, 3, 4, 5):
+                self.assertReadsNothing(_with_field(NODE_LINE, index, value))
+
+    def test_an_invalid_name_drops_its_record(self):
+        for value in ('K3S-BANANA-NODE-001', '-node', 'node-', 'node_001',
+                      'node..one', '.node', 'node.', 'nöde', 'node 001',
+                      'node;rm -rf /', '<no value>', '\u0661'):
+            self.assertReadsNothing(_with_field(NODE_LINE, 1, value))
+            self.assertReadsNothing(_with_field(OOM_LINE, 1, value))
+            self.assertReadsNothing(_with_field(OOM_LINE, 3, value))
+        # A namespace or a container is one label, so a dot is not allowed
+        # there as it is in a node or pod name.
+        for index in (2, 4):
+            self.assertReadsNothing(_with_field(OOM_LINE, index, 'a.b'))
+            self.assertReadsNothing(_with_field(OOM_LINE, index, ''))
+        self.assertReadsNothing(_with_field(NODE_LINE, 1, ''))
+
+    def test_a_name_is_capped_at_its_kubernetes_length(self):
+        # 253 characters for a node or pod name, which may be several
+        # labels; 63 for a namespace or container, which is one.
+        subdomain = '.'.join(['a' * 63] * 4)
+        self.assertEqual(255, len(subdomain))
+        for name, kept in ((subdomain[:253], True), (subdomain[:254], False),
+                           ('a' * 253, True), ('a' * 254, False),
+                           ('a' * 5000, False)):
+            readings = self.parse(_with_field(NODE_LINE, 1, name))
+            self.assertEqual(kept, name in readings['nodes'], len(name))
+            readings = self.parse(_with_field(OOM_LINE, 3, name))
+            self.assertEqual(kept, bool(readings['oom_killed']), len(name))
+
+        for index in (2, 4):
+            for name, kept in (('a' * 63, True), ('a' * 64, False),
+                               ('a' * 62 + '-b', False)):
+                readings = self.parse(_with_field(OOM_LINE, index, name))
+                self.assertEqual(kept, bool(readings['oom_killed']),
+                                 (index, name))
+
+    def test_an_invalid_time_drops_its_record(self):
+        for value in ('2026-10-05 08:12:25Z', '2026-10-05T08:12:25',
+                      '2026-10-05T08:12:25.123Z', '2026-10-05T08:12:25+00:00',
+                      '2026-10-05t08:12:25z', '2026-02-30T08:12:25Z',
+                      '2026-13-05T08:12:25Z', '2026-10-05T24:00:00Z',
+                      '2026-10-05T08:12:60Z', '0000-10-05T08:12:25Z',
+                      '1791187945', '<no value>', '٢٠٢٦-10-05T08:12:25Z',
+                      '2026-10-05T08:12:25Z2026-10-05T08:12:25Z'):
+            self.assertReadsNothing(_with_field(NODE_LINE, 6, value))
+            self.assertReadsNothing(_with_field(OOM_LINE, 6, value))
+        # An OOM kill must say when, because that is how a caller tells a
+        # new one from one it has already seen.
+        self.assertReadsNothing(_with_field(OOM_LINE, 6, ''))
+
+    def test_a_time_is_unix_seconds_in_utc_whatever_the_local_zone(self):
+        # The API's times are UTC. Converting them as local time would be
+        # right only where the local zone is UTC, which is where tests
+        # usually run, so this test runs somewhere it is not: ten hours
+        # east, spelled as a POSIX rule rather than a zone name so that it
+        # needs no timezone database to mean that.
+        if not hasattr(time, 'tzset'):
+            self.skipTest('time.tzset() is not available here')
+        self.addCleanup(time.tzset)
+        patcher = mock.patch.dict(os.environ, {'TZ': 'AEST-10'})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        time.tzset()
+
+        for value, seconds in (('1970-01-01T00:00:00Z', 0),
+                               ('2024-02-29T23:59:59Z', 1709251199),
+                               ('2026-10-05T08:12:25Z', 1791187945)):
+            readings = self.parse(_with_field(NODE_LINE, 6, value))
+            self.assertEqual(
+                seconds,
+                readings['nodes']['k3s-banana-node-001']['ready_since'])
+            readings = self.parse(_with_field(OOM_LINE, 6, value))
+            self.assertEqual(
+                seconds,
+                readings['oom_killed']['k3s-banana-node-002'][0][
+                    'finished_at'])
+
+    def test_an_invalid_restart_count_drops_its_record(self):
+        # Each is something int() would refuse or, worse, accept: a sign,
+        # a float's spelling, a digit separator, non-ASCII digits, a value
+        # too long to serialise, and kubectl's placeholder for a field it
+        # could not find.
+        for value in ('', '-1', '+2', '2.0', '1e+06', '1_000', '\u0663',
+                      '9' * 21, '9' * 5000, '<no value>', 'two'):
+            self.assertReadsNothing(_with_field(OOM_LINE, 5, value))
+        readings = self.parse(_with_field(OOM_LINE, 5, '9' * 20))
+        self.assertEqual(
+            int('9' * 20),
+            readings['oom_killed']['k3s-banana-node-002'][0]['restarts'])
+
+    def test_one_bad_record_leaves_the_others(self):
+        stdout = KUBERNETES_PROBE_OUTPUT.replace(
+            '\tk3s-banana-node-001\tTrue', '\tk3s-banana-node-001\tMaybe')
+        readings = self.parse(stdout)
+        self.assertEqual(['k3s-banana-node-002'], list(readings['nodes']))
+        self.assertEqual(KUBERNETES_PROBE_READINGS['oom_killed'],
+                         readings['oom_killed'])
+
+    def test_the_first_record_for_a_node_wins(self):
+        # The API does not let two nodes share a name, so a second line is
+        # not the API's. Valid, so that it is the order which keeps it out
+        # and not the validation.
+        stdout = KUBERNETES_PROBE_OUTPUT + (
+            'node\tk3s-banana-node-001\tFalse\tTrue\tTrue\tTrue\t'
+            '2026-10-06T21:40:11Z\n')
+        self.assertEqual(KUBERNETES_PROBE_READINGS, self.parse(stdout))
+
+    def test_a_node_is_not_matched_by_a_dropped_record(self):
+        # A first record which was dropped claims nothing, so a later valid
+        # one for the same name is read.
+        stdout = (_with_field(NODE_LINE, 2, 'Maybe') + '\n'
+                  + _with_field(NODE_LINE, 2, 'False') + '\n')
+        self.assertEqual(
+            'False',
+            self.parse(stdout)['nodes']['k3s-banana-node-001']['ready'])
+
+    def test_every_oom_kill_on_a_node_is_kept_in_order(self):
+        stdout = KUBERNETES_PROBE_OUTPUT + (
+            'oom\tk3s-banana-node-002\tkube-system\tcoredns-5d78c9869d-abcde\t'
+            'coredns\t0\t2026-10-05T08:12:25Z\n')
+        entries = self.parse(stdout)['oom_killed']['k3s-banana-node-002']
+        self.assertEqual(['hog', 'coredns'],
+                         [entry['container'] for entry in entries])
+
+    def test_an_oom_kill_on_a_node_with_no_node_line_is_kept(self):
+        # Which node an entry belongs to is health()'s question, not the
+        # parser's: it is filed under the name it gave, and no node
+        # reading is invented for it.
+        stdout = (KUBERNETES_PROBE_OUTPUT
+                  + _with_field(OOM_LINE, 1, 'k3s-banana-node-099') + '\n')
+        readings = self.parse(stdout)
+        self.assertEqual(
+            ['k3s-banana-node-001', 'k3s-banana-node-002'],
+            sorted(readings['nodes']))
+        self.assertEqual(
+            [{'namespace': 'default', 'pod': 'memory-hog-7d9f8b6c5-x2x7k',
+              'container': 'hog', 'restarts': 2,
+              'finished_at': 1791322811}],
+            readings['oom_killed']['k3s-banana-node-099'])
+
+    def test_empty_output_reads_nothing(self):
+        for stdout in ('', None, '\n\n', '\t\t\n'):
+            self.assertEqual({'nodes': {}, 'oom_killed': {}},
+                             self.parse(stdout))
+
+    def test_trailing_whitespace_and_crlf_are_stripped(self):
+        stdout = KUBERNETES_PROBE_OUTPUT.replace('\n', ' \r\n').replace(
+            '\tTrue\t', '\t True \t')
+        self.assertEqual(KUBERNETES_PROBE_READINGS, self.parse(stdout))
+
+    def test_a_line_with_the_wrong_number_of_fields_is_dropped(self):
+        for line in (NODE_LINE, OOM_LINE):
+            self.assertReadsNothing(line + '\t')
+            self.assertReadsNothing(line + '\textra')
+            self.assertReadsNothing(line.rsplit('\t', 1)[0])
+            self.assertReadsNothing(line.replace('\t', ' '))
+
+    def test_lines_which_are_not_records_are_ignored(self):
+        stdout = ('error: the server does not have a resource type "nodez"\n'
+                  'pod\tdefault\tsomething\n'
+                  'NODE' + NODE_LINE[4:] + '\n'
+                  'nodes' + NODE_LINE[4:] + '\n'
+                  '\toom\n'
+                  + KUBERNETES_PROBE_OUTPUT)
+        self.assertEqual(KUBERNETES_PROBE_READINGS, self.parse(stdout))
+
+    def test_the_readings_serialise(self):
+        json.dumps(self.parse(KUBERNETES_PROBE_OUTPUT))
+
+    def test_no_string_makes_it_raise(self):
+        for stdout in ('\t', '\t' * 7, 'node', 'oom', 'node\t' * 7,
+                       'oom\t' * 7, '\x00\t\x00', 'node\t\udcff\tTrue',
+                       'node\tn\tTrue\tTrue\tTrue\tTrue\t\udcff',
+                       'oom\tn\tn\tn\tn\t\u00b2\t2026-10-05T08:12:25Z',
+                       'node\tn\tTrue\tTrue\tTrue\tTrue\t9999-12-31T23:59:59Z',
+                       '\u2028node\t\x85', 'x' * 100000,
+                       ('node\t' + 'a-' * 50000 + '\t\t\t\t\t')):
+            self.parse(stdout)
 
 
 # The framing every k3s configuration file is written with: a quoted
