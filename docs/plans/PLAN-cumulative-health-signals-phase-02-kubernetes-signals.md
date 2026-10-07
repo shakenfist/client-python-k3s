@@ -167,8 +167,8 @@ runs `sf-client k3s health` without `--strict` and fails only on a
 non-zero exit code. Without `--strict` the command exits 0 for any
 cluster it could describe, so that check passes for an unhealthy
 cluster. Its `tier1_nodes_ready()` covers readiness separately, which
-is why this has not mattered yet. To be raised in 33fl rather than
-fixed here.
+is why this has not mattered yet. Raised in 33fl rather than fixed
+here, as [Mach33Labs/33fl#938](https://github.com/Mach33Labs/33fl/issues/938).
 
 ### 9. Command output size is not bounded anywhere we control
 
@@ -430,38 +430,126 @@ dispatches it against the branch and records the readings. Provoking a
 
 ## Definition of done
 
-- [ ] `tox -epy3`, `tox -eflake8` and `pre-commit run --all-files` pass,
+- [x] `tox -epy3`, `tox -eflake8` and `pre-commit run --all-files` pass,
       `python3 -c 'import shakenfist_client_k3s'` succeeds, and
       `python3 tools/mutation-check.py` reports every mutation caught,
       with the count higher than the 43 on `develop` at `78c9df1`.
-- [ ] No CLI option changed:
+- [x] No CLI option changed:
       `git diff develop -- shakenfist_client_k3s/tests/cli_contract/`
       is empty.
-- [ ] The `api` probe is unchanged:
+- [x] The `api` probe is unchanged:
       `git diff develop -- shakenfist_client_k3s/cluster.py | grep
       "^[-+]K3S_API_PROBE_COMMAND"` prints nothing.
-- [ ] A test asserts every node entry carries `kubernetes` with exactly
+- [x] A test asserts every node entry carries `kubernetes` with exactly
       decision 3's keys, and the report a top level `kubernetes` with
       exactly its keys, in every outcome listed in step 2c's brief.
-- [ ] A test asserts `healthy` is False for each of a `NotReady`, an
+- [x] A test asserts `healthy` is False for each of a `NotReady`, an
       `Unknown`, an unregistered node and an unanswered probe, and that
       node level `healthy` is not.
-- [ ] Every `kubectl wait` or node-name command added interpolates a
+- [x] Every `kubectl wait` or node-name command added interpolates a
       name only through `shlex.quote()`: `git diff develop --
       shakenfist_client_k3s/cluster.py | grep "^+.*node/%s\|get node %s"`
       shows each such format fed by a quoted value.
-- [ ] No page still says `healthy` ignores Kubernetes readiness:
+- [x] No page still says `healthy` ignores Kubernetes readiness:
       `grep -rn -i "notready\|issues/76" docs collection` finds nothing
       that does.
-- [ ] `oom_killed` and `ready` are each defined in exactly one prose
+- [x] `oom_killed` and `ready` are each defined in exactly one prose
       place (`docs/library-api.md`) and in `health()`'s docstring
       schema.
-- [ ] *Live results* records a merge tier run against this branch in
+- [x] *Live results* records a merge tier run against this branch in
       which both `health --strict` steps passed, including the minimal
       cluster's at `ci_deploy_test.sh:606`.
-- [ ] The master plan's Future work carries Events (survey finding 4),
+- [x] The master plan's Future work carries Events (survey finding 4),
       non-OOM restart counts (decision 7) and merging the two kubectl
       probes (decision 2). #76 is closed by the merge.
+
+## Live results
+
+Step 2e dispatched the merge tier's `functional-tests.yml` against this
+branch at `bdb0652`:
+[run 37668454070](https://github.com/shakenfist/client-python-k3s/actions/runs/37668454070).
+Its cluster deployment job passed, including both `health --strict`
+steps. Its sanity checks failed only on the sdist size gate in
+`tools/check-wheel-build.sh`, which `431579e` raised; see *Deviations*.
+
+The Ready wait, from the progress phases:
+
+| Cluster | Verb | Nodes | Wait |
+|---|---|---|---|
+| ciMixed | `create` | 3 | 6 s |
+| ciMixed | `expand-workers` | 1 | 6 s |
+| ciMinimal | `create` | 2 | 6 s |
+
+The minimal cluster's worker reports `Ready since 19:10:26`, and its
+`create` returned at 19:10:42. The `health --strict` at
+`ci_deploy_test.sh:606` ran straight after, before any
+`wait_for_nodes`, and its `kubectl get nodes` shows the worker 18
+seconds old. Before decision 8, that check raced the worker's
+registration.
+
+The rendered Kubernetes lines, from the main (`ciMixed`) cluster:
+
+```
+    [ok] k3s-ciMixed-node-001 (e8a46b92-..., control plane): instance created, agent ready
+        booted 2026-10-07T18:54:34Z, k3s active, 0 restarts, 0 OOM kills, 2711 of 3914 MiB available, etcd 138 MiB, snapshots 0 MiB
+        kubernetes: Ready since 2026-10-07T18:58:16Z, no pressure
+    [ok] k3s-ciMixed-node-002 (844a6f96-..., worker): instance created, agent ready
+        booted 2026-10-07T18:56:28Z, k3s-agent active, 0 restarts, 0 OOM kills, 2285 of 2971 MiB available
+        kubernetes: Ready since 2026-10-07T18:59:27Z, no pressure
+```
+
+Every node on both clusters read `registered` and `Ready`. No
+`OOM killed` line, unmatched node or `Kubernetes probe: did not
+answer` line appeared. The instance names are mixed case
+(`k3s-ciMixed-node-001`) and the Kubernetes nodes lowercase
+(`k3s-cimixed-node-001`), so the lowercased match (decision 4) worked
+on a real cluster. kubectl accepted both go-templates on k3s
+`v1.36.5+k3s1`. Each `health` call took about 15 seconds of wall time.
+
+## Deviations and bugs fixed during this work
+
+- **One Ready command for all nodes (step 2b).** The brief asked for one
+  command per node, with a 300 second registration poll and a 300 second
+  `kubectl wait`. The sub-agent found that Shaken Fist expires an agent
+  operation 600 seconds after submission
+  (`AGENT_OPERATION_DEFAULT_DEADLINE`), and commands in one operation
+  run one after another. So even one slow node could be expired before
+  kubectl said why. Review sent it back. It is now one command for every
+  node: 24 polls 5 seconds apart, then one `kubectl wait` of 300 seconds,
+  about 535 seconds worst case for any node count. A test recomputes that
+  from the constants. The poll's `--request-timeout` is 5 seconds rather
+  than 10, so that a hung API server also fits.
+- **The command starts with `printf` (step 2b).** The agent refuses a
+  command whose first word is not on `PATH`, so the command cannot open
+  with a shell loop.
+- **`node_name_for_instance()` and `NodeUnnamedError` (step 2b).** The
+  name rule `remove_worker()` used is now a shared helper. Its comment
+  moved into the helper's docstring, so this plan's pointers to
+  `remove_worker()`'s comment are now one step indirect. A nameless
+  instance raises a new exception rather than `WorkerUnnamedError`,
+  because it may be a control plane node.
+- **The template guards (step 2a).** kubectl 1.21's `eq` fails the whole
+  template on a missing operand, so every operand is tested first.
+  `restartCount` is guarded with `exists` rather than `if`, because `if`
+  is false for 0. Both were found by rendering the templates with real
+  kubectl against throwaway k3s servers. An OOM line with no
+  `finishedAt` is dropped, because decision 5 types the time as an int.
+- **Duplicate lowercased names (step 2c).** Two entries that lowercase to
+  the same name both read None, and the name is not reported as
+  unmatched, because one node object cannot be attributed to either.
+- **`oom_killed` on an unregistered node (step 2c)** carries the kills
+  filed under its name, normally `[]`, rather than always `[]`. An empty
+  list would deny a kill whose pod names the node.
+- **`kubernetes['answered']` is implied** by the readiness term, so no
+  mutation can catch its removal alone. It is kept because decision 6
+  lists it.
+- **The renderer never says "no pressure" unless all three conditions
+  read `False` (step 2d).** An `Unknown` or missing condition renders
+  as unknown rather than as fine.
+- **The sdist size gate.** The merge tier failed the sdist byte bound
+  (2355987 against 2200000). The growth is source and plans, spread over
+  the phases, so `431579e` raised the bound to 2800000 as the gate's
+  comment directs.
 
 ## Back brief
 
