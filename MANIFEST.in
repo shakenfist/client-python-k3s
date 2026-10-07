@@ -1,15 +1,15 @@
 # What the sdist carries, beyond what setuptools_scm's file finder offers
 # it. The finder offers every git-tracked file, which is the right default
-# for a repository of source and documentation and the wrong one as soon as
-# something tracked is large and regenerable.
+# for a repository of source and documentation and the wrong one for
+# anything tracked that describes how the project was built rather than
+# what it is.
 #
-# docs/plans/audit/diffs/ is exactly that. The push audit in
-# docs/plans/PLAN-library-api-and-collection-phase-06-push-audit.md records
-# the ten per-merge diffs it read, 1.2MB of them, so that a reader can check
-# its findings against the code as it was. They stay in git for that reason.
-# They are also mechanically reproducible from the loop in
-# docs/plans/audit/README.md, and they describe this project's history
-# rather than being part of it, so shipping them to everyone who installs
-# from source forever is all cost. The findings and the triage, which are
-# judgements and cannot be regenerated, are small and stay.
-prune docs/plans/audit/diffs
+# docs/plans/ is exactly that. The plans, their phases and the audits
+# filed under them (including the 1.2MB of per-merge diffs the push audit
+# in docs/plans/PLAN-library-api-and-collection-phase-06-push-audit.md
+# recorded) are the project's working history. They stay in git, where a
+# reader checking why the code is shaped the way it is can find them, but
+# nobody installing from source needs them, and they only grow: every new
+# plan made the sdist bigger without changing a line of what it builds.
+# The user-facing documentation elsewhere under docs/ still ships.
+prune docs/plans
