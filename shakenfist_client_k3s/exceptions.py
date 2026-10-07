@@ -844,18 +844,27 @@ class UnsupportedReleaseError(_ReasonedK3sException):
 class ReleaseLookupError(_ReasonedK3sException):
     """Raised when looking up a k3s or Longhorn release fails.
 
-    Covers five sites in ``primitives.py``, which reduce to four distinct
-    message shapes. Construct via the classmethods below:
+    Construct via the classmethods below:
 
+    - ``request_failed(product, url, error)``: the fetch itself failed --
+      no connection, a TLS failure, or no answer within
+      ``primitives.RELEASE_LOOKUP_TIMEOUT``. Raised by
+      ``primitives.get_k3s_release()`` and
+      ``primitives.get_longhorn_release()``. ``error`` is the text of the
+      ``requests`` exception.
     - ``http_status(product, url, status_code, response_text)``: a
       non-2xx response fetching release data, for either product. Raised
       by ``primitives.get_k3s_release()`` on its channel fetch (with
       ``product='k3s'``) and by ``primitives.get_longhorn_release()`` on
-      its release fetch (with ``product='Longhorn'``); both render
+      its chart index fetch (with ``product='Longhorn'``); both render
       identically apart from the product name. ``response_text`` is
       bounded by the caller to ``primitives.RESPONSE_SNIPPET_BYTES``,
       because it is third-party text and whoever serves it would
       otherwise choose the length of this message.
+    - ``unreadable_response(product, url, response_snippet)``: a 2xx
+      response whose body does not parse as the JSON or YAML expected --
+      a captive portal, a proxy error page. Raised by both lookups.
+      ``response_snippet`` is bounded like ``response_text``.
     - ``no_usable_k3s_channels(url, response_snippet)``: raised by
       ``primitives.get_k3s_release()`` when the channel response parsed
       but yielded no channels at all. ``response_snippet`` is the
@@ -865,8 +874,9 @@ class ReleaseLookupError(_ReasonedK3sException):
       ``primitives.get_k3s_release()`` when the requested channel is not
       in the (possibly cached) release map.
     - ``no_parsable_longhorn_release()``: raised by
-      ``primitives.get_longhorn_release()`` when every Longhorn tag
-      failed to parse as a PEP 440 version.
+      ``primitives.get_longhorn_release()`` when the chart index parsed
+      but listed no Longhorn chart version which is a valid, final (not
+      prerelease, not deprecated) PEP 440 version.
 
     Which classmethod built an instance is recorded in ``reason``, but it
     does not decide which attributes exist: every field any of them sets
@@ -876,8 +886,18 @@ class ReleaseLookupError(_ReasonedK3sException):
 
     #: The union of the fields the classmethods below set. See
     #: ``_ReasonedK3sException`` for why this is not left implicit.
-    FIELDS = ('product', 'url', 'status_code', 'response_text',
+    FIELDS = ('product', 'url', 'error', 'status_code', 'response_text',
               'response_snippet', 'release_channel')
+
+    @classmethod
+    def request_failed(cls, product, url, error):
+        message = (
+            'Unable to determine latest %s release version\n'
+            '    GET %s\n'
+            '    failed: %s'
+        ) % (product, url, error)
+        return cls('request_failed', message, product=product, url=url,
+                   error=error)
 
     @classmethod
     def http_status(cls, product, url, status_code, response_text):
@@ -889,6 +909,17 @@ class ReleaseLookupError(_ReasonedK3sException):
         ) % (product, url, status_code, response_text)
         return cls('http_status', message, product=product, url=url,
                    status_code=status_code, response_text=response_text)
+
+    @classmethod
+    def unreadable_response(cls, product, url, response_snippet):
+        message = (
+            'Unable to determine latest %s release version\n'
+            '    GET %s\n'
+            '    returned a response which could not be parsed:\n'
+            '    %s'
+        ) % (product, url, response_snippet)
+        return cls('unreadable_response', message, product=product, url=url,
+                   response_snippet=response_snippet)
 
     @classmethod
     def no_usable_k3s_channels(cls, url, response_snippet):

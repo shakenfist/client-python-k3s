@@ -9,7 +9,7 @@ pre-commit run --all-files
 ```
 
 Unit tests live in `shakenfist_client_k3s/tests/` and mock the Shaken
-Fist API, the k3s update API and the GitHub releases API. They cannot
+Fist API, the k3s update API and the Longhorn chart index. They cannot
 reach the orchestration path -- whether a cluster actually assembles is
 only answerable against a live Shaken Fist cloud, which is what the
 merge tier of CI is for.
@@ -72,7 +72,9 @@ nodes carry its label (a worker added by `expand-workers` included), and
 that the control plane carries the default `NoSchedule` taint. A second,
 minimal cluster with one worker asserts the `node-taint: []` opt-out,
 and is the positive control for the absence checks: Traefik and its
-`svclb-traefik-*` pods have to appear there. Some of the node
+`svclb-traefik-*` pods have to appear there. It is built with
+`--network` on a network the script makes, which its delete has to
+leave in place. Some of the node
 customisation behaviour is covered by unit tests only: the refusal of
 keys the plugin owns, the configuration files on a node and the order
 k3s reads them in, and the zero-worker cluster that is never tainted.

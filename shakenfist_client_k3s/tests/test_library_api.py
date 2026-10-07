@@ -249,18 +249,34 @@ class ClusterLifecycleTestCase(LibraryTestCase):
                               update_kubeconfig=True)
         self.assertEqual('users.banana.testns', e.config_elem)
 
-    def test_delete_destroys_a_network_it_was_given(self):
-        # Known bug, tracked as shakenfist/client-python-k3s#41: delete
-        # removes md['node_network'] whether or not create allocated it, so
-        # a network handed to create --network is destroyed with the
-        # cluster which borrowed it. Pinned here as current behaviour
-        # because this step moves code without changing what it does; the
-        # fix belongs in its own change, and this test is what will fail
-        # loudly when it happens.
+    def test_delete_leaves_a_network_it_was_given(self):
+        # shakenfist/client-python-k3s#41: a network handed to
+        # create --network belongs to whoever made it, and destroying it
+        # with the cluster took down whatever else was on it. The fake's
+        # network carries the name create would have given its own, so this
+        # passes only because the recorded provenance is read rather than
+        # the name.
         c = self._cluster()
         c.create(1, 1, 1, network='net-1')
+        self.assertIs(False, c.get_metadata()['node_network_created'])
+        routed = list(c.get_metadata()['routed_addresses'])
         c.delete()
 
+        self.assertEqual([], self.client.allocated_networks)
+        self.assertEqual([], self.client.deleted_networks)
+        # The addresses this cluster routed into the borrowed network are
+        # still this cluster's to give back.
+        self.assertNotEqual([], routed)
+        self.assertEqual(sorted(routed),
+                         sorted(a for _, a in self.client.unrouted_addresses))
+
+    def test_delete_destroys_a_network_it_created(self):
+        c = self._cluster()
+        c.create(1, 1, 1)
+        self.assertIs(True, c.get_metadata()['node_network_created'])
+        c.delete()
+
+        self.assertEqual(['k3s-banana-node'], self.client.allocated_networks)
         self.assertEqual(['net-1'], self.client.deleted_networks)
 
 

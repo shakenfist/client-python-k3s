@@ -298,8 +298,8 @@ side and not on the create side.
 ### `delete NAME`
 
 Deletes every instance in the cluster, unroutes its floating
-addresses, deletes the node network, and removes the cluster's
-namespace metadata. It then removes the cluster's entries from the
+addresses, deletes the node network if `create` made it, and removes
+the cluster's namespace metadata. It then removes the cluster's entries from the
 local kubeconfig with `kubectl config unset`, unless `--no-kubeconfig`
 is given, in which case that step is skipped and a local `kubectl` is
 not needed.
@@ -310,9 +310,12 @@ and metadata an interrupted `create` managed to leave behind are
 removed the same way, and a note is printed first saying the cluster
 was interrupted rather than complete.
 
-Note that the node network is deleted whether the cluster created it
-or it was named with `create --network`, so deleting a cluster built
-on a shared pre-existing network takes that network with it.
+A network named with `create --network` is borrowed rather than
+owned, so `delete` leaves it in place and only unroutes the addresses
+this cluster routed into it. A cluster created before that
+distinction was recorded is classified by its network's name: a
+network `create` made is always named `k3s-NAME-node`, and only one
+with that name is deleted.
 
 ### `expand-workers NAME [--worker-count N]`
 
@@ -558,6 +561,14 @@ the version cache held in namespace metadata; pass
 `--refresh-version-cache` to re-query upstream. This is the same cache
 `create` uses, so these are the commands to check what a create would
 install.
+
+The k3s version comes from the k3s update API
+(`https://update.k3s.io/v1-release/channels`), and the Longhorn version
+from the index of Longhorn's Helm repository
+(`https://charts.longhorn.io/index.yaml`), the same repository the
+control plane node later installs the chart from. The lookups run where
+`sf-client` runs, so that machine needs to reach both. Each gives up
+after 30 seconds without an answer.
 
 ## Where cluster state lives
 

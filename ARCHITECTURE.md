@@ -110,12 +110,19 @@ that; this section is only the shape.
 ### Release lookups (`primitives.py`)
 
 The latest k3s release per channel is fetched from the k3s update
-API, and the latest Longhorn release from the GitHub releases API.
+API, and the latest Longhorn release from the index of the Helm
+repository the Longhorn install uses (`charts.longhorn.io`). Neither
+upstream has an API rate limit; the GitHub releases API, which the
+Longhorn lookup once used, allows 60 anonymous requests an hour per
+source address and failed creates from behind shared NAT (#97).
 Results are cached in namespace metadata and refreshed when stale.
-Both parsers are defensive about upstream data: k3s channels without
-a `latest` release (for example `v1.16-testing`) are skipped, and
-Longhorn tags which are prereleases or not valid PEP 440 versions are
-ignored (`packaging.version.Version` is used for comparison). These
+Both parsers are defensive about upstream data: a fetch failure, an
+unparsable body or a document of the wrong shape is a
+`ReleaseLookupError` rather than a traceback, k3s channels without a
+`latest` release (for example `v1.16-testing`) are skipped, and
+Longhorn chart versions which are deprecated, prereleases or not valid
+PEP 440 versions are ignored (`packaging.version.Version` is used for
+comparison). These
 are namespace scoped rather than cluster scoped -- the commands behind
 them, `query-k3s-version` and `query-longhorn-version`, name no
 cluster -- so they stay module level functions taking a client, a
