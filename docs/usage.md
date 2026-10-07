@@ -58,6 +58,21 @@ Skipping MetalLB, Longhorn or the local kubeconfig update also skips
 that phase's number, so a create that leaves all three out counts
 fewer phases rather than reporting a phase it never runs.
 
+`create` returns only once every node has registered with Kubernetes
+and reports `Ready`, so `health` straight afterwards sees the nodes as
+Kubernetes does rather than racing the last one's registration. The
+wait comes after k3s is installed on every node and before MetalLB and
+Longhorn, and is a phase of its own (`Waiting for N nodes to become
+Ready`). The nodes are waited for together: they get about two
+minutes to register and five more to become `Ready`, however many
+there are, which keeps the wait inside the ten minutes Shaken Fist
+allows an agent command. A node that does not make it fails the
+`create`, naming the node, and leaves an interrupted cluster (see
+below). Its kubeconfig has
+already been recorded by then, so `getconfig` still gives you what you
+need to ask Kubernetes why the node is not `Ready` before you delete
+it.
+
 #### Sizing
 
 A realistic floor for a control plane node is 4096 MB of RAM. On a
@@ -327,6 +342,13 @@ given the `--agent-config` the cluster recorded, as a drop-in written
 before k3s is installed on them. A cluster created before this
 existed recorded none, so its new workers get no drop-in. The release
 floor is not checked here.
+
+Like `create`, it returns only once the new workers have registered
+with Kubernetes and report `Ready`, waiting for those workers and no
+others. A new worker that does not become `Ready` in time fails the
+command, naming the node. The cluster is still a working cluster
+afterwards, and the new worker stays in its records, so `health`
+reports it and `remove-worker` can take it out.
 
 ### `remove-worker NAME --worker UUID [--worker UUID ...]`
 

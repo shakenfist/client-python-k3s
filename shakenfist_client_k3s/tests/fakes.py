@@ -60,10 +60,17 @@ users:
 class FakeClusterClient:
     """Enough of the sf-client API surface for a whole cluster lifecycle.
 
-    Instances boot instantly, every agent operation completes successfully
-    at submission, file fetches return canned content, and deleting an
-    instance moves it straight to the deleted state so delete's wait loop
-    terminates.
+    Instances boot instantly, every agent operation completes at
+    submission -- successfully, unless a test has named a command to fail
+    with failing_command -- file fetches return canned content, and
+    deleting an instance moves it straight to the deleted state so delete's
+    wait loop terminates.
+
+    Every command succeeding includes the readiness waits create() and
+    expand_workers() run (nodes_ready_command()): exit 0 is what the real
+    command says once the node is Ready, so a fake which says it at once
+    is a cluster whose nodes were Ready immediately, which is the case the
+    lifecycle tests mean.
     """
 
     def __init__(self):
@@ -91,6 +98,16 @@ class FakeClusterClient:
         # -- cannot be made from separate per-call lists, because neither
         # knows where in the other its own calls fell.
         self.executed = []
+
+        # A substring which, when a command line contains it, makes that
+        # command complete with a non-zero return code and failing_stderr,
+        # which is what reap_execute() turns into CommandFailedError. None,
+        # the default, fails nothing. A substring rather than a whole
+        # command, because the commands worth failing are long and built
+        # from module constants, and what a test means is "the wait for
+        # this node" or "the k3s install", not every byte of either.
+        self.failing_command = None
+        self.failing_stderr = 'scripted failure'
 
         # What the caller asked us to destroy, so a test can assert on the
         # teardown as well as the build. Network allocation is recorded as
@@ -180,10 +197,14 @@ class FakeClusterClient:
 
     def instance_execute(self, instance_ref, commandline):
         self.executed.append((instance_ref, commandline))
+        result = {'return-code': 0, 'stdout': '', 'stderr': ''}
+        if self.failing_command and self.failing_command in commandline:
+            result = {'return-code': 1, 'stdout': '',
+                      'stderr': self.failing_stderr}
         return self._complete_aop(
             instance_ref,
             [{'command': 'execute', 'commandline': commandline}],
-            {'0': {'return-code': 0, 'stdout': '', 'stderr': ''}})
+            {'0': result})
 
     def instance_get(self, instance_ref, path):
         return self._complete_aop(

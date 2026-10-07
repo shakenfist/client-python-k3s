@@ -78,8 +78,10 @@ description:
     and in particular the module never adds or removes worker nodes. See
     O(initial_workers) for why.
   - Creating a cluster takes tens of minutes, because it boots instances,
-    waits for their agents, installs k3s on each of them and then installs
-    metallb and Longhorn. The task blocks for all of it. Deleting one is
+    waits for their agents, installs k3s on each of them, waits for every
+    node to register with Kubernetes and report Ready, and then installs
+    metallb and Longhorn. The task blocks for all of it, so the health
+    report it returns is taken after every node was Ready. Deleting one is
     quicker but still waits for every instance to reach the deleted state.
 options:
   name:

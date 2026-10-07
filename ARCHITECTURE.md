@@ -88,7 +88,12 @@ that; this section is only the shape.
   written before its installer runs (see "k3s configuration" in
   `docs/usage.md`), the first control plane node is installed
   with `k3s server`, additional control plane nodes and workers join
-  using the node token, and, unless a caller opts out, MetalLB is
+  using the node token, every node is then waited for, in one
+  command bounded to fit Shaken Fist's agent operation deadline, until
+  it has registered with Kubernetes and reports `Ready` (as are the workers
+  `expand-workers` adds, so neither verb returns a node Kubernetes
+  does not yet count as `Ready`), and, unless a caller opts out,
+  MetalLB is
   installed (from the official metallb helm chart -- the Bitnami
   chart references versioned docker.io/bitnami images which stopped
   being published in 2025) and configured with floating addresses

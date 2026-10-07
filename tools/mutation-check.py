@@ -495,6 +495,64 @@ MUTATIONS = [
         PKG + '.tests.test_cluster.DeleteNodeNetworkOwnershipTestCase',
         'stestr',
     ),
+    (
+        'the node names a readiness wait interpolates are quoted',
+        PKG + '/cluster.py',
+        '    quoted = [shlex.quote(node_name) for node_name in node_names]',
+        '    quoted = list(node_names)',
+        PKG + '.tests.test_cluster.ShellQuotingTestCase',
+        'stestr',
+    ),
+    (
+        'the readiness wait is one command for every node',
+        PKG + '/cluster.py',
+        "            [md['control_plane_nodes'][0]], [nodes_ready_command(node_names)])",
+        "            [md['control_plane_nodes'][0]],\n"
+        "            [nodes_ready_command([n]) for n in node_names])",
+        PKG + '.tests.test_cluster.AwaitNodesReadyTestCase',
+        'stestr',
+    ),
+    (
+        'the readiness wait gives up inside the agent operation deadline',
+        PKG + '/cluster.py',
+        'NODE_REGISTRATION_ATTEMPTS = 24\n',
+        'NODE_REGISTRATION_ATTEMPTS = 60\n',
+        PKG + '.tests.test_cluster.NodesReadyCommandTestCase',
+        'stestr',
+    ),
+    (
+        'a node is waited for by the lowercased name kubelet registered',
+        PKG + '/cluster.py',
+        '    return name.lower()\n',
+        '    return name\n',
+        PKG + '.tests.test_cluster.CreateAwaitsNodesReadyTestCase',
+        'stestr',
+    ),
+    (
+        'create waits for every node to be Ready',
+        PKG + '/cluster.py',
+        "        self.await_nodes_ready(\n"
+        "            md['control_plane_nodes'] + md['worker_nodes'])\n",
+        '',
+        PKG + '.tests.test_cluster.CreateAwaitsNodesReadyTestCase',
+        'stestr',
+    ),
+    (
+        'expand-workers waits for the workers it added to be Ready',
+        PKG + '/cluster.py',
+        '        self.await_nodes_ready(new_workers)\n',
+        '',
+        PKG + '.tests.test_cluster.ExpandWorkersAwaitsNodesReadyTestCase',
+        'stestr',
+    ),
+    (
+        'expand-workers waits only for the workers it added',
+        PKG + '/cluster.py',
+        '        self.await_nodes_ready(new_workers)\n',
+        "        self.await_nodes_ready(md['worker_nodes'])\n",
+        PKG + '.tests.test_cluster.ExpandWorkersTestCase',
+        'stestr',
+    ),
 ]
 
 

@@ -148,6 +148,51 @@ K3S_API_PROBE_COMMAND = 'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yam
 # remove_worker() uncordons the node before re-raising.
 KUBECTL_DRAIN_TIMEOUT = '300s'
 
+# How long nodes_ready_command() waits for the nodes it is given, in two
+# halves, because a node has to register with Kubernetes before it can be
+# Ready and 'kubectl wait' only waits for the second of those: on a node
+# object which does not exist yet it fails at once with NotFound, which is
+# why tools/ci_deploy_test.sh's wait_for_nodes() polls the node count before
+# it waits. So the command polls 'kubectl get node' for every node at once,
+# up to NODE_REGISTRATION_ATTEMPTS times, NODE_REGISTRATION_INTERVAL_SECONDS
+# apart, and then hands the readiness half to one 'kubectl wait' for every
+# node, bounded by KUBECTL_NODE_READY_TIMEOUT.
+#
+# The budget is set by Shaken Fist rather than by what a node needs.
+# AGENT_OPERATION_DEFAULT_DEADLINE, 600 seconds in shakenfist/config.py, is
+# applied to every agent operation whose creator asked for no deadline,
+# which this plugin never does, and it is counted from submission, so time
+# spent queued behind another operation on the control plane node counts
+# against it. An operation which runs past it is expired by the server, and
+# the caller is told the operation expired rather than which node was not
+# Ready, so the command has to give up, and say why, well inside it. The
+# worst case is:
+#
+#   24 attempts x 5s request timeout     = 120s  (an API server which hangs)
+#   23 sleeps x 5s between attempts      = 115s
+#   'kubectl wait' timeout               = 300s
+#                                          -----
+#                                          535s
+#
+# which leaves about a minute of the 600 for queueing and process start up.
+# The usual way the poll gives up is quicker than that: kubectl's NotFound
+# and "connection refused" answers come back in well under a second, so a
+# node which never registers costs about two minutes, and one which
+# registers but never goes Ready about five. That worst case is the same
+# for a cluster of any size, because there is one command for every node
+# rather than one per node: commands sent together run one after another
+# on the agent, so one per node would have multiplied it by the node count.
+#
+# NODE_REGISTRATION_REQUEST_TIMEOUT is what makes the poll's bound a bound.
+# Without it a 'kubectl get' against an API server which accepts the
+# connection and never answers waits as long as the operation lasts, and
+# the attempt count never moves. Five seconds is generous for one get of a
+# handful of node objects from the server on the same machine.
+NODE_REGISTRATION_ATTEMPTS = 24
+NODE_REGISTRATION_INTERVAL_SECONDS = 5
+NODE_REGISTRATION_REQUEST_TIMEOUT = '5s'
+KUBECTL_NODE_READY_TIMEOUT = '300s'
+
 # Where k3s looks for manifests to apply itself, and the filename suffixes
 # it will look at. Everything in this directory is applied when the server
 # starts and again whenever a file in it changes, which is what makes
@@ -490,6 +535,143 @@ def k3s_unit_for_role(role):
         raise ValueError(
             'role must be one of %s, not %r'
             % (', '.join(sorted(K3S_UNIT_BY_ROLE)), role)) from None
+
+
+def node_name_for_instance(inst):
+    """Return the name Kubernetes knows inst's node by, or None if it has none.
+
+    inst is an instance representation from the Shaken Fist API. k3s
+    names a node after the hostname of the machine it runs on, and Shaken
+    Fist derives the guest's hostname from the instance's name: the config
+    drive it builds sets meta_data.json's "hostname" to "<instance
+    name>.local" (see shakenfist/instance.py), which cloud-init applies as
+    the short hostname. There is no separate hostname field in the
+    instance API representation to read instead, so 'name' is the field,
+    and it is read from the instance rather than rebuilt from
+    md['node_serial'] so that a node this plugin did not name is still
+    found by the name k3s knows it by.
+
+    Lowercased, because a Kubernetes node name is a DNS subdomain name and
+    those are lowercase: kubelet lowercases the hostname before it
+    registers, and the API server would refuse an uppercase name if it did
+    not. Shaken Fist does not lowercase -- its instance name guard permits
+    "a-z, A-Z, 0-9, or hyphen (-)", in the POST handler in
+    shakenfist/external_api/instance.py -- so "k3s-MyCluster-node-002" is a
+    real instance name whose node k3s knows as "k3s-mycluster-node-002".
+    Without this, every verb which addresses a node by name is unusable on
+    any cluster whose name has a capital letter in it: kubectl fails to
+    find the node.
+
+    .get() rather than a subscript, matching _node_health(), and None for a
+    missing or empty name rather than a guess. What to do about a node with
+    no name is the caller's decision, because it differs: remove_worker()
+    refuses to drain one, and await_nodes_ready() refuses to wait for one.
+    Neither is reachable from the API as it stands, whose every instance
+    representation carries a name.
+
+    The name is returned as it is, and every caller interpolating it into a
+    command line quotes it there, per rule 1 above.
+    """
+    name = inst.get('name')
+    if not name:
+        return None
+    return name.lower()
+
+
+def nodes_ready_command(node_names):
+    """Build the command which waits for the Kubernetes nodes node_names to be Ready.
+
+    Returns one shell command line, for the in-guest agent to run as root
+    on the first control plane node, which exits 0 once every node has
+    registered with Kubernetes and reports the Ready condition, and
+    non-zero, naming the nodes which had not, when it gives up. node_names
+    are the names k3s registered, from node_name_for_instance(), and must
+    not be empty: there is no command which waits for nothing, and
+    await_nodes_ready() submits none. They are the only values interpolated
+    here which are not this module's literals, so each is quoted once, per
+    rule 1 above, and only the quoted forms are used in the four places
+    the list appears.
+
+    One command for every node rather than one per node, so that the worst
+    case fits inside Shaken Fist's agent operation deadline however many
+    nodes there are; NODE_REGISTRATION_ATTEMPTS has the arithmetic. It is
+    two waits, because 'kubectl wait' fails at once on a node object which
+    does not exist yet:
+
+    - A bounded poll of 'kubectl get node <every name>', which exits 0 only
+      when every named node exists: kubectl prints the nodes it found and a
+      NotFound line for each it did not, and exits 1 if there was any,
+      whatever order they were named in. That was checked against k3s
+      v1.31's kubectl rather than assumed, because the poll is only right
+      if it holds. The poll keeps what kubectl said in $output rather than
+      on stderr, because a node which has not registered yet is the
+      expected state for the first few attempts, and two dozen rounds of
+      "not found" would bury the one line which matters. When it gives up
+      it names the nodes still missing, worked out from that output rather
+      than by asking kubectl again: '-o name' prints each node found as
+      'node/<name>' on a line of its own, so a node with no such line is
+      one which was not found, and grep -x -F compares whole lines as fixed
+      strings, so one name being a prefix of another cannot hide it. Then
+      kubectl's own last answer once, because "not found" is a node which
+      never registered and "connection refused" an API server which was
+      never there to register with, and the operator needs to tell those
+      apart.
+    - Then one 'kubectl wait --for=condition=Ready' for every node, which
+      waits for them all under the one timeout and whose own failure names
+      each node which did not make it ("timed out waiting for the condition
+      on nodes/<name>"), so it needs no message of its own and its exit
+      status is the command's.
+
+    The command begins with printf, which says which nodes are being
+    waited for and is also what the agent needs: it refuses a command line
+    whose first word is not an executable it can find on PATH, so the line
+    cannot begin with a variable assignment or 'until'. printf repeats its
+    format for each argument, which is how one call says one line per node.
+    printf rather than echo for the reason _signal_reading() gives; every
+    message is a literal format, and the values -- the quoted node names,
+    kubectl's output -- are its arguments, so a '%' or a backslash in
+    either is printed rather than interpreted. The rest is POSIX sh,
+    because Debian's /bin/sh is dash: no '[[', no arrays, and arithmetic
+    through '$(( ))'. An assignment's exit status is that of its command
+    substitution, which is POSIX and is what lets the 'until' test
+    kubectl's exit status while keeping its output.
+
+    'exit 1' leaves the shell the agent started for this one command, which
+    is what makes the poll giving up the command's result rather than the
+    beginning of a 'kubectl wait' which would fail for the same reason.
+    """
+    quoted = [shlex.quote(node_name) for node_name in node_names]
+    names = ' '.join(quoted)
+    get_nodes = ('kubectl get node %s -o name --request-timeout=%s '
+                 '--kubeconfig /etc/rancher/k3s/k3s.yaml'
+                 % (names, NODE_REGISTRATION_REQUEST_TIMEOUT))
+    wait_nodes = ('kubectl wait --for=condition=Ready %s --timeout=%s '
+                  '--kubeconfig /etc/rancher/k3s/k3s.yaml'
+                  % (' '.join('node/%s' % q for q in quoted),
+                     KUBECTL_NODE_READY_TIMEOUT))
+    return (
+        "printf 'Waiting for node %%s to register with Kubernetes\\n' "
+        '%(names)s; '
+        'attempt=1; '
+        'until output=$(%(get_nodes)s 2>&1); do '
+        'if [ "$attempt" -ge %(attempts)d ]; then '
+        'missing=; '
+        'for node in %(names)s; do '
+        'printf \'%%s\\n\' "$output" | grep -q -x -F -- "node/$node" '
+        '|| missing="$missing $node"; '
+        'done; '
+        "printf 'Nodes did not register with Kubernetes after %%s attempts, "
+        "%%s seconds apart:%%s. kubectl said: %%s\\n' "
+        '"$attempt" %(interval)d "$missing" "$output" >&2; '
+        'exit 1; '
+        'fi; '
+        'attempt=$((attempt + 1)); '
+        'sleep %(interval)d; '
+        'done; '
+        '%(wait_nodes)s'
+        % {'names': names, 'get_nodes': get_nodes, 'wait_nodes': wait_nodes,
+           'attempts': NODE_REGISTRATION_ATTEMPTS,
+           'interval': NODE_REGISTRATION_INTERVAL_SECONDS})
 
 
 def _signal_reading(key, reading):
@@ -2689,6 +2871,85 @@ class Cluster:
         p.phase('Installing k3s on the worker nodes')
         self.install_k3s_component(instance_uuids, md['node_token'], 'agent')
 
+    def await_nodes_ready(self, instance_uuids):
+        """Wait for the nodes on instance_uuids to register with Kubernetes and be Ready.
+
+        create() calls this for every node once the last k3s install has
+        finished, and expand_workers() for the workers it just added, so
+        that neither returns a cluster which health() would call unhealthy
+        a moment later for a node which simply had not got there yet. The
+        k3s installer returns once the service has started, which is before
+        the kubelet has registered the node and well before the node
+        reports Ready, and nothing waited for either until decision 8 of
+        PLAN-cumulative-health-signals-phase-02-kubernetes-signals.md: the
+        callers which needed Ready nodes, this repo's CI among them, each
+        waited for themselves.
+
+        Like install_workers(), there is no default: a caller says which
+        nodes it means, and expand_workers() means only the ones it made.
+        Waiting for a node which is already Ready costs two quick kubectl
+        calls, so asking for more than that is harmless, but it is also a
+        wait for a node the caller did not touch, which can fail the
+        caller's verb for a reason that is not its own.
+
+        Every node name is resolved from its instance before any wait is
+        submitted, through node_name_for_instance(), and an instance with
+        no name raises NodeUnnamedError rather than guessing one: a guessed
+        name is a node which is never found, two minutes of polling, and
+        then a message which blames the node. An instance which no longer
+        exists is not caught here. The caller created it minutes ago, so
+        its absence is a failure of the call rather than the stale entry
+        remove_worker() tolerates, and the client's
+        ResourceNotFoundException says so.
+
+        Then one command for every node (nodes_ready_command()), run on the
+        first control plane node, which is where kubectl has the cluster's
+        admin kubeconfig. One command rather than one per node, because
+        commands sent together run one after another on the agent, and
+        each per node wait would have been charged against Shaken Fist's
+        agent operation deadline in turn; one command waits for every node
+        under one budget, which NODE_REGISTRATION_ATTEMPTS shows fits inside
+        that deadline for a cluster of any size. A node which does not
+        register or become Ready in time makes the command exit non-zero,
+        and execute_and_await() raises CommandFailedError carrying it, with
+        the poll's message naming the nodes which had not registered or
+        kubectl's naming those which were not Ready. The instance a
+        CommandFailedError names is the control plane node the command ran
+        on, not a node it was waiting for, which is why the message has to
+        carry the nodes' names itself.
+
+        This writes nothing to the metadata, so a failure here leaves the
+        cluster's record exactly as it was before the call: in create(),
+        a cluster in state 'initial', which is what it is.
+        """
+        p = self.get_progress()
+        md = self.get_metadata()
+        p.phase('Waiting for %s to become Ready'
+                % progress.count_str(len(instance_uuids), 'node'))
+
+        node_names = []
+        for instance_uuid in instance_uuids:
+            node_name = node_name_for_instance(
+                self.client.get_instance(instance_uuid))
+            if not node_name:
+                raise exceptions.NodeUnnamedError(self.name, instance_uuid)
+            node_names.append(node_name)
+
+        # Nothing to submit is nothing to wait for. execute_and_await() would
+        # otherwise still wait for the control plane node to go idle, which
+        # is a wait for other people's commands that this call has no
+        # reason to make. expand_workers() is the caller which reaches this,
+        # with a worker count of zero; the phase above is still opened, so
+        # that its count matches the total the caller started with.
+        if not node_names:
+            return
+
+        self.execute_and_await(
+            [md['control_plane_nodes'][0]], [nodes_ready_command(node_names)])
+        p.note('%s Ready: %s' % (
+            progress.count_str(len(node_names), 'node'),
+            ', '.join(node_names)))
+
     def allocate_metallb_addresses(self, metal_address_count):
         p = self.get_progress()
         md = self.get_metadata()
@@ -2875,6 +3136,18 @@ class Cluster:
         knows whether the option was passed at all; see
         _bind_new_cluster_context() in this package's __init__.
 
+        It returns once every node has registered with Kubernetes and
+        reports Ready, and MetalLB and Longhorn are installed after that
+        wait rather than before it (await_nodes_ready()). So a health()
+        straight afterwards sees the nodes as Kubernetes does, rather than
+        racing the last one's registration. A node which is not Ready within
+        the wait's bound -- under nine minutes, see NODE_REGISTRATION_ATTEMPTS
+        -- raises CommandFailedError naming it, and leaves the cluster in
+        state 'initial', as any other failure part way through a create
+        does: delete() is the way to clear it. Its kubeconfig has been
+        recorded by then, so get_kubeconfig() can still be used to ask the
+        cluster why.
+
         write_kubeconfig is the one parameter here whose default is not the
         command line's behaviour. Writing ~/.kube/config, and shelling out
         to kubectl to merge into an existing one, are side effects on the
@@ -3018,15 +3291,17 @@ class Cluster:
         validate_k3s_config(agent_config, 'agent')
 
         # Phases: create control plane nodes, create workers, install control
-        # plane, install workers, fetch credentials, metallb, longhorn, and
-        # update the local kubeconfig. Creating a node network and installing
+        # plane, install workers, fetch credentials, wait for the nodes to be
+        # Ready, metallb, longhorn, and update the local kubeconfig. The wait
+        # is a phase whatever the shape, because every cluster has at least
+        # one node to wait for. Creating a node network and installing
         # additional control plane nodes only sometimes happen; metallb and
         # longhorn are each skipped -- and their phase uncounted -- when the
         # corresponding install_* flag is False; and the local kubeconfig
         # update goes the same way when write_kubeconfig is False. Note that
         # this last one is subtracted by default, because that flag defaults
         # to False rather than to True.
-        total_phases = 8
+        total_phases = 9
         if not network:
             total_phases += 1
         if control_plane_count > 1:
@@ -3253,6 +3528,40 @@ class Cluster:
         kc['current-context'] = fqcn
         md['kubeconfig'] = yaml.dump(kc)
         self.set_metadata(md)
+
+        # Wait for every node to register with Kubernetes and report Ready,
+        # per decision 8 of the phase 2 cumulative health signals plan. That
+        # plan's decision 6 makes health() call a cluster unhealthy while
+        # any node is not, so a create which returned before then would hand
+        # its caller a cluster that fails its first health check for no
+        # reason but timing.
+        #
+        # Every node, control plane included, and one call rather than one
+        # per role, because nothing about readiness differs by role and the
+        # nodes come up in parallel. install_workers() above runs whatever
+        # the worker count -- with none it installs on nothing -- so this
+        # line is after the last k3s install for every shape of cluster,
+        # including a single control plane node and no workers.
+        #
+        # After the credentials rather than straight after the installs,
+        # which is the one choice here: the fetch needs only the first
+        # control plane node's k3s to be running, which install_control_plane()
+        # waited for, and doing it first means a create which fails this
+        # wait leaves a cluster whose kubeconfig is recorded, so that
+        # 'sf-client k3s getconfig' hands the operator what they need to ask
+        # Kubernetes why the node is not Ready. Before MetalLB, because its
+        # speaker daemonset's rollout only counts the nodes which have
+        # registered, so a node which had not yet would be left out of the
+        # rollout that is meant to check it. Longhorn follows MetalLB, so it
+        # is after this too.
+        #
+        # A failure raises out of here with md['state'] still 'initial',
+        # which is the truth about the cluster: everything this function has
+        # recorded so far is complete and correct, and the state is what
+        # says the build did not finish. 'sf-client k3s delete' is the way
+        # out, as it is for every other failure mid-create.
+        self.await_nodes_ready(
+            md['control_plane_nodes'] + md['worker_nodes'])
 
         # Install metallb and longhorn, unless the caller opted out of one
         # or both of them.
@@ -4035,15 +4344,39 @@ class Cluster:
         ``md['node_token']``, which an interrupted create may never have
         fetched, and a k3s agent install carrying a token of None builds
         instances which are charged for and can never join anything.
+
+        It returns once every new worker has registered with Kubernetes and
+        reports Ready (await_nodes_ready()), so a health() straight
+        afterwards sees them as Kubernetes does rather than racing their
+        registration. Only the new workers are waited for. One which is not
+        Ready within the wait's bound -- under nine minutes, see
+        NODE_REGISTRATION_ATTEMPTS -- raises CommandFailedError naming it.
+        The cluster is left in state 'created', because it still is one:
+        the existing nodes are untouched, and the new workers are recorded
+        in the metadata, so health() reports them, delete() removes them,
+        and remove_worker() takes one out on its own.
         """
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
         self._require_usable(md, 'expand-workers')
 
-        p = self.start_progress(2)
+        # Three phases: create the workers, install k3s on them, and wait for
+        # them to be Ready.
+        p = self.start_progress(3)
         new_workers = self.create_and_await_instances(worker_count, 'worker')
         self.install_workers(new_workers)
+
+        # Only the workers this call made, for the reason install_workers()
+        # is handed only those: the nodes already in the cluster are not
+        # this call's business, and one of them being NotReady is something
+        # health() reports rather than a reason to fail an expand which did
+        # what it was asked. Decision 8 of the phase 2 cumulative health
+        # signals plan. A failure raises out of here with the new workers
+        # already recorded in md['worker_nodes'], which
+        # create_and_await_instances() did as it made each one, so health()
+        # reports them and delete() removes them; nothing else is written.
+        self.await_nodes_ready(new_workers)
         p.finish(f'Added {worker_count} workers to cluster {self.name}')
 
     def remove_worker(self, instance_uuids):
@@ -4147,27 +4480,13 @@ class Cluster:
         # three API calls and turns "half the workers are gone and the
         # command failed" into a refusal.
         #
-        # k3s names a node after the hostname of the machine it runs on, and
-        # Shaken Fist derives the guest's hostname from the instance's name:
-        # the config drive it builds sets meta_data.json's "hostname" to
-        # "<instance name>.local" (see shakenfist/instance.py), which
-        # cloud-init applies as the short hostname. There is no separate
-        # hostname field in the instance API representation to read instead,
-        # so 'name' is the field, and it is read from the instance rather
-        # than rebuilt from md['node_serial'] so that a node this plugin did
-        # not name is still drained by the name k3s knows it by.
-        #
-        # Lowercased, because a Kubernetes node name is a DNS subdomain name
-        # and those are lowercase: kubelet lowercases the hostname before it
-        # registers, and the API server would refuse an uppercase name if it
-        # did not. Shaken Fist does not lowercase -- its instance name guard
-        # permits "a-z, A-Z, 0-9, or hyphen (-)", in the POST handler in
-        # shakenfist/external_api/instance.py -- so "k3s-MyCluster-node-002"
-        # is a real instance name whose node k3s knows as
-        # "k3s-mycluster-node-002". Without this, remove-worker is unusable
-        # on any cluster whose name has a capital letter in it: the drain
-        # fails to find the node and raises CommandFailedError, which at
-        # least fails before anything is destroyed.
+        # The name is the one k3s registered the node under, which is the
+        # instance's name lowercased: node_name_for_instance() says why, and
+        # await_nodes_ready() resolves names the same way. Without the
+        # lowercasing remove-worker is unusable on any cluster whose name
+        # has a capital letter in it: the drain fails to find the node and
+        # raises CommandFailedError, which at least fails before anything is
+        # destroyed.
         #
         # ResourceNotFoundException is caught for the reason delete()
         # catches it per instance: cluster metadata can name an instance
@@ -4177,11 +4496,11 @@ class Cluster:
         # would make a stale entry unfixable short of deleting the whole
         # cluster. A None name below means that case and only that case.
         #
-        # .get() rather than a subscript, matching _node_health(), and then
-        # refused rather than worked around: an instance representation with
-        # no name is not one this verb can drain, and guessing would drain
-        # the wrong node. It is not reachable from the API as it stands,
-        # which is why it is a check and not a code path with a story.
+        # An instance with no name is refused rather than worked around: an
+        # instance representation with no name is not one this verb can
+        # drain, and guessing would drain the wrong node. It is not
+        # reachable from the API as it stands, which is why it is a check
+        # and not a code path with a story.
         resolved = []
         for instance_uuid in wanted:
             try:
@@ -4190,10 +4509,10 @@ class Cluster:
                 resolved.append((instance_uuid, None))
                 continue
 
-            node_name = inst.get('name')
+            node_name = node_name_for_instance(inst)
             if not node_name:
                 raise exceptions.WorkerUnnamedError(self.name, instance_uuid)
-            resolved.append((instance_uuid, node_name.lower()))
+            resolved.append((instance_uuid, node_name))
 
         for instance_uuid, node_name in resolved:
             if node_name is None:

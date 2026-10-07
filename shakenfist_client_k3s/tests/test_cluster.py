@@ -295,11 +295,17 @@ class ExpandWorkersTestCase(testtools.TestCase):
         client.create_instance.side_effect = list(new_instances)
         cluster = _make_cluster(client)
 
+        # await_nodes_ready() is patched out with the installs, because the
+        # question for it here is also which instances it is handed, and
+        # the bare MagicMock client has no instance names to build its
+        # commands from. AwaitNodesReadyTestCase covers the commands.
         with mock.patch.object(Cluster, 'await_boot'), \
                 mock.patch.object(Cluster, 'instance_os_update'), \
-                mock.patch.object(Cluster, 'install_k3s_component') as ikc:
+                mock.patch.object(Cluster, 'install_k3s_component') as ikc, \
+                mock.patch.object(Cluster, 'await_nodes_ready') as anr:
             cluster.expand_workers(worker_count)
 
+        self.await_nodes_ready = anr
         return cluster, ikc
 
     def test_only_the_new_worker_has_k3s_installed(self):
@@ -323,6 +329,19 @@ class ExpandWorkersTestCase(testtools.TestCase):
 
         ikc.assert_called_once_with(
             ['uuid-w-002', 'uuid-w-003'], 'node-token', 'agent')
+
+    def test_only_the_new_workers_are_waited_for(self):
+        # Decision 8 of the cumulative health signals phase 2 plan, and the
+        # same argument as the install above: a NotReady node which was
+        # already in the cluster is something health() reports, not a
+        # reason to fail an expand which did what it was asked.
+        cluster, _ = self._expand(
+            ['uuid-w-001', 'uuid-w-002'], 2,
+            [{'uuid': 'uuid-w-003', 'name': 'k3s-banana-node-003'},
+             {'uuid': 'uuid-w-004', 'name': 'k3s-banana-node-004'}])
+
+        self.await_nodes_ready.assert_called_once_with(
+            ['uuid-w-003', 'uuid-w-004'])
 
     def _built_sizes(self, cluster):
         """(cpus, memory, disk) for every create_instance() call, in order."""
@@ -428,32 +447,18 @@ class ExpandWorkersTestCase(testtools.TestCase):
         self.assertEqual([K3S_CONFIG], list(files))
 
 
-class CreateInstallsWorkersTestCase(testtools.TestCase):
-    """Creating a cluster installs k3s on every worker it just created.
+class CreateEnvironmentTestCase(testtools.TestCase):
+    """Shared setup for the tests which drive a whole create() against FakeClusterClient.
 
-    create() hands install_workers() md['worker_nodes'], and when this test
-    was written in step 3a that was the right list only by aliasing:
-    get_metadata() caches the metadata dictionary and set_metadata() stores
-    that same object, so the list create() was holding was the one
-    create_and_await_instances() had appended the new workers to. Nothing
-    at the call site said so, and making the cache copy on read would have
-    had create() install k3s on no workers at all and still report the
-    cluster ready.
-
-    Step 3c closed that: create() now picks the metadata up again after
-    each method which writes to it, so this assertion no longer rests on
-    the cache's identity semantics and holds whether the cache aliases or
-    copies. What is pinned here is the outcome rather than the mechanism --
-    the workers create() built are the workers it installs k3s on -- which
-    is the claim worth keeping either way.
-
-    A scripted fake rather than a MagicMock because create() drives wait
-    loops which compare dictionary values against literals; see
-    tests/fakes.py.
+    Nothing here asserts anything. It keeps create() off the network, out
+    of the operator's ~/.kube and away from a real kubectl, and makes its
+    waits instant, so that the subclasses are left with only their own
+    question. A base class with no tests of its own rather than a helper,
+    so that a subclass needs no setUp of its own.
     """
 
     def setUp(self):
-        super(CreateInstallsWorkersTestCase, self).setUp()
+        super(CreateEnvironmentTestCase, self).setUp()
         self.client = fakes.FakeClusterClient()
 
         patcher = mock.patch('time.sleep', lambda seconds: None)
@@ -485,6 +490,31 @@ class CreateInstallsWorkersTestCase(testtools.TestCase):
                 return_value=release)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+
+class CreateInstallsWorkersTestCase(CreateEnvironmentTestCase):
+    """Creating a cluster installs k3s on every worker it just created.
+
+    create() hands install_workers() md['worker_nodes'], and when this test
+    was written in step 3a that was the right list only by aliasing:
+    get_metadata() caches the metadata dictionary and set_metadata() stores
+    that same object, so the list create() was holding was the one
+    create_and_await_instances() had appended the new workers to. Nothing
+    at the call site said so, and making the cache copy on read would have
+    had create() install k3s on no workers at all and still report the
+    cluster ready.
+
+    Step 3c closed that: create() now picks the metadata up again after
+    each method which writes to it, so this assertion no longer rests on
+    the cache's identity semantics and holds whether the cache aliases or
+    copies. What is pinned here is the outcome rather than the mechanism --
+    the workers create() built are the workers it installs k3s on -- which
+    is the claim worth keeping either way.
+
+    A scripted fake rather than a MagicMock because create() drives wait
+    loops which compare dictionary values against literals; see
+    tests/fakes.py.
+    """
 
     def _create(self, control_plane_count, worker_count):
         cluster = _make_cluster(self.client)
@@ -532,6 +562,563 @@ class CreateInstallsWorkersTestCase(testtools.TestCase):
     def test_a_single_worker_cluster_still_installs_its_worker(self):
         _, workers, agent_calls = self._create(1, 1)
         self._assert_installed_on(workers, agent_calls)
+
+
+# The command the readiness wait sends, as a test expects to find it: built
+# by the function under test from the lowercased names, so that a test
+# comparing against it is asking "were these nodes waited for", and the
+# command's own shape is NodesReadyCommandTestCase's business.
+def _ready_command(node_names):
+    return cluster_module.nodes_ready_command(node_names)
+
+
+def _is_ready_wait(commandline):
+    """True for a command nodes_ready_command() built, whichever nodes it is for."""
+    return commandline.startswith("printf 'Waiting for node ")
+
+
+def _seconds(duration):
+    """Seconds in a kubectl duration this module writes, such as '300s'."""
+    if not duration.endswith('s'):
+        raise ValueError('not a duration in seconds: %r' % duration)
+    return int(duration[:-1])
+
+
+class NodeNameForInstanceTestCase(testtools.TestCase):
+    """A node is found by its instance's name, lowercased, or not at all."""
+
+    def test_the_name_is_lowercased(self):
+        self.assertEqual(
+            'k3s-mycluster-node-002',
+            cluster_module.node_name_for_instance(
+                {'uuid': 'inst-1', 'name': 'k3s-MyCluster-node-002'}))
+
+    def test_a_missing_or_empty_name_is_none_rather_than_a_guess(self):
+        for inst in ({'uuid': 'inst-1'}, {'uuid': 'inst-1', 'name': ''},
+                     {'uuid': 'inst-1', 'name': None}):
+            self.assertIsNone(cluster_module.node_name_for_instance(inst),
+                              inst)
+
+
+class NodesReadyCommandTestCase(testtools.TestCase):
+    """What the readiness wait sends, compared as a string.
+
+    NodesReadyCommandRunsTestCase below runs it; this pins the parts a
+    shell cannot be asked about, such as what the in-guest agent will
+    accept as the first word, and how long the command can take.
+    """
+
+    NAMES = ['k3s-banana-node-001', 'k3s-banana-node-002']
+
+    def test_the_first_word_is_an_executable(self):
+        # The agent looks the command line's first space separated word up
+        # with shutil.which() before it runs anything, and refuses a line
+        # whose first word is not on PATH. A variable assignment or 'until'
+        # would be refused there, on every node, at the end of a create.
+        command = cluster_module.nodes_ready_command(self.NAMES)
+        self.assertEqual('printf', command.split(' ')[0])
+
+    def test_both_waits_name_every_node(self):
+        command = cluster_module.nodes_ready_command(self.NAMES)
+        self.assertIn(
+            'kubectl get node k3s-banana-node-001 k3s-banana-node-002 '
+            '-o name --request-timeout=%s '
+            '--kubeconfig /etc/rancher/k3s/k3s.yaml'
+            % cluster_module.NODE_REGISTRATION_REQUEST_TIMEOUT, command)
+        self.assertTrue(command.endswith(
+            'kubectl wait --for=condition=Ready node/k3s-banana-node-001 '
+            'node/k3s-banana-node-002 --timeout=%s '
+            '--kubeconfig /etc/rancher/k3s/k3s.yaml'
+            % cluster_module.KUBECTL_NODE_READY_TIMEOUT), command)
+
+    def test_the_poll_is_bounded_by_the_constants(self):
+        command = cluster_module.nodes_ready_command(self.NAMES)
+        self.assertIn('[ "$attempt" -ge %d ]'
+                      % cluster_module.NODE_REGISTRATION_ATTEMPTS, command)
+        self.assertIn('sleep %d;'
+                      % cluster_module.NODE_REGISTRATION_INTERVAL_SECONDS,
+                      command)
+
+    def test_the_worst_case_fits_inside_the_agent_operation_deadline(self):
+        # Shaken Fist expires an agent operation 600 seconds after it was
+        # submitted when its creator asked for no deadline, which this
+        # plugin never does (AGENT_OPERATION_DEFAULT_DEADLINE). An expired
+        # wait reports the operation rather than the node, so the command
+        # has to give up first, with room left for the operation to have
+        # queued behind another one. The arithmetic is the comment beside
+        # the constants, recomputed so that changing one of them is a
+        # decision this test makes somebody notice.
+        attempts = cluster_module.NODE_REGISTRATION_ATTEMPTS
+        worst_case = (
+            attempts * _seconds(
+                cluster_module.NODE_REGISTRATION_REQUEST_TIMEOUT)
+            + (attempts - 1)
+            * cluster_module.NODE_REGISTRATION_INTERVAL_SECONDS
+            + _seconds(cluster_module.KUBECTL_NODE_READY_TIMEOUT))
+        self.assertEqual(535, worst_case)
+        self.assertLessEqual(worst_case, 600 - 60)
+
+    def test_every_appearance_of_every_name_is_quoted(self):
+        # Rule 1 at the top of cluster.py. The list appears four times --
+        # the first message, the poll, the loop which names the missing
+        # nodes, and the wait -- and each name has to be in its quoted form.
+        # Without a quote character of its own, a name's quoted form
+        # contains it verbatim, so every raw appearance being inside a
+        # quoted one is the two counts agreeing. A name with a quote in it
+        # is NodesReadyCommandRunsTestCase's, through a shell.
+        hostiles = ['node; touch /pwned #', 'node $(id) other']
+        command = cluster_module.nodes_ready_command(hostiles)
+        for hostile in hostiles:
+            quoted = shlex.quote(hostile)
+            self.assertNotEqual(hostile, quoted)
+            self.assertEqual(4, command.count(quoted), command)
+            self.assertEqual(command.count(quoted), command.count(hostile),
+                             command)
+
+
+class NodesReadyCommandRunsTestCase(testtools.TestCase):
+    """The readiness wait parses as POSIX shell and does what it says.
+
+    Run with the local /bin/sh, which is dash on Debian and Ubuntu as it is
+    on the nodes, with kubectl and sleep replaced by scripts on PATH. The
+    kubectl script behaves as the real one does with several names, which
+    was checked against k3s v1.31: 'get' prints 'node/<name>' for each node
+    it found and a NotFound line for each it did not, and exits 1 if there
+    was any; 'wait' prints 'condition met' or a timeout line per node, and
+    exits 1 if any timed out. Every node is NotFound until a scripted
+    attempt, a node named in NEVER stays NotFound, and a node named in
+    NOT_READY times out. Both scripts record what they were given, so the
+    tests can ask how many attempts were made and what each was about.
+    sleep is replaced so that two dozen attempts cost no time, and records
+    its argument so that the interval is asserted rather than assumed.
+    """
+
+    KUBECTL = (
+        '#!/bin/sh\n'
+        'printf \'%s\\n\' "$*" >> "$KUBECTL_LOG"\n'
+        'for a in "$@"; do printf \'[%s]\\n\' "$a"; done >> "$KUBECTL_ARGS"\n'
+        'verb=$1\n'
+        'shift 2\n'
+        'rc=0\n'
+        'for a in "$@"; do\n'
+        '    case "$a" in -*) break;; esac\n'
+        '    if [ "$verb" = get ]; then\n'
+        '        n=$(grep -c \'^get \' "$KUBECTL_LOG")\n'
+        '        if [ "$n" -le "$REGISTER_AFTER" ] || '
+        'printf \'%s\\n\' "$NEVER" | grep -q -x -F -- "$a"; then\n'
+        '            printf \'Error from server (NotFound): nodes "%s" not '
+        'found\\n\' "$a" >&2\n'
+        '            rc=1\n'
+        '        else\n'
+        '            printf \'node/%s\\n\' "$a"\n'
+        '        fi\n'
+        '    elif [ -n "$NOT_READY" ] && [ "${a#node/}" = "$NOT_READY" ]; then\n'
+        '        printf \'error: timed out waiting for the condition on '
+        'nodes/%s\\n\' "${a#node/}" >&2\n'
+        '        rc=1\n'
+        '    else\n'
+        '        printf \'%s condition met\\n\' "$a"\n'
+        '    fi\n'
+        'done\n'
+        'exit $rc\n')
+
+    SLEEP = '#!/bin/sh\nprintf \'%s\\n\' "$1" >> "$SLEEP_LOG"\n'
+
+    NAMES = ['k3s-mycluster-node-001', 'k3s-mycluster-node-002']
+
+    def setUp(self):
+        super().setUp()
+        if not os.path.exists('/bin/sh'):
+            self.skipTest('/bin/sh does not exist')
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.bin = os.path.join(self.tmp, 'bin')
+        os.mkdir(self.bin)
+        self.cwd = os.path.join(self.tmp, 'cwd')
+        os.mkdir(self.cwd)
+        for name, script in (('kubectl', self.KUBECTL), ('sleep', self.SLEEP)):
+            path = os.path.join(self.bin, name)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(script)
+            os.chmod(path, 0o755)
+
+    def _run(self, node_names, register_after=0, never='', not_ready=''):
+        env = dict(os.environ)
+        env['PATH'] = '%s:%s' % (self.bin, env.get('PATH', '/usr/bin:/bin'))
+        env['KUBECTL_LOG'] = os.path.join(self.tmp, 'kubectl.log')
+        env['KUBECTL_ARGS'] = os.path.join(self.tmp, 'kubectl.args')
+        env['SLEEP_LOG'] = os.path.join(self.tmp, 'sleep.log')
+        env['REGISTER_AFTER'] = str(register_after)
+        env['NEVER'] = never
+        env['NOT_READY'] = not_ready
+        return subprocess.run(
+            ['/bin/sh', '-c', cluster_module.nodes_ready_command(node_names)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, env=env, cwd=self.cwd)
+
+    def _lines(self, name):
+        path = os.path.join(self.tmp, name)
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding='utf-8') as f:
+            return f.read().splitlines()
+
+    def _calls(self, verb):
+        return [line for line in self._lines('kubectl.log')
+                if line.startswith(verb + ' ')]
+
+    def test_nodes_which_register_late_are_waited_for_together(self):
+        result = self._run(self.NAMES, register_after=2)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        # Two rounds of NotFound, then the one which found both, each asking
+        # about every node at once, and a sleep between each pair of
+        # attempts but not after the last.
+        self.assertEqual(
+            ['get node k3s-mycluster-node-001 k3s-mycluster-node-002 -o name '
+             '--request-timeout=%s --kubeconfig /etc/rancher/k3s/k3s.yaml'
+             % cluster_module.NODE_REGISTRATION_REQUEST_TIMEOUT] * 3,
+            self._calls('get'))
+        self.assertEqual(
+            [str(cluster_module.NODE_REGISTRATION_INTERVAL_SECONDS)] * 2,
+            self._lines('sleep.log'))
+        # One wait, for both.
+        self.assertEqual(
+            ['wait --for=condition=Ready node/k3s-mycluster-node-001 '
+             'node/k3s-mycluster-node-002 --timeout=%s '
+             '--kubeconfig /etc/rancher/k3s/k3s.yaml'
+             % cluster_module.KUBECTL_NODE_READY_TIMEOUT],
+            self._calls('wait'))
+
+        # The NotFound answers the poll absorbed are not on stderr, where
+        # they would bury the message that matters on a real failure.
+        self.assertNotIn('NotFound', result.stderr)
+
+    def test_a_node_which_never_registers_fails_naming_it(self):
+        result = self._run(self.NAMES, never='k3s-mycluster-node-002')
+        self.assertEqual(1, result.returncode)
+
+        attempts = cluster_module.NODE_REGISTRATION_ATTEMPTS
+        self.assertEqual(attempts, len(self._calls('get')))
+        self.assertEqual(attempts - 1, len(self._lines('sleep.log')))
+        # The poll giving up is the command's answer. Going on to 'kubectl
+        # wait' would fail a second time for the same reason, and the exit
+        # status would then be kubectl's rather than the poll's.
+        self.assertEqual([], self._calls('wait'))
+
+        # The missing node and only the missing node, then what kubectl
+        # said the last time, once, so that "never registered" can be told
+        # apart from "no API server to ask".
+        self.assertIn(
+            'Nodes did not register with Kubernetes after %d attempts, %d '
+            'seconds apart: k3s-mycluster-node-002. kubectl said: '
+            'node/k3s-mycluster-node-001\n'
+            'Error from server (NotFound): nodes "k3s-mycluster-node-002" '
+            'not found\n'
+            % (attempts, cluster_module.NODE_REGISTRATION_INTERVAL_SECONDS),
+            result.stderr)
+        self.assertEqual(1, result.stderr.count('NotFound'), result.stderr)
+
+    def test_a_name_which_prefixes_another_is_still_reported_missing(self):
+        # node-1 never registers and node-10 does. A substring match on
+        # kubectl's output would find 'node/k3s-x-node-1' inside
+        # 'node/k3s-x-node-10' and report nothing missing.
+        result = self._run(['k3s-x-node-1', 'k3s-x-node-10'],
+                           never='k3s-x-node-1')
+        self.assertEqual(1, result.returncode)
+        self.assertIn('seconds apart: k3s-x-node-1. kubectl said:',
+                      result.stderr)
+
+    def test_a_node_which_never_becomes_ready_fails_with_kubectls_reason(self):
+        result = self._run(self.NAMES, not_ready='k3s-mycluster-node-002')
+        self.assertEqual(1, result.returncode)
+        self.assertEqual(1, len(self._calls('get')))
+        self.assertEqual(1, len(self._calls('wait')))
+        self.assertIn('timed out waiting for the condition on '
+                      'nodes/k3s-mycluster-node-002', result.stderr)
+        self.assertNotIn('nodes/k3s-mycluster-node-001', result.stderr)
+
+    def test_a_hostile_name_reaches_kubectl_as_one_argument(self):
+        # Rule 1, asked of the shell rather than of a string. A name which
+        # escaped its quoting would split into several arguments, or run
+        # 'touch' in the working directory, which starts empty.
+        hostile = "node'; touch pwned; echo '$(touch pwned2) \"q\""
+        result = self._run(['k3s-mycluster-node-001', hostile],
+                           register_after=1)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        self.assertEqual([], os.listdir(self.cwd))
+        args = self._lines('kubectl.args')
+        self.assertEqual(2, args.count('[%s]' % hostile), args)
+        self.assertEqual(1, args.count('[node/%s]' % hostile), args)
+        self.assertIn('Waiting for node %s to register' % hostile,
+                      result.stdout)
+
+    def test_a_hostile_missing_name_is_reported_without_running_it(self):
+        # The loop which names the missing nodes is the fourth place the
+        # list appears, and the one reached only on failure.
+        hostile = "node'; touch pwned; echo '$(touch pwned2)"
+        result = self._run(['k3s-mycluster-node-001', hostile], never=hostile)
+        self.assertEqual(1, result.returncode)
+        self.assertEqual([], os.listdir(self.cwd))
+        self.assertIn('seconds apart: %s. kubectl said:' % hostile,
+                      result.stderr)
+
+
+class AwaitNodesReadyTestCase(testtools.TestCase):
+    """await_nodes_ready() waits on every node by its Kubernetes name, in one command."""
+
+    def setUp(self):
+        super(AwaitNodesReadyTestCase, self).setUp()
+        self.client = fakes.FakeClusterClient()
+        self.client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'control_plane_nodes': ['inst-cp1', 'inst-cp2'],
+            'worker_nodes': ['inst-w1']}
+        for instance_uuid, name in [('inst-cp1', 'k3s-MixedCase-node-001'),
+                                    ('inst-cp2', 'k3s-MixedCase-node-002'),
+                                    ('inst-w1', 'k3s-MixedCase-node-003')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+        self.cluster = _make_cluster(self.client)
+
+    def test_every_node_is_waited_for_in_one_command(self):
+        self.cluster.await_nodes_ready(['inst-cp1', 'inst-cp2', 'inst-w1'])
+
+        # One command however many nodes, so that the wait's worst case is
+        # one budget rather than one per node; lowercased, because that is
+        # the name kubelet registered; in the order the caller gave; on the
+        # first control plane node, which is where the kubeconfig is.
+        self.assertEqual(
+            [('inst-cp1', _ready_command(['k3s-mixedcase-node-001',
+                                          'k3s-mixedcase-node-002',
+                                          'k3s-mixedcase-node-003']))],
+            self.client.executed)
+        self.assertNotIn('MixedCase', self.client.executed[0][1])
+
+    def test_the_phase_counts_the_nodes(self):
+        self.cluster.await_nodes_ready(['inst-cp1', 'inst-cp2', 'inst-w1'])
+        self.assertIn('[1/1] Waiting for 3 nodes to become Ready',
+                      self.cluster.reporter.lines)
+
+    def test_a_failed_wait_raises_naming_the_node(self):
+        command = _ready_command(['k3s-mixedcase-node-002',
+                                  'k3s-mixedcase-node-003'])
+        self.client.failing_command = command
+        self.client.failing_stderr = (
+            'error: timed out waiting for the condition on '
+            'nodes/k3s-mixedcase-node-003')
+
+        e = self.assertRaises(exceptions.CommandFailedError,
+                              self.cluster.await_nodes_ready,
+                              ['inst-cp2', 'inst-w1'])
+        # The instance a CommandFailedError names is the one the command
+        # ran on, which is the control plane node, so the nodes waited for
+        # have to be in the command and the message.
+        self.assertEqual('inst-cp1', e.instance_uuid)
+        self.assertIn('node/k3s-mixedcase-node-003', e.commandline)
+        self.assertIn('nodes/k3s-mixedcase-node-003', str(e))
+
+    def test_an_unnamed_instance_is_refused_before_anything_is_sent(self):
+        self.client.instances['inst-w1']['name'] = ''
+        e = self.assertRaises(exceptions.NodeUnnamedError,
+                              self.cluster.await_nodes_ready,
+                              ['inst-cp2', 'inst-w1'])
+        self.assertEqual('inst-w1', e.instance_uuid)
+        self.assertEqual([], self.client.executed)
+
+    def test_no_nodes_sends_nothing(self):
+        self.cluster.await_nodes_ready([])
+        self.assertEqual([], self.client.executed)
+        self.assertIn('[1/1] Waiting for 0 nodes to become Ready',
+                      self.cluster.reporter.lines)
+
+
+class CreateAwaitsNodesReadyTestCase(CreateEnvironmentTestCase):
+    """create() waits for every node to be Ready after k3s and before MetalLB.
+
+    Decision 8 of the cumulative health signals phase 2 plan. The order is
+    asserted from the fake's one ordered log of executed commands, because
+    "after the last install and before MetalLB" is a claim about where in
+    one sequence the wait fell, which separate per-step records cannot
+    answer. The cluster name has a capital letter in it, so that a wait
+    aimed at the instance's name rather than the node's is a wait for a
+    node which does not exist, and fails here rather than after two
+    minutes on a real cluster.
+    """
+
+    def _create(self, control_plane_count, worker_count, **kwargs):
+        self.cluster = Cluster(self.client, 'MixedCase', 'testns',
+                               reporter=progress.CollectingReporter())
+        self.cluster.create(control_plane_count, worker_count, 1, **kwargs)
+
+    def _node_names(self):
+        return [inst['name'].lower() for inst in self.client.instances.values()]
+
+    def _waits(self):
+        return [(instance_uuid, commandline)
+                for instance_uuid, commandline in self.client.executed
+                if _is_ready_wait(commandline)]
+
+    def _indexes(self, predicate):
+        return [i for i, (_, commandline) in enumerate(self.client.executed)
+                if predicate(commandline)]
+
+    def _assert_wait_between_installs_and_metallb(self):
+        installs = self._indexes(lambda c: 'get.k3s.io' in c)
+        waits = self._indexes(_is_ready_wait)
+        metallb = self._indexes(lambda c: 'metallb' in c)
+        longhorn = self._indexes(lambda c: 'longhorn' in c)
+        self.assertNotEqual([], installs)
+        self.assertEqual(1, len(waits), self.client.executed)
+        self.assertLess(max(installs), waits[0],
+                        'the nodes were waited for before the last k3s '
+                        'install')
+        for later in (metallb, longhorn):
+            if later:
+                self.assertLess(waits[0], min(later),
+                                'MetalLB or Longhorn was set up before every '
+                                'node was Ready')
+
+    def test_every_node_is_waited_for_by_its_kubernetes_name(self):
+        self._create(2, 2)
+
+        first_control_plane = list(self.client.instances)[0]
+        self.assertEqual(
+            [(first_control_plane, _ready_command(self._node_names()))],
+            self._waits())
+        self.assertEqual(
+            ['k3s-mixedcase-node-001', 'k3s-mixedcase-node-002',
+             'k3s-mixedcase-node-003', 'k3s-mixedcase-node-004'],
+            self._node_names())
+
+    def test_the_wait_is_after_the_last_install_and_before_metallb(self):
+        self._create(2, 2)
+        self._assert_wait_between_installs_and_metallb()
+
+    def test_a_cluster_with_no_workers_still_waits_for_its_control_plane(self):
+        # install_workers() runs with an empty list for this shape, so the
+        # last install is the control plane's.
+        self._create(1, 0)
+        self.assertEqual(
+            [_ready_command(['k3s-mixedcase-node-001'])],
+            [c for _, c in self._waits()])
+        self._assert_wait_between_installs_and_metallb()
+
+    def test_without_metallb_the_wait_is_still_before_longhorn(self):
+        self._create(1, 1, install_metallb=False)
+        self._assert_wait_between_installs_and_metallb()
+
+    def test_the_wait_is_its_own_phase(self):
+        self._create(1, 2)
+        self.assertIn(
+            'Waiting for 3 nodes to become Ready',
+            ' '.join(self.cluster.reporter.lines))
+
+    def test_a_failed_wait_leaves_the_cluster_interrupted(self):
+        self.client.failing_command = _ready_command(
+            ['k3s-mixedcase-node-001', 'k3s-mixedcase-node-002'])
+        self.client.failing_stderr = (
+            'error: timed out waiting for the condition on '
+            'nodes/k3s-mixedcase-node-002')
+
+        e = self.assertRaises(exceptions.CommandFailedError, self._create, 1, 1)
+        self.assertIn('node/k3s-mixedcase-node-002', e.commandline)
+        self.assertIn('nodes/k3s-mixedcase-node-002', str(e))
+
+        # What is recorded is what create() had finished when it stopped,
+        # and the state is what says it did not finish: 'initial', which
+        # every verb that needs a built cluster refuses and delete clears.
+        md = self.client.metadata[cluster_module.METADATA_KEY % 'MixedCase']
+        self.assertEqual('initial', md['state'])
+        self.assertEqual('initial', self.cluster._interrupted_state(md))
+        self.assertEqual(2, len(md['control_plane_nodes'] + md['worker_nodes']))
+
+        # Nothing after the wait ran. No addresses were routed, so there is
+        # nothing charged for that the failure has to account for.
+        self.assertEqual([], [c for _, c in self.client.executed
+                              if 'metallb' in c or 'longhorn' in c])
+        self.assertEqual([], md['routed_addresses'])
+
+        # The credentials were recorded before the wait, so the operator can
+        # still reach the cluster to ask why the node is not Ready.
+        self.assertIn('MixedCase.testns', self.cluster.get_kubeconfig())
+
+        # And a second create of the name says the cluster is interrupted,
+        # rather than that the name is merely taken.
+        again = Cluster(self.client, 'MixedCase', 'testns',
+                        reporter=progress.CollectingReporter())
+        self.assertRaises(exceptions.ClusterInterruptedError,
+                          again.create, 1, 1, 1)
+
+
+class ExpandWorkersAwaitsNodesReadyTestCase(testtools.TestCase):
+    """expand_workers() waits for the workers it added, and only those.
+
+    ExpandWorkersTestCase asserts which instances the wait is handed; this
+    drives the real wait against the scripted client, to see the command
+    it sends and what a failure leaves.
+    """
+
+    def setUp(self):
+        super(ExpandWorkersAwaitsNodesReadyTestCase, self).setUp()
+        self.client = fakes.FakeClusterClient()
+        self.client.instance_serial = 2
+        self.md = {
+            'name': 'MixedCase', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 3, 'node_network': 'net-1',
+            'node_token': 'node-token', 'server_token': 'server-token',
+            'k3s_version': 'v1.33', 'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4', 'join_address': '10.0.0.4',
+            'control_plane_nodes': ['inst-001'], 'worker_nodes': ['inst-002'],
+            'routed_addresses': []
+        }
+        self.client.metadata[
+            cluster_module.METADATA_KEY % 'MixedCase'] = self.md
+        for serial, instance_uuid in enumerate(['inst-001', 'inst-002'], 1):
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid,
+                'name': 'k3s-MixedCase-node-%03d' % serial,
+                'state': 'created', 'agent_state': 'ready'}
+        self.cluster = Cluster(self.client, 'MixedCase', 'testns',
+                               reporter=progress.CollectingReporter())
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_only_the_new_workers_are_waited_for(self):
+        self.cluster.expand_workers(2)
+
+        self.assertEqual(
+            [('inst-001', _ready_command(['k3s-mixedcase-node-003',
+                                          'k3s-mixedcase-node-004']))],
+            [(i, c) for i, c in self.client.executed if _is_ready_wait(c)])
+
+        # And after the new workers' k3s install, not before it.
+        installs = [i for i, (_, c) in enumerate(self.client.executed)
+                    if 'get.k3s.io' in c]
+        waits = [i for i, (_, c) in enumerate(self.client.executed)
+                 if _is_ready_wait(c)]
+        self.assertLess(max(installs), min(waits))
+
+    def test_a_failed_wait_raises_and_leaves_the_cluster_usable(self):
+        self.client.failing_command = _ready_command(
+            ['k3s-mixedcase-node-003'])
+
+        e = self.assertRaises(exceptions.CommandFailedError,
+                              self.cluster.expand_workers, 1)
+        self.assertIn('node/k3s-mixedcase-node-003', e.commandline)
+
+        # The cluster was built and still is: its state is untouched, and
+        # the new worker is recorded, so health() reports it and delete()
+        # and remove-worker can reach it.
+        md = self.cluster.get_metadata()
+        self.assertEqual('created', md['state'])
+        self.assertEqual(['inst-002', 'inst-003'], md['worker_nodes'])
 
 
 class ActionLogClient(fakes.FakeClusterClient):
@@ -2735,6 +3322,39 @@ class ShellQuotingTestCase(testtools.TestCase):
             probe = drains[0].replace('kubectl', 'true', 1)
             probe = probe.replace('/pwned', 'pwned')
             subprocess.run(probe, shell=True, cwd=tempdir, capture_output=True)
+            self.assertEqual([], os.listdir(tempdir),
+                             'the shell read the node name as a second '
+                             'command: %s' % probe)
+
+    def test_the_awaited_node_name_is_quoted(self):
+        # The readiness wait create() and expand_workers() run, which
+        # addresses a node by the name its instance carries, as the drain
+        # above does and for the same reason needs quoting.
+        client = fakes.FakeClusterClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1']}
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        client.instances['inst-w1'] = {
+            'uuid': 'inst-w1', 'name': 'node;touch /pwned',
+            'state': 'created', 'agent_state': 'ready'}
+
+        _make_cluster(client).await_nodes_ready(['inst-w1'])
+
+        self.assertEqual(1, len(client.executed), client.executed)
+        wait = client.executed[0][1]
+        self.assertIn("kubectl get node 'node;touch /pwned' ", wait)
+        self.assertIn("node/'node;touch /pwned' ", wait)
+
+        # And through a shell. kubectl becomes true, so the poll succeeds at
+        # once and the wait does nothing, and every word of the line is
+        # still parsed the way a node's shell would parse it.
+        with tempfile.TemporaryDirectory() as tempdir:
+            probe = wait.replace('kubectl', 'true').replace('/pwned', 'pwned')
+            subprocess.run(['/bin/sh', '-c', probe], cwd=tempdir,
+                           capture_output=True)
             self.assertEqual([], os.listdir(tempdir),
                              'the shell read the node name as a second '
                              'command: %s' % probe)

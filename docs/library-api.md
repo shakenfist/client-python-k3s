@@ -104,8 +104,8 @@ is public here is a compatibility surface for external callers. Everything else 
 `execute_and_await()`, `instance_os_update()`,
 `install_control_plane()`, `install_k3s_component()`,
 `install_extra_control_plane()`, `install_workers()`,
-`allocate_metallb_addresses()`, `configure_metallb_addresses()`,
-`setup_metallb()`, `setup_longhorn()`,
+`await_nodes_ready()`, `allocate_metallb_addresses()`,
+`configure_metallb_addresses()`, `setup_metallb()`, `setup_longhorn()`,
 `create_and_await_instances()`, `start_progress()`,
 `get_progress()`,
 `_interrupted_state()` and `_require_usable()` -- is internal
@@ -145,6 +145,33 @@ it. Skipping MetalLB or Longhorn, by contrast, is not a change to
 `setup_metallb()` or `setup_longhorn()`
 themselves -- they are exactly as unconditional as before -- it is
 `create()` deciding whether to call them at all.
+
+`create()` and `expand_workers()` return only once every node they
+added has registered with Kubernetes and reports `Ready`, so a
+`health()` straight afterwards sees those nodes as Kubernetes does
+rather than racing the last one's registration. `create()` waits for
+every node, after the last k3s install and before MetalLB and
+Longhorn; `expand_workers()` waits for the workers it added and no
+others. The wait is one command for all of those nodes, run on the
+first control plane node: it polls for up to about two minutes for
+every node to register, then gives one `kubectl wait
+--for=condition=Ready` five more. Its worst case, about nine minutes
+if the API server hangs on every poll, is the same for any number of
+nodes and fits inside the 600 seconds Shaken Fist allows an agent
+operation that asks for no deadline of its own, as this library
+never does; past that the server would expire it and the error would
+name the operation rather than the node. A node that is not `Ready`
+in time raises `CommandFailedError`, whose output names the nodes
+that had not registered, or kubectl's names those that were not
+`Ready`; the `instance` it names is the control plane node the wait
+ran on. After a `create()` that leaves the
+cluster in state `initial`, like any other failure part way through a
+create, with its kubeconfig already recorded so `get_kubeconfig()` can
+reach the cluster to ask why; `delete()` clears it. After an
+`expand_workers()` the cluster stays `created`, with the new workers
+in its metadata. A node is found by its instance's name, lowercased,
+because that is the name kubelet registers; `remove_worker()` finds
+the node it drains the same way.
 
 `create()`'s remaining keyword arguments (`refresh_version_cache`,
 `release_channel`, `sshkey`, `install_metallb`, `install_longhorn`,
@@ -283,6 +310,7 @@ a correct caller never needs to catch it.
 | `ClusterIncompleteError` | `get_kubeconfig()` is called on a cluster that exists but has not finished `create()` |
 | `WorkerNotFoundError` | `remove_worker()` is given a uuid that is not one of the cluster's workers |
 | `WorkerUnnamedError` | `remove_worker()` finds a worker whose instance record has no name, so the k3s node it became cannot be identified |
+| `NodeUnnamedError` | `create()` or `expand_workers()` finds a node it just added whose instance record has no name, so it cannot wait for that node to become `Ready` |
 | `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable or not decodable as UTF-8, not valid YAML or JSON, or a line colliding with the staging marker |
 | `GuestFileError` | a file this library writes onto a cluster node carries a line equal to the heredoc marker used to write it, so writing it would run the rest as commands on the node. The values that reach these bodies come from the namespace metadata document, which is third-party writable |
 | `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
@@ -293,7 +321,7 @@ a correct caller never needs to catch it.
 | `ClusterMetadataError` | a value read back out of the namespace metadata cannot be used -- `expand_addresses()` finds something in `routed_addresses` that is not an IP address, or the API hands back one that is not. Raised before any address is routed, because the addresses are charged for and the configuration they go into is written afterwards |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
-| `CommandFailedError` | an agent command completes with a non-zero return code |
+| `CommandFailedError` | an agent command completes with a non-zero return code, including the wait `create()` and `expand_workers()` make for a node that does not become `Ready` |
 | `KubeconfigError` | a local `~/.kube/config` merge or `kubectl config unset` fails, or a merge is needed and there is no local `kubectl`. A failed write of the file itself is an `OSError` |
 
 Each exception's docstring in `shakenfist_client_k3s/exceptions.py`
@@ -495,15 +523,17 @@ on the `KubeconfigError` it raises.
 progress text `sf-client k3s create` prints, for example:
 
 ```
-[1/8] Creating node network
+[1/9] Creating node network
   created k3s-mycluster-node (uuid ...)
 ...
-[8/8] Setting up longhorn version 1.6.0
+[7/9] Waiting for 3 nodes to become Ready
+...
+[9/9] Setting up longhorn version 1.6.0
 Cluster mycluster is ready (... total)
 ```
 
 The total follows what the call actually does, so the command line's
-nine-phase create becomes eight here: the example above did not ask
+ten-phase create becomes nine here: the example above did not ask
 for `write_kubeconfig`, so there is no `Updating local kubeconfig`
 phase to count.
 

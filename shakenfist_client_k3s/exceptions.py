@@ -333,6 +333,44 @@ class WorkerUnnamedError(K3sClusterException):
                 % (self.name, self.instance_uuid))
 
 
+class NodeUnnamedError(K3sClusterException):
+    """Raised when a node just added has no name to wait for its readiness by.
+
+    Raised by ``Cluster.await_nodes_ready()``, which ``create()`` and
+    ``expand_workers()`` call once k3s is installed on the nodes they
+    added, to wait for each of them to register with Kubernetes and report
+    Ready. The node is found by the name k3s registered it under, which is
+    its instance's name lowercased (see ``node_name_for_instance()`` in
+    ``cluster.py``), so an instance representation with no usable
+    ``name`` is one whose node cannot be asked after.
+
+    A separate class from ``WorkerUnnamedError`` rather than that one
+    reused, because the node may be a control plane node, and because what
+    could not be done is a wait rather than a drain. Nothing is destroyed
+    either way, and every name is resolved before any wait is submitted,
+    so this fires before the first one starts.
+
+    Not reachable from the Shaken Fist API as it stands, for the reason
+    ``WorkerUnnamedError`` gives, and the instance in question is one the
+    same call created minutes earlier. It exists so that a caller which
+    catches ``K3sClusterException`` is not handed an ``AttributeError`` from
+    the last minutes of a create, and so that the wait never guesses a
+    name: a guessed name is a node which is never found, and two minutes
+    of polling before a message which blames the node.
+    """
+
+    def __init__(self, name, instance_uuid):
+        self.name = name
+        self.instance_uuid = instance_uuid
+        super(NodeUnnamedError, self).__init__(name)
+
+    def __str__(self):
+        return ('Cluster %s has a node, instance %s, whose instance record\n'
+                'has no name, so the k3s node it became cannot be identified\n'
+                'and there is no way to wait for it to become Ready.'
+                % (self.name, self.instance_uuid))
+
+
 class ComponentNotInstalledError(K3sClusterException):
     """Raised when a verb needs an optional component this cluster was built without.
 
