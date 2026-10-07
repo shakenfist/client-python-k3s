@@ -858,8 +858,8 @@ def validate_node_sizes(sizes):
     to the API at all.
 
     It checks the values it is given and not the shape they come in: a
-    missing role or field is not reported. Its one caller, create(), always
-    builds the complete mapping, so there is nothing to catch today; a new
+    missing role or field is not reported. Its one caller,
+    validate_create_arguments(), always builds the complete mapping, so there is nothing to catch today; a new
     caller handing it something partial has to check the shape itself.
     """
     for role, size in sizes.items():
@@ -3055,6 +3055,8 @@ class Cluster:
                     # does not matter, and spawning a shell to run a
                     # constant buys nothing. The two paths travel as
                     # environment values rather than as argv either way.
+                    # The merge needs KUBECONFIG's list, so a home
+                    # directory containing ':' is unsupported here.
                     merged = subprocess.run(
                         ['kubectl', 'config', 'view', '--flatten'],
                         capture_output=True,
@@ -3713,13 +3715,18 @@ class Cluster:
         if update_kubeconfig:
             self._delete_kubeconfig_entries()
 
-    def _run_local_kubectl(self, argv, main_config_path, fqcn, log_stdout=True):
-        """Run a local kubectl argument list for delete(), capturing its output.
+    def _run_local_kubectl(self, args, main_config_path, fqcn, log_stdout=True):
+        """Run 'kubectl --kubeconfig main_config_path' with args for delete(), capturing its output.
 
-        KUBECONFIG is set to main_config_path for the child alone, so the
-        command acts on the file create() wrote rather than on whatever
-        the caller's KUBECONFIG lists. A literal path rather than a list:
-        it is one file, from _local_kubeconfig_path().
+        --kubeconfig is what makes the command act on the file create()
+        wrote rather than on whatever the caller's KUBECONFIG lists: when
+        the flag is given kubectl loads that one file and ignores
+        KUBECONFIG entirely, so the inherited environment is passed on
+        untouched. The flag rather than setting KUBECONFIG for the child,
+        because KUBECONFIG is an os.pathsep-separated list, and a home
+        directory containing ':' would be split into paths which are not
+        this file. As one element of an argument list the path is literal.
+        It is also the spelling the KubeconfigError remediation prints.
 
         capture_output is what stops kubectl's 'deleted context ...' lines
         going to the process's file descriptor 1, which the reporter does not
@@ -3733,8 +3740,8 @@ class Cluster:
         the kubeconfig read; its stderr is still logged.
         """
         try:
-            result = subprocess.run(argv, capture_output=True,
-                                    env={**os.environ, 'KUBECONFIG': main_config_path})
+            result = subprocess.run(['kubectl', '--kubeconfig', main_config_path] + list(args),
+                                    capture_output=True)
         except FileNotFoundError:
             raise exceptions.KubeconfigError.missing_kubectl_on_delete(main_config_path, fqcn)
         if result.returncode == 0:
@@ -3776,7 +3783,7 @@ class Cluster:
         # values as they are -- for every cluster in the file, not only
         # this one. The output is therefore secret: it is parsed for names
         # and never logged.
-        view = self._run_local_kubectl(['kubectl', 'config', 'view', '-o', 'json'],
+        view = self._run_local_kubectl(['config', 'view', '-o', 'json'],
                                        main_config_path, fqcn, log_stdout=False)
         if view.returncode != 0:
             # Decoded at the raise, matching merge_failed() on the create side.
@@ -3809,7 +3816,7 @@ class Cluster:
             # property-path grammar 'kubectl config unset' used cannot
             # express a cluster name containing a dot, or a namespace named
             # like a kubeconfig field, such as 'cluster' or 'user'.
-            deleted = self._run_local_kubectl(['kubectl', 'config', command, fqcn],
+            deleted = self._run_local_kubectl(['config', command, fqcn],
                                               main_config_path, fqcn)
             if deleted.returncode != 0:
                 # The other half of capturing the output: kubectl's

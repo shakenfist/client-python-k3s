@@ -376,17 +376,17 @@ class CommandWiringTestCase(testtools.TestCase):
 
     def test_delete_updates_the_local_kubeconfig(self):
         # A file to clean, or the cleanup runs no kubectl at all.
-        fakes.home_with_kubeconfig(self)
+        path = fakes.home_with_kubeconfig(self)
         result = self.runner.invoke(
             shakenfist_client_k3s.k3s, ['delete', 'banana'],
             obj={'VERBOSE': False, 'CLIENT': self.client})
 
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual(
-            [fakes.KUBECTL_CONFIG_VIEW_JSON,
-             ['kubectl', 'config', 'delete-context', 'banana.testns'],
-             ['kubectl', 'config', 'delete-user', 'banana.testns'],
-             ['kubectl', 'config', 'delete-cluster', 'banana.testns']],
+            [fakes.cleanup_kubectl(path, fakes.KUBECTL_CONFIG_VIEW_JSON),
+             fakes.cleanup_kubectl(path, ['config', 'delete-context', 'banana.testns']),
+             fakes.cleanup_kubectl(path, ['config', 'delete-user', 'banana.testns']),
+             fakes.cleanup_kubectl(path, ['config', 'delete-cluster', 'banana.testns'])],
             [call[0][0] for call in self.subprocess_run.call_args_list])
 
     def test_delete_with_no_kubeconfig_leaves_it_alone(self):

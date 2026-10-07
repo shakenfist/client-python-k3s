@@ -562,10 +562,11 @@ class CreateTestCase(ModuleTestCase):
         self.assertTrue(run.result['health']['healthy'])
 
     def test_initial_workers_is_the_worker_count_create_is_given(self):
-        """The module's one involvement with worker counts.
+        """The module's one use of a worker count.
 
         initial_workers becomes create()'s worker_count on the path which
-        creates a cluster and is read nowhere else. The default is 0 rather
+        creates a cluster; otherwise it is read only by the floor check
+        made before a client is built. The default is 0 rather
         than the command line's 2, because a play which hands the cluster
         straight to a scaler wants control plane nodes and nothing else.
         """

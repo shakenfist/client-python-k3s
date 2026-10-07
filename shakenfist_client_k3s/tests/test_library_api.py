@@ -243,7 +243,7 @@ class ClusterLifecycleTestCase(LibraryTestCase):
         self.kubectl.names = ['foo; touch /tmp/pwned.testns']
         # update_kubeconfig and a file to clean, or the cleanup under test
         # does not run at all.
-        self._write_existing_kubeconfig()
+        path = self._write_existing_kubeconfig()
         c.delete(update_kubeconfig=True)
 
         self.assertEqual(4, len(self.subprocess_run.call_args_list))
@@ -251,7 +251,7 @@ class ClusterLifecycleTestCase(LibraryTestCase):
             self.assertIsInstance(call[0][0], list)
             self.assertNotIn('shell', call[1])
         self.assertEqual(
-            ['kubectl', 'config', 'delete-cluster', 'foo; touch /tmp/pwned.testns'],
+            fakes.cleanup_kubectl(path, ['config', 'delete-cluster', 'foo; touch /tmp/pwned.testns']),
             self.subprocess_run.call_args_list[-1][0][0])
 
     def test_delete_raises_when_a_kubectl_delete_fails(self):
@@ -997,13 +997,15 @@ def _is_kubectl_delete(command):
     """Is this subprocess.run() first argument a 'kubectl config delete-*'?
 
     The argument is a list rather than a shell string, so a prefix match on
-    a string does not work here. Matching on the list's leading elements
-    keeps this working whichever way a future change spells the call.
+    a string does not work here. Matching on the list's leading elements,
+    after any --kubeconfig, keeps this working whichever way a future
+    change spells the call.
     """
     if isinstance(command, str):
         return command.startswith('kubectl config delete-')
-    return (list(command[:2]) == ['kubectl', 'config']
-            and len(command) > 2 and command[2].startswith('delete-'))
+    subcommand = fakes.kubectl_subcommand(command)
+    return (list(command[:1]) == ['kubectl'] and subcommand[:1] == ['config']
+            and len(subcommand) > 1 and subcommand[1].startswith('delete-'))
 
 
 def _is_kubectl_config_view(command):
@@ -1016,7 +1018,8 @@ def _is_kubectl_config_view(command):
     """
     if isinstance(command, str):
         return command.startswith('kubectl config view')
-    return list(command[:3]) == ['kubectl', 'config', 'view']
+    return (list(command[:1]) == ['kubectl']
+            and fakes.kubectl_subcommand(command)[:2] == ['config', 'view'])
 
 
 def _is_kubectl(command):
@@ -1158,14 +1161,14 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
     def test_delete_removes_all_three_entries_when_asked(self):
         c = self._cluster()
         c.create(1, 1, 1)
-        self._write_existing_kubeconfig()
+        path = self._write_existing_kubeconfig()
         c.delete(update_kubeconfig=True)
 
         self.assertEqual(
-            [fakes.KUBECTL_CONFIG_VIEW_JSON,
-             ['kubectl', 'config', 'delete-context', 'banana.testns'],
-             ['kubectl', 'config', 'delete-user', 'banana.testns'],
-             ['kubectl', 'config', 'delete-cluster', 'banana.testns']],
+            [fakes.cleanup_kubectl(path, fakes.KUBECTL_CONFIG_VIEW_JSON),
+             fakes.cleanup_kubectl(path, ['config', 'delete-context', 'banana.testns']),
+             fakes.cleanup_kubectl(path, ['config', 'delete-user', 'banana.testns']),
+             fakes.cleanup_kubectl(path, ['config', 'delete-cluster', 'banana.testns'])],
             [call.args[0] for call in self._kubectl_calls(_is_kubectl)])
 
         # Nothing else shelled out, since this create declined the write.
@@ -1176,6 +1179,10 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         # cleanup has to act on that file too. Left to the caller's
         # KUBECONFIG, it would read and edit some other file -- and find
         # nothing, or remove a same-named entry that create() never wrote.
+        #
+        # With --kubeconfig given, kubectl loads that one file and ignores
+        # KUBECONFIG, so the flag is the whole of the redirect: the
+        # environment is inherited as it is, and KUBECONFIG is not set.
         c = self._cluster()
         with mock.patch.dict('os.environ', {'KUBECONFIG': '/elsewhere/config'}):
             c.create(1, 1, 1, write_kubeconfig=True)
@@ -1184,8 +1191,28 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         calls = self._kubectl_calls(_is_kubectl)
         self.assertEqual(4, len(calls))
         for call in calls:
-            self.assertEqual(self._kubeconfig_path(),
-                             call.kwargs['env']['KUBECONFIG'], call)
+            self.assertEqual(['kubectl', '--kubeconfig', self._kubeconfig_path()],
+                             call.args[0][:3], call)
+            self.assertNotIn('env', call.kwargs, call)
+
+    def test_a_home_directory_containing_a_colon_is_one_path(self):
+        # KUBECONFIG is an os.pathsep-separated list, so setting it to this
+        # path would hand kubectl two paths, neither of which is the file.
+        # As one element of the argument list it is taken literally.
+        # Inside the temporary home, so it is still cleaned up.
+        self.home = os.path.join(self.home, 'ho:me')
+        os.makedirs(self.home)
+        with mock.patch.dict('os.environ', {'HOME': self.home}):
+            path = self._write_existing_kubeconfig()
+            c = self._cluster()
+            c.create(1, 1, 1)
+            c.delete(update_kubeconfig=True)
+
+        self.assertIn(':', path)
+        calls = self._kubectl_calls(_is_kubectl)
+        self.assertEqual(4, len(calls))
+        for call in calls:
+            self.assertEqual(['kubectl', '--kubeconfig', path], call.args[0][:3], call)
 
     def test_no_kubeconfig_file_means_nothing_to_clean(self):
         # A cluster created without write_kubeconfig on a machine with no
@@ -1303,16 +1330,19 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
                 reporter=self.reporter).delete(update_kubeconfig=True)
 
     def _deletes(self):
-        return [call.args[0] for call in self._kubectl_calls(_is_kubectl_delete)]
+        # Without the leading 'kubectl --kubeconfig FILE': these tests are
+        # about the names, and the file is OptionalKubeconfigTestCase's.
+        return [fakes.kubectl_subcommand(call.args[0])
+                for call in self._kubectl_calls(_is_kubectl_delete)]
 
     def test_a_namespace_named_like_a_kubeconfig_field(self):
         self.kubectl.names = ['banana.cluster']
         self._delete('banana', 'cluster')
 
         self.assertEqual(
-            [['kubectl', 'config', 'delete-context', 'banana.cluster'],
-             ['kubectl', 'config', 'delete-user', 'banana.cluster'],
-             ['kubectl', 'config', 'delete-cluster', 'banana.cluster']],
+            [['config', 'delete-context', 'banana.cluster'],
+             ['config', 'delete-user', 'banana.cluster'],
+             ['config', 'delete-cluster', 'banana.cluster']],
             self._deletes())
 
     def test_a_dotted_name_from_before_names_were_validated(self):
@@ -1322,9 +1352,9 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
         self._delete('my.cluster', 'testns')
 
         self.assertEqual(
-            [['kubectl', 'config', 'delete-context', 'my.cluster.testns'],
-             ['kubectl', 'config', 'delete-user', 'my.cluster.testns'],
-             ['kubectl', 'config', 'delete-cluster', 'my.cluster.testns']],
+            [['config', 'delete-context', 'my.cluster.testns'],
+             ['config', 'delete-user', 'my.cluster.testns'],
+             ['config', 'delete-cluster', 'my.cluster.testns']],
             self._deletes())
 
     def test_entries_already_gone_are_not_deleted_again(self):
@@ -1337,7 +1367,8 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
 
         self.assertEqual([], self._deletes())
         self.assertEqual([fakes.KUBECTL_CONFIG_VIEW_JSON],
-                         [call.args[0] for call in self._kubectl_calls(_is_kubectl)])
+                         [fakes.kubectl_subcommand(call.args[0])
+                          for call in self._kubectl_calls(_is_kubectl)])
 
     def test_an_empty_kubeconfig_needs_no_deletes(self):
         # kubectl reports an empty section as null rather than [].
@@ -1357,7 +1388,7 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
         self._delete('banana', 'testns')
 
         self.assertEqual(
-            [['kubectl', 'config', 'delete-cluster', 'banana.testns']],
+            [['config', 'delete-cluster', 'banana.testns']],
             self._deletes())
 
     def test_the_kubeconfig_read_is_never_logged(self):

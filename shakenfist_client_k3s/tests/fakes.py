@@ -62,8 +62,27 @@ users:
 """
 
 
-# What Cluster.delete() runs to learn which kubeconfig entries are present.
-KUBECTL_CONFIG_VIEW_JSON = ['kubectl', 'config', 'view', '-o', 'json']
+# What Cluster.delete() runs to learn which kubeconfig entries are present,
+# after the 'kubectl --kubeconfig FILE' which starts every cleanup call.
+KUBECTL_CONFIG_VIEW_JSON = ['config', 'view', '-o', 'json']
+
+
+def cleanup_kubectl(main_config_path, args):
+    """The argument list delete()'s cleanup runs for args, against main_config_path."""
+    return ['kubectl', '--kubeconfig', main_config_path] + list(args)
+
+
+def kubectl_subcommand(argv):
+    """argv without 'kubectl' and a leading '--kubeconfig FILE': what the call does, not to which file.
+
+    For matchers and for tests whose subject is the names a call carries.
+    Which file a cleanup call acts on is pinned separately, by
+    OptionalKubeconfigTestCase in test_library_api.
+    """
+    argv = list(argv[1:])
+    if argv[:1] == ['--kubeconfig']:
+        argv = argv[2:]
+    return argv
 
 
 def home_with_kubeconfig(testcase):
@@ -123,7 +142,7 @@ class FakeKubectl:
         }).encode('utf-8')
 
     def __call__(self, args, **kwargs):
-        if list(args) != KUBECTL_CONFIG_VIEW_JSON:
+        if list(args[:1]) != ['kubectl'] or kubectl_subcommand(args) != KUBECTL_CONFIG_VIEW_JSON:
             return mock.DEFAULT
         stdout = self.view_stdout
         if stdout is None:

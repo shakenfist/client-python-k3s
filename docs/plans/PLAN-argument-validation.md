@@ -224,6 +224,11 @@ proceeds on them unless the operator says otherwise.
    permissions, and writing it atomically, which is more code to own
    for a smaller gain. Recommendation: use `delete-user` if its floor
    is v1.24 or older, and document the floor in `docs/usage.md`.
+   Resolved: the floor is v1.20, not v1.24. The Kubernetes
+   CHANGELOG-1.20.md lists "Added get-users and delete-user to the
+   kubectl config subcommand (#89840)", so `get-users`, which
+   `tools/ci_deploy_test.sh` uses, arrived in the same change.
+   `docs/usage.md` documents the floor with that citation.
 3. **Exit code 2 to exit code 1 for out-of-range sizes on the CLI.**
    Decision 5 accepts this to get a single home for each floor. The
    alternative is to keep `IntRange` as a duplicate early check, which

@@ -334,10 +334,14 @@ that step is skipped and a local `kubectl` is not needed.
 The cleanup acts on `~/.kube/config` whatever `KUBECONFIG` says,
 because that is the file `create` writes. If the file does not exist
 there is nothing to remove, and `kubectl` is not run. Otherwise it
-reads the entries present with `kubectl config view` and then runs
+names the file with `kubectl --kubeconfig`, reads the entries present
+with `kubectl config view` and then runs
 `kubectl config delete-context`, `delete-user` and `delete-cluster`
 for each one by name, so it requires `kubectl` v1.20 or later
-(`delete-user` arrived in v1.20.0). Any failure here -- no local
+(`delete-user` arrived in v1.20.0: "Added get-users and delete-user
+to the kubectl config subcommand (#89840)", in the Kubernetes
+[CHANGELOG-1.20.md](https://github.com/kubernetes/kubernetes/blob/master/CHANGELOG/CHANGELOG-1.20.md)).
+Any failure here -- no local
 `kubectl`, or a `kubectl` call that fails -- comes after the cluster
 itself has gone, so running `delete` again only reports that the
 cluster does not exist. The error says which entries may remain and

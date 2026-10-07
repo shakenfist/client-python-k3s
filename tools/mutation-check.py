@@ -477,8 +477,8 @@ MUTATIONS = [
     (
         "delete's kubeconfig cleanup acts on the file create wrote, not on KUBECONFIG",
         PKG + '/cluster.py',
-        "env={**os.environ, 'KUBECONFIG': main_config_path})",
-        'env=dict(os.environ))',
+        "['kubectl', '--kubeconfig', main_config_path] + list(args),",
+        "['kubectl'] + list(args),",
         PKG + '.tests.test_library_api.OptionalKubeconfigTestCase'
         '.test_the_cleanup_acts_on_the_file_create_writes',
         'stestr',

@@ -491,14 +491,16 @@ def _present(module, cluster, reporter, mutation):
     # 6 of the phase 5 plan promised, and it caches its answer -- including
     # a miss -- so the health() calls below cost no second read.
     if cluster.get_metadata() is None:
-        # The second entry of shape below is the whole of this module's
-        # involvement with worker counts: initial_workers becomes the count
-        # create() needs, on the one path which creates a cluster. Do not
+        # The second entry of shape below is, beyond run_module()'s floor
+        # check, the whole of this module's involvement with worker counts:
+        # initial_workers becomes the count create() needs, on the one path
+        # which creates a cluster. Do not
         # grow a branch which compares it against a cluster that already
         # exists -- see the DOCUMENTATION for initial_workers for what that
-        # would race with. It is also deliberately the only occurrence of
-        # that argument's name anywhere under collection/, which the phase 5
-        # plan's done criteria check for exactly this reason.
+        # would race with. The key it goes under, named after create()'s
+        # worker count argument, is deliberately that name's only
+        # occurrence under collection/ -- so this comment does not spell it
+        # -- which the phase 5 plan's done criteria check for this reason.
         shape = {
             'control_plane_count': module.params['control_plane_count'],
             'worker_count': module.params['initial_workers'],
