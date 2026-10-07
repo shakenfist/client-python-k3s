@@ -1208,6 +1208,10 @@ class KubeconfigError(_ReasonedK3sException):
       a machine which created its first cluster, which needs no
       ``kubectl`` because there was nothing to merge into, and used to be
       a ``FileNotFoundError`` traceback.
+    - ``kubectl_unrunnable(main_config_path, entry_name, detail)``: raised
+      by ``Cluster.delete()`` when a local ``kubectl`` is there but
+      starting it fails some other way -- it is not executable, say, which
+      is a ``PermissionError``. ``detail`` is the ``OSError``'s text.
     - ``view_failed(main_config_path, entry_name, returncode, stderr)``:
       raised by ``Cluster.delete()`` when the ``kubectl config view -o
       json`` it reads the present entry names from exits non-zero.
@@ -1221,7 +1225,7 @@ class KubeconfigError(_ReasonedK3sException):
       delete-context``, ``delete-user`` or ``delete-cluster`` calls exits
       non-zero. ``command`` is the subcommand which failed.
 
-    These last four are the cleanup's failures, and all four happen
+    These last five are the cleanup's failures, and all five happen
     after the cluster's metadata has gone, so re-running ``delete``
     raises ``ClusterNotFoundError`` before it reaches the cleanup again.
     Each therefore carries ``main_config_path``, the file the cleanup
@@ -1264,7 +1268,7 @@ class KubeconfigError(_ReasonedK3sException):
     def _cleanup_failure(lines, main_config_path, entry_name, stderr=None):
         """Render a cleanup failure: its own lines, kubectl's stderr, then the way out.
 
-        The way out is the same for all four: the cluster has gone, so
+        The way out is the same for all five: the cluster has gone, so
         the entries have to be removed by hand. The commands name the file
         with --kubeconfig, because that is the file the cleanup acted on
         whatever the caller's KUBECONFIG says.
@@ -1287,6 +1291,15 @@ class KubeconfigError(_ReasonedK3sException):
             main_config_path, entry_name)
         return cls('missing_kubectl_on_delete', message,
                    main_config_path=main_config_path, entry_name=entry_name)
+
+    @classmethod
+    def kubectl_unrunnable(cls, main_config_path, entry_name, detail):
+        message = cls._cleanup_failure(
+            ['Could not run the local kubectl to remove the cluster from\n'
+             '%s: %s' % (main_config_path, detail)],
+            main_config_path, entry_name)
+        return cls('kubectl_unrunnable', message, main_config_path=main_config_path,
+                   entry_name=entry_name, detail=detail)
 
     @classmethod
     def view_failed(cls, main_config_path, entry_name, returncode, stderr=None):

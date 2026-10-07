@@ -402,6 +402,19 @@ class KubeconfigErrorTestCase(testtools.TestCase):
             '/home/u/.kube/config, but none was found.\n' + self.CLEANUP_TAIL,
             str(e))
 
+    def test_kubectl_unrunnable(self):
+        e = exceptions.KubeconfigError.kubectl_unrunnable(
+            '/home/u/.kube/config', 'banana.testns',
+            "[Errno 13] Permission denied: 'kubectl'")
+        self.assertEqual('kubectl_unrunnable', e.reason)
+        self.assertEqual('/home/u/.kube/config', e.main_config_path)
+        self.assertEqual('banana.testns', e.entry_name)
+        self.assertEqual("[Errno 13] Permission denied: 'kubectl'", e.detail)
+        self.assertEqual(
+            'Could not run the local kubectl to remove the cluster from\n'
+            "/home/u/.kube/config: [Errno 13] Permission denied: 'kubectl'\n"
+            + self.CLEANUP_TAIL, str(e))
+
     def test_the_remedy_quotes_a_name_from_before_names_were_validated(self):
         # The commands are there to be pasted into a shell, and a cluster
         # created before create() checked names can contain anything.

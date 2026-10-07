@@ -1469,6 +1469,24 @@ class KubeconfigCleanupTestCase(LibraryTestCase):
         self.assertEqual(self._kubeconfig_path(), e.main_config_path)
         self.assertNotIn(MD_KEY, self.client.metadata)
 
+    def test_a_kubectl_which_cannot_run_is_a_reasoned_error(self):
+        # Present but not executable is a PermissionError rather than a
+        # FileNotFoundError, and is just as much a dead end. It must not
+        # escape as a traceback either, for the same reason: the cluster
+        # has already gone, and the message is the only place the
+        # remaining entries are named.
+        self.subprocess_run.side_effect = PermissionError(13, 'Permission denied', 'kubectl')
+
+        e = self.assertRaises(exceptions.KubeconfigError, self._delete,
+                              'banana', 'testns')
+
+        self.assertEqual('kubectl_unrunnable', e.reason)
+        self.assertEqual('banana.testns', e.entry_name)
+        self.assertEqual(self._kubeconfig_path(), e.main_config_path)
+        self.assertIn('Permission denied', e.detail)
+        self.assertIn('config delete-context banana.testns', str(e))
+        self.assertNotIn(MD_KEY, self.client.metadata)
+
 
 class ManifestStagingTestCase(LibraryTestCase):
     """create(manifests=...) stages files on the node before k3s is installed.

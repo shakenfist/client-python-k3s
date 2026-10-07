@@ -491,6 +491,15 @@ MUTATIONS = [
         PKG + '.tests.test_library_api.KubeconfigCleanupTestCase',
         'stestr',
     ),
+    (
+        "the collection's floor on this package covers what its module calls",
+        'collection/requirements.txt',
+        'shakenfist_client_k3s>=0.3.0\n',
+        'shakenfist_client_k3s>=0.1.0\n',
+        PKG + '.tests.test_collection_floor.CollectionFloorTestCase'
+        '.test_the_floor_covers_every_referenced_symbol',
+        'stestr',
+    ),
 ]
 
 

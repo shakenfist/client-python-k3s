@@ -2393,6 +2393,18 @@ class ReservedClusterNameTestCase(testtools.TestCase):
             # Refused before anything is asked of the API.
             self.assertEqual([], client.mock_calls)
 
+    def test_a_tuple_name_does_not_break_the_reserved_check(self):
+        # A name is formatted into the key as one value. Formatted bare, a
+        # two-element tuple raised TypeError out of the constructor, and a
+        # one-element tuple was unpacked into its element -- so
+        # ('k3s_version_cache',) would have been refused as reserved. The
+        # name rule, which refuses a non-string, is create()'s to apply.
+        for name in (('a', 'b'), ('k3s_version_cache',)):
+            cluster = Cluster(mock.MagicMock(), name, 'testns',
+                              reporter=progress.CollectingReporter())
+            self.assertEqual(cluster_module.METADATA_KEY % (name,),
+                             cluster._metadata_key())
+
     def test_an_ordinary_name_is_not_refused(self):
         for name in ('banana', 'MyCluster'):
             cluster = Cluster(mock.MagicMock(), name, 'testns',

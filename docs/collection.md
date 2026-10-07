@@ -57,7 +57,7 @@ documents -- to reach `Cluster` and `make_client()`, and that import
 has to resolve on whichever machine actually runs the module (the
 control node, when the task uses `delegate_to: localhost` or a local
 connection, as every example on this page does). `collection/requirements.txt`
-names `shakenfist_client_k3s>=0.1.0` for exactly this reason: it is a
+names `shakenfist_client_k3s>=0.3.0` for exactly this reason: it is a
 fact about what the module's Python source imports, not about what
 Ansible needs, so Ansible Galaxy -- which only ever installs
 collections, never their Python dependencies -- cannot install it for

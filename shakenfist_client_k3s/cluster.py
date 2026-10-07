@@ -859,8 +859,9 @@ def validate_node_sizes(sizes):
 
     It checks the values it is given and not the shape they come in: a
     missing role or field is not reported. Its one caller,
-    validate_create_arguments(), always builds the complete mapping, so there is nothing to catch today; a new
-    caller handing it something partial has to check the shape itself.
+    validate_create_arguments(), always builds the complete mapping, so
+    there is nothing to catch today; a new caller handing it something
+    partial has to check the shape itself.
     """
     for role, size in sizes.items():
         for field, value in size.items():
@@ -1259,7 +1260,7 @@ class Cluster:
     def __init__(self, client, name, namespace, reporter=None):
         # Every verb refuses a reserved name, while validate_cluster_name()
         # is the create paths' alone; ClusterNameError has why.
-        md_key = METADATA_KEY % name
+        md_key = METADATA_KEY % (name,)
         if md_key in primitives.RESERVED_METADATA_KEYS:
             raise exceptions.ClusterNameError.reserved(name, md_key)
 
@@ -1283,7 +1284,7 @@ class Cluster:
 
     def _metadata_key(self):
         """Return the namespace metadata key this cluster's state is stored under."""
-        return METADATA_KEY % self.name
+        return METADATA_KEY % (self.name,)
 
     def get_metadata(self):
         """Return this cluster's metadata, fetching it once and then caching it.
@@ -3744,6 +3745,11 @@ class Cluster:
                                     capture_output=True)
         except FileNotFoundError:
             raise exceptions.KubeconfigError.missing_kubectl_on_delete(main_config_path, fqcn)
+        except OSError as e:
+            # A kubectl which is there but cannot be started -- not
+            # executable, or a directory -- is as much a dead end as one
+            # which is missing, and arrives after the cluster has gone.
+            raise exceptions.KubeconfigError.kubectl_unrunnable(main_config_path, fqcn, str(e))
         if result.returncode == 0:
             outputs = [result.stderr]
             if log_stdout:
