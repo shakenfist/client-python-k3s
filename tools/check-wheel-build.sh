@@ -105,8 +105,13 @@ echo "check-wheel-build: $(basename "${sdist}") OK (no build artefacts)"
 # If this trips, read the listing it prints before changing the numbers.
 # The question is always whether the biggest new entries belong in a
 # source distribution, not whether the number is too small.
+#
+# Raised from 2200000 bytes by cumulative health signals phase 2, at 140
+# entries and 2355987 bytes: the growth was test_cluster.py, cluster.py
+# and the phase plans, all of which are source, spread across the phases
+# since the bound was set rather than arriving as a jump.
 MAX_SDIST_ENTRIES=160
-MAX_SDIST_BYTES=2200000
+MAX_SDIST_BYTES=2800000
 
 sdist_entries=$(tar tzf "${sdist}" | wc -l)
 sdist_bytes=$(tar tzvf "${sdist}" | awk '{s+=$3} END {print s+0}')
