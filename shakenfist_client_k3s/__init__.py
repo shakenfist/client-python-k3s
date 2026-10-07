@@ -1,4 +1,5 @@
 import click
+from datetime import datetime, timezone
 from shakenfist_client import apiclient
 import sys
 
@@ -401,6 +402,7 @@ def _render_health(out, report):
         if not node['exists']:
             out.write('    [%s] %s (%s): this instance no longer exists\n'
                       % (marker, node['uuid'], role))
+            _render_signals(out, node)
             continue
         # 'or' on the name for the same reason as on the agent state:
         # _node_health() reads every field with .get() so that a health
@@ -409,6 +411,7 @@ def _render_health(out, report):
         out.write('    [%s] %s (%s, %s): instance %s, agent %s\n' % (
             marker, node['name'] or '(unnamed)', node['uuid'], role,
             node['state'], node['agent_state'] or 'not yet contactable'))
+        _render_signals(out, node)
 
     api = report['api']
     if api['answered']:
@@ -424,6 +427,119 @@ def _render_health(out, report):
             if line:
                 out.write('    %s\n' % line)
     out.flush()
+
+
+def _render_signals(out, node):
+    """Write the one-line summary of a node's signals, if it has any.
+
+    The line is indented further than the node line it belongs to, so that
+    it reads as a property of that node and not as another node, and it is
+    only ever a statement of what was read. Nothing is judged here: there
+    are no markers and no thresholds, because whether 3 restarts or 200 MiB
+    available is a problem depends on what the cluster is for, and the
+    caller who knows that diffs the raw readings against a baseline (see
+    docs/library-api.md). A reading which could not be taken is written as
+    'unknown' rather than dropped, so the line keeps its shape and a
+    missing reading is visibly missing, and the literal string None never
+    appears.
+
+    A report without 'signals' at all (from an older library, or a
+    hand-built dict) is skipped rather than reported as an error, as
+    nothing was probed and nothing is being claimed.
+
+    The same reports are why every reading is checked for being the type
+    health() documents before it is shown, and one which is not is
+    'unknown' exactly as None is. The counts, the sizes and the boot time
+    must be an int -- and not a bool, which Python counts as one, but which
+    a report saying ``True`` OOM kills is not a count of -- and the unit and
+    its state must be a string. Without that a boot time or size which
+    went through JSON as a float, or was written as a string by a caller
+    building the dict, raises TypeError from the arithmetic or from
+    datetime and loses the whole report, or renders as a fractional MiB,
+    and ``'3'`` restarts or ``True`` OOM kills render as if they were
+    readings; a value the renderer cannot vouch for is not shown as one.
+    """
+    signals = node.get('signals')
+    if signals is None:
+        return
+
+    if not signals.get('probed'):
+        out.write('        signals: not read (%s)\n'
+                  % (signals.get('error') or 'unknown'))
+        return
+
+    def is_count(reading):
+        return isinstance(reading, int) and not isinstance(reading, bool)
+
+    def text(reading):
+        return reading if isinstance(reading, str) else 'unknown'
+
+    def count(reading):
+        return str(reading) if is_count(reading) else 'unknown'
+
+    def counted(reading, noun):
+        # Singular for exactly one, and plural for everything else: zero,
+        # other counts, and 'unknown', which reads as "an unknown number
+        # of restarts". is_count() first, so that True is not one.
+        singular = is_count(reading) and reading == 1
+        return '%s %s%s' % (count(reading), noun, '' if singular else 's')
+
+    def mib(reading):
+        return str(reading // 1048576) if is_count(reading) else 'unknown'
+
+    # The type checks mean only an int ever reaches the division, str() or
+    # datetime, whoever built the report. Nothing the parser produces comes
+    # near what str() refuses -- more than 4300 digits, on Python 3.11 and
+    # later -- because it caps every reading at twenty digits, 2**64 - 1,
+    # and the memory sizes it scales by 1024 gain four more at most. The
+    # int checks, and mib() dividing before it calls str(), exist for the
+    # hand-built report, which can hold anything: a float or a string is
+    # 'unknown' rather than a TypeError or a fractional MiB, and a size is
+    # shortened before it is turned into text rather than after. An int
+    # thousands of digits long is not something health() can return, and
+    # is not defended against beyond that.
+    #
+    # A timestamp is different, because twenty digits is far more than
+    # datetime takes: a btime past the year 9999, or past what the
+    # platform's time_t holds, raises OverflowError, OSError or ValueError
+    # depending on where it overflows. That is a reading which cannot be
+    # shown rather than a reason to lose the whole report, and the parser's
+    # rule is that nothing about a node's output can raise, so the
+    # renderer's has to be too: such a btime is 'unknown', as one which
+    # could not be read is.
+    booted_at = signals.get('booted_at')
+    booted = 'unknown'
+    if is_count(booted_at):
+        try:
+            # Explicitly UTC: the operator and the node are rarely in the
+            # same timezone and a bare local time would be wrong for one of
+            # them.
+            booted = datetime.fromtimestamp(booted_at, timezone.utc).strftime(
+                '%Y-%m-%dT%H:%M:%SZ')
+        except (OverflowError, OSError, ValueError):
+            booted = 'unknown'
+
+    readings = [
+        'booted %s' % booted,
+        '%s %s, %s' % (
+            text(signals.get('k3s_unit')), text(signals.get('k3s_state')),
+            counted(signals.get('k3s_restarts'), 'restart')),
+        counted(signals.get('oom_kills'), 'OOM kill'),
+        '%s of %s MiB available' % (
+            mib(signals.get('memory_available_bytes')),
+            mib(signals.get('memory_total_bytes')))]
+
+    # etcd only exists on the control plane, so a worker's line is shorter
+    # by design rather than by a failed reading.
+    if node.get('role') == 'control_plane':
+        readings.append('etcd %s MiB, snapshots %s MiB' % (
+            mib(signals.get('etcd_bytes')),
+            mib(signals.get('etcd_snapshot_bytes'))))
+
+    line = ', '.join(readings)
+    if signals.get('error'):
+        line += ' (%s)' % signals['error']
+    out.write('        %s\n' % line)
 
 
 @k3s.command(name='delete', help='Destroy a k3s cluster')

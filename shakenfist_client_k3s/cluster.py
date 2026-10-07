@@ -117,13 +117,27 @@ AGENT_OP_FINISHED_STATES = ('complete', 'deleted')
 AGENT_OP_KNOWN_STATES = (AGENT_OP_PENDING_STATES + AGENT_OP_FAILED_STATES
                          + AGENT_OP_FINISHED_STATES)
 
-# How long health()'s read only probe waits for its one command before it
-# reports a timeout as a finding. The server's own deadline would bound it
-# eventually, but ten minutes of silence is not a health check: a
-# 'kubectl get nodes' on a cluster which is answering returns in well
-# under a second, so a cluster which has not answered in thirty is the
-# answer rather than a slow one.
+# How long health()'s read only probes wait for their commands before each
+# one still running is reported as a timeout. It is one budget for the
+# whole call rather than one per probe: health() submits every probe before
+# waiting for any and measures them all against a single deadline, so the
+# waiting on a cluster of any size fits within it. It bounds the waiting
+# only: the API round trips around it -- one per node to read its
+# instance, one per probe to submit it, and the reads of each operation --
+# are serial and not bounded by it, so on a slow Shaken Fist API the call
+# as a whole can take longer. The server's own deadline
+# would bound the wait eventually, but ten minutes of silence is not a
+# health check: a 'kubectl get nodes' on a cluster which is answering
+# returns in well under a second, and the node signals command reads a few
+# files and sizes two directories, so a node which has not answered in
+# thirty is the answer rather than a slow one.
 HEALTH_PROBE_TIMEOUT_SECONDS = 30
+
+# The command health() runs on the first control plane node to ask whether
+# the k3s API answers. --kubeconfig explicitly, matching remove_worker():
+# bare kubectl works on these nodes today, and being consistent about saying
+# so keeps the next reader from wondering which spelling matters.
+K3S_API_PROBE_COMMAND = 'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'
 
 # The timeout passed to 'kubectl drain'. Without it a drain which cannot
 # evict a pod blocks until the agent operation's own deadline expires,
@@ -291,6 +305,95 @@ K3S_AGENT_OWNED_KEYS = frozenset([
 # check_k3s_release() parses from the release string.
 K3S_RELEASE_FLOOR = (1, 21, 1)
 
+# The systemd unit k3s runs as on each kind of node, keyed by the role
+# strings health() and _node_health() use. The names are not ours to
+# choose: install_control_plane() and install_k3s_component() run the
+# installer as 'sh -s - <role>', and get.k3s.io names the unit 'k3s' for
+# 'server' and 'k3s-<role>' for anything else, so a worker's is
+# 'k3s-agent'. Asking a worker about 'k3s' is not an error -- systemctl
+# reports a unit which does not exist as LoadState=not-found and
+# NRestarts=0, which reads as "never restarted" -- and that is why the
+# unit is chosen by role rather than assumed (survey finding 2 of
+# docs/plans/PLAN-cumulative-health-signals-phase-01-agent-signals.md).
+K3S_UNIT_BY_ROLE = {
+    'control_plane': 'k3s',
+    'worker': 'k3s-agent',
+}
+
+# Where a server keeps its embedded etcd member. Every cluster this plugin
+# builds runs embedded etcd, because install_control_plane() sets
+# cluster-init on the first server, and the path is fixed because
+# data-dir is in K3S_SERVER_OWNED_KEYS: k3s's server data directory is
+# /var/lib/rancher/k3s/server, and the member lives in db/etcd under it.
+K3S_ETCD_DIR = '/var/lib/rancher/k3s/server/db/etcd'
+
+# Where k3s writes etcd snapshots when nobody says otherwise: its
+# etcd-snapshot-dir defaults to db/snapshots under the same server data
+# directory. Unlike data-dir, etcd-snapshot-dir is not an owned key, so a
+# caller's server_config can move the snapshots, which is why
+# node_signals_command() takes the directory as an argument and only falls
+# back to this one.
+K3S_ETCD_SNAPSHOT_DIR = '/var/lib/rancher/k3s/server/db/snapshots'
+
+# The readings parse_node_signals() returns: the keys of the ``signals``
+# dict health() reports on each node, less ``probed`` and ``error`` (decision
+# 1 of the cumulative health signals phase 1 plan). Named here so that the
+# report for a node which was never probed can be built with exactly the
+# keys of one which was, which is the rule the ``api`` report already
+# follows: a caller must not have to work out what happened from which
+# keys exist.
+NODE_SIGNAL_KEYS = (
+    'boot_id',
+    'booted_at',
+    'k3s_unit',
+    'k3s_state',
+    'k3s_restarts',
+    'oom_kills',
+    'memory_total_bytes',
+    'memory_available_bytes',
+    'etcd_bytes',
+    'etcd_snapshot_bytes',
+)
+
+# Matches a reading parse_node_signals() will believe is a count or a
+# size. Narrower than what int() accepts on purpose: int() also takes a
+# sign, '_' digit separators and non-ASCII digits, none of which the
+# command prints, so a value carrying one is not a reading and is reported
+# as None rather than coerced into one.
+#
+# It is also capped at twenty digits, which is as long as the largest
+# value any reading can hold: every one of them is a kernel or systemd
+# counter or size of at most 64 bits, and 2**64 - 1 has twenty digits.
+# Uncapped, a garbage reading could be thousands of digits long, and the
+# report would then break whoever serialises it -- Python 3.11 and later
+# refuse to turn an int of more than 4300 digits into a string, and
+# memory is scaled by 1024 after parsing, so json.dumps() of the Ansible
+# module's result would raise on a reading this parser had accepted.
+NODE_SIGNAL_INTEGER_RE = re.compile(r'\A[0-9]{1,20}\Z')
+
+# Match the two readings parse_node_signals() keeps as strings. Without
+# them a string reading is whatever the node printed, and each has a
+# consequence beyond looking odd. boot_id is the reading a caller compares
+# with its baseline to decide whether the node rebooted, so a garbage one --
+# a truncated read, a stray line -- reads as a reboot and voids every
+# counter's baseline; and an unbounded string in either flows on into the
+# Ansible module's result and every log which records it.
+#
+# The kernel prints boot_id as an 8-4-4-4-12 hexadecimal UUID in lowercase.
+# The pattern accepts either case and the parser lowercases what it accepts,
+# so that one boot is always one string to a caller comparing them, however
+# a future kernel or a shim in front of /proc chooses to print it.
+# k3s_state is a systemd ActiveState -- active, inactive, activating,
+# deactivating, failed, reloading, maintenance, refreshing -- all lowercase
+# words joined by hyphens. The pattern admits a state systemd adds later
+# rather than naming today's, and its length cap is well above the longest
+# of them. Anything else is not a reading, and is None like one which could
+# not be taken.
+NODE_SIGNAL_BOOT_ID_RE = re.compile(
+    r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z',
+    re.IGNORECASE)
+NODE_SIGNAL_STATE_RE = re.compile(r'\A[a-z-]{1,32}\Z')
+
 # Every command this module builds is a shell command line, run as root on
 # a cluster node by the in-guest agent. Two rules keep that safe, and they
 # are rules rather than case by case judgements because the next reader
@@ -367,6 +470,244 @@ def heredoc(remote_path, body, delimiter='EOF'):
             remote_path, delimiter)
     return ("cat - > %s << '%s'\n%s%s\n"
             % (shlex.quote(remote_path), delimiter, body, delimiter))
+
+
+def k3s_unit_for_role(role):
+    """Return the systemd unit k3s runs as on a node of role.
+
+    role is 'control_plane' or 'worker', the strings _node_health() is
+    given; see K3S_UNIT_BY_ROLE for why the answer differs. Anything else
+    raises ValueError rather than falling back to either unit, because the
+    wrong unit is not an error systemctl reports: it is a unit which is not
+    loaded, which would turn every reading of it into None on a node whose
+    k3s is perfectly well.
+    """
+    try:
+        return K3S_UNIT_BY_ROLE[role]
+    except (KeyError, TypeError):
+        raise ValueError(
+            'role must be one of %s, not %r'
+            % (', '.join(sorted(K3S_UNIT_BY_ROLE)), role)) from None
+
+
+def _signal_reading(key, reading):
+    """Build the command which prints 'key=<what reading printed>', always.
+
+    The key line is printed whether or not reading succeeds, and a reading
+    which fails prints an empty value, so one unreadable source can neither
+    hide the others nor fail the command line it is part of. That is what
+    lets parse_node_signals() report a reading it could not take as None on
+    its own, and what keeps a missing directory from being reported as the
+    whole probe failing.
+
+    printf rather than echo, because Debian's /bin/sh is dash, whose echo
+    interprets backslash escapes in its arguments; printf only interprets
+    them in its format, which is a literal here. The command substitution
+    strips the reading's trailing newline, which is the one the format puts
+    back. Quoting inside "$( )" starts afresh, so a reading may carry its
+    own single quoted awk program.
+    """
+    return "printf '%s=%%s\\n' \"$(%s)\"" % (key, reading)
+
+
+def _proc_field(path, field):
+    """Build the command which prints the second field of path's line for field.
+
+    /proc/stat, /proc/vmstat and /proc/meminfo are all lines of a name and
+    a number, separated by whitespace. field is matched against the whole
+    first field, so 'MemTotal:' keeps its colon and 'oom_kill' does not
+    also match 'oom_kill_other' should a later kernel add one. exit after
+    the first match so that a name appearing twice still prints one value.
+    The program is POSIX awk, because Debian 12 ships mawk and not gawk.
+    Both arguments are this module's literals, so neither is quoted (rule
+    1 above).
+    """
+    return "awk '$1 == \"%s\" { print $2; exit }' %s" % (field, path)
+
+
+def node_signals_command(role, snapshot_dir=None):
+    """Build the read only command which takes a node's health signals.
+
+    Returns one shell command line, for the in-guest agent to run as root,
+    which prints 'key=value' lines for parse_node_signals() to read:
+    boot_id, booted_at, oom_kills, memory_total_kb and memory_available_kb
+    from /proc; then whatever 'systemctl show' prints for the k3s unit's
+    LoadState, ActiveState and NRestarts; and on a control plane node only,
+    etcd_bytes and etcd_snapshot_bytes, the 'du -sb' sizes of the embedded
+    etcd member and of its snapshot directory. Each reading is independent
+    of the others, and one which cannot be taken prints its key with an
+    empty value (see _signal_reading()).
+
+    The command exits 0 whatever it finds. Every /proc reading and both
+    sizes end in a printf, which succeeds; systemctl is the one command
+    whose own exit status would otherwise reach the caller -- as the last
+    command on a worker -- and it is followed by '|| true' because the only
+    way it fails is a node without a running systemd, where it prints
+    nothing and the unit's readings are None, which says so. A non-zero exit
+    is therefore left meaning what it should: the agent could not run the
+    command at all.
+
+    du's errors are discarded because a snapshot directory which does not
+    exist is an expected state, not a fault -- k3s creates it with the first
+    snapshot -- and decision 6 reports it as None rather than as 0. The
+    other readings' errors are left on stderr: none of them is expected to
+    fail, so one which does is worth finding in the agent operation log.
+    '--' ends du's options, so that a snapshot directory beginning with a
+    hyphen is a path and not a flag.
+
+    snapshot_dir is the cluster's etcd-snapshot-dir, from a caller's
+    server_config, and is caller data, so it is quoted per rule 1 above;
+    it is the only value here which is not one of this module's literals.
+    None or an empty string means K3S_ETCD_SNAPSHOT_DIR, as an empty
+    etcd-snapshot-dir does to k3s. A relative one is not sized, and its
+    reading is printed empty and so parses to None; the comment below says
+    why. It is ignored for a worker, which has no etcd member to size.
+    """
+    unit = k3s_unit_for_role(role)
+    commands = [
+        _signal_reading('boot_id', 'cat /proc/sys/kernel/random/boot_id'),
+        _signal_reading('booted_at', _proc_field('/proc/stat', 'btime')),
+        _signal_reading('oom_kills', _proc_field('/proc/vmstat', 'oom_kill')),
+        _signal_reading('memory_total_kb',
+                        _proc_field('/proc/meminfo', 'MemTotal:')),
+        _signal_reading('memory_available_kb',
+                        _proc_field('/proc/meminfo', 'MemAvailable:')),
+        ('systemctl show %s -p LoadState -p ActiveState -p NRestarts || true'
+         % unit),
+    ]
+
+    if role == 'control_plane':
+        commands.append(_signal_reading(
+            'etcd_bytes',
+            'du -sb -- %s 2>/dev/null | cut -f1' % K3S_ETCD_DIR))
+        # A relative etcd-snapshot-dir is not sized at all. du here would
+        # resolve it against the agent's working directory, and what k3s
+        # resolved it against when it took the snapshots -- its own working
+        # directory as systemd started it, or anything else k3s chooses -- is
+        # not something this can know from here. du would then report None
+        # for a directory which exists, or worse, the size of an unrelated
+        # directory which happens to share the name, and a wrong number is
+        # worse than None: None says the reading could not be taken, and a
+        # number is a claim a caller would diff against its baseline. The
+        # key is still printed, with an empty value, so the output keeps the
+        # shape _signal_reading() promises and the parser reports None.
+        # startswith('/') rather than os.path.isabs(), because the path is
+        # the node's, which is POSIX whatever runs this. The printf is a
+        # literal, and its format carries the newline, as every other
+        # reading's does.
+        if snapshot_dir and not snapshot_dir.startswith('/'):
+            commands.append("printf 'etcd_snapshot_bytes=\\n'")
+        else:
+            commands.append(_signal_reading(
+                'etcd_snapshot_bytes',
+                'du -sb -- %s 2>/dev/null | cut -f1'
+                % shlex.quote(snapshot_dir or K3S_ETCD_SNAPSHOT_DIR)))
+
+    return '; '.join(commands)
+
+
+def _signal_integer(raw, key, scale=1):
+    """Return raw[key] as an int times scale, or None if it is not a count.
+
+    None for a key the output did not carry, for an empty value (a reading
+    which could not be taken), and for anything NODE_SIGNAL_INTEGER_RE does
+    not match. What it does match is at most twenty ASCII digits, which
+    int() always converts, so nothing here can raise.
+    """
+    value = raw.get(key)
+    if value is None or not NODE_SIGNAL_INTEGER_RE.match(value):
+        return None
+    return int(value) * scale
+
+
+def _signal_string(raw, key, pattern):
+    """Return raw[key] if pattern matches it, or None if it is not a reading.
+
+    None for a key the output did not carry, for an empty value, and for
+    anything pattern does not match: NODE_SIGNAL_BOOT_ID_RE or
+    NODE_SIGNAL_STATE_RE, whose comment says why a string reading is held
+    to a shape rather than taken as printed.
+    """
+    value = raw.get(key)
+    if value is None or not pattern.match(value):
+        return None
+    return value
+
+
+def parse_node_signals(stdout, role):
+    """Turn node_signals_command()'s output into health()'s readings.
+
+    Returns a dict with exactly the keys in NODE_SIGNAL_KEYS, whatever
+    stdout holds. A reading the output does not carry, or carries in a
+    form which is not a reading, is None on its own and voids none of the
+    others. None of it is judged: these are facts for a caller who has a
+    baseline to compare them with (decisions 2 and 3 of the cumulative
+    health signals phase 1 plan).
+
+    Lines are split on their first '=', so a value containing one is kept
+    whole -- and, since no reading contains one, is then not a reading,
+    rather than being cut short into one at its second '='. A line without
+    an '=', and a key this does not know, are ignored, which is how a
+    stray line of output is survived rather than reported. Keys and
+    values are stripped, so that a CRLF or trailing space does not make a
+    count unparsable. The first occurrence of a key wins: the command
+    prints every key this reads before the one value which derives from
+    caller data, the snapshot directory's size, so a directory name
+    carrying a newline and a 'key=' line of its own cannot replace a
+    reading which came before it.
+
+    The two string readings are held to a shape as the counts are: boot_id
+    must be a UUID, which is lowercased, and k3s_state a systemd
+    ActiveState's lowercase-and-hyphens form (NODE_SIGNAL_BOOT_ID_RE and
+    NODE_SIGNAL_STATE_RE). Anything else is None.
+
+    The units are made uniform here rather than in the command: memory is
+    converted from /proc/meminfo's kB (which are KiB) to bytes, so every
+    size in the report is in bytes. k3s_state and k3s_restarts are None
+    unless the unit's LoadState is 'loaded', because systemctl reports
+    NRestarts=0 for a unit which does not exist and zero would be a claim.
+    The etcd sizes are None on a worker whatever the output says, because
+    a worker has no etcd member and a number there would be one somebody
+    else's command printed. k3s_unit is always the unit the command asked
+    about, from role, so a reader does not have to know the installer's
+    naming to know what k3s_state describes.
+
+    stdout of None is read as empty. Nothing here raises for any string,
+    which matters because the output comes from a node which is, by the
+    time anybody asks, possibly unwell. role is validated as it is by
+    node_signals_command(), and raises ValueError for the same reasons.
+    """
+    unit = k3s_unit_for_role(role)
+
+    raw = {}
+    for line in (stdout or '').splitlines():
+        key, separator, value = line.partition('=')
+        if not separator:
+            continue
+        raw.setdefault(key.strip(), value.strip())
+
+    signals = dict.fromkeys(NODE_SIGNAL_KEYS)
+    signals['k3s_unit'] = unit
+    boot_id = _signal_string(raw, 'boot_id', NODE_SIGNAL_BOOT_ID_RE)
+    signals['boot_id'] = boot_id.lower() if boot_id else None
+    signals['booted_at'] = _signal_integer(raw, 'booted_at')
+    signals['oom_kills'] = _signal_integer(raw, 'oom_kills')
+    signals['memory_total_bytes'] = _signal_integer(
+        raw, 'memory_total_kb', scale=1024)
+    signals['memory_available_bytes'] = _signal_integer(
+        raw, 'memory_available_kb', scale=1024)
+
+    if raw.get('LoadState') == 'loaded':
+        signals['k3s_state'] = _signal_string(
+            raw, 'ActiveState', NODE_SIGNAL_STATE_RE)
+        signals['k3s_restarts'] = _signal_integer(raw, 'NRestarts')
+
+    if role == 'control_plane':
+        signals['etcd_bytes'] = _signal_integer(raw, 'etcd_bytes')
+        signals['etcd_snapshot_bytes'] = _signal_integer(
+            raw, 'etcd_snapshot_bytes')
+
+    return signals
 
 
 def read_manifests(paths):
@@ -1180,23 +1521,64 @@ class Cluster:
         judgement.
 
         timeout is a budget in seconds measured on the monotonic clock,
-        after which the operation
-        as last seen is returned with whatever state it had. It is None for
-        every caller but health()'s probe: an install which takes eleven
-        minutes is a slow install rather than a failed one, and abandoning
-        it would leave the caller believing a command it can still see
-        running did not happen. Abandoning a read only 'kubectl get nodes'
-        costs nothing, which is why that one caller can. A caller passing a
-        timeout has to be prepared for a pending state in the returned
-        operation; reap_execute() does not pass one, and so its own state
-        check is exhaustive.
+        after which the operation as last seen is returned with whatever
+        state it had. It is None for every caller but health()'s probes: an
+        install which takes eleven minutes is a slow install rather than a
+        failed one, and abandoning it would leave the caller believing a
+        command it can still see running did not happen. Abandoning a read
+        only 'kubectl get nodes' or signals read costs nothing, which is why
+        that one caller can. A caller passing a timeout has to be prepared
+        for a pending state in the returned operation; reap_execute() does
+        not pass one, and so its own state check is exhaustive.
+
+        The loop reads before it sleeps, and that order is what the rest of
+        this rests on:
+
+        - An operation handed in already finished is returned as it is,
+          with no read, since nothing can move it on.
+        - One handed in pending is always read at least once, even when the
+          timeout has already run out, so "as last seen" means as read from
+          the server by this call, never only as handed in. The operation a
+          caller passes is usually the one instance_execute() returned, and
+          this plugin's client is built with ASYNC_CONTINUE, so that is the
+          operation in its submission state -- pending, whatever has
+          happened since. health() collects every probe against one shared
+          deadline, so all but the first may arrive with nothing left of
+          it, and returning the operation as handed in would report a probe
+          which finished long ago as abandoned on the strength of a state
+          it left before anybody looked.
+        - An operation which has finished by the time it is first read
+          costs no sleep at all. health() collects its probes one after
+          another, but every one of them is running on the server while an
+          earlier one is waited for, so a probe collected late has usually
+          finished already; with the sleep first, each cost a second
+          whether or not it had, and a healthy cluster of N nodes took
+          about N seconds rather than about one. Read first, health()'s
+          waiting is about its slowest probe rather than the sum of them;
+          its API round trips, one read per probe among them, come on top.
+        - There is no sleep after the deadline: the read which finds it
+          passed is the last thing this does. A pending operation with a
+          budget of T seconds is read T + 1 times, at 0, 1, ..., T.
+        - An API error from any read propagates. _collect_probe() catches
+          apiclient.APIException around this and reports it, so swallowing
+          one here into a pending state would turn a refusal into an
+          abandonment.
+
+        The callers with no timeout -- reap_execute(), after
+        execute_and_await() has already waited for the instance to be idle
+        -- get the same order, which only ever saves them a second: an
+        operation already finished on its first read is returned without
+        the sleep they used to take before it, and one still pending costs
+        one more read than it used to and no more sleeping.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while aop['state'] in AGENT_OP_PENDING_STATES:
-            if deadline is not None and time.monotonic() >= deadline:
-                return aop
-            time.sleep(1)
             aop = self.client.get_agent_operation(aop['uuid'])
+            if aop['state'] not in AGENT_OP_PENDING_STATES:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            time.sleep(1)
         return aop
 
     def reap_execute(self, aop):
@@ -1261,40 +1643,15 @@ class Cluster:
         for aop in aops:
             self.reap_execute(aop)
 
-    def _probe_k3s_api(self, instance_uuid):
-        """Ask a control plane node whether its k3s API answers, and report the answer.
+    def _new_probe(self, instance_uuid, command):
+        """Build a probe report for a command which has not been run yet.
 
-        This is execute_and_await()'s read only sibling, and exists because
-        that method cannot be used here. It submits every command and only
-        then reaps the results, and its reaping raises: await_idle() raises
-        AgentOperationError for an operation which entered the error state,
-        and reap_execute() raises CommandFailedError for a non-zero return
-        code. A failing kubectl is the finding health() exists to report, so
-        raising on it would defeat the verb. This therefore submits the
-        command itself, waits for that one operation with await_execute(),
-        and reads the return code as data.
-
-        await_idle() is deliberately not called either, for a second reason:
-        it waits for *every* agent operation on the instance to complete,
-        including ones another process queued, and a read only health check
-        must not block on somebody else's k3s install.
-
-        Returns the dict health() reports under ``api``; see health()'s
-        docstring for the keys. Nothing here raises for an unhealthy answer.
-        apiclient.APIException is caught, rather than only its
-        ResourceNotFoundException subclass, because every way the API can
-        refuse to run a command on this node -- the instance is gone, it is
-        in a state which cannot accept agent operations, the cluster is
-        unwell enough to return a 500 -- is a fact about this cluster's
-        health rather than a bug in this code. An authentication or
-        authorisation failure would already have stopped get_metadata()
-        before we got here.
+        The starting point both halves of a probe fill in. ``probed`` starts
+        True and ``answered`` False, so every branch only has to say what
+        went wrong, and the one which reads a zero exit code is the only
+        place ``answered`` becomes True.
         """
-        # --kubeconfig explicitly, matching remove_worker(): bare kubectl
-        # works on these nodes today, and being consistent about saying so
-        # keeps the next reader from wondering which spelling matters.
-        command = 'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'
-        probe = {
+        return {
             'probed': True,
             'answered': False,
             'instance_uuid': instance_uuid,
@@ -1305,20 +1662,113 @@ class Cluster:
             'error': None
         }
 
-        self.reporter.debug('Asking %s whether the k3s API answers' % instance_uuid)
+    def _probe_refused(self, probe, instance_uuid, e):
+        """Record in a probe report that the API would not run its command.
+
+        apiclient.APIException is caught, rather than only its
+        ResourceNotFoundException subclass, because every way the API can
+        refuse to run a command on this node -- the instance is gone, it is
+        in a state which cannot accept agent operations, the cluster is
+        unwell enough to return a 500 -- is a fact about this cluster's
+        health rather than a bug in this code. An authentication or
+        authorisation failure would already have stopped get_metadata()
+        before we got here.
+
+        Both halves of a probe call this: _submit_probe() for a refused
+        submission, and _collect_probe() for an API error while polling the
+        operation, which was caught by the same handler before the two
+        halves were split apart.
+        """
+        # apiclient's exceptions never pass their message to
+        # Exception.__init__(), so str() on one is the empty string and
+        # the only way to the explanation is the attribute.
+        detail = getattr(e, 'message', None) or str(e) or 'no detail given'
+        probe['probed'] = False
+        probe['error'] = ('the command could not be run on instance %s: %s: %s'
+                          % (instance_uuid, e.__class__.__name__, detail))
+        return probe
+
+    def _submit_probe(self, instance_uuid, command):
+        """Submit a probe's command to an instance's agent, without waiting for it.
+
+        The first half of a probe; _collect_probe() is the second. A probe
+        is how health() asks a node something -- whether the k3s API
+        answers, and what the node's signals read -- and the pair is
+        execute_and_await()'s read only sibling, which exists because that
+        method cannot be used here. It submits every command and only then
+        reaps the results, and its reaping raises: await_idle() raises
+        AgentOperationError for an operation which entered the error state,
+        and reap_execute() raises CommandFailedError for a non-zero return
+        code. A failing kubectl is the finding health() exists to report, so
+        raising on it would defeat the verb. A probe therefore submits its
+        command itself, waits for that one operation with await_execute(),
+        and reads the return code as data.
+
+        await_idle() is deliberately not called either, for a second reason:
+        it waits for *every* agent operation on the instance to complete,
+        including ones another process queued, and a read only health check
+        must not block on somebody else's k3s install.
+
+        The two halves are separate methods so that health(), which runs a
+        probe on every node able to answer one, can submit all of them
+        before waiting for any, against one shared deadline, while every
+        probe still goes through the one set of branches which turn an
+        operation into a report.
+
+        Returns a tuple ``(aop, probe)`` with exactly one of the two not
+        None. If the API accepted the command, ``aop`` is the agent
+        operation to pass to _collect_probe() and ``probe`` is None. If the
+        API refused it, ``aop`` is None and ``probe`` is the finished
+        report, with ``probed`` False and ``error`` saying why; there is
+        nothing to collect, and the caller reports it as is. Nothing here
+        raises for a refusal; see _probe_refused().
+        """
+        try:
+            return self.client.instance_execute(instance_uuid, command), None
+        except apiclient.APIException as e:
+            return None, self._probe_refused(
+                self._new_probe(instance_uuid, command), instance_uuid, e)
+
+    def _collect_probe(self, instance_uuid, command, aop, deadline, name=None):
+        """Wait for a submitted probe's command, and turn its ending into a report.
+
+        The second half of a probe; _submit_probe() is the first, and aop
+        is the agent operation it returned. deadline is a time.monotonic()
+        value rather than a budget, so that several probes submitted
+        together can share one: each waits only for what is left of it, and
+        one which is collected after the deadline has passed is read once
+        and does not wait at all. await_execute() reads the operation from
+        the server before it considers sleeping, and does so even with no
+        time left: aop is the operation as submitted, and so pending however
+        long ago the command finished, and judging it on that would report
+        every probe collected after a slow first one as abandoned.
+
+        Collection is one probe after another, but the commands are not:
+        every one was submitted before the first is collected, and runs on
+        its node while an earlier one is waited for. A probe which finished
+        while its turn came round is read once and costs no sleep, so
+        collecting N probes waits about as long as the slowest of them, not
+        the sum, and sleeps no longer than the shared budget in all. The
+        reads themselves are API round trips which that budget does not
+        bound; see health()'s docstring.
+
+        name is how the error messages refer to the command. Left None, they
+        quote the command line, which for 'kubectl get nodes' is the clearest
+        thing they could say. The node signals command is several hundred
+        characters of printf and awk, which tells the reader of an error
+        nothing and would bury the part that does, so health() names that
+        one instead.
+
+        Returns a probe report in the shape health() reports under ``api``;
+        see health()'s docstring for the keys. Nothing here raises for an
+        unhealthy answer.
+        """
+        probe = self._new_probe(instance_uuid, command)
         try:
             aop = self.await_execute(
-                self.client.instance_execute(instance_uuid, command),
-                timeout=HEALTH_PROBE_TIMEOUT_SECONDS)
+                aop, timeout=max(0, deadline - time.monotonic()))
         except apiclient.APIException as e:
-            # apiclient's exceptions never pass their message to
-            # Exception.__init__(), so str() on one is the empty string and
-            # the only way to the explanation is the attribute.
-            detail = getattr(e, 'message', None) or str(e) or 'no detail given'
-            probe['probed'] = False
-            probe['error'] = ('the command could not be run on instance %s: %s: %s'
-                              % (instance_uuid, e.__class__.__name__, detail))
-            return probe
+            return self._probe_refused(probe, instance_uuid, e)
 
         if aop['state'] in AGENT_OP_PENDING_STATES:
             # The wait gave up. This is the state a node whose agent is not
@@ -1332,19 +1782,22 @@ class Cluster:
             # command is still queued against the instance, and this is
             # where an operator or a polling caller finds out which one to
             # look at. See health()'s docstring for what that costs.
+            # The number of seconds named is the budget every probe's
+            # deadline is measured from, rather than whatever was left of it
+            # by the time this probe was collected.
             probe['probed'] = False
             probe['error'] = (
-                "'%s' had not finished after %s seconds (agent operation %s "
+                '%s had not finished after %s seconds (agent operation %s '
                 'is still %s), so the wait was abandoned'
-                % (command, HEALTH_PROBE_TIMEOUT_SECONDS, aop['uuid'],
-                   aop['state']))
+                % (name or "'%s'" % command, HEALTH_PROBE_TIMEOUT_SECONDS,
+                   aop['uuid'], aop['state']))
             return probe
 
         if aop['state'] in AGENT_OP_FAILED_STATES:
             probe['error'] = (
                 'the agent operation for %s entered the %s state'
-                % (progress.describe_agent_op(aop, max_len=None) or command,
-                   aop['state']))
+                % (name or progress.describe_agent_op(aop, max_len=None)
+                   or command, aop['state']))
             return probe
 
         # Anything left is an ending this version does not know about:
@@ -1376,7 +1829,8 @@ class Cluster:
         probe['stderr'] = result.get('stderr')
         probe['answered'] = probe['return_code'] == 0
         if not probe['answered']:
-            probe['error'] = "'%s' exited %s" % (command, probe['return_code'])
+            probe['error'] = ('%s exited %s'
+                              % (name or "'%s'" % command, probe['return_code']))
         return probe
 
     def _unprobed(self, instance_uuid, error):
@@ -1397,6 +1851,58 @@ class Cluster:
             'stderr': None,
             'error': error
         }
+
+    def _cannot_answer(self, subject, node):
+        """Say why a probe was not run on a node which is not able to answer it.
+
+        node is one of health()'s node entries, which is not healthy. The
+        API probe and the signals probe are skipped for the same reason and
+        say so in the same words, built here so that they cannot drift
+        apart: a caller matching on one has matched on both. The fallbacks
+        are for the values the API leaves as None -- an instance which no
+        longer exists has no state, an agent which has never been reached
+        has no agent_state -- so that None never reaches the message as
+        text.
+        """
+        return ('%s is not in a state which can answer: instance %s, agent %s'
+                % (subject, node['state'] or 'gone',
+                   node['agent_state'] or 'not contactable'))
+
+    def _unprobed_signals(self, role, error):
+        """Build a node's ``signals`` report for a signals probe which was not run.
+
+        The same keys as one which was, which is the rule _unprobed()
+        follows for ``api`` and for the same reason: a caller must not have
+        to work out what happened from which keys exist. Every reading is
+        None, because none was taken, except ``k3s_unit``, which is not a
+        reading but the name of the unit one would have been taken from,
+        and is known from the role alone.
+        """
+        signals = {'probed': False, 'error': error}
+        signals.update(dict.fromkeys(NODE_SIGNAL_KEYS))
+        signals['k3s_unit'] = k3s_unit_for_role(role)
+        return signals
+
+    def _signals_from_probe(self, role, probe):
+        """Turn a collected or refused signals probe into a node's ``signals`` report.
+
+        ``probed`` and ``error`` mean what they mean in ``api``, because
+        they come from the same _submit_probe() and _collect_probe(). The
+        readings are parsed from stdout whatever the exit code was: the
+        command is built so that no one unreadable source can fail it, so a
+        non-zero exit says something went wrong around the readings rather
+        than that the ones it printed are false, and each reading it did
+        print is still a reading. A probe with no stdout -- refused,
+        abandoned, failed -- parses to every reading None.
+
+        Nothing else from the probe is kept. The command line, its stdout
+        and its stderr are raw material rather than findings, and what a
+        caller receives -- including the Ansible module's result -- is
+        exactly the keys health()'s docstring lists.
+        """
+        signals = {'probed': probe['probed'], 'error': probe['error']}
+        signals.update(parse_node_signals(probe['stdout'], role))
+        return signals
 
     def _node_health(self, instance_uuid, role):
         """Report the Shaken Fist state of one node, whether or not it still exists.
@@ -2529,22 +3035,44 @@ class Cluster:
         Nothing about an unhealthy cluster raises. An instance in the error
         state, an instance the metadata names which no longer exists, a
         cluster which was interrupted mid-create, a cluster with no control
-        plane node at all, and a kubectl which exits non-zero are all
-        findings in the returned report. The only thing which raises is a
-        cluster this namespace has no metadata for, which is not an
-        unhealthy cluster but a question about a cluster that does not
-        exist.
+        plane node at all, and a kubectl or signals command which exits
+        non-zero are all findings in the returned report. The only thing
+        which raises is a cluster this namespace has no metadata for, which
+        is not an unhealthy cluster but a question about a cluster that does
+        not exist.
 
-        Nor does it hang. The k3s API probe is only attempted when the node
-        it would be run on looks able to answer -- the node entry this
-        method has just built says whether the instance exists, is created
-        and has a ready agent -- and it carries a wall clock timeout even
-        then. An agent operation queued against an instance whose agent is
-        not connected never leaves its queued state, so a probe which is
-        attempted anyway waits forever on exactly the cluster this verb
-        exists to describe. Every one of those outcomes is ``probed``
-        False with an ``error`` saying which, so a caller never has to
-        tell them apart by which keys are present.
+        Nor does it hang. Each probe -- the k3s API probe on the first
+        control plane node, and a signals probe on every node -- is only
+        attempted when the node it would be run on looks able to answer --
+        the node entry this method has just built says whether the instance
+        exists, is created and has a ready agent -- and they share one wall
+        clock timeout even then. An agent operation queued against an
+        instance whose agent is not connected never leaves its queued
+        state, so a probe which is attempted anyway waits forever on exactly
+        the cluster this verb exists to describe. Every probe is submitted
+        before any is waited for, and every one is waited for against a
+        single deadline, HEALTH_PROBE_TIMEOUT_SECONDS from before the first
+        submission, so the waiting is bounded by one budget on a cluster of
+        any size rather than one per node. That bounds the waiting, not the
+        call: on top of it come one API round trip per node to read its
+        instance, one per probe to submit it, and the reads of each
+        operation, all serial, so on a slow Shaken Fist API the wall time
+        can exceed the budget. A skipped probe and an abandoned one are
+        both ``probed`` False with an ``error`` saying which, so a caller
+        never has to tell them apart by which keys are present. A probe
+        collected after that deadline has passed is still read from the
+        server once, without waiting, so one which finished while an earlier
+        probe used up the budget is reported as it finished rather than as
+        abandoned.
+
+        The budget is a ceiling rather than a cost. Probes are collected one
+        after another, but each operation is read before the wait considers
+        sleeping, and every command is running on its node while an earlier
+        one is waited for, so a probe which has finished by its turn costs
+        one read and no sleep. A healthy cluster therefore waits for about
+        the time its slowest probe takes -- typically a second or two
+        whatever its size -- rather than a second per node, plus the API
+        round trips above.
 
         The report is::
 
@@ -2561,7 +3089,21 @@ class Cluster:
                         'exists': bool,         # the instance still exists
                         'state': str or None,   # the instance state
                         'agent_state': str or None,
-                        'healthy': bool         # created, and its agent ready
+                        'healthy': bool,        # created, and its agent ready
+                        'signals': {
+                            'probed': bool,                 # the command ran at all
+                            'error': str or None,           # why not, or why it failed
+                            'boot_id': str or None,         # /proc/sys/kernel/random/boot_id
+                            'booted_at': int or None,       # /proc/stat btime, Unix seconds
+                            'k3s_unit': str,                # 'k3s' or 'k3s-agent', by role
+                            'k3s_state': str or None,       # systemd ActiveState
+                            'k3s_restarts': int or None,    # systemd NRestarts
+                            'oom_kills': int or None,       # /proc/vmstat oom_kill, since boot
+                            'memory_total_bytes': int or None,
+                            'memory_available_bytes': int or None,
+                            'etcd_bytes': int or None,      # control plane only
+                            'etcd_snapshot_bytes': int or None
+                        }
                     },
                     ...
                 ],
@@ -2585,6 +3127,40 @@ class Cluster:
         'not yet contactable' is the caller's business, as it is in
         await_boot().
 
+        ``signals`` is what the node says about itself, read through its
+        agent by the command node_signals_command() builds; that function
+        and parse_node_signals() say where each reading comes from. Every
+        node entry carries it, always with the same keys. A node which was
+        not probed -- its instance is gone, or it is not in a state which
+        can answer -- says why in ``error``, in the words ``api`` uses for
+        a skipped probe. A reading which could not be taken is None on its
+        own and voids none of the others; ``error`` is for the probe as a
+        whole -- not run, abandoned, failed, or exited non-zero.
+        ``k3s_state`` and ``k3s_restarts`` are None when the unit is not
+        loaded, because systemd reports a restart count of zero for a unit
+        which does not exist and zero would be a claim. ``boot_id`` is None
+        unless it is a UUID, and is lowercased, and ``k3s_state`` unless it
+        is lowercase letters and hyphens, so that garbage on a node never
+        reads as a reboot or a state. The etcd sizes are always None on a
+        worker, and memory is converted from /proc/meminfo's kB so that
+        every size here is in bytes.
+
+        The readings are raw and cumulative, and health() stores none of
+        them: a verb whose contract is that it has no side effects beyond
+        its probes does not grow a metadata write to remember the last
+        answer, and "since anyone last asked" means nothing when the
+        command line, a daily poll and an Ansible play all ask. A caller
+        which wants a delta keeps its own previous report as a baseline and
+        reads the counters by one rule: a changed ``boot_id``, or a counter
+        lower than its baseline under an unchanged one, voids the baseline,
+        and the current value is the delta. Every reading but the etcd sizes
+        resets at boot, which ``boot_id`` detects; systemd is understood to
+        clear ``k3s_restarts`` when an operator restarts the unit by hand,
+        which only the lower-than-baseline half catches. ``oom_kills``
+        counts every OOM kill the kernel makes, cgroup kills included, so a
+        pod killed for exceeding its own memory limit increments it just as
+        a node running out of memory does.
+
         The top level ``healthy`` is the conjunction a caller would
         otherwise have to write itself: the cluster finished being built,
         every node in it exists and is up, and the k3s API answered. The
@@ -2597,6 +3173,14 @@ class Cluster:
         unhealthy because there was no k3s API to ask, which is the same
         answer for the more informative reason.
 
+        Nothing in ``signals`` affects ``healthy``, at node or cluster
+        level, and nothing in it is judged against a threshold: a restart
+        count with no baseline, or available memory with no workload to
+        compare it with, cannot be judged here. A signals probe which fails
+        on a node that is otherwise up leaves that node healthy, with the
+        failure in ``signals['error']``, so that a slow ``du`` cannot flip
+        a ``--strict`` run.
+
         Unlike expand_workers(), remove_worker() and expand_addresses() this
         does not call _require_usable(): reporting on a cluster which never
         finished being built is exactly what the verb is for, so an
@@ -2606,16 +3190,21 @@ class Cluster:
         probe rather than an IndexError.
 
         One thing this leaves behind, which matters to a caller polling it in
-        a loop: the probe submits an agent operation, and when it gives up
-        waiting the operation is still queued against the control plane node.
-        Nothing here reaps it, because there is nothing to reap it with -- the
-        command may yet run -- so the server's own deadline ends it, and until
-        then an await_idle() in a later expand-workers or update-os waits for
-        it along with everything else. The uuid of an abandoned operation is in
-        ``api['error']`` so that wait can be accounted for rather than
-        guessed at. This is bounded rather than free: a reconcile loop
-        polling health() against a node whose agent is intermittently slow
-        pays for it in a delayed later verb, not in a hang.
+        a loop: every probe submits an agent operation -- one on each node it
+        probes, and the kubectl one beside it on the first control plane
+        node -- and each one still waiting when the shared deadline passes is
+        abandoned while queued against its node. Nothing here reaps them,
+        because there is nothing to reap them with -- the commands may yet
+        run -- so the server's own deadline ends each one, and until then an
+        await_idle() in a later expand-workers or update-os waits for them
+        along with everything else. That is up to one operation per probed
+        node, plus the kubectl one, rather than one in total. The uuid of
+        each abandoned operation is in its probe's ``error`` --
+        ``api['error']``, or the node's ``signals['error']`` -- so that wait
+        can be accounted for rather than guessed at. This is bounded rather
+        than free: a reconcile loop polling health() against nodes whose
+        agents are intermittently slow pays for it in a delayed later verb,
+        not in a hang.
         """
         md = self.get_metadata()
         if not md:
@@ -2627,14 +3216,40 @@ class Cluster:
             for instance_uuid in md.get(md_key) or []:
                 nodes.append(self._node_health(instance_uuid, role))
 
+        # One deadline for every probe, taken before the first is submitted
+        # so that the budget covers the submissions as well as the waits.
+        # Everything is submitted before anything is waited for, so the
+        # waits overlap rather than queue: the first probe collected waits
+        # for whatever is left of the budget, and each one after it only for
+        # whatever is left after that, which is what bounds this call's
+        # waiting at one budget on a cluster of any size rather than one per
+        # node. Its waiting, not its wall time: the get_instance() calls
+        # above happen before the deadline is taken, and nothing bounds the
+        # submissions below or the reads of each operation, every one a
+        # serial API round trip, so on a slow Shaken Fist API the call takes
+        # longer than the budget. Within that bound it costs about the
+        # slowest probe, not the sum: each wait reads its operation before
+        # it sleeps, so one which finished while an earlier probe was waited
+        # for costs no sleep. Taking it here starts every probe's clock a
+        # little early, by however long the submissions before it take -- a
+        # few API calls -- which decision 8 of the cumulative health signals
+        # phase 1 plan accepts.
+        deadline = time.monotonic() + HEALTH_PROBE_TIMEOUT_SECONDS
+
         # The k3s API is asked through the first control plane node, which an
         # interrupted create may never have made. That is a finding rather
         # than an error, so it is reported the same way a kubectl which
-        # exits non-zero is.
+        # exits non-zero is. It is submitted before any node's signals, so
+        # that on the first control plane node, where both run, the
+        # established finding is not queued behind a du.
         control_plane = md.get('control_plane_nodes') or []
         first = nodes[0] if control_plane else None
+        api_aop = None
         if first and first['exists'] and first['healthy']:
-            api = self._probe_k3s_api(control_plane[0])
+            self.reporter.debug(
+                'Asking %s whether the k3s API answers' % control_plane[0])
+            api_aop, api = self._submit_probe(
+                control_plane[0], K3S_API_PROBE_COMMAND)
         elif not control_plane:
             api = self._unprobed(
                 None,
@@ -2650,10 +3265,54 @@ class Cluster:
             # verb most needs to answer about.
             api = self._unprobed(
                 control_plane[0],
-                'the first control plane node is not in a state which can '
-                'answer: instance %s, agent %s'
-                % (first['state'] or 'gone',
-                   first['agent_state'] or 'not contactable'))
+                self._cannot_answer('the first control plane node', first))
+
+        # The snapshot directory is the one value in the signals command
+        # which is the caller's rather than this module's: etcd-snapshot-dir
+        # is not an owned key, so a server_config can move the snapshots.
+        # Metadata written before server_config was recorded has none. Only
+        # a string is passed on, because node_signals_command() quotes it
+        # and anything else is not a directory k3s could have been given;
+        # and the document is checked for being a dict rather than trusted
+        # to be one, because this is the verb which must describe a cluster
+        # whose metadata it did not write.
+        server_config = md.get('server_config')
+        snapshot_dir = None
+        if isinstance(server_config, dict):
+            snapshot_dir = server_config.get('etcd-snapshot-dir')
+            if not isinstance(snapshot_dir, str):
+                snapshot_dir = None
+
+        # Each node's signals are read under the API probe's rule, for the
+        # API probe's reason: a node is asked only when its entry says it
+        # can answer, and one which cannot says why instead.
+        submitted = []
+        for node in nodes:
+            if not node['exists']:
+                node['signals'] = self._unprobed_signals(
+                    node['role'], 'this instance no longer exists')
+            elif not node['healthy']:
+                node['signals'] = self._unprobed_signals(
+                    node['role'], self._cannot_answer('this node', node))
+            else:
+                command = node_signals_command(
+                    node['role'],
+                    snapshot_dir if node['role'] == 'control_plane' else None)
+                self.reporter.debug('Reading the signals of %s' % node['uuid'])
+                aop, probe = self._submit_probe(node['uuid'], command)
+                submitted.append((node, command, aop, probe))
+
+        # Only now is anything waited for. A probe the API refused at
+        # submission has no operation and its report is already final.
+        if api_aop is not None:
+            api = self._collect_probe(
+                control_plane[0], K3S_API_PROBE_COMMAND, api_aop, deadline)
+        for node, command, aop, probe in submitted:
+            if aop is not None:
+                probe = self._collect_probe(
+                    node['uuid'], command, aop, deadline,
+                    name='the node signals command')
+            node['signals'] = self._signals_from_probe(node['role'], probe)
 
         # _interrupted_state() answers 'unknown' rather than None for
         # metadata carrying no state at all, so interrupted is True for that

@@ -307,8 +307,9 @@ health:
       C(none) when there is no cluster to report on, and also for
       O(state=absent), where the module does not probe a cluster it is about
       to destroy.
-    - Obtaining it submits one read-only agent operation against the first
-      control plane node, to run C(kubectl get nodes) there.
+    - Obtaining it submits read-only agent operations - one against the
+      first control plane node, to run C(kubectl get nodes) there, and one
+      signals command against every healthy node.
     - There is deliberately no return value carrying the cluster's raw
       namespace metadata, because that document holds the cluster's
       kubeconfig, its k3s node token and any SSH key it was built with.
@@ -338,7 +339,13 @@ health:
       description:
         - One entry per node the metadata names, control plane nodes first,
           each giving the instance UUID, the role, the instance and agent
-          states, and whether that node is healthy.
+          states, and whether that node is healthy. Each also has a
+          C(signals) dict of raw, cumulative readings taken from the node
+          (boot, k3s restarts, kernel OOM kills, memory and, on control
+          plane nodes, etcd sizes), which never affect C(healthy). What
+          each reading means, and how to diff it against a baseline, is
+          documented in docs/library-api.md in the
+          shakenfist/client-python-k3s repository.
       type: list
       elements: dict
     api:
@@ -705,8 +712,9 @@ def run_module():
     #
     # K3sClusterException alone is not enough, which the review of #90
     # pointed out and cluster.py confirms: it catches
-    # apiclient.APIException at particular call sites -- _probe_k3s_api(),
-    # remove_worker() and _uncordon() -- precisely because the client
+    # apiclient.APIException at particular call sites -- health()'s probes
+    # (_submit_probe() and _collect_probe()), remove_worker() and
+    # _uncordon() -- precisely because the client
     # raises it unwrapped, so every other call through the client can hand
     # one straight out. Named by method rather than by line number, which
     # is how this comment was written: all three numbers it gave were

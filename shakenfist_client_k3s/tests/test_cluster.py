@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1430,16 +1431,22 @@ class HealthTestCase(testtools.TestCase):
     def test_a_healthy_cluster_reports_every_node(self):
         report = self.cluster.health()
 
+        # signals is mock.ANY here because its content has tests of its own
+        # in HealthSignalsTestCase; this one is about the node keys, and
+        # still pins that there are no others.
         self.assertEqual(
             [{'uuid': 'inst-cp1', 'role': 'control_plane',
               'name': 'k3s-banana-node-001', 'exists': True,
-              'state': 'created', 'agent_state': 'ready', 'healthy': True},
+              'state': 'created', 'agent_state': 'ready', 'healthy': True,
+              'signals': mock.ANY},
              {'uuid': 'inst-w1', 'role': 'worker',
               'name': 'k3s-banana-node-002', 'exists': True,
-              'state': 'created', 'agent_state': 'ready', 'healthy': True},
+              'state': 'created', 'agent_state': 'ready', 'healthy': True,
+              'signals': mock.ANY},
              {'uuid': 'inst-w2', 'role': 'worker',
               'name': 'k3s-banana-node-003', 'exists': True,
-              'state': 'created', 'agent_state': 'ready', 'healthy': True}],
+              'state': 'created', 'agent_state': 'ready', 'healthy': True,
+              'signals': mock.ANY}],
             report['nodes'])
         self.assertEqual('created', report['state'])
         self.assertFalse(report['interrupted'])
@@ -1450,10 +1457,19 @@ class HealthTestCase(testtools.TestCase):
     def test_the_api_is_probed_on_the_first_control_plane_node(self):
         report = self.cluster.health()
 
+        # Every node's signals are read through the agent too, so the
+        # kubectl probe is no longer the only command: it is the first, and
+        # the only kubectl.
+        self.assertEqual(
+            ('inst-cp1',
+             'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'),
+            self.client.executed[0])
         self.assertEqual(
             [('inst-cp1',
               'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml')],
-            self.client.executed)
+            [(instance_uuid, command)
+             for instance_uuid, command in self.client.executed
+             if command.startswith('kubectl')])
         self.assertTrue(report['api']['probed'])
         self.assertTrue(report['api']['answered'])
         self.assertEqual('inst-cp1', report['api']['instance_uuid'])
@@ -1463,8 +1479,8 @@ class HealthTestCase(testtools.TestCase):
 
     def test_nothing_is_repaired(self):
         # health() must not be the verb which quietly fixes things, so the
-        # only thing it is allowed to ask the cluster to do is the read only
-        # probe: no metadata write, no instance created or destroyed, no
+        # only things it is allowed to ask the cluster to do are the read
+        # only probes: no metadata write, no instance created or destroyed, no
         # network touched. The write is asserted as a call rather than as a
         # changed document because set_metadata() stores the very dictionary
         # the cache is already holding, so a write back leaves the stored
@@ -1482,7 +1498,10 @@ class HealthTestCase(testtools.TestCase):
         self.assertEqual([], self.client.unrouted_addresses)
         self.assertEqual(0, self.client.instance_serial)
         self.assertEqual(
-            ['kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'],
+            ['kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml',
+             cluster_module.node_signals_command('control_plane'),
+             cluster_module.node_signals_command('worker'),
+             cluster_module.node_signals_command('worker')],
             [command for _, command in self.client.executed])
 
     def test_an_instance_in_the_error_state_is_reported_rather_than_raised(self):
@@ -1530,7 +1549,14 @@ class HealthTestCase(testtools.TestCase):
         self.assertEqual(
             {'uuid': 'inst-w1', 'role': 'worker', 'name': None,
              'exists': False, 'state': None, 'agent_state': None,
-             'healthy': False},
+             'healthy': False,
+             'signals': {
+                 'probed': False, 'error': 'this instance no longer exists',
+                 'boot_id': None, 'booted_at': None,
+                 'k3s_unit': 'k3s-agent', 'k3s_state': None,
+                 'k3s_restarts': None, 'oom_kills': None,
+                 'memory_total_bytes': None, 'memory_available_bytes': None,
+                 'etcd_bytes': None, 'etcd_snapshot_bytes': None}},
             [n for n in report['nodes'] if n['uuid'] == 'inst-w1'][0])
         self.assertFalse(report['healthy'])
         self.assertEqual(3, len(report['nodes']))
@@ -3129,6 +3155,511 @@ class HeredocDelimiterTestCase(testtools.TestCase):
                           destinations)
 
 
+class NodeSignalsCommandTestCase(testtools.TestCase):
+    """The command health() will run on each node to take its signals.
+
+    Decisions 5 and 6 of the cumulative health signals phase 1 plan: the
+    k3s unit is chosen by role, because a worker's is k3s-agent and asking
+    it about k3s reports a unit which does not exist as never having
+    restarted; and etcd is sized on control plane nodes only, at the
+    caller's etcd-snapshot-dir when there is one. That directory is the
+    one value in the command which is not a literal of cluster.py, so it
+    is the one rule 1 applies to.
+    """
+
+    def test_a_control_plane_node_reads_k3s_and_etcd(self):
+        command = cluster_module.node_signals_command('control_plane')
+
+        self.assertIn('systemctl show k3s -p LoadState -p ActiveState '
+                      '-p NRestarts', command)
+        self.assertNotIn('k3s-agent', command)
+        self.assertIn('etcd_bytes=', command)
+        self.assertIn('etcd_snapshot_bytes=', command)
+        self.assertIn('du -sb -- %s ' % cluster_module.K3S_ETCD_DIR, command)
+        self.assertIn('du -sb -- %s ' % cluster_module.K3S_ETCD_SNAPSHOT_DIR,
+                      command)
+
+    def test_a_worker_reads_k3s_agent_and_no_etcd(self):
+        command = cluster_module.node_signals_command('worker')
+
+        self.assertIn('systemctl show k3s-agent -p LoadState -p ActiveState '
+                      '-p NRestarts', command)
+        self.assertNotIn('systemctl show k3s ', command)
+        self.assertNotIn('etcd', command)
+        self.assertNotIn('du ', command)
+
+    def test_every_role_reads_the_same_proc_signals(self):
+        for role in ('control_plane', 'worker'):
+            command = cluster_module.node_signals_command(role)
+            for key in ('boot_id', 'booted_at', 'oom_kills',
+                        'memory_total_kb', 'memory_available_kb'):
+                self.assertIn("printf '%s=%%s\\n'" % key, command)
+            self.assertIn('/proc/sys/kernel/random/boot_id', command)
+            self.assertIn('"btime"', command)
+            self.assertIn('"oom_kill"', command)
+            self.assertIn('"MemTotal:"', command)
+            self.assertIn('"MemAvailable:"', command)
+
+    def test_the_command_is_one_line(self):
+        # The agent takes one command line. The '\n' in each printf format
+        # is a backslash and an n, for printf to interpret on the node.
+        for role in ('control_plane', 'worker'):
+            self.assertNotIn(
+                '\n', cluster_module.node_signals_command(role, '/x'))
+
+    def test_a_failing_systemctl_does_not_fail_the_command(self):
+        # On a worker the systemctl call is the last command, so its exit
+        # status would be the command line's.
+        for role in ('control_plane', 'worker'):
+            self.assertIn(
+                'NRestarts || true',
+                cluster_module.node_signals_command(role))
+
+    def test_the_snapshot_directory_is_quoted(self):
+        snapshot_dir = '/srv/etcd snaps/$HOME; touch /pwned'
+        command = cluster_module.node_signals_command(
+            'control_plane', snapshot_dir)
+
+        self.assertIn('du -sb -- %s 2>/dev/null' % shlex.quote(snapshot_dir),
+                      command)
+        self.assertNotIn(snapshot_dir,
+                         command.replace(shlex.quote(snapshot_dir), ''))
+        self.assertNotIn(cluster_module.K3S_ETCD_SNAPSHOT_DIR, command)
+
+    def test_an_empty_snapshot_directory_is_the_default(self):
+        # As it is to k3s, which uses its default for an empty
+        # etcd-snapshot-dir.
+        self.assertEqual(
+            cluster_module.node_signals_command('control_plane'),
+            cluster_module.node_signals_command('control_plane', ''))
+
+    def test_a_relative_snapshot_directory_is_not_sized(self):
+        # du would resolve it against the agent's working directory, which
+        # need not be what k3s resolved it against, and a size of the wrong
+        # directory is worse than no size. The key is still printed, empty,
+        # so it parses to None like any reading which could not be taken.
+        for snapshot_dir in ('snapshots', './snapshots', '../var/snaps',
+                             'srv/etcd snaps/$HOME'):
+            command = cluster_module.node_signals_command(
+                'control_plane', snapshot_dir)
+
+            # The command ends with the empty reading, and neither the
+            # caller's directory nor the default one is sized instead: the
+            # one du left is the etcd member's.
+            self.assertTrue(
+                command.endswith("; printf 'etcd_snapshot_bytes=\\n'"),
+                command)
+            self.assertNotIn(snapshot_dir, command)
+            self.assertNotIn(shlex.quote(snapshot_dir), command)
+            self.assertEqual(1, command.count('du -sb'), snapshot_dir)
+            self.assertIn('du -sb -- %s ' % cluster_module.K3S_ETCD_DIR,
+                          command)
+            self.assertNotIn(cluster_module.K3S_ETCD_SNAPSHOT_DIR, command,
+                             snapshot_dir)
+
+    def test_an_absolute_snapshot_directory_is_still_sized(self):
+        # The negative of the above: only the leading slash decides.
+        command = cluster_module.node_signals_command(
+            'control_plane', '/srv/snapshots')
+
+        self.assertEqual(2, command.count('du -sb'))
+        self.assertIn('du -sb -- /srv/snapshots 2>/dev/null', command)
+
+    def test_a_worker_ignores_the_snapshot_directory(self):
+        self.assertEqual(
+            cluster_module.node_signals_command('worker'),
+            cluster_module.node_signals_command('worker', '/srv/snaps'))
+
+    def test_an_unknown_role_is_refused(self):
+        # k3s's own role names are the likeliest mistake, because
+        # install_k3s_component() is handed those.
+        for role in ('server', 'agent', 'controlplane', '', None,
+                     ['worker']):
+            self.assertRaises(ValueError,
+                              cluster_module.node_signals_command, role)
+            self.assertRaises(ValueError,
+                              cluster_module.parse_node_signals, '', role)
+
+
+# Defined beside HealthClient, which answers the signals probe with them, so
+# that what the parser is tested on and what health() is tested with are
+# the same output.
+SERVER_SIGNALS_OUTPUT = fakes.SERVER_SIGNALS_OUTPUT
+WORKER_SIGNALS_OUTPUT = fakes.WORKER_SIGNALS_OUTPUT
+
+
+class ParseNodeSignalsTestCase(testtools.TestCase):
+    """What a node's signals output becomes in health()'s report.
+
+    Decision 1 of the cumulative health signals phase 1 plan: always the
+    same keys, a reading which could not be taken is None on its own, and
+    a zero is only reported where it was measured. The output comes from a
+    node which may be unwell, so nothing a node prints may make this raise.
+    """
+
+    def test_a_realistic_server_output(self):
+        self.assertEqual(
+            {
+                'boot_id': '3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11',
+                'booted_at': 1759712345,
+                'k3s_unit': 'k3s',
+                'k3s_state': 'active',
+                'k3s_restarts': 3,
+                'oom_kills': 2,
+                'memory_total_bytes': 4022148 * 1024,
+                'memory_available_bytes': 2876544 * 1024,
+                'etcd_bytes': 68321280,
+                'etcd_snapshot_bytes': 41943040,
+            },
+            cluster_module.parse_node_signals(
+                SERVER_SIGNALS_OUTPUT, 'control_plane'))
+
+    def test_a_realistic_worker_output(self):
+        self.assertEqual(
+            {
+                'boot_id': '9a1d7c22-0e4b-4c5f-a0b3-77c1e2d4f6a8',
+                'booted_at': 1759712399,
+                'k3s_unit': 'k3s-agent',
+                'k3s_state': 'activating',
+                'k3s_restarts': 0,
+                'oom_kills': 0,
+                'memory_total_bytes': 2010264 * 1024,
+                'memory_available_bytes': 1102336 * 1024,
+                'etcd_bytes': None,
+                'etcd_snapshot_bytes': None,
+            },
+            cluster_module.parse_node_signals(
+                WORKER_SIGNALS_OUTPUT, 'worker'))
+
+    def test_the_key_set_is_always_the_same(self):
+        expected = set(cluster_module.NODE_SIGNAL_KEYS)
+        self.assertEqual(10, len(expected))
+        for stdout, role in ((SERVER_SIGNALS_OUTPUT, 'control_plane'),
+                             (WORKER_SIGNALS_OUTPUT, 'worker'),
+                             ('', 'control_plane'), (None, 'worker'),
+                             ('rubbish', 'worker')):
+            self.assertEqual(
+                expected,
+                set(cluster_module.parse_node_signals(stdout, role)))
+
+    def test_a_unit_which_is_not_loaded_has_no_state_or_restarts(self):
+        # What systemctl prints for a unit which does not exist: a zero
+        # restart count which would otherwise read as a measurement.
+        stdout = SERVER_SIGNALS_OUTPUT.replace(
+            'LoadState=loaded', 'LoadState=not-found').replace(
+            'NRestarts=3', 'NRestarts=0').replace(
+            'ActiveState=active', 'ActiveState=inactive')
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+
+        self.assertEqual('k3s', signals['k3s_unit'])
+        self.assertIsNone(signals['k3s_state'])
+        self.assertIsNone(signals['k3s_restarts'])
+        # The other readings are not voided by it.
+        self.assertEqual(2, signals['oom_kills'])
+        self.assertEqual(68321280, signals['etcd_bytes'])
+
+    def test_a_missing_load_state_is_not_loaded(self):
+        stdout = SERVER_SIGNALS_OUTPUT.replace('LoadState=loaded\n', '')
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+        self.assertIsNone(signals['k3s_state'])
+        self.assertIsNone(signals['k3s_restarts'])
+
+    def test_empty_output_is_all_none_but_the_unit(self):
+        for stdout in ('', None, '\n\n'):
+            for role, unit in (('control_plane', 'k3s'),
+                               ('worker', 'k3s-agent')):
+                expected = dict.fromkeys(cluster_module.NODE_SIGNAL_KEYS)
+                expected['k3s_unit'] = unit
+                self.assertEqual(
+                    expected,
+                    cluster_module.parse_node_signals(stdout, role))
+
+    def test_readings_which_could_not_be_taken_are_none_on_their_own(self):
+        # What the command prints when a source is unreadable: the key,
+        # with nothing after it.
+        stdout = SERVER_SIGNALS_OUTPUT.replace(
+            'oom_kills=2', 'oom_kills=').replace(
+            'boot_id=3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11', 'boot_id=').replace(
+            'etcd_snapshot_bytes=41943040', 'etcd_snapshot_bytes=')
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+
+        self.assertIsNone(signals['oom_kills'])
+        self.assertIsNone(signals['boot_id'])
+        self.assertIsNone(signals['etcd_snapshot_bytes'])
+        self.assertEqual(1759712345, signals['booted_at'])
+        self.assertEqual(68321280, signals['etcd_bytes'])
+        self.assertEqual(3, signals['k3s_restarts'])
+
+    def test_garbage_values_are_none(self):
+        # Each is something int() would either refuse or, worse, accept:
+        # a sign, a digit separator, non-ASCII digits, and a string longer
+        # than Python 3.11 will convert at all.
+        stdout = (
+            'boot_id=   \n'
+            'booted_at=yesterday\n'
+            'oom_kills=-1\n'
+            'memory_total_kb=12.5\n'
+            'memory_available_kb=١٢٣\n'
+            'LoadState=loaded\n'
+            'ActiveState=\n'
+            'NRestarts=+3\n'
+            'etcd_bytes=1_000\n'
+            'etcd_snapshot_bytes=%s\n' % ('9' * 5000))
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+
+        expected = dict.fromkeys(cluster_module.NODE_SIGNAL_KEYS)
+        expected['k3s_unit'] = 'k3s'
+        self.assertEqual(expected, signals)
+
+    def test_a_reading_is_at_most_twenty_digits_and_always_serialises(self):
+        # Twenty digits is 2**64 - 1's length, the most any reading here
+        # can hold, and is accepted; twenty-one is not a reading. The cap
+        # is what keeps the report serialisable: memory is scaled by 1024
+        # after parsing, and json.dumps() refuses an int of more than 4300
+        # digits on Python 3.11 and later, which would break the Ansible
+        # module's result over one garbage line.
+        twenty = '9' * 20
+        stdout = ''.join('%s=%s\n' % (key, twenty) for key in (
+            'booted_at', 'oom_kills', 'memory_total_kb',
+            'memory_available_kb', 'NRestarts', 'etcd_bytes',
+            'etcd_snapshot_bytes'))
+        signals = cluster_module.parse_node_signals(
+            'LoadState=loaded\n' + stdout, 'control_plane')
+
+        self.assertEqual(int(twenty), signals['oom_kills'])
+        self.assertEqual(int(twenty) * 1024, signals['memory_total_bytes'])
+        json.dumps(signals)
+
+        signals = cluster_module.parse_node_signals(
+            'oom_kills=%s\n' % ('9' * 21), 'control_plane')
+        self.assertIsNone(signals['oom_kills'])
+
+        signals = cluster_module.parse_node_signals(
+            'memory_total_kb=%s\n' % ('9' * 4300), 'control_plane')
+        self.assertIsNone(signals['memory_total_bytes'])
+        json.dumps(signals)
+
+    def test_trailing_whitespace_and_crlf_are_stripped(self):
+        stdout = SERVER_SIGNALS_OUTPUT.replace('\n', ' \r\n').replace(
+            'oom_kills=2', 'oom_kills=\t2')
+        self.assertEqual(
+            cluster_module.parse_node_signals(
+                SERVER_SIGNALS_OUTPUT, 'control_plane'),
+            cluster_module.parse_node_signals(stdout, 'control_plane'))
+
+    def test_a_worker_has_no_etcd_whatever_it_prints(self):
+        stdout = WORKER_SIGNALS_OUTPUT + (
+            'etcd_bytes=68321280\n'
+            'etcd_snapshot_bytes=41943040\n')
+        signals = cluster_module.parse_node_signals(stdout, 'worker')
+        self.assertIsNone(signals['etcd_bytes'])
+        self.assertIsNone(signals['etcd_snapshot_bytes'])
+
+    def test_lines_and_keys_which_are_not_readings_are_ignored(self):
+        stdout = ('sh: 1: something: not found\n'
+                  'Unit=k3s\n'
+                  'k3s_unit=k3s-agent\n'
+                  '=7\n' + SERVER_SIGNALS_OUTPUT)
+        self.assertEqual(
+            cluster_module.parse_node_signals(
+                SERVER_SIGNALS_OUTPUT, 'control_plane'),
+            cluster_module.parse_node_signals(stdout, 'control_plane'))
+
+    def test_a_value_is_split_from_its_key_at_the_first_equals(self):
+        # And kept whole, so a value with a second '=' in it is not a
+        # reading -- no reading contains one -- rather than being cut down
+        # to the part which looks like one. The line still claims its key,
+        # so the first-occurrence rule applies to it as to any other.
+        stdout = SERVER_SIGNALS_OUTPUT.replace(
+            'ActiveState=active', 'ActiveState=active=x').replace(
+            'oom_kills=2', 'oom_kills=2=3')
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+
+        self.assertIsNone(signals['k3s_state'])
+        self.assertIsNone(signals['oom_kills'])
+        self.assertEqual(3, signals['k3s_restarts'])
+
+    def test_a_boot_id_is_a_uuid_or_none(self):
+        # boot_id is what a caller compares to decide whether the node
+        # rebooted, so anything which is not one is None rather than a
+        # string which differs from the baseline and reads as a reboot.
+        uuid = '3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11'
+        for value, expected in (
+                (uuid, uuid),
+                # Either case is accepted and reported in lowercase, so one
+                # boot is always one string.
+                (uuid.upper(), uuid),
+                ('', None),
+                ('abc', None),
+                ('evil', None),
+                (uuid[:-1], None),
+                (uuid + '0', None),
+                (uuid + '-' + uuid, None),
+                (uuid.replace('-', ''), None),
+                ('{%s}' % uuid, None),
+                (uuid.replace('f', 'g'), None),
+                # Non-ASCII digits, which int() would take and a \d would
+                # match.
+                (uuid.replace('3', '\u0663'), None),
+                ('x' * 5000, None)):
+            stdout = SERVER_SIGNALS_OUTPUT.replace(
+                'boot_id=' + uuid, 'boot_id=' + value)
+            signals = cluster_module.parse_node_signals(
+                stdout, 'control_plane')
+            self.assertEqual(expected, signals['boot_id'], value)
+
+    def test_a_k3s_state_is_an_active_state_or_none(self):
+        for value in ('active', 'inactive', 'activating', 'deactivating',
+                      'failed', 'reloading', 'maintenance', 'refreshing',
+                      'some-future-state', 'a' * 32):
+            stdout = SERVER_SIGNALS_OUTPUT.replace(
+                'ActiveState=active', 'ActiveState=' + value)
+            self.assertEqual(
+                value,
+                cluster_module.parse_node_signals(
+                    stdout, 'control_plane')['k3s_state'])
+
+        for value in ('', 'Active', 'ACTIVE', 'active (running)',
+                      'active;rm -rf /', 'active\x00', 'a' * 33, 'x' * 5000,
+                      'act1ve', 'active_state', '\u00e4ctive'):
+            stdout = SERVER_SIGNALS_OUTPUT.replace(
+                'ActiveState=active', 'ActiveState=' + value)
+            signals = cluster_module.parse_node_signals(
+                stdout, 'control_plane')
+            self.assertIsNone(signals['k3s_state'], value)
+            # It voids that reading alone.
+            self.assertEqual(3, signals['k3s_restarts'], value)
+
+    def test_the_first_occurrence_of_a_key_wins(self):
+        # The snapshot size is printed last and is the one value derived
+        # from caller data, so a directory name holding a newline and a
+        # line of its own cannot replace a reading printed before it.
+        stdout = SERVER_SIGNALS_OUTPUT + (
+            'boot_id=0b5e7d3a-2c41-4f6e-8a90-1d2c3b4a5f60\n'
+            'ActiveState=failed\nNRestarts=0\n')
+        signals = cluster_module.parse_node_signals(stdout, 'control_plane')
+        # Valid readings every one, so that it is the order which keeps
+        # them out and not the shape checks.
+        self.assertEqual('3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11',
+                         signals['boot_id'])
+        self.assertEqual('active', signals['k3s_state'])
+        self.assertEqual(3, signals['k3s_restarts'])
+
+    def test_no_string_makes_it_raise(self):
+        for stdout in ('=', '==', '\x00=\x00', 'booted_at=\udcff',
+                       '\n'.join('%s=%s' % (k, k)
+                                 for k in cluster_module.NODE_SIGNAL_KEYS),
+                       'LoadState=loaded\nNRestarts=²'):
+            for role in ('control_plane', 'worker'):
+                cluster_module.parse_node_signals(stdout, role)
+
+
+class NodeSignalsCommandRunsTestCase(testtools.TestCase):
+    """The command parses as shell and survives its own quoting.
+
+    The other tests compare the command with strings, which cannot tell
+    whether the awk programs' quotes nest correctly inside the command
+    substitutions, or whether a quoted snapshot directory reaches du
+    intact. This runs it with the local /bin/sh. systemctl is replaced by
+    a script on PATH, so that the unit's readings are this test's rather
+    than the host's. The /proc readings are the host's, so the only
+    assertions about them are that they are there and are numbers; it is
+    skipped where there is no /proc to read.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if not sys.platform.startswith('linux'):
+            self.skipTest('the command reads Linux /proc files')
+        for path in ('/bin/sh', '/proc/stat', '/proc/meminfo'):
+            if not os.path.exists(path):
+                self.skipTest('%s does not exist' % path)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.bin = os.path.join(self.tmp, 'bin')
+        os.mkdir(self.bin)
+
+    def _systemctl(self, script):
+        path = os.path.join(self.bin, 'systemctl')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#!/bin/sh\n' + script)
+        os.chmod(path, 0o755)
+
+    def _run(self, role, snapshot_dir=None, cwd=None):
+        env = dict(os.environ)
+        env['PATH'] = '%s:%s' % (self.bin, env.get('PATH', '/usr/bin:/bin'))
+        return subprocess.run(
+            ['/bin/sh', '-c',
+             cluster_module.node_signals_command(role, snapshot_dir)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, env=env, cwd=cwd)
+
+    def test_a_control_plane_node(self):
+        self._systemctl(
+            'printf "NRestarts=4\\nLoadState=loaded\\nActiveState=active\\n"\n')
+        # Every character rule 1 exists for, in the one value it covers.
+        snapshot_dir = os.path.join(
+            self.tmp, 'snaps $HOME \'q\' "dq" ) `id`; x')
+        os.mkdir(snapshot_dir)
+        with open(os.path.join(snapshot_dir, 'snapshot'), 'wb') as f:
+            f.write(b'x' * 5000)
+
+        result = self._run('control_plane', snapshot_dir)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        signals = cluster_module.parse_node_signals(
+            result.stdout, 'control_plane')
+        self.assertIsInstance(signals['booted_at'], int, result.stdout)
+        self.assertIsInstance(signals['memory_total_bytes'], int,
+                              result.stdout)
+        self.assertEqual('active', signals['k3s_state'])
+        self.assertEqual(4, signals['k3s_restarts'])
+        # du -sb counts the directory as well as the file.
+        self.assertGreaterEqual(signals['etcd_snapshot_bytes'], 5000,
+                                result.stdout)
+
+    def test_a_worker_whose_systemctl_fails(self):
+        # The last command on a worker, and the one whose exit status
+        # '|| true' keeps from becoming the probe's.
+        self._systemctl(
+            'echo "System has not been booted with systemd" >&2\nexit 1\n')
+
+        result = self._run('worker')
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        signals = cluster_module.parse_node_signals(result.stdout, 'worker')
+        self.assertIsInstance(signals['booted_at'], int, result.stdout)
+        self.assertIsNone(signals['k3s_state'])
+        self.assertIsNone(signals['k3s_restarts'])
+
+    def test_a_missing_directory_is_none_not_zero(self):
+        self._systemctl('exit 0\n')
+        result = self._run('control_plane',
+                           os.path.join(self.tmp, 'does-not-exist'))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('etcd_snapshot_bytes=\n', result.stdout)
+        self.assertIsNone(cluster_module.parse_node_signals(
+            result.stdout, 'control_plane')['etcd_snapshot_bytes'])
+
+    def test_a_relative_directory_is_none_even_where_it_resolves(self):
+        # The command is run from a working directory in which the relative
+        # name does exist and has something in it, which is the case a du
+        # would have answered with a confident size for a directory nobody
+        # knows is the one k3s writes to.
+        self._systemctl('exit 0\n')
+        os.mkdir(os.path.join(self.tmp, 'snaps'))
+        with open(os.path.join(self.tmp, 'snaps', 'snapshot'), 'wb') as f:
+            f.write(b'x' * 5000)
+
+        result = self._run('control_plane', 'snaps', cwd=self.tmp)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('etcd_snapshot_bytes=\n', result.stdout)
+        self.assertIsNone(cluster_module.parse_node_signals(
+            result.stdout, 'control_plane')['etcd_snapshot_bytes'])
+
+
 # The framing every k3s configuration file is written with: a quoted
 # heredoc, its body, and the delimiter on a line of its own. A body which
 # did not end in a newline would put the delimiter on the body's last line
@@ -3959,7 +4490,45 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
             lambda: cluster.await_execute(_pending_aop(), timeout=30))
 
         self.assertEqual('complete', aop['state'])
-        self.assertEqual(3, elapsed)
+        # Read at 0 (queued), sleep, read at 1 (executing), sleep, read at 2
+        # (complete), return: three reads and two seconds. It was three
+        # seconds when the wait slept before each read, the first sleep
+        # being for an operation nobody had yet looked at.
+        self.assertEqual(2, elapsed)
+        self.assertEqual(3, client.get_agent_operation.call_count)
+
+    def test_an_operation_finished_on_its_first_read_costs_no_sleep(self):
+        # The property health()'s run time rests on. Its probes are
+        # collected one after another, but all of them are running on the
+        # server while the first is waited for, so the later ones have
+        # usually finished by their turn. Each costs one read and nothing
+        # else; a sleep before that read was a second per node on a
+        # cluster with nothing wrong with it.
+        client, cluster = self._cluster(['complete'])
+        sleep = mock.MagicMock()
+
+        with mock.patch('time.sleep', sleep):
+            aop = cluster.await_execute(_pending_aop(), timeout=30)
+
+        self.assertEqual('complete', aop['state'])
+        self.assertEqual(1, client.get_agent_operation.call_count)
+        sleep.assert_not_called()
+
+    def test_an_operation_handed_in_finished_is_not_read(self):
+        # Nothing can move a finished operation on, so there is nothing a
+        # read could tell the caller. With a timeout or without, and with
+        # the timeout already spent: the at-least-once read is for an
+        # operation handed in pending, not for every operation.
+        for timeout in (None, 30, 0):
+            client, cluster = self._cluster([])
+            given = _pending_aop('complete')
+
+            aop, elapsed = self._with_clock(
+                lambda: cluster.await_execute(given, timeout=timeout))
+
+            self.assertIs(given, aop, timeout)
+            self.assertEqual(0, elapsed, timeout)
+            client.get_agent_operation.assert_not_called()
 
     def test_a_wall_clock_step_does_not_move_the_deadline(self):
         # time.time() is not the clock for measuring how long something has
@@ -3976,6 +4545,78 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
         self.assertEqual('queued', aop['state'])
         self.assertEqual(5, elapsed)
 
+    def test_an_operation_past_its_deadline_is_read_once(self):
+        # health() collects every probe against one shared deadline, so all
+        # but the first may be collected with none of it left, and each is
+        # handed the operation instance_execute() returned: queued, because
+        # the plugin's client does not wait for anything it submits.
+        # Returning that as given would report a command which finished
+        # long ago as abandoned without anybody having looked.
+        client, cluster = self._cluster(['complete'])
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=0))
+
+        self.assertEqual('complete', aop['state'])
+        self.assertEqual(0, elapsed)
+        self.assertEqual(1, client.get_agent_operation.call_count)
+
+    def test_an_operation_still_pending_past_its_deadline_is_read_only_once(self):
+        # Looking once is not waiting: one read, no sleep, and the pending
+        # state that read found is returned for the caller to report.
+        client, cluster = self._cluster(['queued'] * 100)
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=0))
+
+        self.assertEqual('queued', aop['state'])
+        self.assertEqual(0, elapsed)
+        self.assertEqual(1, client.get_agent_operation.call_count)
+
+    def test_a_wait_reads_at_each_second_up_to_and_including_the_deadline(self):
+        # Read first, then sleep, so a budget of five seconds is reads at
+        # 0, 1, 2, 3, 4 and 5: six, the last landing on the deadline. That
+        # read finds the deadline passed and is the last thing the wait
+        # does, so there is no sixth sleep -- elapsed is 5, not 6 -- and no
+        # seventh read of an operation whose state was read a moment ago.
+        client, cluster = self._cluster(['queued'] * 100)
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=5))
+
+        self.assertEqual('queued', aop['state'])
+        self.assertEqual(5, elapsed)
+        self.assertEqual(6, client.get_agent_operation.call_count)
+
+    def test_a_deadline_which_passes_mid_sleep_still_gets_its_read(self):
+        # A budget which is not a whole number of seconds: the read at 2
+        # finds 0.5 seconds left, so the wait sleeps a whole second past
+        # the deadline and reads once more at 3. That read is the one at
+        # least once the deadline has passed, and finds the operation done.
+        client, cluster = self._cluster(['queued', 'queued', 'queued',
+                                         'complete'])
+
+        aop, elapsed = self._with_clock(
+            lambda: cluster.await_execute(_pending_aop(), timeout=2.5))
+
+        self.assertEqual('complete', aop['state'])
+        self.assertEqual(3, elapsed)
+        self.assertEqual(4, client.get_agent_operation.call_count)
+
+    def test_an_api_error_from_the_look_past_the_deadline_propagates(self):
+        # As one from the wait's own reads does: _collect_probe() catches
+        # apiclient.APIException around await_execute() and reports it, and
+        # this must not swallow it into a pending state on its way there.
+        client, cluster = self._cluster([])
+        client.get_agent_operation.side_effect = apiclient.APIException(
+            'the server is too busy to answer', 'GET',
+            'http://sf-1:13000/agentoperations/aop-001', 503, 'busy')
+
+        self.assertRaises(
+            apiclient.APIException,
+            self._with_clock,
+            lambda: cluster.await_execute(_pending_aop(), timeout=0))
+
     def test_no_timeout_keeps_waiting(self):
         # Which is every caller but the probe. An install which takes
         # eleven minutes is a slow install, and abandoning it would leave
@@ -3987,7 +4628,11 @@ class AwaitExecuteTimeoutTestCase(testtools.TestCase):
             lambda: cluster.await_execute(_pending_aop()))
 
         self.assertEqual('complete', aop['state'])
-        self.assertEqual(601, elapsed)
+        # 600 pending reads at 0 to 599, each followed by a sleep, and the
+        # 601st at 600 finds it complete. It was 601 seconds when the wait
+        # slept before its first read as well as between them.
+        self.assertEqual(600, elapsed)
+        self.assertEqual(601, client.get_agent_operation.call_count)
 
 
 class HealthProbeIsSkippedTestCase(testtools.TestCase):
@@ -3998,7 +4643,14 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
     the API and then never runs, so the probe waited on exactly the cluster
     health() is for. The node entry has already read the state and
     agent_state which say so, a few lines earlier in the same method.
+
+    Every node is also asked for its signals under the same rule, so where
+    a test here says a node is not asked, the one healthy node beside it
+    still is, and only for its signals.
     """
+
+    KUBECTL = 'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'
+    WORKER_ONLY = [('inst-w1', cluster_module.node_signals_command('worker'))]
 
     def setUp(self):
         super(HealthProbeIsSkippedTestCase, self).setUp()
@@ -4015,6 +4667,15 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
             self.client.instances[instance_uuid] = {
                 'uuid': instance_uuid, 'name': name, 'state': 'created',
                 'agent_state': 'ready'}
+
+        # HealthClient hands every operation out queued, as the server does,
+        # so every probe is read at least once, and one scripted to stay
+        # pending is waited on through sleeps. Real seconds would make the
+        # tests which do that slow for nothing.
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         self.cluster = _make_cluster(self.client)
 
     def test_an_agentless_control_plane_node_is_not_asked(self):
@@ -4022,7 +4683,7 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
 
         report = self.cluster.health()
 
-        self.assertEqual([], self.client.executed)
+        self.assertEqual(self.WORKER_ONLY, self.client.executed)
         self.assertFalse(report['api']['probed'])
         self.assertFalse(report['api']['answered'])
         self.assertFalse(report['healthy'])
@@ -4034,7 +4695,7 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
 
         report = self.cluster.health()
 
-        self.assertEqual([], self.client.executed)
+        self.assertEqual(self.WORKER_ONLY, self.client.executed)
         self.assertIn('instance error', report['api']['error'])
 
     def test_a_vanished_control_plane_node_is_not_asked(self):
@@ -4042,7 +4703,7 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
 
         report = self.cluster.health()
 
-        self.assertEqual([], self.client.executed)
+        self.assertEqual(self.WORKER_ONLY, self.client.executed)
         self.assertFalse(report['api']['probed'])
         self.assertEqual('inst-cp1', report['api']['instance_uuid'])
         self.assertIn('instance gone', report['api']['error'])
@@ -4055,7 +4716,10 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
 
         report = self.cluster.health()
 
-        self.assertEqual(1, len(self.client.executed))
+        self.assertEqual(
+            [('inst-cp1', self.KUBECTL),
+             ('inst-cp1', cluster_module.node_signals_command('control_plane'))],
+            self.client.executed)
         self.assertTrue(report['api']['probed'])
         self.assertTrue(report['api']['answered'])
         self.assertFalse(report['healthy'])
@@ -4084,7 +4748,11 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
         with mock.patch.object(cluster_module, 'HEALTH_PROBE_TIMEOUT_SECONDS', 0):
             report = self.cluster.health()
 
-        self.assertEqual(1, len(self.client.executed))
+        self.assertEqual(
+            [('inst-cp1', self.KUBECTL),
+             ('inst-cp1', cluster_module.node_signals_command('control_plane')),
+             ('inst-w1', cluster_module.node_signals_command('worker'))],
+            self.client.executed)
         self.assertFalse(report['api']['probed'])
         self.assertIn('had not finished after 0 seconds',
                       report['api']['error'])
@@ -4122,6 +4790,546 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
         self.assertTrue(report['api']['probed'])
         self.assertFalse(report['api']['answered'])
         self.assertIn('expired state', report['api']['error'])
+
+
+# Decision 1 of the cumulative health signals phase 1 plan, written out
+# rather than taken from NODE_SIGNAL_KEYS, so that a key added to or dropped
+# from the constant is a change to a documented return shape that a test
+# notices rather than one it follows.
+SIGNALS_KEYS = {
+    'probed', 'error', 'boot_id', 'booted_at', 'k3s_unit', 'k3s_state',
+    'k3s_restarts', 'oom_kills', 'memory_total_bytes',
+    'memory_available_bytes', 'etcd_bytes', 'etcd_snapshot_bytes'}
+
+
+class HealthSignalsTestCase(testtools.TestCase):
+    """health() reads every node's signals, and they change nothing else.
+
+    Decisions 1, 3, 7 and 8 of the cumulative health signals phase 1 plan:
+    each node carries a ``signals`` dict with the same twelve keys whatever
+    happened; only a node able to answer is asked; every probe is
+    submitted before any is waited for and all share one deadline; and no
+    reading, and no failure to take one, moves ``healthy``. The last is the
+    one with consequences outside this package, because the Ansible
+    module's documented gate and ``--strict`` branch on ``healthy``.
+    """
+
+    def setUp(self):
+        super(HealthSignalsTestCase, self).setUp()
+        self.client = fakes.HealthClient()
+
+        self.md = {
+            'name': 'banana',
+            'namespace': 'testns',
+            'state': 'created',
+            'node_serial': 4,
+            'node_network': 'net-1',
+            'node_token': 'node-token',
+            'k3s_version': 'v1.33',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'],
+            'worker_nodes': ['inst-w1', 'inst-w2'],
+            'routed_addresses': []
+        }
+        self.client.metadata[MD_KEY] = self.md
+
+        for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                    ('inst-w1', 'k3s-banana-node-002'),
+                                    ('inst-w2', 'k3s-banana-node-003')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.cluster = _make_cluster(self.client)
+
+    def _node(self, report, instance_uuid):
+        return [n for n in report['nodes'] if n['uuid'] == instance_uuid][0]
+
+    def _assert_every_node_has_the_signal_keys(self, report):
+        self.assertEqual(12, len(SIGNALS_KEYS))
+        self.assertNotEqual([], report['nodes'])
+        for node in report['nodes']:
+            self.assertEqual(SIGNALS_KEYS, set(node['signals']), node)
+
+    def _with_clock(self, fn):
+        # A fake clock, as AwaitExecuteTimeoutTestCase uses, because the
+        # point is how long health() waits: real time would make the
+        # assertion either slow or untrue. Every sleep is recorded as well
+        # as added to the clock, so a test can say there were none.
+        clock = [1000.0]
+        self.sleeps = []
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            clock[0] += seconds
+
+        with mock.patch('time.monotonic', lambda: clock[0]), \
+                mock.patch('time.sleep', sleep):
+            return fn(), clock[0] - 1000.0
+
+    def _seven_nodes(self):
+        # One control plane node and six workers, all able to answer: eight
+        # probes, the kubectl one and seven signals.
+        self.md['worker_nodes'] = ['inst-w%d' % n for n in range(1, 7)]
+        for n in range(3, 7):
+            self.client.instances['inst-w%d' % n] = {
+                'uuid': 'inst-w%d' % n, 'name': 'k3s-banana-node-%03d' % (n + 1),
+                'state': 'created', 'agent_state': 'ready'}
+
+    def _reads_by_operation(self):
+        # In submission order: aop-001 is the kubectl probe, and then each
+        # node's signals in node order.
+        return [self.client.agent_operation_reads_by_uuid.get(uuid, 0)
+                for uuid in sorted(self.client.operations)]
+
+    def _everything_pending(self):
+        self.client.probe_state = 'queued'
+        for instance_uuid in self.client.instances:
+            self.client.signals_state[instance_uuid] = 'queued'
+
+    # The shape, in every outcome.
+
+    def test_a_healthy_cluster_has_the_signal_keys_on_every_node(self):
+        self._assert_every_node_has_the_signal_keys(self.cluster.health())
+
+    def test_a_gone_node_has_the_signal_keys(self):
+        del self.client.instances['inst-w1']
+
+        self._assert_every_node_has_the_signal_keys(self.cluster.health())
+
+    def test_an_unready_node_has_the_signal_keys(self):
+        self.client.instances['inst-w2']['agent_state'] = 'not ready'
+        self.client.instances['inst-cp1']['state'] = 'error'
+
+        self._assert_every_node_has_the_signal_keys(self.cluster.health())
+
+    def test_a_failed_probe_has_the_signal_keys(self):
+        self.client.signals_state['inst-cp1'] = 'error'
+        self.client.signals_return_code['inst-w1'] = 1
+        self.client.signals_raises['inst-w2'] = fakes.not_found('inst-w2')
+
+        self._assert_every_node_has_the_signal_keys(self.cluster.health())
+
+    # What is read, and what is not.
+
+    def test_the_readings_reach_the_report(self):
+        report = self.cluster.health()
+
+        self.assertEqual(
+            {'probed': True, 'error': None,
+             'boot_id': '3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11',
+             'booted_at': 1759712345, 'k3s_unit': 'k3s',
+             'k3s_state': 'active', 'k3s_restarts': 3, 'oom_kills': 2,
+             'memory_total_bytes': 4022148 * 1024,
+             'memory_available_bytes': 2876544 * 1024,
+             'etcd_bytes': 68321280, 'etcd_snapshot_bytes': 41943040},
+            self._node(report, 'inst-cp1')['signals'])
+
+        worker = self._node(report, 'inst-w1')['signals']
+        self.assertTrue(worker['probed'])
+        self.assertEqual('k3s-agent', worker['k3s_unit'])
+        self.assertEqual('activating', worker['k3s_state'])
+        self.assertEqual(0, worker['k3s_restarts'])
+        self.assertEqual(2010264 * 1024, worker['memory_total_bytes'])
+        self.assertIsNone(worker['etcd_bytes'])
+
+    def test_each_node_is_read_on_its_own(self):
+        # Answers are per operation, so one node's output is not another's.
+        self.client.signals_stdout['inst-w2'] = (
+            fakes.WORKER_SIGNALS_OUTPUT.replace('NRestarts=0', 'NRestarts=7'))
+
+        report = self.cluster.health()
+
+        self.assertEqual(0, self._node(report, 'inst-w1')['signals']['k3s_restarts'])
+        self.assertEqual(7, self._node(report, 'inst-w2')['signals']['k3s_restarts'])
+
+    def test_a_gone_node_is_not_asked_and_says_why(self):
+        del self.client.instances['inst-w1']
+
+        report = self.cluster.health()
+
+        self.assertNotIn('inst-w1', [i for i, _ in self.client.executed])
+        signals = self._node(report, 'inst-w1')['signals']
+        self.assertFalse(signals['probed'])
+        self.assertEqual('this instance no longer exists', signals['error'])
+        self.assertEqual('k3s-agent', signals['k3s_unit'])
+        self.assertEqual(
+            set(), {k for k, v in signals.items()
+                    if v is not None and k not in ('probed', 'error', 'k3s_unit')})
+
+    def test_an_unready_node_is_not_asked_and_says_why(self):
+        self.client.instances['inst-w2']['agent_state'] = 'not ready'
+
+        report = self.cluster.health()
+
+        self.assertNotIn('inst-w2', [i for i, _ in self.client.executed])
+        signals = self._node(report, 'inst-w2')['signals']
+        self.assertFalse(signals['probed'])
+        self.assertEqual(
+            'this node is not in a state which can answer: instance '
+            'created, agent not ready', signals['error'])
+        self.assertIsNone(signals['boot_id'])
+        self.assertIsNone(signals['k3s_restarts'])
+
+    def test_a_skipped_node_says_why_in_the_api_probe_s_words(self):
+        # Both probes are skipped for the same reason on the same node, and
+        # a caller matching on one message must have matched on both.
+        self.client.instances['inst-cp1']['agent_state'] = None
+
+        report = self.cluster.health()
+
+        self.assertEqual([], [i for i, _ in self.client.executed
+                              if i == 'inst-cp1'])
+        reason = ('is not in a state which can answer: instance created, '
+                  'agent not contactable')
+        self.assertEqual('the first control plane node ' + reason,
+                         report['api']['error'])
+        self.assertEqual('this node ' + reason,
+                         self._node(report, 'inst-cp1')['signals']['error'])
+        self.assertEqual('k3s',
+                         self._node(report, 'inst-cp1')['signals']['k3s_unit'])
+
+    # Submission order and the one budget.
+
+    def test_the_kubectl_probe_is_submitted_first(self):
+        self._everything_pending()
+
+        self._with_clock(self.cluster.health)
+
+        self.assertEqual(
+            ('inst-cp1', cluster_module.K3S_API_PROBE_COMMAND),
+            self.client.executed[0])
+        self.assertEqual(4, len(self.client.executed))
+
+    def test_every_probe_is_submitted_before_any_is_waited_for(self):
+        self._everything_pending()
+
+        self._with_clock(self.cluster.health)
+
+        kinds = [call[0] for call in self.client.calls]
+        self.assertEqual(4, kinds.count('execute'))
+        self.assertIn('read', kinds)
+        self.assertNotIn('execute', kinds[kinds.index('read'):], kinds)
+
+    def test_every_probe_pending_costs_one_budget_not_one_per_node(self):
+        # Seven nodes, none of which ever answers. Waited for one after
+        # another this is eight budgets; submitted together against one
+        # deadline it is one.
+        self._seven_nodes()
+        self._everything_pending()
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        self.assertEqual(8, len(self.client.executed))
+        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS, elapsed)
+        # One read a second across one budget, and then one read each of
+        # the operations left. The kubectl probe is collected first, with
+        # the whole budget: a read and then a sleep each second, so reads at
+        # 0, 1, ..., 30 -- 31 of them, the last landing exactly on the
+        # deadline, after which the wait returns without sleeping. Each of
+        # the seven signals probes is collected after that with no time
+        # left, and is read once without sleeping, because the state it was
+        # handed is the one it was submitted in. 31 + 7 = 38, and it is
+        # exact rather than a range: fewer would mean a probe judged without
+        # being read, and more a wait which slept or read twice after the
+        # deadline.
+        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 1 + 7,
+                         self.client.agent_operation_reads)
+        self.assertEqual(
+            [cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 1] + [1] * 7,
+            self._reads_by_operation())
+
+        self.assertFalse(report['api']['probed'])
+        for node in report['nodes']:
+            self.assertFalse(node['signals']['probed'])
+            self.assertIn('the node signals command had not finished after '
+                          '30 seconds', node['signals']['error'])
+            self.assertIn('is still queued', node['signals']['error'])
+            # The node itself is as healthy as it was.
+            self.assertTrue(node['healthy'])
+
+    def test_a_healthy_cluster_of_seven_nodes_costs_no_sleep(self):
+        # The other end of the budget, and the case it is spent on almost
+        # every time: nothing wrong, and every operation finished by the
+        # time it is first read. Collection is one probe after another, so a
+        # wait which slept before its first read cost a second a probe --
+        # eight seconds here, and the whole budget on a cluster of thirty --
+        # for a cluster with nothing to report. Read first, each probe is
+        # one read and no sleep, so the call takes no time on the fake clock
+        # at all.
+        self._seven_nodes()
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        self.assertEqual(0, elapsed)
+        self.assertEqual([], self.sleeps)
+        self.assertEqual([1] * 8, self._reads_by_operation())
+        self.assertTrue(report['healthy'])
+        self.assertTrue(report['api']['answered'])
+        self.assertEqual(7, len(report['nodes']))
+        for node in report['nodes']:
+            self.assertTrue(node['signals']['probed'], node['uuid'])
+            self.assertIsNone(node['signals']['error'], node['uuid'])
+
+    def test_a_slow_first_probe_costs_its_own_time_not_one_second_per_node(self):
+        # The kubectl probe is still running when it is first read, and
+        # done on its second, one sleep later. The signals probes ran
+        # alongside it on their nodes, so each has finished by the time it
+        # is collected and is read once without sleeping. The call takes
+        # the slowest probe's second, not that second plus one per node.
+        self._seven_nodes()
+        self.client.probe_state = 'executing'
+        original = self.client.get_agent_operation
+
+        def read(operation_uuid):
+            aop = original(operation_uuid)
+            # Whatever was read, the kubectl command finishes straight
+            # after: the first read, of aop-001, finds it executing, and
+            # every later one finds it complete.
+            self.client.probe_state = 'complete'
+            return aop
+
+        self.client.get_agent_operation = read
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        self.assertEqual(1, elapsed)
+        self.assertEqual([1], self.sleeps)
+        self.assertEqual([2] + [1] * 7, self._reads_by_operation())
+        self.assertTrue(report['healthy'])
+        self.assertTrue(all(n['signals']['probed'] for n in report['nodes']))
+
+    def test_a_pending_kubectl_probe_does_not_hold_up_the_signals(self):
+        # Each operation answers for itself: the API probe is abandoned and
+        # the signals, which completed, are still read.
+        self.client.probe_state = 'queued'
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        self.assertFalse(report['api']['probed'])
+        self.assertIn('had not finished', report['api']['error'])
+        self.assertTrue(all(n['signals']['probed'] for n in report['nodes']))
+        self.assertEqual(3, self._node(report, 'inst-cp1')['signals']['k3s_restarts'])
+
+    def test_a_pending_signals_probe_does_not_void_the_api_answer(self):
+        self.client.signals_state['inst-w2'] = 'queued'
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        self.assertTrue(report['api']['answered'])
+        self.assertTrue(self._node(report, 'inst-w1')['signals']['probed'])
+        self.assertFalse(self._node(report, 'inst-w2')['signals']['probed'])
+        self.assertTrue(report['healthy'])
+
+    def _signals_operation(self, instance_uuid):
+        return [uuid for uuid, (kind, inst, _) in self.client.operations.items()
+                if kind == 'signals' and inst == instance_uuid][0]
+
+    def test_signals_collected_after_the_deadline_are_read_not_judged_as_submitted(self):
+        # The kubectl probe never leaves 'queued' and so uses up the whole
+        # budget; it is collected first. Every signals operation is
+        # 'queued' as submitted, as the server returns every operation to
+        # an ASYNC_CONTINUE client, and 'complete' the first time anybody
+        # reads it. Collected after the deadline, each must still be read
+        # once and reported as the finished probe it is. The bug was that
+        # with no time left the wait returned the operation it was handed
+        # without reading it, so every node's signals were reported
+        # abandoned, still 'queued', on a cluster where every one of them
+        # had answered.
+        self.client.probe_state = 'queued'
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        # One budget, spent on the kubectl probe, which is abandoned.
+        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS, elapsed)
+        self.assertFalse(report['api']['probed'])
+        self.assertIn('had not finished after 30 seconds',
+                      report['api']['error'])
+        self.assertIn('agent operation aop-001 is still queued',
+                      report['api']['error'])
+
+        # And every node's signals, read once each after the deadline.
+        for node in report['nodes']:
+            self.assertTrue(node['healthy'], node)
+            signals = node['signals']
+            self.assertTrue(signals['probed'], signals)
+            self.assertIsNone(signals['error'], signals)
+            self.assertEqual(
+                1, self.client.agent_operation_reads_by_uuid.get(
+                    self._signals_operation(node['uuid']), 0), node['uuid'])
+
+        self.assertEqual(
+            {'probed': True, 'error': None,
+             'boot_id': '3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11',
+             'booted_at': 1759712345, 'k3s_unit': 'k3s',
+             'k3s_state': 'active', 'k3s_restarts': 3, 'oom_kills': 2,
+             'memory_total_bytes': 4022148 * 1024,
+             'memory_available_bytes': 2876544 * 1024,
+             'etcd_bytes': 68321280, 'etcd_snapshot_bytes': 41943040},
+            self._node(report, 'inst-cp1')['signals'])
+        for worker in ('inst-w1', 'inst-w2'):
+            signals = self._node(report, worker)['signals']
+            self.assertEqual('9a1d7c22-0e4b-4c5f-a0b3-77c1e2d4f6a8',
+                             signals['boot_id'])
+            self.assertEqual('k3s-agent', signals['k3s_unit'])
+            self.assertEqual('activating', signals['k3s_state'])
+            self.assertEqual(1102336 * 1024, signals['memory_available_bytes'])
+
+    def test_a_signals_probe_still_pending_after_the_deadline_is_abandoned(self):
+        # The other half of looking once: the one read after the deadline
+        # finds inst-w2's operation still queued, and that is reported as
+        # abandoned, naming the operation, without a second read or any
+        # further wait. The nodes beside it are read and answer.
+        self.client.probe_state = 'queued'
+        self.client.signals_state['inst-w2'] = 'queued'
+
+        report, elapsed = self._with_clock(self.cluster.health)
+
+        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS, elapsed)
+        operation = self._signals_operation('inst-w2')
+        self.assertEqual(
+            1, self.client.agent_operation_reads_by_uuid.get(operation, 0))
+
+        signals = self._node(report, 'inst-w2')['signals']
+        self.assertFalse(signals['probed'])
+        self.assertEqual(
+            'the node signals command had not finished after 30 seconds '
+            '(agent operation %s is still queued), so the wait was '
+            'abandoned' % operation, signals['error'])
+        self.assertIsNone(signals['boot_id'])
+        self.assertTrue(self._node(report, 'inst-w2')['healthy'])
+
+        for other in ('inst-cp1', 'inst-w1'):
+            self.assertTrue(self._node(report, other)['signals']['probed'],
+                            other)
+
+    # A signals probe never moves healthy.
+
+    def _assert_still_healthy(self, report):
+        self.assertTrue(all(n['healthy'] for n in report['nodes']))
+        self.assertTrue(report['api']['answered'])
+        self.assertTrue(report['healthy'])
+
+    def test_an_errored_signals_probe_leaves_the_cluster_healthy(self):
+        self.client.signals_state['inst-w1'] = 'error'
+
+        report = self.cluster.health()
+
+        self._assert_still_healthy(report)
+        signals = self._node(report, 'inst-w1')['signals']
+        self.assertTrue(signals['probed'])
+        self.assertEqual('the agent operation for the node signals command '
+                         'entered the error state', signals['error'])
+        self.assertIsNone(signals['boot_id'])
+
+    def test_an_abandoned_signals_probe_leaves_the_cluster_healthy(self):
+        self.client.signals_state['inst-cp1'] = 'queued'
+
+        with mock.patch.object(cluster_module, 'HEALTH_PROBE_TIMEOUT_SECONDS', 0):
+            report = self.cluster.health()
+
+        self._assert_still_healthy(report)
+        signals = self._node(report, 'inst-cp1')['signals']
+        self.assertFalse(signals['probed'])
+        # The uuid of the operation left queued, as for the API probe: it
+        # is the thing a later await_idle() will wait on. aop-001 is the
+        # kubectl probe, submitted first; aop-002 is this node's signals.
+        self.assertEqual(
+            'the node signals command had not finished after 0 seconds '
+            '(agent operation aop-002 is still queued), so the wait was '
+            'abandoned', signals['error'])
+
+    def test_a_refused_signals_probe_leaves_the_cluster_healthy(self):
+        self.client.signals_raises['inst-w2'] = apiclient.APIException(
+            'the server is too busy to answer', 'POST',
+            'http://sf-1:13000/instances/inst-w2/agent/execute', 503, 'busy')
+
+        report = self.cluster.health()
+
+        self._assert_still_healthy(report)
+        signals = self._node(report, 'inst-w2')['signals']
+        self.assertFalse(signals['probed'])
+        self.assertIn('APIException', signals['error'])
+        self.assertIn('inst-w2', signals['error'])
+
+    def test_a_signals_command_which_exits_non_zero_leaves_the_cluster_healthy(self):
+        # And what it did print is still read: each reading stands alone.
+        self.client.signals_return_code['inst-w1'] = 2
+        self.client.signals_stdout['inst-w1'] = (
+            'boot_id=0b5e7d3a-2c41-4f6e-8a90-1d2c3b4a5f60\noom_kills=5\n')
+
+        report = self.cluster.health()
+
+        self._assert_still_healthy(report)
+        signals = self._node(report, 'inst-w1')['signals']
+        self.assertTrue(signals['probed'])
+        self.assertEqual('the node signals command exited 2', signals['error'])
+        self.assertEqual('0b5e7d3a-2c41-4f6e-8a90-1d2c3b4a5f60',
+                         signals['boot_id'])
+        self.assertEqual(5, signals['oom_kills'])
+        self.assertIsNone(signals['memory_total_bytes'])
+
+    def test_no_raw_command_output_reaches_the_report(self):
+        # The stderr of a failed read and the command line itself are raw
+        # material; only the twelve keys are reported.
+        self.client.signals_return_code['inst-w1'] = 1
+        self.client.signals_stderr['inst-w1'] = 'awk: cannot open /proc/vmstat'
+
+        report = self.cluster.health()
+
+        rendered = json.dumps([n['signals'] for n in report['nodes']])
+        self.assertNotIn('awk', rendered)
+        self.assertNotIn('printf', rendered)
+        self.assertNotIn('systemctl', rendered)
+        self.assertNotIn('cannot open', rendered)
+
+    # Read only, and the one caller value.
+
+    def test_no_metadata_is_written(self):
+        self.md['server_config'] = {'etcd-snapshot-dir': '/srv/snapshots'}
+        before = copy.deepcopy(self.client.metadata)
+
+        self.cluster.health()
+
+        self.assertEqual(before, self.client.metadata)
+        self.assertEqual([], self.client.metadata_writes)
+        self.assertEqual([], self.client.metadata_deletes)
+        self.assertEqual([], self.client.deleted_instances)
+
+    def test_a_recorded_snapshot_directory_reaches_the_control_plane_command_quoted(self):
+        snapshot_dir = '/srv/etcd snaps/$HOME'
+        self.md['server_config'] = {'etcd-snapshot-dir': snapshot_dir,
+                                    'node-label': ['a=b']}
+
+        self.cluster.health()
+
+        commands = dict(self.client.executed[1:])
+        self.assertEqual(
+            cluster_module.node_signals_command('control_plane', snapshot_dir),
+            commands['inst-cp1'])
+        self.assertIn(shlex.quote(snapshot_dir), commands['inst-cp1'])
+        for worker in ('inst-w1', 'inst-w2'):
+            self.assertEqual(cluster_module.node_signals_command('worker'),
+                             commands[worker])
+            self.assertNotIn('snaps', commands[worker])
+
+    def test_without_a_recorded_snapshot_directory_the_default_is_read(self):
+        # Metadata written before server_config was recorded has none, and
+        # a value which is not a string is not a directory k3s was given.
+        for server_config in (None, {}, {'etcd-snapshot-dir': ['/srv/x']},
+                              {'etcd-snapshot-dir': 7}, ['not', 'a', 'dict']):
+            self.md['server_config'] = server_config
+            self.client.executed = []
+
+            _make_cluster(self.client).health()
+
+            self.assertEqual(
+                cluster_module.node_signals_command('control_plane'),
+                dict(self.client.executed[1:])['inst-cp1'], server_config)
 
 
 class ActionLogFailingDrainClient(ActionLogClient):

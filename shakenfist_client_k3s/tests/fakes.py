@@ -205,6 +205,35 @@ class FakeClusterClient:
         self.unrouted_addresses.append((network_uuid, address))
 
 
+# What node_signals_command() prints on a healthy node of each role, for
+# HealthClient to answer the signals probe with and for the parser's tests
+# to read. Written by hand from what each source prints rather than captured
+# from a node, which is why the plan's live run exists. The worker's k3s
+# agent is mid-restart, because 'activating' is a state a real one is seen
+# in and the report has to carry it as it is.
+SERVER_SIGNALS_OUTPUT = (
+    'boot_id=3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11\n'
+    'booted_at=1759712345\n'
+    'oom_kills=2\n'
+    'memory_total_kb=4022148\n'
+    'memory_available_kb=2876544\n'
+    'NRestarts=3\n'
+    'LoadState=loaded\n'
+    'ActiveState=active\n'
+    'etcd_bytes=68321280\n'
+    'etcd_snapshot_bytes=41943040\n')
+
+WORKER_SIGNALS_OUTPUT = (
+    'boot_id=9a1d7c22-0e4b-4c5f-a0b3-77c1e2d4f6a8\n'
+    'booted_at=1759712399\n'
+    'oom_kills=0\n'
+    'memory_total_kb=2010264\n'
+    'memory_available_kb=1102336\n'
+    'NRestarts=0\n'
+    'LoadState=loaded\n'
+    'ActiveState=activating\n')
+
+
 class HealthClient(FakeClusterClient):
     """A scripted client which can be made unwell in each of the ways health() reports.
 
@@ -212,6 +241,27 @@ class HealthClient(FakeClusterClient):
     about is created with its agent ready and every agent command it is
     given completes with a return code of zero. A health check whose entire
     purpose is reporting bad news needs a client which can deliver some.
+
+    health() runs two kinds of command through the agent, and this answers
+    them separately, routed by command line: one starting 'kubectl ' is the
+    k3s API probe and answers from the ``probe_*`` attributes, exactly as it
+    did when it was the only command there was, and anything else is a
+    node's signals probe and answers from the ``signals_*`` attributes for
+    the instance it was sent to. Each operation keeps its own kind and
+    instance, so a pending kubectl probe and a complete signals probe -- or
+    the other way around -- can be in flight together, which is the shape
+    of the cases worth testing.
+
+    Submission and reading are modelled as the real server does them for
+    this plugin, whose client is built with ASYNC_CONTINUE: instance_execute()
+    returns the operation as submitted, 'queued' with no results, and only
+    get_agent_operation() reports what the command did. So the scripted
+    attributes -- probe_state, signals_state and the rest -- say what the
+    operation is when it is read, never what instance_execute() hands back.
+    This fake used to return the scripted ending from instance_execute()
+    itself, which let a probe that was never read report a result it had not
+    looked for, and so hid a wait that judged probes on their submission
+    state.
     """
 
     def __init__(self):
@@ -230,7 +280,9 @@ class HealthClient(FakeClusterClient):
         # What the kubectl probe does. Between them these cover the three
         # ways it can fail: the command runs and exits non-zero, the agent
         # operation itself errors, and the API refuses to accept the
-        # command at all.
+        # command at all. probe_state is the state the operation is in when
+        # it is read; at submission it is always 'queued' (see the class
+        # docstring).
         self.probe_return_code = 0
         self.probe_stdout = (
             'NAME                  STATUS   ROLES\n'
@@ -239,13 +291,41 @@ class HealthClient(FakeClusterClient):
         self.probe_state = 'complete'
         self.probe_raises = None
 
-        # How many times the operation may be re-read before this fake
+        # What each node's signals probe does, keyed by instance uuid, so
+        # one node can be made to fail while the others answer. The same
+        # three ways to fail as the kubectl probe, plus what the command
+        # prints. An instance with no entry answers as a healthy node would
+        # when read: state 'complete', exit 0, and the realistic output above
+        # for the role the command was built for.
+        self.signals_stdout = {}
+        self.signals_stderr = {}
+        self.signals_return_code = {}
+        self.signals_state = {}
+        self.signals_raises = {}
+
+        # Every call to instance_execute() and get_agent_operation(), in the
+        # order made, as ('execute', instance uuid, command line) and
+        # ('read', operation uuid). health() must submit every probe before
+        # it waits for any, and that is a claim about the order of two kinds
+        # of call which neither's own record can show.
+        self.calls = []
+
+        # Which probe and which instance each operation this fake handed out
+        # belongs to, so that a re-read answers for that operation rather
+        # than for whichever command was submitted last.
+        self.operations = {}
+
+        # How many times one operation may be re-read before this fake
         # decides the wait is not going to end. A wait which does not end
         # is the bug health() had, so a test for it must fail rather than
         # hang: a hung suite names no test, and nobody reads a run which
         # did not finish. The correct code reads a pending operation once
-        # per second up to its timeout, which is well inside this.
+        # per second up to its timeout, which is well inside this. Counted
+        # per operation rather than in total, so the limit scales with the
+        # number of operations in flight -- one per probed node and the
+        # kubectl one -- rather than assuming there is only one.
         self.agent_operation_reads = 0
+        self.agent_operation_reads_by_uuid = {}
         self.max_agent_operation_reads = 60
 
     def set_namespace_metadata_item(self, namespace, key, value):
@@ -262,40 +342,90 @@ class HealthClient(FakeClusterClient):
         self.deleted_instances.append(instance_ref)
         return super(HealthClient, self).delete_instance(instance_ref)
 
+    def _answer(self, kind, instance_ref, commandline):
+        """Return (state, results) for an operation of kind on instance_ref.
+
+        Called only when an operation is read, never at submission, and
+        read afresh on every call rather than captured, as the probe_*
+        answer always was, so a test may change an attribute between
+        submission and the wait, or between one read and the next.
+        """
+        if kind == 'kubectl':
+            return self.probe_state, {
+                '0': {'return-code': self.probe_return_code,
+                      'stdout': self.probe_stdout,
+                      'stderr': self.probe_stderr}}
+
+        # The default output follows the unit the command asked about,
+        # which is how a real node's output follows its role: it prints
+        # what it was asked for.
+        if 'systemctl show k3s-agent ' in (commandline or ''):
+            default_stdout = WORKER_SIGNALS_OUTPUT
+        else:
+            default_stdout = SERVER_SIGNALS_OUTPUT
+        return self.signals_state.get(instance_ref, 'complete'), {
+            '0': {'return-code': self.signals_return_code.get(instance_ref, 0),
+                  'stdout': self.signals_stdout.get(instance_ref,
+                                                    default_stdout),
+                  'stderr': self.signals_stderr.get(instance_ref, '')}}
+
     def get_agent_operation(self, operation_uuid):
         # A probe which is still pending stays pending: this is the node
         # whose agent is not connected, where the operation is accepted and
-        # then never runs. A test which wants the wait to end sets
-        # probe_state to a terminal state.
+        # then never runs. A test which wants the wait to end sets the
+        # state to a terminal one. An operation this fake did not hand out
+        # answers as the kubectl probe, which is what every operation was
+        # before there was more than one kind.
+        self.calls.append(('read', operation_uuid))
         self.agent_operation_reads += 1
-        if self.agent_operation_reads > self.max_agent_operation_reads:
+        reads = self.agent_operation_reads_by_uuid.get(operation_uuid, 0) + 1
+        self.agent_operation_reads_by_uuid[operation_uuid] = reads
+
+        kind, instance_ref, commandline = self.operations.get(
+            operation_uuid, ('kubectl', None, None))
+        state, results = self._answer(kind, instance_ref, commandline)
+        # The command the operation was submitted with, as the server
+        # reports it on every read, so that a description of the operation
+        # built from what was read names it.
+        commands = []
+        if commandline is not None:
+            commands = [{'command': 'execute', 'commandline': commandline}]
+        if reads > self.max_agent_operation_reads:
             raise AssertionError(
-                'the wait re-read the agent operation %d times without '
+                'the wait re-read the agent operation %s %d times without '
                 'ending. The operation is %r, which is not a state it can '
                 'leave, so whatever is waiting on it is waiting forever.'
-                % (self.agent_operation_reads, self.probe_state))
+                % (operation_uuid, reads, state))
         return {
             'uuid': operation_uuid,
-            'instance_uuid': None,
-            'state': self.probe_state,
-            'commands': [],
-            'results': {'0': {'return-code': self.probe_return_code,
-                              'stdout': self.probe_stdout,
-                              'stderr': self.probe_stderr}}
+            'instance_uuid': instance_ref,
+            'state': state,
+            'commands': commands,
+            'results': results
         }
 
     def instance_execute(self, instance_ref, commandline):
         self.executed.append((instance_ref, commandline))
-        if self.probe_raises:
-            raise self.probe_raises
+        self.calls.append(('execute', instance_ref, commandline))
 
+        kind = 'kubectl' if commandline.startswith('kubectl ') else 'signals'
+        raises = (self.probe_raises if kind == 'kubectl'
+                  else self.signals_raises.get(instance_ref))
+        if raises:
+            raise raises
+
+        # The operation as the server returns it on submission: queued,
+        # with nothing run and so no results, whatever the scripted ending
+        # is. A caller which wants to know how the command went has to read
+        # the operation, which is the path health() takes on a real cluster
+        # and so the one its tests must exercise.
         self.aop_serial += 1
+        operation_uuid = 'aop-%03d' % self.aop_serial
+        self.operations[operation_uuid] = (kind, instance_ref, commandline)
         return {
-            'uuid': 'aop-%03d' % self.aop_serial,
+            'uuid': operation_uuid,
             'instance_uuid': instance_ref,
-            'state': self.probe_state,
+            'state': 'queued',
             'commands': [{'command': 'execute', 'commandline': commandline}],
-            'results': {'0': {'return-code': self.probe_return_code,
-                              'stdout': self.probe_stdout,
-                              'stderr': self.probe_stderr}}
+            'results': {}
         }

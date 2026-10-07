@@ -48,19 +48,19 @@ copy lives in shakenfist/development at
 
 ## Situation
 
-**This is a placeholder. It records a real problem and the evidence
-for it, so that the work is not lost and does not have to be
-rediscovered, but its phases are deliberately unplanned. Flesh it out
-before executing anything.**
+This began as a placeholder recording a real problem and the evidence
+for it. Its phases are planned one at a time; open questions 1 to 3
+are answered by [phase 1's plan](PLAN-cumulative-health-signals-phase-01-agent-signals.md), and the
+others are answered below.
 
-`Cluster.health()` (`cluster.py:1603`) answers one question, and
+`Cluster.health()` in `cluster.py` answers one question, and
 answers it well: are this cluster's node instances up, and is the k3s
 API responding. Per decision 7 of
 [phase 3 of the library API plan][p3]
 it returns structured data rather than text so that an Ansible module
 can branch on it, and it deliberately repairs nothing, on the grounds
 that a verb which silently fixes things cannot be used to decide
-whether to fix things. `_node_health()` (`cluster.py:849`) builds each
+whether to fix things. `_node_health()` builds each
 node's entry: `uuid`, `role`, `name`, `exists`, `state`,
 `agent_state`, `healthy`.
 
@@ -79,13 +79,16 @@ The signals that would have caught it are all cumulative -- a counter,
 or a log entry -- and all cheap to read through the `sf-agent2` side
 channel the plugin already uses for everything else:
 
-- **`systemctl show k3s -p NRestarts`.** The single best signal. It
+- **`systemctl show k3s -p NRestarts`.** The single best signal. (On
+  workers the unit is `k3s-agent`; see phase 1's survey finding 2.) It
   read 5 and then 7 across that testing while
   `systemctl show k3s -p ActiveState` said `active` throughout.
-- **The kernel's OOM kill count.** Read it from `journalctl -k`, not
-  `dmesg`: during the same testing the `dmesg` count went *down* from
-  2 to 1 as the ring buffer wrapped, and a counter that can decrease
-  is not a counter.
+- **The kernel's OOM kill count.** Not from `dmesg`: during the same
+  testing the `dmesg` count went *down* from 2 to 1 as the ring buffer
+  wrapped, and a counter that can decrease is not a counter. This
+  section used to say `journalctl -k` instead, which shares the flaw
+  over a longer timescale; phase 1 reads the kernel's own counter,
+  `oom_kill` in `/proc/vmstat` (its survey finding 3).
 - **`MemAvailable` from `/proc/meminfo`.** Warning before the cliff
   rather than forensics after it.
 - **The etcd data directory size.** 383 MB of data plus 80 MB of
@@ -120,14 +123,15 @@ has no recovery path at all today.
 
 ## Open questions
 
-All of these need answering before this plan has phases. None of them
-are answered yet.
+Each question carries its answer, or says where to find it.
 
 1. **Where do cumulative signals live in the returned structure?**
    Per-node alongside `agent_state`, or under a new top-level key? The
    return value is a documented contract that phase 5's Ansible module
    branches on, so adding keys is cheaper than moving existing ones,
    but the shape should be decided once rather than grown.
+   **Answered** by [phase 1 decision 1](PLAN-cumulative-health-signals-phase-01-agent-signals.md): per node, under a
+   `signals` key with a fixed set of keys in every outcome.
 2. **How is "since when" expressed?** This is the sharpest design
    question. A counter is only meaningful against a previous reading,
    so either the caller stores the baseline and the verb reports raw
@@ -136,12 +140,15 @@ are answered yet.
    *write*, which collides with it being the read-only verb you reach
    for when you do not trust the cluster. Recommendation to be tested
    during planning: report raw cumulative values and let the caller
-   diff, keeping the verb read-only.
+   diff, keeping the verb read-only. **Answered** by
+   [phase 1 decision 2](PLAN-cumulative-health-signals-phase-01-agent-signals.md): as recommended, with the boot id
+   reported so that a caller can tell when its baseline is void.
 3. **Does `health()` gain opinions, or only facts?** `MemAvailable` is
    a number; "this node is about to OOM" is a judgement with a
    threshold in it. A verb that reports facts stays useful as
    workloads change; a verb with thresholds baked in starts lying when
-   they are wrong.
+   they are wrong. **Answered** by [phase 1 decision 3](PLAN-cumulative-health-signals-phase-01-agent-signals.md): facts
+   only, and no signal changes `healthy`.
 4. **What is the recovery story, and whose plan is it?** The roles are
    asymmetrical. A worker is already replaceable with `remove-worker`
    plus `expand-workers`, and 33fl's phase 4 conductor scale loop
@@ -149,7 +156,9 @@ are answered yet.
    replaceable at all: there is one etcd member and no verb to replace
    it, so `--control-plane-count 3` for quorum may be the whole
    answer. Decide whether that belongs here, in its own plan, or in
-   neither.
+   neither. **Answered** by [phase 1 decision 10](PLAN-cumulative-health-signals-phase-01-agent-signals.md): its own plan,
+   proposed once this plan's signals show how often it is needed; see
+   Future work.
 5. **Is any of this worth doing before the cluster it was found on is
    rebuilt?** The evidence above came from nodes of the old hardcoded
    2 vCPU / 2048 MB size. Once
@@ -157,20 +166,21 @@ are answered yet.
    built at sane sizes, control plane OOM should become rare. Rare is
    not never, and a silent failure that happens rarely is worse than
    one that happens often, but it is a fair question whether this is
-   next or much later.
+   next or much later. **Answered** by scheduling: node customisation
+   landed (its push audit merged as `4a6f38e`), and the operator chose
+   to start this plan next.
 
 ## Execution
 
-**Unplanned. This is the placeholder's main gap.** The phases below
-are a guess at the shape, not a plan: each needs its open questions
-resolved and its own detail before anyone starts. The push audit row
-is mandatory and is the only row that is certainly correct.
+Phases are planned one at a time, each in its own file, and each
+corrects the rows after it when its survey finds them wrong. The push
+audit row is mandatory.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Agent-read signals | `NRestarts`, the `journalctl -k` OOM count, `MemAvailable` and the etcd directory size, read through the agent and added to each node's entry. Needs open questions 1, 2 and 3 answered first | Proposed | |
-| 2. API-read signals | `OOMKilled` terminations, and whatever else the API exposes that current state discards. Needs open question 1 | Proposed | |
-| 3. Live validation | Provoke each signal on a throwaway cluster and assert the verb reports it. 33fl's `tools/k3s-health-check.py` tier 3 is a ready-made way to provoke control plane OOM | Proposed | |
+| 1. Agent-read signals | [PLAN-cumulative-health-signals-phase-01-agent-signals.md](PLAN-cumulative-health-signals-phase-01-agent-signals.md) -- `NRestarts` from `k3s` or `k3s-agent` by role, the `/proc/vmstat` OOM kill count, `MemTotal` and `MemAvailable`, the boot id and boot time, and the etcd data and snapshot directory sizes on control plane nodes, read by one agent operation per healthy node under the existing probe budget and reported raw under each node's `signals`. `healthy` is unchanged. Answers open questions 1, 2 and 3. (This row used to read the OOM count from `journalctl -k`.) | In progress | |
+| 2. API-read signals | `OOMKilled` terminations, and whatever else the API exposes that current state discards, placed per node where they belong to a node (phase 1 decision 1). Includes the node `Ready` condition from [#76](https://github.com/shakenfist/client-python-k3s/issues/76), which is current state rather than history and is the one reading that may reasonably change `healthy` -- decide that here | Proposed | |
+| 3. Live validation | Provoke each signal on a throwaway cluster and assert the verb reports it, in `tools/ci_deploy_test.sh` or by hand. 33fl's `tools/k3s-health-check.py` tier 3 is a ready-made way to provoke control plane OOM. Also confirm two things phase 1 took from source rather than observation: that restarting k3s by hand resets `NRestarts`, and that a pod exceeding its own memory limit increments `oom_kill` | Proposed | |
 | 4. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-3 against `develop` | Proposed | |
 
 <!-- shared-block: plan-push-audit-phase v3 -->
@@ -536,7 +546,18 @@ We should list obvious extensions, known issues, unrelated bugs we
 encountered, and anything else we should one day do but have
 chosen to defer to here, so that we do not forget them.
 
-...
+* A recovery plan, separate from this one (open question 4, phase 1
+  decision 10). Workers are already replaceable with `remove-worker`
+  plus `expand-workers`; a control plane node is not replaceable at
+  all, and `--control-plane-count 3` may be the whole answer there.
+  Propose it once these signals have shown how often recovery is
+  needed.
+* Bound the health probes' agent operations with a short deadline, so
+  that an abandoned probe expires in seconds rather than after the
+  server's 600 second default. `shakenfist_client`'s
+  `instance_execute()` has a `deadline_seconds` argument on its
+  development branch but in no release; this needs the client floor
+  raised once one ships (phase 1 survey finding 5).
 
 ### Bugs fixed during this work
 

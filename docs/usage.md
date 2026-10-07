@@ -462,12 +462,27 @@ Cluster mycluster in namespace default is healthy
   state: created
   nodes:
     [ok] k3s-mycluster-node-001 (3fa85f64-5717-4562-b3fc-2c963f66afa6, control plane): instance created, agent ready
+        booted 2026-10-06T06:47:11Z, k3s active, 0 restarts, 0 OOM kills, 2702 of 3914 MiB available, etcd 138 MiB, snapshots 0 MiB
     [ok] k3s-mycluster-node-002 (7c9e6679-7425-40de-944b-e07fc1f90ae7, worker): instance created, agent ready
+        booted 2026-10-06T06:50:41Z, k3s-agent active, 0 restarts, 0 OOM kills, 2173 of 2971 MiB available
   k3s API: answered on 3fa85f64-5717-4562-b3fc-2c963f66afa6
     NAME                     STATUS   ROLES                  AGE   VERSION
     k3s-mycluster-node-001   Ready    control-plane,master   10m   v1.30.2+k3s1
     k3s-mycluster-node-002   Ready    <none>                 9m    v1.30.2+k3s1
 ```
+
+The indented line under each node is what that node reports about
+itself: when it booted, whether k3s is running and how many times
+systemd has restarted it, how many kernel OOM kills there have been
+since boot, available memory, and on control plane nodes the size of
+etcd and its snapshots. Nothing on it is judged -- there are no
+markers and no thresholds, and it never changes whether the node or
+the cluster is reported healthy -- because whether a number is a
+problem depends on what the cluster is for. A node that could not be
+read says `signals: not read` and why. The counts are cumulative
+since boot, so compare against an earlier report to see what changed;
+see [What `signals` reports](library-api.md#what-signals-reports) for
+what each reading is and how to diff it.
 
 A cluster that never finished being built is reported here too, rather
 than refused -- reporting on a broken cluster is what this command is
@@ -476,19 +491,27 @@ instead of `created`, and an instance the metadata names but which no
 longer exists is reported as gone rather than failing the command.
 
 The command never hangs, which matters most on exactly the clusters
-it is for. The `kubectl get nodes` probe is only attempted when the
-control plane node it would run on looks able to answer -- the report
-has already read that node's instance and agent state -- and it is
-given a thirty second budget even then, because a command queued
-against an instance whose agent is not connected is accepted and then
-never runs. Each of those outcomes is reported on the `k3s API:` line
-with the reason, rather than waited on.
+it is for. The `kubectl get nodes` probe, and the signals read on
+each node, are only attempted when the node they would run on looks
+able to answer -- the report has already read that node's instance and
+agent state -- and they share a thirty second budget even then,
+because a command queued against an instance whose agent is not
+connected is accepted and then never runs. Each of those outcomes is
+reported with the reason, on the `k3s API:` line or on the node's
+signals line, rather than waited on. The budget is only spent when
+something is wrong: the probes run on every node at once, so a
+healthy cluster waits for about as long as its slowest probe takes,
+whatever its size. The budget bounds the waiting only: on top of it
+come one Shaken Fist API round trip per node to read its instance, one
+per probe to submit it, and the reads of each probe, so on a slow Shaken
+Fist API the command can take longer than thirty seconds.
 
-An abandoned probe leaves its `kubectl get nodes` queued against the
-control plane node, and the reason on the `k3s API:` line names the
-agent operation so it can be recognised later: until Shaken Fist's own
-deadline ends it, a subsequent `expand-workers` or `update-os` waits
-for it along with everything else. That is a delay in a later command,
+An abandoned run leaves operations queued: up to one per probed node,
+plus the `kubectl get nodes` against the control plane node. The
+reason on the `k3s API:` line names that agent operation so it can be
+recognised later: until Shaken Fist's own deadline ends it, a
+subsequent `expand-workers` or `update-os` waits for it along with
+everything else. That is a delay in a later command,
 not a failure of it -- those commands wait for every agent operation on
 a node, because the next command must not race one still running, but
 they only fail on the ones they submitted themselves. It is still worth

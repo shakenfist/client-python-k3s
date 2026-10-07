@@ -574,6 +574,65 @@ class HealthCommandTestCase(testtools.TestCase):
         self.assertIn('k3s-banana-node-001   Ready    control-plane',
                       result.output)
 
+    def test_a_healthy_cluster_renders_each_nodes_signals_under_its_line(self):
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+
+        # etcd is only read on the control plane, so only its line has the
+        # etcd readings.
+        self.assertIn(
+            '(inst-cp1, control plane): instance created, agent ready\n'
+            '        booted 2025-10-06T00:59:05Z, k3s active, 3 restarts, '
+            '2 OOM kills, 2809 of 3927 MiB available, '
+            'etcd 65 MiB, snapshots 40 MiB\n', result.output)
+        self.assertIn(
+            '(inst-w1, worker): instance created, agent ready\n'
+            '        booted 2025-10-06T00:59:59Z, k3s-agent activating, '
+            '0 restarts, 0 OOM kills, 1076 of 1963 MiB available\n',
+            result.output)
+        self.assertEqual(1, result.output.count('etcd '))
+        self.assertNotIn('None', result.output)
+
+    def test_a_node_whose_signals_were_skipped_says_so(self):
+        del self.client.instances['inst-w2']
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn(
+            '[!!] inst-w2 (worker): this instance no longer exists\n'
+            '        signals: not read (', result.output)
+        self.assertNotIn('None', result.output)
+
+    def test_a_node_with_missing_readings_renders_unknown(self):
+        # No memory or etcd lines at all, so those readings are None in
+        # the report and the line must keep its shape.
+        self.client.signals_stdout['inst-cp1'] = (
+            'boot_id=3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11\nbooted_at=1759712345\n'
+            'oom_kills=2\n'
+            'NRestarts=3\nLoadState=loaded\nActiveState=active\n')
+
+        result = self._invoke()
+
+        self.assertIn(
+            '        booted 2025-10-06T00:59:05Z, k3s active, 3 restarts, '
+            '2 OOM kills, unknown of unknown MiB available, '
+            'etcd unknown MiB, snapshots unknown MiB\n', result.output)
+        self.assertNotIn('None', result.output)
+
+    def test_a_probed_node_with_an_error_appends_it(self):
+        self.client.signals_return_code['inst-w1'] = 1
+        self.client.signals_stderr['inst-w1'] = 'du: cannot read\n'
+
+        result = self._invoke()
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertRegex(
+            result.output,
+            r'1076 of 1963 MiB available \(.+\)\n')
+        self.assertNotIn('None', result.output)
+
     def test_an_unhealthy_cluster_renders_and_still_exits_zero(self):
         self._make_unhealthy()
 
@@ -680,10 +739,24 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
         'nodes': [
             {'uuid': 'inst-cp1', 'role': 'control_plane',
              'name': 'k3s-banana-node-001', 'exists': True,
-             'state': 'created', 'agent_state': 'ready', 'healthy': True},
+             'state': 'created', 'agent_state': 'ready', 'healthy': True,
+             'signals': {
+                 'probed': True, 'error': None, 'boot_id': 'abc',
+                 'booted_at': 1759712345, 'k3s_unit': 'k3s',
+                 'k3s_state': 'active', 'k3s_restarts': 1, 'oom_kills': 0,
+                 'memory_total_bytes': 4 * 1048576 * 1000,
+                 'memory_available_bytes': 3 * 1048576 * 1000,
+                 'etcd_bytes': 64 * 1048576,
+                 'etcd_snapshot_bytes': 32 * 1048576}},
             {'uuid': 'inst-w1', 'role': 'worker', 'name': None,
              'exists': False, 'state': None, 'agent_state': None,
-             'healthy': False}
+             'healthy': False,
+             'signals': {
+                 'probed': False, 'error': 'instance is gone',
+                 'boot_id': None, 'booted_at': None, 'k3s_unit': 'k3s-agent',
+                 'k3s_state': None, 'k3s_restarts': None, 'oom_kills': None,
+                 'memory_total_bytes': None, 'memory_available_bytes': None,
+                 'etcd_bytes': None, 'etcd_snapshot_bytes': None}}
         ],
         'api': {
             'probed': True, 'answered': True, 'instance_uuid': 'inst-cp1',
@@ -711,6 +784,208 @@ class HealthRenderingReporterTestCase(testtools.TestCase):
         self.assertIn('[!!] (unnamed) (inst-w1, worker): instance created',
                       reporter.getvalue())
         self.assertNotIn('None', reporter.getvalue())
+
+    def test_signals_render_under_each_node_line(self):
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, self.REPORT)
+
+        self.assertIn(
+            '(inst-cp1, control plane): instance created, agent ready\n'
+            '        booted 2025-10-06T00:59:05Z, k3s active, 1 restart, '
+            '0 OOM kills, 3000 of 4000 MiB available, '
+            'etcd 64 MiB, snapshots 32 MiB\n', reporter.getvalue())
+        self.assertIn(
+            'this instance no longer exists\n'
+            '        signals: not read (instance is gone)\n',
+            reporter.getvalue())
+        self.assertNotIn('None', reporter.getvalue())
+
+    def test_unread_values_render_unknown_and_never_None(self):
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals'].update({
+            'k3s_state': None, 'k3s_restarts': None, 'booted_at': None,
+            'memory_available_bytes': None, 'etcd_bytes': None})
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn(
+            '        booted unknown, k3s unknown, unknown restarts, '
+            '0 OOM kills, unknown of 4000 MiB available, '
+            'etcd unknown MiB, snapshots 32 MiB\n', reporter.getvalue())
+        self.assertNotIn('None', reporter.getvalue())
+
+    def test_a_boot_time_datetime_cannot_hold_renders_unknown(self):
+        # The parser accepts up to twenty digits as a btime, and datetime
+        # takes far fewer: twenty nines of seconds is far past the year
+        # 9999, and fromtimestamp() raises for it (OverflowError, OSError or
+        # ValueError, depending on the platform and where it overflows).
+        # That must cost the one reading, not the report: the rest of the
+        # line, and the rest of the nodes, are rendered as usual.
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals']['booted_at'] = int('9' * 20)
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn(
+            '        booted unknown, k3s active, 1 restart, '
+            '0 OOM kills, 3000 of 4000 MiB available, '
+            'etcd 64 MiB, snapshots 32 MiB\n', reporter.getvalue())
+        self.assertIn('signals: not read (instance is gone)',
+                      reporter.getvalue())
+        self.assertIn('k3s API: answered on inst-cp1', reporter.getvalue())
+
+    # Every int reading, and the line they render to when none of them is an
+    # int. The unit and its state are strings and stay as they are.
+    INT_READINGS = ('booted_at', 'k3s_restarts', 'oom_kills',
+                    'memory_total_bytes', 'memory_available_bytes',
+                    'etcd_bytes', 'etcd_snapshot_bytes')
+    ALL_UNKNOWN = (
+        '        booted unknown, k3s active, unknown restarts, '
+        'unknown OOM kills, unknown of unknown MiB available, '
+        'etcd unknown MiB, snapshots unknown MiB\n')
+
+    def _render_with(self, readings):
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals'].update(readings)
+        reporter = progress.CollectingReporter()
+        shakenfist_client_k3s._render_health(reporter, report)
+        return reporter.getvalue()
+
+    def test_string_readings_render_unknown(self):
+        # A caller which built the report by hand, or read it back from
+        # somewhere that stores everything as text. '1759712345' // 1048576
+        # and fromtimestamp('1759712345') both raise TypeError, which used
+        # to lose the whole report; '3' restarts rendered as if it had been
+        # read from systemd.
+        rendered = self._render_with(
+            {key: '1759712345' for key in self.INT_READINGS})
+
+        self.assertIn(self.ALL_UNKNOWN, rendered)
+        self.assertIn('k3s API: answered on inst-cp1', rendered)
+
+    def test_float_readings_render_unknown(self):
+        # The shape a JSON round trip through something which does not keep
+        # ints apart from floats leaves. A float size used to render as a
+        # fractional MiB, and a float restart count as '3.0 restarts'; a
+        # float boot time happened to render, but is no more a reading this
+        # package took than the others are.
+        rendered = self._render_with(
+            {key: 1759712345.0 for key in self.INT_READINGS})
+
+        self.assertIn(self.ALL_UNKNOWN, rendered)
+        self.assertNotIn('.0', rendered)
+        self.assertNotIn('2025-', rendered)
+
+    def test_bool_readings_render_unknown(self):
+        # bool is a subclass of int, so isinstance(True, int) alone would
+        # let True through as a restart count of 1 and a boot time of one
+        # second past the epoch. It is not a reading of either.
+        for flag in (True, False):
+            rendered = self._render_with(
+                {key: flag for key in self.INT_READINGS})
+
+            self.assertIn(self.ALL_UNKNOWN, rendered, flag)
+            self.assertNotIn('True', rendered, flag)
+            self.assertNotIn('False', rendered, flag)
+            self.assertNotIn('1970-', rendered, flag)
+
+    def test_a_unit_state_which_is_not_a_string_renders_unknown(self):
+        # The same rule for the two string readings: a state of 7 is not
+        # something systemd said.
+        rendered = self._render_with({'k3s_unit': 7, 'k3s_state': True})
+
+        self.assertIn('        booted 2025-10-06T00:59:05Z, unknown unknown, '
+                      '1 restart, ', rendered)
+
+    def test_the_epoch_is_a_boot_time_and_not_unknown(self):
+        # The negative of the above: zero is a timestamp datetime can hold,
+        # and a falsy one, so it is rendered rather than caught or mistaken
+        # for a reading which was not taken.
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals']['booted_at'] = 0
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn('        booted 1970-01-01T00:00:00Z, k3s active, ',
+                      reporter.getvalue())
+
+    def test_hand_built_sizes_at_str_s_digit_limit_still_render(self):
+        # The other conversions on an int, swept for the same failure:
+        # Python 3.11 and later refuse str() of an int past 4300 digits. The
+        # parser caps a reading at twenty digits, so nothing it produces
+        # comes near that, but the renderer also takes reports a caller
+        # built, and must not raise on those either. A size at the limit,
+        # scaled by 1024 as memory is, renders because mib() divides before
+        # str() sees it.
+        biggest = int('9' * 4300)
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals'].update({
+            'memory_total_bytes': biggest * 1024,
+            'memory_available_bytes': biggest * 1024,
+            'k3s_restarts': biggest, 'oom_kills': biggest,
+            'etcd_bytes': biggest, 'etcd_snapshot_bytes': biggest})
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn('k3s API: answered on inst-cp1', reporter.getvalue())
+        self.assertIn(' MiB available, etcd ', reporter.getvalue())
+
+    def test_a_count_of_one_is_singular(self):
+        # And only one: zero and every other count are plural, as is a
+        # count which could not be read ('unknown restarts').
+        for restarts, oom_kills, expected in (
+                (1, 1, '1 restart, 1 OOM kill, '),
+                (0, 2, '0 restarts, 2 OOM kills, '),
+                (None, 1, 'unknown restarts, 1 OOM kill, '),
+                (11, None, '11 restarts, unknown OOM kills, ')):
+            rendered = self._render_with(
+                {'k3s_restarts': restarts, 'oom_kills': oom_kills})
+
+            self.assertIn('k3s active, %s3000 of 4000 MiB available' % expected,
+                          rendered)
+
+    def test_a_worker_line_has_no_etcd(self):
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][1].update({'exists': True, 'name': 'w', 'state': 'created',
+                                   'agent_state': 'ready'})
+        report['nodes'][1]['signals'].update({
+            'probed': True, 'error': None, 'booted_at': 0,
+            'k3s_state': 'active', 'k3s_restarts': 0, 'oom_kills': 0,
+            'memory_total_bytes': 1048576, 'memory_available_bytes': 1048576})
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn(
+            '        booted 1970-01-01T00:00:00Z, k3s-agent active, '
+            '0 restarts, 0 OOM kills, 1 of 1 MiB available\n',
+            reporter.getvalue())
+
+    def test_a_probed_node_with_an_error_appends_it(self):
+        report = copy.deepcopy(self.REPORT)
+        report['nodes'][0]['signals']['error'] = 'du timed out'
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertIn('snapshots 32 MiB (du timed out)\n', reporter.getvalue())
+
+    def test_a_node_with_no_signals_at_all_is_skipped(self):
+        # A report from an older library, or built by hand.
+        report = copy.deepcopy(self.REPORT)
+        for node in report['nodes']:
+            del node['signals']
+        reporter = progress.CollectingReporter()
+
+        shakenfist_client_k3s._render_health(reporter, report)
+
+        self.assertNotIn('booted', reporter.getvalue())
+        self.assertNotIn('signals:', reporter.getvalue())
 
     def test_the_report_goes_to_the_reporter_and_not_to_stdout(self):
         reporter = progress.CollectingReporter()
