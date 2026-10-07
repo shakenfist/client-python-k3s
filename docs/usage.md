@@ -26,9 +26,9 @@ Builds a cluster and, unless `--no-kubeconfig` is given, leaves it in
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `--control-plane-count` | 1 | Control plane nodes. More than one gives a highly available control plane. |
-| `--worker-count` | 2 | Worker nodes. |
-| `--metal-address-count` | 5 | Floating addresses routed into the cluster network for MetalLB to hand out. Accepted but ignored when `--no-metallb` is given. |
+| `--control-plane-count` | 1 | Control plane nodes, at least 1. More than one gives a highly available control plane. |
+| `--worker-count` | 2 | Worker nodes, at least 0. |
+| `--metal-address-count` | 5 | Floating addresses, at least 0, routed into the cluster network for MetalLB to hand out. Accepted but ignored when `--no-metallb` is given. |
 | `--network` | (a new one) | Join a pre-existing Shaken Fist network instead of creating one for this cluster. |
 | `--release-channel` | `stable` | A k3s release channel. `stable`, `latest`, or a version-pinned channel such as `v1.26`. |
 | `--refresh-version-cache` | off | Re-query the k3s and Longhorn release APIs instead of using the cached answers. |
@@ -57,6 +57,33 @@ it goes.
 Skipping MetalLB, Longhorn or the local kubeconfig update also skips
 that phase's number, so a create that leaves all three out counts
 fewer phases rather than reporting a phase it never runs.
+
+#### Cluster names and counts
+
+`NAME` may contain only ASCII letters, digits and hyphens, must start
+and end with a letter or digit, and may be at most 48 characters
+long. Mixed case is accepted. The name becomes part of every node's
+Shaken Fist instance name, `k3s-NAME-node-SERIAL`, which must be a DNS
+host name of at most 63 characters; 48 leaves room for the prefix and
+for serials up to five digits, so a cluster which was legal to create
+can still grow. A name which breaks the rule is refused before
+anything is built, rather than at the first instance create, which
+would leave an interrupted cluster behind. Only `create` applies this
+rule: a cluster that already exists under some other name keeps
+working with every other command.
+
+The names `k3s_version_cache` and `longhorn_version_cache` are refused
+by every command, because they collide with the keys the release caches
+use in the namespace's metadata.
+
+The counts are checked the same way, and a boolean or a value that is
+not an integer is refused. `expand-workers` and `expand-addresses`
+require a count of at least 1, because 0 or less asks for nothing.
+
+The size options below are checked by the library rather than by
+Click, so an out-of-range size exits 1 with the library's message, like
+every other refusal, rather than Click's exit 2 usage error. A refused
+`create` does not create the `--namespace` namespace.
 
 #### Sizing
 
@@ -299,10 +326,27 @@ side and not on the create side.
 
 Deletes every instance in the cluster, unroutes its floating
 addresses, deletes the node network if `create` made it, and removes
-the cluster's namespace metadata. It then removes the cluster's entries from the
-local kubeconfig with `kubectl config unset`, unless `--no-kubeconfig`
-is given, in which case that step is skipped and a local `kubectl` is
-not needed.
+the cluster's namespace metadata. It then removes the cluster's
+entries -- a user, context and cluster named `NAME.NAMESPACE` -- from
+`~/.kube/config`, unless `--no-kubeconfig` is given, in which case
+that step is skipped and a local `kubectl` is not needed.
+
+The cleanup acts on `~/.kube/config` whatever `KUBECONFIG` says,
+because that is the file `create` writes. If the file does not exist
+there is nothing to remove, and `kubectl` is not run. Otherwise it
+names the file with `kubectl --kubeconfig`, reads the entries present
+with `kubectl config view` and then runs
+`kubectl config delete-context`, `delete-user` and `delete-cluster`
+for each one by name, so it requires `kubectl` v1.20 or later
+(`delete-user` arrived in v1.20.0: "Added get-users and delete-user
+to the kubectl config subcommand (#89840)", in the Kubernetes
+[CHANGELOG-1.20.md](https://github.com/kubernetes/kubernetes/blob/master/CHANGELOG/CHANGELOG-1.20.md)).
+Any failure here -- no local
+`kubectl`, or a `kubectl` call that fails -- comes after the cluster
+itself has gone, so running `delete` again only reports that the
+cluster does not exist. The error says which entries may remain and
+gives the `kubectl --kubeconfig ~/.kube/config config delete-*`
+commands that remove them by hand.
 
 This also works on a cluster that never finished being built --
 indeed it is the supported way to clear one: whatever nodes, network
@@ -319,7 +363,7 @@ with that name is deleted.
 
 ### `expand-workers NAME [--worker-count N]`
 
-Adds `N` more workers (default 2) to a running cluster. Existing
+Adds `N` more workers (default 2, at least 1) to a running cluster. Existing
 nodes are untouched. Refuses to run against a cluster that never
 finished being built; see `create`, above. New workers are built at
 the worker size the cluster recorded when it was created, and are
@@ -398,7 +442,7 @@ instance `k3s-MyCluster-node-002` is the k3s node
 
 ### `expand-addresses NAME [--address-count N]`
 
-Routes `N` more floating addresses (default 2) into the cluster
+Routes `N` more floating addresses (default 2, at least 1) into the cluster
 network and reconfigures MetalLB's pool to include them. Refuses to
 run against a cluster that never finished being built; see `create`,
 above.

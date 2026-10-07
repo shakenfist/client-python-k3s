@@ -57,7 +57,7 @@ documents -- to reach `Cluster` and `make_client()`, and that import
 has to resolve on whichever machine actually runs the module (the
 control node, when the task uses `delegate_to: localhost` or a local
 connection, as every example on this page does). `collection/requirements.txt`
-names `shakenfist_client_k3s>=0.1.0` for exactly this reason: it is a
+names `shakenfist_client_k3s>=0.3.0` for exactly this reason: it is a
 fact about what the module's Python source imports, not about what
 Ansible needs, so Ansible Galaxy -- which only ever installs
 collections, never their Python dependencies -- cannot install it for
@@ -244,6 +244,14 @@ when there is no other writer yet: its default of `0` builds a
 cluster with control plane nodes only, which is what a play that hands
 the cluster straight to such a scaler wants, rather than the command
 line's default of `2`.
+
+The module checks `name` only when it would create the cluster, so a
+cluster that already exists under a name `create` would now refuse is
+still found, reported unchanged and deletable (the two release cache
+names are refused for every state). The counts are checked at
+`state: present` before a client is built, so a bad count fails the
+same way in check mode as in a real run, and names the module's own
+parameter (`initial_workers`, not `worker_count`).
 
 Every other shape parameter the module takes -- `control_plane_count`,
 `metal_address_count`, `network`, `release_channel`, `sshkey`,

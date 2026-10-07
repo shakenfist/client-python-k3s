@@ -414,10 +414,26 @@ NODE_SIGNAL_STATE_RE = re.compile(r'\A[a-z-]{1,32}\Z')
 #    built by heredoc() below, which refuses such a body.
 #
 # 3. Where a real argument list is available, it is used instead of a
-#    shell command line, so that no shell parses the value at all. Both
-#    local kubectl invocations -- create()'s merge and delete()'s unset
-#    calls -- are argument lists. The agent commands cannot be, because
-#    the agent takes a command line.
+#    shell command line, so that no shell parses the value at all. Every
+#    local kubectl invocation -- create()'s merge and delete()'s cleanup
+#    -- is an argument list. The agent commands cannot be, because the
+#    agent takes a command line.
+
+
+def _local_kubeconfig_path():
+    """The file create(write_kubeconfig=True) writes, and delete()'s cleanup acts on.
+
+    Always ~/.kube/config, whatever KUBECONFIG says: create() writes or
+    merges into this file and nowhere else, so the cleanup has to read and
+    edit the same one rather than whichever files the caller's KUBECONFIG
+    happens to list. One function, so the two cannot drift apart.
+
+    Every component is chosen by this module -- the user's home
+    directory, a fixed directory name and a fixed file name -- so the join
+    needs no containment check and there is nothing for a realpath() guard
+    to prove. An outside value appearing in it later would need both.
+    """
+    return os.path.join(os.path.expanduser('~'), '.kube', 'config')
 
 
 def _is_address(value):
@@ -842,9 +858,10 @@ def validate_node_sizes(sizes):
     to the API at all.
 
     It checks the values it is given and not the shape they come in: a
-    missing role or field is not reported. Its one caller, create(), always
-    builds the complete mapping, so there is nothing to catch today; a new
-    caller handing it something partial has to check the shape itself.
+    missing role or field is not reported. Its one caller,
+    validate_create_arguments(), always builds the complete mapping, so
+    there is nothing to catch today; a new caller handing it something
+    partial has to check the shape itself.
     """
     for role, size in sizes.items():
         for field, value in size.items():
@@ -852,6 +869,85 @@ def validate_node_sizes(sizes):
                     or value < 1):
                 raise exceptions.NodeSizeError.not_positive_integer(
                     role, field, value)
+
+
+# The longest cluster name create() accepts. Every node's Shaken Fist
+# instance name is 'k3s-%s-node-%03d' % (name, serial) -- see
+# create_instance() -- and Shaken Fist refuses an instance name longer than
+# 63 characters. The template adds 'k3s-' and '-node-', ten characters, to
+# the name, plus the serial: three digits at first, since %03d pads to
+# three, but as many as the serial needs once it passes 999. The serial
+# counts every node the cluster has ever had, removed ones included, so a
+# long lived cluster with workers coming and going does pass 999. 63 - 10 -
+# 3 = 50 is the true ceiling today; 63 - 10 - 5 = 48 leaves room for
+# serials up to 99999, so that a cluster which was legal to create does not
+# become one that cannot grow.
+CLUSTER_NAME_MAX_LENGTH = 48
+
+# What a cluster name may be made of: ASCII letters, digits and hyphens,
+# starting and ending with a letter or a digit. Explicit ranges rather than
+# \w, which takes underscores and the letters of every other script. \Z
+# rather than $, because $ also matches before a trailing newline, which
+# would let 'banana\n' through.
+CLUSTER_NAME_PATTERN = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\Z')
+
+
+def validate_cluster_name(name):
+    """Refuse a cluster name which cannot become a node's instance name, before anything is built.
+
+    Raises exceptions.ClusterNameError: ``invalid_characters`` unless the
+    name is a string matching CLUSTER_NAME_PATTERN, then ``too_long`` past
+    CLUSTER_NAME_MAX_LENGTH. Characters come first because no amount of
+    shortening fixes a dot. The rule is Shaken Fist's instance name rule
+    applied to the part of the name this package does not choose, so that
+    a bad name fails here rather than at the first instance create, after
+    the name is registered and the network allocated; ClusterNameError
+    gives each refusal's reasoning, mixed case included.
+
+    Only the create paths call this: create(), and through
+    validate_create_arguments() the command line's create and the Ansible
+    module's create path. Every other verb acts on a cluster which already
+    exists, and one created under a name this refuses has to stay possible
+    to show, repair and delete. Pure, like validate_node_sizes(), so that
+    it runs before anything talks to the API.
+    """
+    if not isinstance(name, str) or not CLUSTER_NAME_PATTERN.match(name):
+        raise exceptions.ClusterNameError.invalid_characters(name)
+    if len(name) > CLUSTER_NAME_MAX_LENGTH:
+        raise exceptions.ClusterNameError.too_long(
+            name, CLUSTER_NAME_MAX_LENGTH)
+
+
+def validate_counts(floor, **counts):
+    """Refuse a count which is not an integer of at least floor, before anything is built.
+
+    counts are keyword arguments named as the verb names them, so that the
+    exceptions.ShapeError raised for the first unusable one, in order, can
+    name it: ``not_an_integer`` for a non-int or a bool, ``below_floor``
+    for an int under floor. The floor is an argument because it is the
+    verb's, not the count's. This is the one statement of the floors'
+    reasons; the values are passed by validate_create_counts() and the
+    two expand verbs:
+
+    - control_plane_count on create(): 1. With no control plane there is
+      no API server, and the create fails tens of minutes in without
+      naming the count.
+    - worker_count and metal_address_count on create(): 0. Both are
+      clusters a caller can mean: workloads run on an untainted control
+      plane (docs/usage.md), and expand_addresses() can add a pool later.
+    - worker_count on expand_workers() and address_count on
+      expand_addresses(): 1. Zero or less asks for nothing, and the verb
+      would report success having done nothing.
+
+    A bool is refused because True >= 1 would build a node from a YAML
+    ``yes``, and a float rather than rounded quietly, as in
+    validate_node_sizes(). Pure, like that function.
+    """
+    for parameter, value in counts.items():
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise exceptions.ShapeError.not_an_integer(parameter, value, floor)
+        if value < floor:
+            raise exceptions.ShapeError.below_floor(parameter, value, floor)
 
 
 def validate_k3s_config(config, role):
@@ -962,6 +1058,84 @@ def validate_k3s_config(config, role):
             role, K3S_CONFIG_DELIMITER)
 
     return text
+
+
+# What create() calls its three counts, which is what validate_create_counts()
+# names them in a refusal unless its caller spells them differently.
+CREATE_COUNT_NAMES = ('control_plane_count', 'worker_count',
+                      'metal_address_count')
+
+
+def validate_create_counts(control_plane_count, worker_count,
+                           metal_address_count, names=CREATE_COUNT_NAMES):
+    """Refuse create()'s three counts below their floors, before anything is built.
+
+    The floors are validate_counts()'s. names is the three counts' names,
+    in that order, as the refusal should spell them. The Ansible module
+    passes its own option names, so that a play is told about
+    initial_workers, which it set, rather than about a parameter it has
+    never seen.
+    """
+    control_plane_name, worker_name, address_name = names
+    validate_counts(1, **{control_plane_name: control_plane_count})
+    validate_counts(0, **{worker_name: worker_count,
+                          address_name: metal_address_count})
+
+
+def validate_create_arguments(name, control_plane_count, worker_count,
+                              metal_address_count, manifests=None,
+                              control_plane_cpus=DEFAULT_NODE_SIZE['cpus'],
+                              control_plane_memory=DEFAULT_NODE_SIZE['memory'],
+                              control_plane_disk=DEFAULT_NODE_SIZE['disk'],
+                              worker_cpus=DEFAULT_NODE_SIZE['cpus'],
+                              worker_memory=DEFAULT_NODE_SIZE['memory'],
+                              worker_disk=DEFAULT_NODE_SIZE['disk'],
+                              server_config=None, agent_config=None):
+    """Refuse every argument Cluster.create() can check without the API.
+
+    The arguments are create()'s, under its names and with its defaults,
+    and name is the cluster's. create() calls this as its first act, and
+    the command line calls it before it creates a namespace too, so that
+    a refused create leaves nothing behind. Each check is still made by
+    the one function which owns the rule, in this order:
+    validate_cluster_name(), validate_create_counts(), read_manifests(),
+    validate_node_sizes() and validate_k3s_config() for each role. The
+    first refusal is raised.
+
+    Returns ``(staged_manifests, node_sizes)``: what read_manifests()
+    read, and the six sizes in the nested shape the metadata records.
+    create() stages and records exactly these rather than reading or
+    building them again. A caller which only wants the refusal ignores
+    them.
+
+    Not quite pure: read_manifests() reads the manifest files. A caller
+    which runs this ahead of create() therefore reads them twice, which is
+    harmless, because create() stages only what its own call read.
+    """
+    validate_cluster_name(name)
+    validate_create_counts(control_plane_count, worker_count,
+                           metal_address_count)
+    staged_manifests = read_manifests(manifests)
+    node_sizes = {
+        'control_plane': {
+            'cpus': control_plane_cpus,
+            'memory': control_plane_memory,
+            'disk': control_plane_disk,
+        },
+        'worker': {
+            'cpus': worker_cpus,
+            'memory': worker_memory,
+            'disk': worker_disk,
+        },
+    }
+    validate_node_sizes(node_sizes)
+    # The text validate_k3s_config() returns is not kept: what create()
+    # records is the mapping, so that show displays its structure rather
+    # than a block of YAML, and the text is produced again from the
+    # recorded mapping when a node is configured.
+    validate_k3s_config(server_config, 'server')
+    validate_k3s_config(agent_config, 'agent')
+    return staged_manifests, node_sizes
 
 
 class _NoAliasSafeLoader(yaml.SafeLoader):
@@ -1079,9 +1253,18 @@ class Cluster:
     behind ``query-k3s-version`` and ``query-longhorn-version`` -- builds
     no Cluster at all and calls the module level functions in
     ``primitives`` instead.
+
+    Constructing one refuses a reserved name (``ClusterNameError.reserved``),
+    which is the only check on the name made here.
     """
 
     def __init__(self, client, name, namespace, reporter=None):
+        # Every verb refuses a reserved name, while validate_cluster_name()
+        # is the create paths' alone; ClusterNameError has why.
+        md_key = METADATA_KEY % (name,)
+        if md_key in primitives.RESERVED_METADATA_KEYS:
+            raise exceptions.ClusterNameError.reserved(name, md_key)
+
         self.client = client
         self.name = name
         self.namespace = namespace
@@ -1102,7 +1285,7 @@ class Cluster:
 
     def _metadata_key(self):
         """Return the namespace metadata key this cluster's state is stored under."""
-        return METADATA_KEY % self.name
+        return METADATA_KEY % (self.name,)
 
     def get_metadata(self):
         """Return this cluster's metadata, fetching it once and then caching it.
@@ -2535,55 +2718,44 @@ class Cluster:
         K3S_RELEASE_FLOOR, v1.21.1, whichever configuration it was given:
         older releases ignore the drop-in directory, or the ``+`` suffix,
         without saying so. check_k3s_release() has the detail.
+
+        The cluster's name and the three counts are checked before anything
+        is asked of the API, as the sizes and the configuration are, by
+        validate_create_arguments(). The name must be one
+        validate_cluster_name() accepts, because it becomes part of every
+        node's instance name; create() is the only verb which checks it, so
+        that a cluster created before the rule existed can still be shown
+        and deleted. validate_counts() states the counts' floors.
         """
-        # Read the manifests before anything else happens, which is
-        # earlier than this function checks any of its other arguments --
-        # sshkey is read after the name and the network have been settled.
-        # A bad path or a duplicate basename discovered once a network has
-        # been allocated and several instances booted is a cluster the
-        # caller has to delete before the name can be used again, and the
-        # only thing between a library caller and that is this line.
+        # Every argument which can be refused without the API is refused
+        # here, before anything else happens -- sshkey, by contrast, is read
+        # after the name and the network have been settled. The placement
+        # matters more than it looks. The name is registered in the cluster
+        # list a few lines below, and the metadata document written in state
+        # 'initial' shortly after; a value which can never be valid (a name
+        # with a dot in it, a zero size, a key the plugin owns) discovered
+        # once those exist leaves a claimed name and a document stuck in
+        # 'initial' that only a delete clears. Discovered later still, once
+        # a network has been allocated and instances booted, it is a cluster
+        # the caller has to delete before the name can be used again.
+        # test_an_invalid_size_registers_nothing and its siblings pin this.
+        # None of it is a check of what Shaken Fist will accept: a valid
+        # size the API still refuses, for quota or because no hypervisor has
+        # the room, fails mid-create, as any other API refusal there does.
         #
-        # The result is kept and handed to install_control_plane() below,
-        # rather than letting it read the paths again. There are ten to
-        # twenty minutes between here and there, and a file which changed
-        # in that window would make this check a check of something else.
-        #
-        # The node sizes are checked here for the same reason, and the
-        # placement matters more than it looks. The name is registered in
-        # the cluster list a few lines below, and the metadata document
-        # written in state 'initial' shortly after; a size which can never
-        # be valid (zero, a string, True) discovered once those exist
-        # leaves a claimed name and a document stuck in 'initial' that only
-        # a delete clears. Moving this one line later turns a typo into
-        # that, which is what test_an_invalid_size_registers_nothing pins.
-        # This is not a check of what Shaken Fist will accept: a valid size
-        # the API still refuses, for quota or because no hypervisor has the
-        # room, fails mid-create, as any other API refusal there does.
-        #
-        # The k3s configuration is checked here too, for the same reason
-        # and with one more: it is recorded in the initial metadata below,
-        # which is JSON, so a value set_metadata() cannot store would
-        # otherwise surface as a failed write after the name is claimed.
-        # The text validate_k3s_config() returns is not kept: what is
-        # recorded is the mapping, so that show displays its structure
-        # rather than a block of YAML.
-        staged_manifests = read_manifests(manifests)
-        node_sizes = {
-            'control_plane': {
-                'cpus': control_plane_cpus,
-                'memory': control_plane_memory,
-                'disk': control_plane_disk,
-            },
-            'worker': {
-                'cpus': worker_cpus,
-                'memory': worker_memory,
-                'disk': worker_disk,
-            },
-        }
-        validate_node_sizes(node_sizes)
-        validate_k3s_config(server_config, 'server')
-        validate_k3s_config(agent_config, 'agent')
+        # The manifests read here are kept and handed to
+        # install_control_plane() below, rather than letting it read the
+        # paths again. There are ten to twenty minutes between here and
+        # there, and a file which changed in that window would make this
+        # check a check of something else. node_sizes is kept for the same
+        # reason: what is recorded is what was checked.
+        staged_manifests, node_sizes = validate_create_arguments(
+            self.name, control_plane_count, worker_count, metal_address_count,
+            manifests=manifests, control_plane_cpus=control_plane_cpus,
+            control_plane_memory=control_plane_memory,
+            control_plane_disk=control_plane_disk, worker_cpus=worker_cpus,
+            worker_memory=worker_memory, worker_disk=worker_disk,
+            server_config=server_config, agent_config=agent_config)
 
         # Phases: create control plane nodes, create workers, install control
         # plane, install workers, fetch credentials, metallb, longhorn, and
@@ -2836,14 +3008,11 @@ class Cluster:
         # here. See create()'s docstring, and decision 6 of the phase 3 plan.
         if write_kubeconfig:
             p.phase('Updating local kubeconfig')
-            # Every component of these paths is chosen by this module -- the
-            # user's home directory, a fixed directory name, a fixed file
-            # name, and below a tempfile directory -- so the joins need no
-            # containment check and there is nothing for a realpath() guard
-            # to prove. An outside value appearing in one of them later
-            # would need both.
-            kube_dir = os.path.join(os.path.expanduser('~'), '.kube')
-            main_config_path = os.path.join(kube_dir, 'config')
+            # ~/.kube/config, and ~/.kube; see _local_kubeconfig_path(). The
+            # merge's temporary file below is also a fixed name under a
+            # tempfile directory, so it needs no containment check either.
+            main_config_path = _local_kubeconfig_path()
+            kube_dir = os.path.dirname(main_config_path)
 
             # 0700, rather than whatever the process umask makes of 0777. A
             # k3s kubeconfig embeds client-certificate-data and
@@ -2883,11 +3052,13 @@ class Cluster:
                     # at the top of this module. Nothing here is
                     # interpolated, so the shell had nothing to find and
                     # this is consistency rather than a fix -- but a reader
-                    # comparing this with delete()'s unset calls should not
+                    # comparing this with delete()'s kubectl calls should not
                     # have to work out for themselves that the difference
                     # does not matter, and spawning a shell to run a
                     # constant buys nothing. The two paths travel as
                     # environment values rather than as argv either way.
+                    # The merge needs KUBECONFIG's list, so a home
+                    # directory containing ':' is unsupported here.
                     merged = subprocess.run(
                         ['kubectl', 'config', 'view', '--flatten'],
                         capture_output=True,
@@ -3370,10 +3541,11 @@ class Cluster:
         This is the body of ``sf-client k3s delete``.
 
         update_kubeconfig governs one thing: whether this cluster's entries
-        are removed from the local ~/.kube/config. It is the counterpart of
-        ``create()``'s write_kubeconfig and it defaults off for the same
-        reason -- the calling machine's kubectl configuration is not part of
-        the cluster, and a library should not edit it unasked. ``k3s
+        are removed from ~/.kube/config, the file create() writes, whatever
+        KUBECONFIG says. It is the counterpart of ``create()``'s
+        write_kubeconfig and it defaults off for the same reason -- the
+        calling machine's kubectl configuration is not part of the
+        cluster, and a library should not edit it unasked. ``k3s
         delete`` passes True unless --no-kubeconfig was given, so the
         command line is unchanged. Decision 6 of the phase 3 plan has the
         argument.
@@ -3543,57 +3715,125 @@ class Cluster:
         # effect. Everything above this point is the cluster; this is the
         # calling machine's kubectl configuration.
         if update_kubeconfig:
-            fqcn = '%s.%s' % (self.name, self.namespace)
-            for config_elem in ['users.%s' % fqcn,
-                                'contexts.%s' % fqcn,
-                                'clusters.%s' % fqcn]:
-                # An argument list, not a shell string: config_elem
-                # interpolates the cluster name, which arrives from a
-                # click.STRING argument, an Ansible playbook variable or an
-                # API request with no validation anywhere on the path, so a
-                # name containing shell metacharacters would otherwise run
-                # as a command.
-                #
-                # That settles injection and not kubectl's own grammar,
-                # which is a separate question the paragraph above should
-                # not be read as answering. 'kubectl config unset' resolves
-                # its argument as a dot separated path into the config
-                # structure -- 'users' is a map, the next segment is the
-                # key, and a further segment is a field of the result -- so
-                # a cluster name containing a dot produces a path with an
-                # extra segment that kubectl cannot resolve, and the
-                # non-zero exit below becomes a KubeconfigError. By then
-                # the cluster really is gone and delete_metadata() has run,
-                # so re-running the delete raises ClusterNotFoundError and
-                # the stale entries stay in ~/.kube/config. 'my.cluster' is
-                # a name somebody will type. Validating the cluster name on
-                # the way in is what fixes it, and is
-                # shakenfist/client-python-k3s#96.
-                unset = subprocess.run(
-                    ['kubectl', 'config', 'unset', config_elem],
-                    capture_output=True)
+            self._delete_kubeconfig_entries()
 
-                # capture_output is what stops kubectl's three 'Property
-                # "..." unset.' lines going to the process's file descriptor
-                # 1, which the reporter does not own and a caller emitting
-                # JSON there cannot afford. They are not thrown away: the
-                # reporter gets them, at debug level, because they only
-                # confirm something the caller asked for.
-                if unset.stdout:
-                    self.reporter.debug(
-                        unset.stdout.decode('utf-8', errors='replace').rstrip())
+    def _run_local_kubectl(self, args, main_config_path, fqcn, log_stdout=True):
+        """Run 'kubectl --kubeconfig main_config_path' with args for delete(), capturing its output.
 
-                if unset.returncode != 0:
-                    # And this is the other half of capturing the output:
-                    # kubectl's explanation of the failure used to reach the
-                    # terminal on its own, so it now has to be carried by
-                    # the exception. Decoded at the raise, matching
-                    # merge_failed() on the create side.
-                    stderr = None
-                    if unset.stderr:
-                        stderr = unset.stderr.decode('utf-8', errors='replace')
-                    raise exceptions.KubeconfigError.unset_failed(
-                        config_elem, stderr)
+        --kubeconfig is what makes the command act on the file create()
+        wrote rather than on whatever the caller's KUBECONFIG lists: when
+        the flag is given kubectl loads that one file and ignores
+        KUBECONFIG entirely, so the inherited environment is passed on
+        untouched. The flag rather than setting KUBECONFIG for the child,
+        because KUBECONFIG is an os.pathsep-separated list, and a home
+        directory containing ':' would be split into paths which are not
+        this file. As one element of an argument list the path is literal.
+        It is also the spelling the KubeconfigError remediation prints.
+
+        capture_output is what stops kubectl's 'deleted context ...' lines
+        going to the process's file descriptor 1, which the reporter does not
+        own and a caller emitting JSON there cannot afford. They are not
+        thrown away: the reporter gets them, at debug level, because they
+        only confirm something the caller asked for. So does stderr on
+        success, which is where kubectl warns that the context it removed
+        was the current one.
+
+        log_stdout=False is for a command whose output is secret, which is
+        the kubeconfig read; its stderr is still logged.
+        """
+        try:
+            result = subprocess.run(['kubectl', '--kubeconfig', main_config_path] + list(args),
+                                    capture_output=True)
+        except FileNotFoundError:
+            raise exceptions.KubeconfigError.missing_kubectl_on_delete(main_config_path, fqcn)
+        except OSError as e:
+            # A kubectl which is there but cannot be started -- not
+            # executable, or a directory -- is as much a dead end as one
+            # which is missing, and arrives after the cluster has gone.
+            raise exceptions.KubeconfigError.kubectl_unrunnable(main_config_path, fqcn, str(e))
+        if result.returncode == 0:
+            outputs = [result.stderr]
+            if log_stdout:
+                outputs.insert(0, result.stdout)
+            for output in outputs:
+                if output:
+                    self.reporter.debug(output.decode('utf-8', errors='replace').rstrip())
+        return result
+
+    def _delete_kubeconfig_entries(self):
+        """Remove the user, context and cluster create() named fqcn from ~/.kube/config.
+
+        The file is the one create() writes, whatever KUBECONFIG says; see
+        _local_kubeconfig_path(). If it does not exist there is nothing to
+        remove, and kubectl is neither run nor required.
+
+        kubectl's delete-* subcommands fail on a name which is not there, so
+        the names present are read first and only those are deleted. That
+        keeps the cleanup succeeding without touching anything for a
+        cluster created without write_kubeconfig, and for entries the user
+        has already removed. It does not make a second delete work: by the
+        time this runs the cluster's metadata has gone, so a re-run raises
+        ClusterNotFoundError before it gets here, and each failure below
+        says how to remove the entries by hand instead.
+        """
+        fqcn = '%s.%s' % (self.name, self.namespace)
+        main_config_path = _local_kubeconfig_path()
+        if not os.path.exists(main_config_path):
+            self.reporter.debug('There is no %s, so there are no kubeconfig entries to remove'
+                                % main_config_path)
+            return
+
+        # Not --raw, but that does not make the output safe to log. Without
+        # it kubectl replaces tokens, passwords and the certificate, key
+        # and CA data, but prints an auth-provider's config (an OIDC
+        # id-token, refresh-token or client-secret) and an exec plugin's env
+        # values as they are -- for every cluster in the file, not only
+        # this one. The output is therefore secret: it is parsed for names
+        # and never logged.
+        view = self._run_local_kubectl(['config', 'view', '-o', 'json'],
+                                       main_config_path, fqcn, log_stdout=False)
+        if view.returncode != 0:
+            # Decoded at the raise, matching merge_failed() on the create side.
+            stderr = None
+            if view.stderr:
+                stderr = view.stderr.decode('utf-8', errors='replace')
+            raise exceptions.KubeconfigError.view_failed(
+                main_config_path, fqcn, view.returncode, stderr)
+
+        # An empty section is null rather than an empty list in kubectl's
+        # JSON, hence the 'or []'.
+        try:
+            config = json.loads(view.stdout.decode('utf-8'))
+            present = {}
+            for section in ('contexts', 'users', 'clusters'):
+                present[section] = {entry['name'] for entry in config.get(section) or []}
+        except (ValueError, AttributeError, KeyError, TypeError) as e:
+            raise exceptions.KubeconfigError.view_unparseable(main_config_path, fqcn, str(e))
+
+        # The context first, because it is the entry which refers to the
+        # other two.
+        for command, section in [('delete-context', 'contexts'),
+                                 ('delete-user', 'users'),
+                                 ('delete-cluster', 'clusters')]:
+            if fqcn not in present[section]:
+                continue
+
+            # fqcn is one element of an argument list, so no shell parses
+            # it, and kubectl takes it as a literal name. Both matter: the
+            # property-path grammar 'kubectl config unset' used cannot
+            # express a cluster name containing a dot, or a namespace named
+            # like a kubeconfig field, such as 'cluster' or 'user'.
+            deleted = self._run_local_kubectl(['config', command, fqcn],
+                                              main_config_path, fqcn)
+            if deleted.returncode != 0:
+                # The other half of capturing the output: kubectl's
+                # explanation of the failure reaches nobody unless the
+                # exception carries it.
+                stderr = None
+                if deleted.stderr:
+                    stderr = deleted.stderr.decode('utf-8', errors='replace')
+                raise exceptions.KubeconfigError.delete_failed(
+                    main_config_path, command, fqcn, stderr)
 
     def expand_workers(self, worker_count):
         """Add worker nodes to this cluster.
@@ -3603,7 +3843,11 @@ class Cluster:
         ``md['node_token']``, which an interrupted create may never have
         fetched, and a k3s agent install carrying a token of None builds
         instances which are charged for and can never join anything.
+
+        worker_count is checked against its floor (validate_counts())
+        before the metadata is read, so a refusal costs no API call.
         """
+        validate_counts(1, worker_count=worker_count)
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)
@@ -3927,7 +4171,11 @@ class Cluster:
         ones have been routed, and ``heredoc()`` refuses a body one of
         them could end -- a refusal which is correct and which would
         otherwise arrive after the allocation.
+
+        address_count is checked against its floor (validate_counts())
+        before the metadata is read, so a refusal costs no API call.
         """
+        validate_counts(1, address_count=address_count)
         md = self.get_metadata()
         if not md:
             raise exceptions.ClusterNotFoundError.not_found(self.name)

@@ -123,6 +123,15 @@ module in check mode, a form which wants to reject a file before the
 operator waits twenty minutes -- can do the same check the real call
 will do. It touches no cluster and no API client.
 
+The argument checks `create()` and the expand verbs run first are
+public pure functions too, for the same reason: `validate_cluster_name(name)`,
+`validate_counts(floor, **counts)`, `validate_create_counts(...)`,
+`validate_create_arguments(...)` (every check `create()` can make without
+the API, in one call) and `CLUSTER_NAME_MAX_LENGTH`. They raise
+`ClusterNameError`, `ShapeError` and the other errors above, touch no
+cluster and no API client, and let an Ansible module in check mode or a
+form refuse a bad request before the operator waits for it.
+
 `read_k3s_config(path, role)` is public on the same terms. It takes the
 path of a k3s configuration file and `'server'` or `'agent'`, and
 returns the mapping the file holds, ready to pass as `server_config` or
@@ -167,7 +176,10 @@ it.
 `create(write_kubeconfig=...)` and `delete(update_kubeconfig=...)`
 govern the only two things either call does to the machine it runs on
 rather than to the cluster: writing and merging `~/.kube/config`, and
-shelling out to `kubectl config unset`. Both default to `False` here,
+shelling out to `kubectl config delete-context`, `delete-user` and
+`delete-cluster` against that same file. Both act on `~/.kube/config`
+whatever `KUBECONFIG` says, and the cleanup does nothing when that
+file does not exist. Both default to `False` here,
 which is the one place a `Cluster` method's default differs from what
 `sf-client k3s` does -- the command line passes `True` unless
 `--no-kubeconfig` was given, so `sf-client k3s` behaves as it always
@@ -190,7 +202,7 @@ free.
 The cluster's kubeconfig is recorded in `md['kubeconfig']` regardless of
 `write_kubeconfig`, and `get_kubeconfig()` serves it either way -- only
 the local file write, the `kubectl config view --flatten` merge, and
-the `kubectl config unset` cleanup are gated, never the credentials
+the `kubectl config delete-*` cleanup are gated, never the credentials
 themselves.
 
 `k3s list`, `query-k3s-version` and `query-longhorn-version` name no
@@ -287,6 +299,8 @@ a correct caller never needs to catch it.
 | `GuestFileError` | a file this library writes onto a cluster node carries a line equal to the heredoc marker used to write it, so writing it would run the rest as commands on the node. The values that reach these bodies come from the namespace metadata document, which is third-party writable |
 | `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
 | `NodeSizeError` | `create()` is given a node size that is not a positive integer (a bool counts as not), before anything is built or the name is registered |
+| `ClusterNameError` | `create()` is given a name that cannot become a node's instance name, before anything is built or the name is registered: `invalid_characters` (not a string, empty, or not ASCII letters, digits and hyphens starting and ending alphanumeric), `too_long` (over `CLUSTER_NAME_MAX_LENGTH`, 48). Any verb, `create()` included, raises `reserved` for `k3s_version_cache` and `longhorn_version_cache`, which collide with the release caches' metadata keys |
+| `ShapeError` | `create()`, `expand_workers()` or `expand_addresses()` is given a count that is not an integer (`not_an_integer`; a bool counts as not) or is below its floor (`below_floor`): 1 for `control_plane_count` and for the two expand counts, 0 for `worker_count` and `metal_address_count` on `create()`. Raised before anything is built |
 | `K3sConfigError` | `create(server_config=..., agent_config=...)` is given a mapping that cannot be used -- not a mapping, a non-string key, a key containing `=`, a value that does not survive a JSON round trip, a key the plugin owns (or k3s's alias for one), or text that collides with the heredoc marker -- or `read_k3s_config()` cannot read or parse its file, before anything is built or the name is registered |
 | `UnsupportedReleaseError` | `create()` resolves a k3s release older than `v1.21.1+k3s1`, or one it cannot parse, right after the channel lookup and before anything is built or the name is registered |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
@@ -294,7 +308,7 @@ a correct caller never needs to catch it.
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code |
-| `KubeconfigError` | a local `~/.kube/config` merge or `kubectl config unset` fails, or a merge is needed and there is no local `kubectl`. A failed write of the file itself is an `OSError` |
+| `KubeconfigError` | a local `~/.kube/config` merge fails (`merge_failed`), or `delete()`'s cleanup cannot read `~/.kube/config` (`view_failed`, `view_unparseable`) or remove an entry from it (`delete_failed`), or either needs a local `kubectl` and there is none (`missing_kubectl`, `missing_kubectl_on_delete`), or `delete()`'s finds one it cannot start (`kubectl_unrunnable`, carrying the `OSError`'s text as `detail`). The five cleanup reasons are raised after the cluster has gone, so a retry of `delete()` raises `ClusterNotFoundError`; each carries `main_config_path` and `entry_name`, and its message gives the `kubectl` commands that remove the entries by hand. A failed write of the file itself is an `OSError`. Before 0.3.0 the cleanup ran `kubectl config unset`, and a failure there was `unset_failed` carrying `config_elem`; from 0.3.0 both are gone, replaced by `delete_failed` and `entry_name` alongside the new `view_failed`, `view_unparseable`, `missing_kubectl_on_delete` and `kubectl_unrunnable` reasons |
 
 Each exception's docstring in `shakenfist_client_k3s/exceptions.py`
 names the exact call site and the attributes it carries; several are
@@ -483,13 +497,13 @@ print(reporter.getvalue())
 No call here writes anything to `sys.stdout`; a caller that owns
 stdout for its own output (an Ansible module's JSON result, in
 particular) can run any of them and keep it that way. That includes
-`delete()`, which used to be an exception: its three `kubectl config
-unset` calls ran with no captured output, so the child process
-inherited file descriptor 1 and kubectl's `Property "..." unset.`
-lines reached the real stdout directly, bypassing both `sys.stdout`
-and the reporter. They now capture their output, and what kubectl
-says arrives through the reporter (at debug level) or, on a failure,
-on the `KubeconfigError` it raises.
+`delete()`, which used to be an exception: its kubectl calls ran
+with no captured output, so the child process inherited file
+descriptor 1 and kubectl's own lines reached the real stdout
+directly, bypassing both `sys.stdout` and the reporter. They now
+capture their output, and what kubectl says arrives through the
+reporter (at debug level) or, on a failure, on the `KubeconfigError`
+it raises.
 
 `reporter.getvalue()` holds the same numbered-phase, per-node
 progress text `sf-client k3s create` prints, for example:

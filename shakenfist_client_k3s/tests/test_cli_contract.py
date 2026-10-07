@@ -47,11 +47,18 @@ class CliContractTestCase(testtools.TestCase):
     update, per the phase plan's decision 7.
 
     A phase which deliberately adds a command, or an option to an existing
-    command, is the one exception, and it grows the fixtures the same way:
+    command, is one exception, and it grows the fixtures the same way:
     for a new command SUBCOMMANDS gains the name, and the new fixture and
     the regenerated group.txt are produced by invoking --help rather than
     typed; for a new option the command's fixture is regenerated the same
     way. Nothing existing may change in the diff.
+
+    The other is a deliberate change to the contract, recorded in
+    docs/usage.md. The six size options are bare click.INT rather than
+    click.IntRange(min=1), so that the library's validate_node_sizes() is
+    the only floor and every front door refuses a size with the same
+    message; create.txt was regenerated the same way for that, and only
+    those six options changed in its diff.
     """
 
     def setUp(self):

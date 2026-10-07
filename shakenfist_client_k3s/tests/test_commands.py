@@ -201,10 +201,15 @@ class CreateNodeSizingOptionsTestCase(testtools.TestCase):
         self.assertEqual(size['disk'], kwargs['worker_disk'])
 
     def test_a_zero_size_is_refused_before_create_is_called(self):
+        # By the library's validate_create_arguments(), not by click: the
+        # option is a plain click.INT, so this is the library's message and
+        # the group handler's exit code 1. ArgumentRefusalTestCase in
+        # test_cli_errors.py asserts the streams separately.
         result = self._invoke('--worker-memory', '0')
 
-        self.assertEqual(2, result.exit_code)
-        self.assertIn('--worker-memory', result.output)
+        self.assertEqual(1, result.exit_code)
+        self.assertIn('worker memory must be a positive integer, not 0',
+                      result.output)
         self.create.assert_not_called()
 
     def _write_config(self, text):
@@ -321,6 +326,8 @@ class CommandWiringTestCase(testtools.TestCase):
 
         self.subprocess_run = mock.MagicMock()
         self.subprocess_run.return_value.returncode = 0
+        # delete reads the kubeconfig before it removes anything from it.
+        self.subprocess_run.side_effect = fakes.FakeKubectl(['banana.testns'])
         patcher = mock.patch('subprocess.run', self.subprocess_run)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -368,15 +375,18 @@ class CommandWiringTestCase(testtools.TestCase):
                       result.output)
 
     def test_delete_updates_the_local_kubeconfig(self):
+        # A file to clean, or the cleanup runs no kubectl at all.
+        path = fakes.home_with_kubeconfig(self)
         result = self.runner.invoke(
             shakenfist_client_k3s.k3s, ['delete', 'banana'],
             obj={'VERBOSE': False, 'CLIENT': self.client})
 
         self.assertEqual(0, result.exit_code, result.output)
         self.assertEqual(
-            [['kubectl', 'config', 'unset', 'users.banana.testns'],
-             ['kubectl', 'config', 'unset', 'contexts.banana.testns'],
-             ['kubectl', 'config', 'unset', 'clusters.banana.testns']],
+            [fakes.cleanup_kubectl(path, fakes.KUBECTL_CONFIG_VIEW_JSON),
+             fakes.cleanup_kubectl(path, ['config', 'delete-context', 'banana.testns']),
+             fakes.cleanup_kubectl(path, ['config', 'delete-user', 'banana.testns']),
+             fakes.cleanup_kubectl(path, ['config', 'delete-cluster', 'banana.testns'])],
             [call[0][0] for call in self.subprocess_run.call_args_list])
 
     def test_delete_with_no_kubeconfig_leaves_it_alone(self):

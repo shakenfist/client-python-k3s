@@ -229,7 +229,7 @@ above and rewrites `collection/galaxy.yml`'s version to match before
 `ansible-galaxy collection build` runs, so collection and package never
 carry two different version numbers for one commit. The dependency
 runs the other way at install time: `collection/requirements.txt` pins
-a static floor on `shakenfist_client_k3s` from PyPI (`>=0.1.0`, raised
+a static floor on `shakenfist_client_k3s` from PyPI (`>=0.3.0`, raised
 only when the module starts calling a newer verb) rather than a
 build-time match to the collection's own version, because a locally
 built development collection demanding the plugin release with its own

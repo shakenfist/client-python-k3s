@@ -5,10 +5,10 @@
 #
 #     pip install -r requirements.txt
 #
-# 0.1.0 is a STATIC floor, not something tools/build-collection.py rewrites
+# 0.3.0 is a STATIC floor, not something tools/build-collection.py rewrites
 # alongside galaxy.yml's version. The two are facts about different things:
 # this floor says every verb the module's source calls shipped in
-# shakenfist_client_k3s 0.1.0, which is true regardless of which collection
+# shakenfist_client_k3s 0.3.0, which is true regardless of which collection
 # version is being built. A build-time floor tied to the collection's own
 # version would instead say "this collection demands the plugin release with
 # the same number as itself" -- which is false for a locally built
@@ -16,6 +16,14 @@
 # match an unreleased collection version, and the install would fail for a
 # reason that has nothing to do with compatibility.
 #
+# 0.3.0 is the release which added validate_create_counts(),
+# validate_create_arguments(), ShapeError and ClusterNameError, which the
+# module calls to refuse bad arguments before it changes anything.
+#
 # Raise this floor in the commit that first makes the module call a verb
-# newer than 0.1.0 introduced -- not before, and not automatically.
-shakenfist_client_k3s>=0.1.0
+# newer than 0.3.0 introduced -- not before, and not automatically.
+# shakenfist_client_k3s/tests/test_collection_floor.py checks this: it
+# parses the module for what it uses from this package, and fails when a
+# symbol it does not know the release of appears, or when the floor is
+# older than a symbol in use.
+shakenfist_client_k3s>=0.3.0

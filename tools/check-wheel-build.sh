@@ -90,23 +90,28 @@ echo "check-wheel-build: $(basename "${sdist}") OK (no build artefacts)"
 # committed ten per-merge diffs under docs/plans/audit/diffs, deliberately
 # and for a good reason, and they rode into the sdist as 1.2MB across
 # eleven files. No name matched, the wheel stayed at twelve entries, and
-# the gate stayed green. MANIFEST.in prunes them now.
+# the gate stayed green. MANIFEST.in pruned them.
 #
 # The bound is on the whole rather than per file. Of the eleven diffs
 # only three were bigger than test_cluster.py, so a per-file cap would
 # have had to sit just above the largest legitimate source file to catch
 # them, and would still have let the other eight through. Total size and
 # entry count are what actually moved: 136 entries and 2.9MB, against
-# 126 and 1.7MB once they were pruned. These two are what the sdist
-# measures today plus room to grow, not a target -- a legitimate increase is normal and raising them is the
-# right response. What is not normal is a jump, which is what this asks
-# about.
+# 126 and 1.7MB once they were pruned.
+#
+# It tripped again for the rest of docs/plans, which had grown one plan
+# at a time to 141 entries and 2.3MB without any single jump. Plans are
+# working history, not source, so MANIFEST.in now prunes the whole
+# directory, which took the sdist to 103 entries and 1.4MB. These two
+# are that plus room to grow, not a target -- a legitimate increase is
+# normal and raising them is the right response. What is not normal is
+# a jump, which is what this asks about.
 #
 # If this trips, read the listing it prints before changing the numbers.
 # The question is always whether the biggest new entries belong in a
 # source distribution, not whether the number is too small.
-MAX_SDIST_ENTRIES=160
-MAX_SDIST_BYTES=2200000
+MAX_SDIST_ENTRIES=130
+MAX_SDIST_BYTES=1850000
 
 sdist_entries=$(tar tzf "${sdist}" | wc -l)
 sdist_bytes=$(tar tzvf "${sdist}" | awk '{s+=$3} END {print s+0}')
