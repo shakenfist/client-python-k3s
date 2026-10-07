@@ -415,6 +415,92 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'healthy requires every node to be Ready',
+        PKG + '/cluster.py',
+        "                        and kubernetes['answered']\n"
+        "                        and all(node['kubernetes']['ready'] == 'True' for node in nodes))",
+        "                        and kubernetes['answered'])",
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'a node whose Ready is Unknown, or unread, is not Ready',
+        PKG + '/cluster.py',
+        "                        and all(node['kubernetes']['ready'] == 'True' for node in nodes))",
+        "                        and all(node['kubernetes']['ready'] != 'False' for node in nodes))",
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        # The kubernetes['answered'] term of healthy cannot be mutated on
+        # its own: a probe which did not answer leaves every ready None,
+        # so the readiness term already refuses it and removing the
+        # answered term changes no report. What the failed probe's
+        # unhealthiness rests on is this gate, so it is the mutation.
+        'nothing is read from a Kubernetes probe which did not answer',
+        PKG + '/cluster.py',
+        "        if not probe['answered']:\n"
+        "            for node in nodes:\n"
+        "                node['kubernetes'] = self._unread_kubernetes()\n",
+        "        if probe['stdout'] is None:\n"
+        "            for node in nodes:\n"
+        "                node['kubernetes'] = self._unread_kubernetes()\n",
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'the node level healthy does not take Kubernetes readiness',
+        PKG + '/cluster.py',
+        "            node['kubernetes']['oom_killed'] = readings['oom_killed'].get(name, [])\n",
+        "            node['kubernetes']['oom_killed'] = readings['oom_killed'].get(name, [])\n"
+        "            node['healthy'] = node['healthy'] and node['kubernetes']['ready'] == 'True'\n",
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'oom_killed is None, not [], when nothing was read',
+        PKG + '/cluster.py',
+        '        return dict.fromkeys(KUBERNETES_NODE_KEYS)\n',
+        '        return dict(dict.fromkeys(KUBERNETES_NODE_KEYS), oom_killed=[])\n',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'two nodes sharing a lowercased name are not given its readings',
+        PKG + '/cluster.py',
+        '            if not name or claims[name] > 1:\n',
+        '            if not name:\n',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'health() sends exactly the Kubernetes probe command the fake answers',
+        PKG + '/cluster.py',
+        '            kubernetes_aop, kubernetes_probe = self._submit_probe(\n'
+        '                control_plane[0], K3S_KUBERNETES_PROBE_COMMAND)\n',
+        '            kubernetes_aop, kubernetes_probe = self._submit_probe(\n'
+        "                control_plane[0], K3S_KUBERNETES_PROBE_COMMAND + ' ')\n",
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'the API probe is submitted before the Kubernetes probe',
+        PKG + '/cluster.py',
+        '            api_aop, api = self._submit_probe(\n'
+        '                control_plane[0], K3S_API_PROBE_COMMAND)\n'
+        '            self.reporter.debug(\n'
+        "                'Asking %s what Kubernetes says of each node' % control_plane[0])\n"
+        '            kubernetes_aop, kubernetes_probe = self._submit_probe(\n'
+        '                control_plane[0], K3S_KUBERNETES_PROBE_COMMAND)\n',
+        '            kubernetes_aop, kubernetes_probe = self._submit_probe(\n'
+        '                control_plane[0], K3S_KUBERNETES_PROBE_COMMAND)\n'
+        '            api_aop, api = self._submit_probe(\n'
+        '                control_plane[0], K3S_API_PROBE_COMMAND)\n',
+        PKG + '.tests.test_cluster.HealthSignalsTestCase.'
+        'test_the_api_probe_is_submitted_first_and_the_kubernetes_probe_second',
+        'stestr',
+    ),
+    (
         'a probe collected after the deadline is read, not judged as submitted',
         PKG + '/cluster.py',
         "        while aop['state'] in AGENT_OP_PENDING_STATES:\n"
