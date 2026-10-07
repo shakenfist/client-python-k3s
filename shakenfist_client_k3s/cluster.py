@@ -925,8 +925,9 @@ def validate_counts(floor, **counts):
     exceptions.ShapeError raised for the first unusable one, in order, can
     name it: ``not_an_integer`` for a non-int or a bool, ``below_floor``
     for an int under floor. The floor is an argument because it is the
-    verb's, not the count's. This is the one statement of the floors and
-    their reasons:
+    verb's, not the count's. This is the one statement of the floors'
+    reasons; the values are passed by validate_create_counts() and the
+    two expand verbs:
 
     - control_plane_count on create(): 1. With no control plane there is
       no API server, and the create fails tens of minutes in without

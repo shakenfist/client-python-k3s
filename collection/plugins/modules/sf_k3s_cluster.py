@@ -438,8 +438,8 @@ class _Mutation:
                     'partly removed; run again with "state: absent" to '
                     'finish it.')
         if self.arguments_refused:
-            return ("Nothing was changed. Correct the task's parameters "
-                    'before running it again.')
+            return ("Nothing was changed. Correct the task's parameters, "
+                    'or the files they name, before running it again.')
         return 'Nothing was changed, so the task can simply be run again.'
 
 
@@ -494,10 +494,9 @@ def _present(module, cluster, reporter, mutation):
         # The second entry of shape below is, beyond run_module()'s floor
         # check, the whole of this module's involvement with worker counts:
         # initial_workers becomes the count create() needs, on the one path
-        # which creates a cluster. Do not
-        # grow a branch which compares it against a cluster that already
-        # exists -- see the DOCUMENTATION for initial_workers for what that
-        # would race with. The key it goes under, named after create()'s
+        # which creates a cluster. Do not grow a branch which compares it
+        # against a cluster that already exists -- see the DOCUMENTATION
+        # for initial_workers for what that would race with. The key it goes under, named after create()'s
         # worker count argument, is deliberately that name's only
         # occurrence under collection/ -- so this comment does not spell it
         # -- which the phase 5 plan's done criteria check for this reason.

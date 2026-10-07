@@ -819,8 +819,8 @@ class NameRuleTestCase(ModuleTestCase):
 
         # Not "run it again": a refused name is refused on every run.
         self.assertEqual(
-            "%s Nothing was changed. Correct the task's parameters before "
-            'running it again.'
+            "%s Nothing was changed. Correct the task's parameters, or the "
+            'files they name, before running it again.'
             % sf_exceptions.ClusterNameError.invalid_characters(self.NAME),
             run.msg)
         self.assertIs(False, run.result['changed'])
