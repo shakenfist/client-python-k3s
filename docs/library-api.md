@@ -465,7 +465,7 @@ command, so it lives on that machine's entry.
 | `k3s_unit` | The systemd unit k3s runs as: `k3s` on control plane nodes and `k3s-agent` on workers. Reported so that a reader does not have to know the installer's naming. |
 | `k3s_state` | That unit's systemd `ActiveState`, such as `active`, `activating` or `failed`. Only lowercase letters and hyphens, at most 32 characters, are reported; anything else is `None`. |
 | `k3s_restarts` | That unit's systemd `NRestarts`. |
-| `oom_kills` | `oom_kill` from `/proc/vmstat`: every kernel OOM kill since boot, including a pod exceeding its own memory limit. |
+| `oom_kills` | `oom_kill` from `/proc/vmstat`: the kills the kernel has made since boot, including those at a pod's own memory limit. The count per container is not one-to-one: one container's death can raise it by more than one. |
 | `memory_total_bytes` | `MemTotal` from `/proc/meminfo`, converted from kB to bytes. |
 | `memory_available_bytes` | `MemAvailable` from `/proc/meminfo`, in bytes. |
 | `etcd_bytes` | Size of the embedded etcd data directory. Control plane nodes only. |
@@ -490,8 +490,10 @@ usually yesterday's report, and diffs:
   delta. An unexpected reboot is itself a finding the current report
   cannot show on its own.
 * A counter lower than its baseline with an unchanged `boot_id` has
-  been reset by some other route, and the same rule applies. systemd is
-  understood to reset `NRestarts` when the unit is restarted by hand.
+  been reset by some other route, and the same rule applies. A restart
+  systemd makes itself (`Restart=always` after the process is killed)
+  increments `NRestarts`; a stop followed by a start by hand resets it
+  to 0.
 
 Signals never affect `healthy`, on a node or on the cluster. They are
 facts, not judgements: whether three restarts or 200 MiB available is a
@@ -560,8 +562,9 @@ from one already seen, keep the previous report and compare entries by
 `namespace`, `pod` and `container`: a later `finished_at` for the same
 three is a new kill; the same `finished_at` is one you have seen. A pod
 that was deleted and recreated has a new name and so reads as new. This
-differs from `signals['oom_kills']`, which counts every kernel OOM kill
-on the machine since boot but cannot say which container it was.
+differs from `signals['oom_kills']`, which counts the kills the kernel
+has made on the machine since boot, not one per container, and cannot
+say which container it was.
 
 The top level `kubernetes` is the probe's own outcome:
 

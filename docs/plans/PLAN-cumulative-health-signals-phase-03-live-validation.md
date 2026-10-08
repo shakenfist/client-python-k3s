@@ -409,11 +409,11 @@ The live behaviour itself can only be checked by step 3b's run.
       which every step from 4a to 4f passed. It quotes the printed
       readings, including the observed `k3s_restarts` after the hand
       start.
-- [ ] No page hedges about `NRestarts` or cgroup OOM kills any more:
+- [x] No page hedges about `NRestarts` or cgroup OOM kills any more:
       `grep -rn "understood to" docs/library-api.md` finds nothing.
-- [ ] `docs/testing.md` says that the minimal cluster is damaged on
+- [x] `docs/testing.md` says that the minimal cluster is damaged on
       purpose, and that `--strict` is asserted to exit 1.
-- [ ] #101 and #102 each carry a comment that links the run and says
+- [x] #101 and #102 each carry a comment that links the run and says
       what is still open.
 
 ## Back brief

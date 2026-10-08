@@ -78,6 +78,11 @@ leave in place. Some of the node
 customisation behaviour is covered by unit tests only: the refusal of
 keys the plugin owns, the configuration files on a node and the order
 k3s reads them in, and the zero-worker cluster that is never tainted.
+The minimal cluster is then damaged on purpose by
+`tools/ci_health_signals.py`: a pod OOM-killed at its memory limit, a
+SIGKILLed k3s-agent, a stopped kubelet and a nearly full disk. It
+asserts that `health()` reports each, and that `health --strict` exits
+1 while the kubelet is stopped.
 The script runs on an ephemeral VM runner, in that runner's own
 per-job Shaken Fist namespace on the under-cloud, so everything the
 test creates dies with the runner. A full run is 20-30 minutes.
