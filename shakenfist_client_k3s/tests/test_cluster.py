@@ -577,6 +577,11 @@ def _is_ready_wait(commandline):
     return commandline.startswith("printf 'Waiting for node ")
 
 
+def _is_k3s_install(commandline):
+    """True for a command that runs the k3s installer, on any node in any role."""
+    return commandline.startswith('curl -sfL https://get.k3s.io | ')
+
+
 def _seconds(duration):
     """Seconds in a kubectl duration this module writes, such as '300s'."""
     if not duration.endswith('s'):
@@ -968,7 +973,7 @@ class CreateAwaitsNodesReadyTestCase(CreateEnvironmentTestCase):
                 if predicate(commandline)]
 
     def _assert_wait_between_installs_and_metallb(self):
-        installs = self._indexes(lambda c: 'get.k3s.io' in c)
+        installs = self._indexes(_is_k3s_install)
         waits = self._indexes(_is_ready_wait)
         metallb = self._indexes(lambda c: 'metallb' in c)
         longhorn = self._indexes(lambda c: 'longhorn' in c)
@@ -1100,7 +1105,7 @@ class ExpandWorkersAwaitsNodesReadyTestCase(testtools.TestCase):
 
         # And after the new workers' k3s install, not before it.
         installs = [i for i, (_, c) in enumerate(self.client.executed)
-                    if 'get.k3s.io' in c]
+                    if _is_k3s_install(c)]
         waits = [i for i, (_, c) in enumerate(self.client.executed)
                  if _is_ready_wait(c)]
         self.assertLess(max(installs), min(waits))
