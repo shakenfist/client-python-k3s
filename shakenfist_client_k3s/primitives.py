@@ -31,6 +31,16 @@ CLUSTER_LIST = 'orchestrated_k3s_clusters'
 K3S_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_k3s_version_cache'
 LONGHORN_VERSION_CACHE_KEY = 'orchestrated_k3s_cluster_longhorn_version_cache'
 
+# The namespace metadata keys this package uses for something other than a
+# cluster, and which share cluster.METADATA_KEY's prefix, so no cluster's
+# key may be one of them; ClusterNameError.reserved has why. CLUSTER_LIST
+# is not here because it cannot collide: it is 'orchestrated_k3s_clusters',
+# and every cluster key has an underscore where that has its final 's'. A
+# key added to the namespace document later which does share the prefix
+# belongs here.
+RESERVED_METADATA_KEYS = frozenset((K3S_VERSION_CACHE_KEY,
+                                    LONGHORN_VERSION_CACHE_KEY))
+
 # How much of a third-party HTTP response body is quoted back in an error
 # message. Enough to recognise a proxy error page or a rate limit notice,
 # and bounded because the party choosing those bytes is not this one: an

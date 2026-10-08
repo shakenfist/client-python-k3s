@@ -23,6 +23,8 @@ between those versions even when the streams are separate.
 
 import copy
 import inspect
+import os
+import tempfile
 import time
 
 import click
@@ -38,6 +40,7 @@ import shakenfist_client_k3s
 from shakenfist_client_k3s import cluster as cluster_module
 from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
+from shakenfist_client_k3s.tests import fakes
 
 
 MD_KEY = cluster_module.METADATA_KEY % 'banana'
@@ -202,23 +205,27 @@ class CommandExceptionTestCase(ClientTestCase):
             exceptions.ClusterNotFoundError, {})
         self.assertEqual('not_found', e.reason)
 
-    def test_delete_kubectl_unset_failure(self):
-        # stdout and stderr are bytes because the loop captures them, which
+    def test_delete_kubectl_delete_failure(self):
+        # stdout and stderr are bytes because the calls capture them, which
         # is also why the exception has to carry the explanation: nothing
         # else would ever show the operator kubectl's own account of this.
+        # The read succeeds and finds the entries; the first delete fails.
         completed = mock.MagicMock()
         completed.returncode = 1
         completed.stdout = b''
         completed.stderr = b'error: unable to parse /home/u/.kube/config\n'
-        with mock.patch('subprocess.run',
-                        return_value=completed):
+        main_config_path = fakes.home_with_kubeconfig(self)
+        with mock.patch('subprocess.run', return_value=completed,
+                        side_effect=fakes.FakeKubectl(['banana.clientns'])):
             e = self._assert_raises(
                 shakenfist_client_k3s.k3s_delete, ['banana'],
                 exceptions.KubeconfigError,
                 {CLUSTER_LIST: ['banana'], MD_KEY: copy.deepcopy(DELETABLE_MD)})
 
-        self.assertEqual('unset_failed', e.reason)
-        self.assertEqual('users.banana.clientns', e.config_elem)
+        self.assertEqual('delete_failed', e.reason)
+        self.assertEqual('delete-context', e.command)
+        self.assertEqual('banana.clientns', e.entry_name)
+        self.assertEqual(main_config_path, e.main_config_path)
         self.assertEqual('error: unable to parse /home/u/.kube/config\n',
                          e.stderr)
 
@@ -318,20 +325,27 @@ class GroupHandlerTestCase(ClientTestCase):
             ['create', 'banana', '--network', 'nosuch'],
             'Specified network does not exist\n', dict(_version_cache()))
 
-    def test_delete_kubectl_unset_failure(self):
+    def test_delete_kubectl_delete_failure(self):
         completed = mock.MagicMock()
         completed.returncode = 1
         completed.stdout = b''
         completed.stderr = b'error: unable to parse /home/u/.kube/config\n'
-        with mock.patch('subprocess.run',
-                        return_value=completed):
+        main_config_path = fakes.home_with_kubeconfig(self)
+        with mock.patch('subprocess.run', return_value=completed,
+                        side_effect=fakes.FakeKubectl(['banana.clientns'])):
             self._assert_cli_failure(
                 ['delete', 'banana'],
-                # kubectl's stderr keeps its own trailing newline, exactly
-                # as the create side's merge_failed renders it, so the
-                # handler's newline lands after it as a blank line.
-                'Could not unset kubectl config element users.banana.clientns\n'
-                'error: unable to parse /home/u/.kube/config\n\n',
+                # The cluster has gone by now, so the message ends with how
+                # to remove the entries by hand rather than with a retry.
+                "Could not remove banana.clientns from %(path)s with "
+                "'kubectl config delete-context'\n"
+                'error: unable to parse /home/u/.kube/config\n'
+                'The cluster has been deleted, but kubeconfig entries named banana.clientns\n'
+                'may remain in %(path)s. Remove them with:\n'
+                '    kubectl --kubeconfig %(path)s config delete-context banana.clientns\n'
+                '    kubectl --kubeconfig %(path)s config delete-user banana.clientns\n'
+                '    kubectl --kubeconfig %(path)s config delete-cluster banana.clientns\n'
+                % {'path': main_config_path},
                 {CLUSTER_LIST: ['banana'], MD_KEY: copy.deepcopy(DELETABLE_MD)})
 
     def test_query_k3s_version_http_error(self):
@@ -350,6 +364,108 @@ class GroupHandlerTestCase(ClientTestCase):
             self._assert_cli_failure(
                 ['query-longhorn-version', '--refresh-version-cache'],
                 'Unable to determine the latest Longhorn release\n', {})
+
+
+class ArgumentRefusalTestCase(ClientTestCase):
+    """A name, count or size the library refuses fails the command with exit code 1.
+
+    The command line has no floors of its own: the counts and sizes are
+    plain click.INT and the name a plain click.STRING, so each reaches the
+    library's validators and is refused there, through the group handler,
+    with exit code 1 and the library's message on stderr. Until the library
+    checked them the sizes were click.IntRange(min=1), a usage error with
+    exit code 2, and the counts and the name were not checked at all. The
+    client is asserted untouched, which is what refusing before the API is
+    asked for anything means.
+
+    The --namespace cases are the reason create calls
+    validate_create_arguments() before it binds the cluster context:
+    binding creates a namespace which does not exist yet, so a refusal
+    after it left an empty namespace behind. A bad manifest did exactly
+    that before this; a bad --server-config key never did, because the
+    file was already read before the bind.
+    """
+
+    def _assert_refused(self, args, expected_stderr):
+        result = self._invoke(shakenfist_client_k3s.k3s, args)
+        self.assertEqual(1, result.exit_code, result.stderr)
+        self.assertEqual('', result.stdout)
+        self.assertEqual(expected_stderr, result.stderr)
+        self.assertEqual([], self.client.mock_calls)
+
+    def test_create_a_zero_size(self):
+        self._assert_refused(
+            ['create', 'banana', '--worker-memory', '0'],
+            'worker memory must be a positive integer, not 0\n')
+
+    def test_create_a_name_with_a_dot(self):
+        self._assert_refused(
+            ['create', 'my.cluster'],
+            str(exceptions.ClusterNameError.invalid_characters('my.cluster'))
+            + '\n')
+
+    def test_create_no_control_plane(self):
+        self._assert_refused(
+            ['create', 'banana', '--control-plane-count', '0'],
+            'control_plane_count must be at least 1, not 0.\n')
+
+    def test_create_a_negative_worker_count(self):
+        self._assert_refused(
+            ['create', 'banana', '--worker-count', '-1'],
+            'worker_count must be at least 0, not -1.\n')
+
+    def _new_namespace(self, *args):
+        # A namespace which does not exist, so that binding would create it.
+        self.client.get_namespace.return_value = None
+        return ['create'] + list(args) + ['--namespace', 'newns']
+
+    def _write(self, name, text):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = os.path.join(directory.name, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        return path
+
+    def test_create_a_zero_size_leaves_no_namespace(self):
+        self._assert_refused(
+            self._new_namespace('banana', '--worker-memory', '0'),
+            'worker memory must be a positive integer, not 0\n')
+
+    def test_create_a_bad_name_leaves_no_namespace(self):
+        self._assert_refused(
+            self._new_namespace('my.cluster'),
+            str(exceptions.ClusterNameError.invalid_characters('my.cluster'))
+            + '\n')
+
+    def test_create_an_owned_server_config_key_leaves_no_namespace(self):
+        self._assert_refused(
+            self._new_namespace(
+                'banana', '--server-config',
+                self._write('server.yaml', 'token: x\n')),
+            str(exceptions.K3sConfigError.owned_key('server', 'token'))
+            + '\n')
+
+    def test_create_a_duplicate_manifest_leaves_no_namespace(self):
+        first = self._write('m.yaml', 'kind: ConfigMap\n')
+        second = self._write('m.yaml', 'kind: ConfigMap\n')
+        result = self._invoke(
+            shakenfist_client_k3s.k3s,
+            self._new_namespace('banana', '--manifest', first,
+                                '--manifest', second))
+        self.assertEqual(1, result.exit_code, result.stderr)
+        self.assertIn('m.yaml', result.stderr)
+        self.assertEqual([], self.client.mock_calls)
+
+    def test_expand_workers_by_zero(self):
+        self._assert_refused(
+            ['expand-workers', 'banana', '--worker-count', '0'],
+            'worker_count must be at least 1, not 0.\n')
+
+    def test_expand_addresses_by_a_negative_count(self):
+        self._assert_refused(
+            ['expand-addresses', 'banana', '--address-count', '-1'],
+            'address_count must be at least 1, not -1.\n')
 
 
 class GroupHandlerScopeTestCase(testtools.TestCase):

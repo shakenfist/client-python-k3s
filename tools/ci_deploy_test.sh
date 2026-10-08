@@ -148,6 +148,65 @@ pod_names() {
     echo "${pods}" | awk '{print $1 "/" $2}'
 }
 
+cluster_namespace() {
+    # The Shaken Fist namespace cluster $1 lives in. k3s show prints:
+    # namespace = ns, and is captured first for the reason
+    # count_routed_addresses() gives above.
+    local show_output namespace
+    show_output=$(sf-client k3s show "$1") || return 1
+    namespace=$(echo "${show_output}" | sed -n 's/^    namespace = //p')
+    [ -n "${namespace}" ] || return 1
+    echo "${namespace}"
+}
+
+kubeconfig_fqcn() {
+    # The name create gives the cluster's kubeconfig user, context and
+    # cluster, <name>.<namespace>.
+    local namespace
+    namespace=$(cluster_namespace "$1") || return 1
+    echo "$1.${namespace}"
+}
+
+assert_refused() {
+    # Run the command after $1 and require it to fail with output
+    # containing the fixed string $1.
+    local expected=$1 output=/tmp/k3s-ci-refusal
+    shift
+    if "$@" > "${output}" 2>&1; then
+        echo "$* succeeded; it should have been refused"
+        cat "${output}"
+        exit 1
+    fi
+    if ! grep -qF "${expected}" "${output}"; then
+        echo "$* failed, but its output does not mention ${expected}:"
+        cat "${output}"
+        exit 1
+    fi
+}
+
+assert_kubeconfig_entries() {
+    # $1 is present or absent, $2 the entry name, $3 the kubeconfig file,
+    # named with --kubeconfig so KUBECONFIG plays no part in which file is
+    # asked. Asked of kubectl rather than grepped from the file, because
+    # delete leaves current-context naming the context it removed.
+    local kind names found
+    for kind in context user cluster; do
+        case "${kind}" in
+            context) names=$(kubectl --kubeconfig "$3" config get-contexts -o name) || return 1 ;;
+            user) names=$(kubectl --kubeconfig "$3" config get-users) || return 1 ;;
+            cluster) names=$(kubectl --kubeconfig "$3" config get-clusters) || return 1 ;;
+        esac
+        found=absent
+        if echo "${names}" | grep -qFx "$2"; then
+            found=present
+        fi
+        if [ "${found}" != "$1" ]; then
+            echo "Expected kubeconfig ${kind} $2 to be $1 in $3, but it is ${found}"
+            exit 1
+        fi
+    done
+}
+
 assert_node_sizes() {
     # k3s show prints node_sizes = {...} as a Python repr, which
     # ast.literal_eval reads back; the comparison is between dicts, so key
@@ -524,11 +583,22 @@ if [ "${after}" -ne $((before + 1)) ]; then
 fi
 
 status 'Delete the cluster'
+# The delete's kubeconfig cleanup acts on ~/.kube/config, which is where
+# create wrote this cluster's entries, whatever KUBECONFIG says -- and here
+# KUBECONFIG names getconfig's copy, which holds entries of the same name.
+# So the real kubectl's delete-* calls have to empty ~/.kube/config and
+# leave the copy alone. Present first, so the absence is not vacuous.
+main_kubeconfig="${HOME}/.kube/config"
+cluster_fqcn=$(kubeconfig_fqcn "${CLUSTER}")
+assert_kubeconfig_entries present "${cluster_fqcn}" "${main_kubeconfig}"
+assert_kubeconfig_entries present "${cluster_fqcn}" "${KUBECONFIG}"
 sf-client k3s delete "${CLUSTER}"
 if sf-client k3s list | grep -q "^${CLUSTER}$"; then
     echo 'The cluster is still listed after deletion'
     exit 1
 fi
+assert_kubeconfig_entries absent "${cluster_fqcn}" "${main_kubeconfig}"
+assert_kubeconfig_entries present "${cluster_fqcn}" "${KUBECONFIG}"
 # --all includes error state instances, which the default listing hides:
 # a node the delete failed to remove must not pass this check just
 # because it fell into the error state.
@@ -562,13 +632,12 @@ status 'Create a cluster with none of the optional components'
 # leaves ~/.kube/config alone, not the absence of a home directory.
 #
 # Compared rather than asserted absent: the first create wrote
-# ~/.kube/config (asserted above) and the delete which followed rewrote it
-# with kubectl config unset rather than removing it, so the file exists
-# whatever this create does. What --no-kubeconfig promises is that this
-# create does not touch it, and only a before-and-after comparison says
-# that. An earlier version of this script asserted the file did not exist,
-# which could never pass.
-kubeconfig_before=$(sha256sum "${HOME}/.kube/config")
+# ~/.kube/config (asserted above) and its delete removed that cluster's
+# entries but not the file, so the file exists whatever this create does.
+# What --no-kubeconfig promises is that this create does not touch it, and
+# only a before-and-after comparison says that. An earlier version of this
+# script asserted the file did not exist, which could never pass.
+kubeconfig_before=$(sha256sum "${main_kubeconfig}")
 
 # The opt-out from the default control plane taint. Its replacing the
 # taint in config.yaml, rather than being merged with it, is a k3s rule
@@ -589,13 +658,13 @@ sf-client k3s create "${MINIMAL_CLUSTER}" \
 rm -rf "${minimal_config_dir}"
 
 status 'Verify --no-kubeconfig left the local kubeconfig alone'
-kubeconfig_after=$(sha256sum "${HOME}/.kube/config")
+kubeconfig_after=$(sha256sum "${main_kubeconfig}")
 if [ "${kubeconfig_before}" != "${kubeconfig_after}" ]; then
-    echo "create --no-kubeconfig changed ${HOME}/.kube/config anyway"
+    echo "create --no-kubeconfig changed ${main_kubeconfig} anyway"
     exit 1
 fi
-if grep -q "${MINIMAL_CLUSTER}" "${HOME}/.kube/config"; then
-    echo "create --no-kubeconfig wrote ${MINIMAL_CLUSTER} into ${HOME}/.kube/config"
+if grep -q "${MINIMAL_CLUSTER}" "${main_kubeconfig}"; then
+    echo "create --no-kubeconfig wrote ${MINIMAL_CLUSTER} into ${main_kubeconfig}"
     exit 1
 fi
 
@@ -681,22 +750,56 @@ if ! grep -qi 'metallb' /tmp/k3s-ci-expand-refusal; then
     exit 1
 fi
 
+status 'Verify bad names and counts are refused before any API call'
+# The library refuses these before it asks the API for anything, so they
+# cost seconds. create makes a missing namespace named by --namespace, and
+# a refused create must not leave one behind; this one is derived from
+# the job's own namespace, so it is unique per run. 'namespace show'
+# succeeding is the failure. It fails for a namespace these credentials
+# cannot see as well as for a missing one, so on a runner without admin
+# the check is as strong as the credentials allow, and no stronger.
+refused_namespace="$(cluster_namespace "${MINIMAL_CLUSTER}")-refused"
+assert_refused "Cluster name 'my.cluster' cannot be used" \
+    sf-client k3s create my.cluster --namespace "${refused_namespace}"
+if sf-client namespace show "${refused_namespace}" > /dev/null 2>&1; then
+    echo "The refused create made namespace ${refused_namespace} anyway"
+    exit 1
+fi
+# The minimal cluster, which still exists, so the count is the only thing
+# wrong with the request.
+assert_refused worker_count \
+    sf-client k3s expand-workers "${MINIMAL_CLUSTER}" --worker-count 0
+
 status 'Delete the minimal cluster'
-kubeconfig_before=$(sha256sum "${HOME}/.kube/config")
+# delete --no-kubeconfig skips the kubeconfig cleanup, which is the half of
+# the flag create cannot exercise. The cleanup acts on ~/.kube/config, and
+# this cluster was created with --no-kubeconfig, so that file holds nothing
+# of its own: entries of its name are planted there first, which a delete
+# that ran the cleanup anyway would remove. The file must also come out
+# byte-identical. The planted entries are removed afterwards.
+minimal_fqcn=$(kubeconfig_fqcn "${MINIMAL_CLUSTER}")
+kubectl --kubeconfig "${main_kubeconfig}" config set-cluster "${minimal_fqcn}" \
+    --server https://192.0.2.1:6443 > /dev/null
+kubectl --kubeconfig "${main_kubeconfig}" config set-credentials "${minimal_fqcn}" \
+    --token planted > /dev/null
+kubectl --kubeconfig "${main_kubeconfig}" config set-context "${minimal_fqcn}" \
+    --cluster "${minimal_fqcn}" --user "${minimal_fqcn}" > /dev/null
+assert_kubeconfig_entries present "${minimal_fqcn}" "${main_kubeconfig}"
+kubeconfig_before=$(sha256sum "${main_kubeconfig}")
 sf-client k3s delete "${MINIMAL_CLUSTER}" --no-kubeconfig
 if sf-client k3s list | grep -q "^${MINIMAL_CLUSTER}$"; then
     echo 'The minimal cluster is still listed after deletion'
     exit 1
 fi
-# delete --no-kubeconfig skips the kubectl config unset loop, which is the
-# half of the flag create cannot exercise: there was nothing of this
-# cluster's in the file to unset, so a delete which ran the loop anyway
-# would still rewrite the file.
-kubeconfig_after=$(sha256sum "${HOME}/.kube/config")
+kubeconfig_after=$(sha256sum "${main_kubeconfig}")
 if [ "${kubeconfig_before}" != "${kubeconfig_after}" ]; then
-    echo "delete --no-kubeconfig changed ${HOME}/.kube/config anyway"
+    echo "delete --no-kubeconfig changed ${main_kubeconfig} anyway"
     exit 1
 fi
+assert_kubeconfig_entries present "${minimal_fqcn}" "${main_kubeconfig}"
+for kind in context user cluster; do
+    kubectl --kubeconfig "${main_kubeconfig}" config "delete-${kind}" "${minimal_fqcn}" > /dev/null
+done
 
 status 'Verify the minimal cluster left the network it borrowed'
 # The state rather than the lookup succeeding, because a network Shaken

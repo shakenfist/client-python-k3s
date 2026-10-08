@@ -1621,10 +1621,11 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
     Reading the code found that it already does work, and that the three
     things which looked like they would break do not: md['kubeconfig'] is
     only ever written by delete, never read; an empty control_plane_nodes
-    makes the instance loop a no-op rather than an IndexError; and
-    'kubectl config unset' on an entry which was never written exits zero.
-    These tests exist so that stays true, because it is true by accident
-    rather than by design.
+    makes the instance loop a no-op rather than an IndexError; and the
+    kubeconfig cleanup deletes only the entries kubectl reports as present,
+    so one which was never written is skipped rather than failed on.
+    These tests exist so that stays true, because most of it is true by
+    accident rather than by design.
     """
 
     def setUp(self):
@@ -1636,7 +1637,7 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # delete() only runs its three 'kubectl config unset' calls when
+        # delete() only runs its kubeconfig cleanup's kubectl calls when
         # asked, which these tests do not do; the mock stays so that a
         # regression there fails rather than edits the operator's own
         # ~/.kube/config.
@@ -2596,10 +2597,10 @@ class ValidateNodeSizesTestCase(testtools.TestCase):
     It is read_manifests()'s sibling: a pure function create() calls before
     it registers the name, so that a size which cannot be built costs the
     caller an error rather than a claimed name and a metadata document
-    stuck in 'initial'. The command line's click.IntRange(min=1) refuses
-    most of these first, but a library caller -- an Ansible variable, a
-    YAML document -- has no click, so each refusal is pinned here against
-    the function itself.
+    stuck in 'initial'. It is the only floor: the command line passes the
+    sizes through as plain integers, and a library caller -- an Ansible
+    variable, a YAML document -- has no click at all, so each refusal is
+    pinned here against the function itself.
     """
 
     def _sizes(self, role=None, field=None, value=None):
@@ -2664,6 +2665,362 @@ class ValidateNodeSizesTestCase(testtools.TestCase):
 
     def test_none_is_refused(self):
         self._assert_refused('control_plane', 'memory', None)
+
+
+class ValidateClusterNameTestCase(testtools.TestCase):
+    """validate_cluster_name() accepts what can become an instance name, and nothing else.
+
+    The cluster name is embedded in every node's Shaken Fist instance name,
+    and Shaken Fist only refuses a bad one at the first instance create,
+    after the name has been registered and the node network allocated. So
+    each refusal is pinned here against the function itself, and so is
+    each thing which must keep working -- mixed case above all, which is
+    documented.
+    """
+
+    def test_the_limit_is_48(self):
+        self.assertEqual(48, cluster_module.CLUSTER_NAME_MAX_LENGTH)
+
+    def test_the_limit_leaves_room_for_five_digit_serials(self):
+        # The arithmetic the constant's comment gives, checked against the
+        # template create_instance() really uses: a 48 character name at
+        # serial 99999 is exactly Shaken Fist's 63 character limit, and one
+        # more serial digit would not fit.
+        name = 'a' * cluster_module.CLUSTER_NAME_MAX_LENGTH
+        self.assertEqual(63, len('k3s-%s-node-%03d' % (name, 99999)))
+        self.assertEqual(64, len('k3s-%s-node-%03d' % (name, 100000)))
+
+    def test_ordinary_names_are_accepted(self):
+        for name in ('banana', 'k3s', 'prod-1', 'a-b-c', 'a--b', '42',
+                     '1st-cluster'):
+            self.assertIsNone(cluster_module.validate_cluster_name(name),
+                              name)
+
+    def test_mixed_case_is_accepted(self):
+        # docs/usage.md documents a cluster called MyCluster working: Shaken
+        # Fist accepts the capital in the instance name, and k3s lowercases
+        # it for the node name.
+        for name in ('MyCluster', 'BANANA', 'Prod-East-1'):
+            self.assertIsNone(cluster_module.validate_cluster_name(name),
+                              name)
+
+    def test_a_single_character_is_accepted(self):
+        # The optional group in the pattern: one character is both the
+        # first and the last, and must not be required to be two.
+        for name in ('a', 'Z', '7'):
+            self.assertIsNone(cluster_module.validate_cluster_name(name),
+                              name)
+
+    def test_48_characters_are_accepted(self):
+        self.assertIsNone(cluster_module.validate_cluster_name('a' * 48))
+        self.assertIsNone(
+            cluster_module.validate_cluster_name('A' + '-b' * 23 + 'c'))
+
+    def test_49_characters_are_refused(self):
+        name = 'a' * 49
+        e = self.assertRaises(
+            exceptions.ClusterNameError, cluster_module.validate_cluster_name,
+            name)
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('too_long', e.reason)
+        self.assertEqual(name, e.name)
+        self.assertEqual(48, e.max_length)
+        self.assertIn('49 characters long', str(e))
+        self.assertIn('at most 48', str(e))
+
+    def _assert_invalid_characters(self, name):
+        e = self.assertRaises(
+            exceptions.ClusterNameError, cluster_module.validate_cluster_name,
+            name)
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual('invalid_characters', e.reason, repr(name))
+        self.assertIs(name, e.name)
+        self.assertIsNone(e.max_length)
+        self.assertIn('Cluster name %r cannot be used.' % (name,), str(e))
+        self.assertIn('letters, digits and hyphens', str(e))
+        return e
+
+    def test_a_dot_is_refused(self):
+        # Shaken Fist refuses a dot in an instance name outright, and a
+        # dotted name also broke delete()'s kubeconfig cleanup.
+        self._assert_invalid_characters('my.cluster')
+
+    def test_an_underscore_is_refused(self):
+        # Not a host name character. This is also what makes the two
+        # reserved names impossible to create.
+        self._assert_invalid_characters('my_cluster')
+
+    def test_a_space_is_refused(self):
+        self._assert_invalid_characters('my cluster')
+
+    def test_a_leading_hyphen_is_refused(self):
+        self._assert_invalid_characters('-banana')
+
+    def test_a_trailing_hyphen_is_refused(self):
+        # Which would also run into the '-node-' after it.
+        self._assert_invalid_characters('banana-')
+
+    def test_a_lone_hyphen_is_refused(self):
+        self._assert_invalid_characters('-')
+
+    def test_the_empty_string_is_refused(self):
+        self._assert_invalid_characters('')
+
+    def test_a_trailing_newline_is_refused(self):
+        # $ in a Python regular expression matches before a trailing
+        # newline, which is why the pattern ends in \Z instead.
+        self._assert_invalid_characters('banana\n')
+
+    def test_letters_from_other_scripts_are_refused(self):
+        # Explicit ASCII ranges, not \w, which would take these.
+        self._assert_invalid_characters('bänana')
+        self._assert_invalid_characters('ｂanana')
+
+    def test_a_name_which_is_not_a_string_is_refused(self):
+        # A library caller, or an Ansible variable, can hand over anything.
+        # None, an int and bytes have no characters a name is made of, so
+        # they are refused for that reason rather than reaching the regular
+        # expression and raising TypeError.
+        for name in (None, 42, b'banana', ['banana']):
+            self._assert_invalid_characters(name)
+
+    def test_characters_are_checked_before_length(self):
+        # A long name with a dot in it cannot be fixed by shortening it, so
+        # that is the refusal worth reporting first.
+        self._assert_invalid_characters('a.' * 30)
+
+
+class ValidateCountsTestCase(testtools.TestCase):
+    """validate_counts() accepts integers at or above the floor it is given, and nothing else.
+
+    The floors are the verbs': create() asks for at least one control plane
+    node and zero or more workers and addresses, and the two expand verbs
+    for at least one of whatever they add. Each is pinned at its boundary
+    and one below it, with the parameter name the verb uses, so that what
+    create() and the expand verbs will pass is what is tested here.
+    """
+
+    def test_each_floor_is_accepted_at_its_boundary(self):
+        self.assertIsNone(cluster_module.validate_counts(
+            1, control_plane_count=1))
+        self.assertIsNone(cluster_module.validate_counts(
+            0, worker_count=0, metal_address_count=0))
+        self.assertIsNone(cluster_module.validate_counts(1, worker_count=1))
+        self.assertIsNone(cluster_module.validate_counts(1, address_count=1))
+
+    def test_counts_above_the_floor_are_accepted(self):
+        self.assertIsNone(cluster_module.validate_counts(
+            1, control_plane_count=3))
+        self.assertIsNone(cluster_module.validate_counts(
+            0, worker_count=5, metal_address_count=5))
+
+    def test_no_counts_is_nothing_to_refuse(self):
+        self.assertIsNone(cluster_module.validate_counts(1))
+
+    def _assert_refused(self, reason, floor, parameter, value):
+        e = self.assertRaises(
+            exceptions.ShapeError, cluster_module.validate_counts, floor,
+            **{parameter: value})
+        self.assertIsInstance(e, exceptions.K3sClusterException)
+        self.assertEqual(reason, e.reason)
+        self.assertEqual(parameter, e.parameter)
+        self.assertIs(value, e.value)
+        self.assertEqual(floor, e.floor)
+        self.assertIn(parameter, str(e))
+        self.assertIn('at least %d' % floor, str(e))
+        self.assertIn('not %r' % (value,), str(e))
+        return e
+
+    def test_zero_control_plane_nodes_are_refused(self):
+        # A cluster with no API server, which the create would otherwise
+        # find out tens of minutes in.
+        e = self._assert_refused('below_floor', 1, 'control_plane_count', 0)
+        self.assertEqual('control_plane_count must be at least 1, not 0.',
+                         str(e))
+
+    def test_negative_create_counts_are_refused(self):
+        self._assert_refused('below_floor', 0, 'worker_count', -1)
+        self._assert_refused('below_floor', 0, 'metal_address_count', -1)
+
+    def test_an_expand_by_zero_is_refused(self):
+        # Which used to report 'Added 0 workers' having done nothing.
+        self._assert_refused('below_floor', 1, 'worker_count', 0)
+        self._assert_refused('below_floor', 1, 'address_count', 0)
+
+    def test_a_negative_expand_is_refused(self):
+        self._assert_refused('below_floor', 1, 'address_count', -1)
+
+    def test_true_is_refused(self):
+        # True is an int and is >= 1, so without the bool check a YAML
+        # 'yes' would build one node and say nothing.
+        e = self._assert_refused('not_an_integer', 1, 'control_plane_count',
+                                 True)
+        self.assertEqual(
+            'control_plane_count must be an integer of at least 1, not True, '
+            'which is a bool.', str(e))
+
+    def test_false_is_refused_where_zero_is_allowed(self):
+        # False is 0, which passes a floor of 0; it is refused for being a
+        # bool, not for its value.
+        self._assert_refused('not_an_integer', 0, 'worker_count', False)
+
+    def test_a_float_is_refused(self):
+        # Refused rather than truncated, even when it is whole.
+        self._assert_refused('not_an_integer', 0, 'worker_count', 2.0)
+        self._assert_refused('not_an_integer', 1, 'address_count', 2.5)
+
+    def test_a_string_is_refused(self):
+        e = self._assert_refused('not_an_integer', 0, 'metal_address_count',
+                                 '2')
+        self.assertIn("not '2'", str(e))
+
+    def test_none_is_refused(self):
+        self._assert_refused('not_an_integer', 1, 'control_plane_count', None)
+
+    def test_the_first_bad_count_is_the_one_reported(self):
+        # In the order passed, which keyword arguments preserve.
+        e = self.assertRaises(
+            exceptions.ShapeError, cluster_module.validate_counts, 0,
+            worker_count=-1, metal_address_count='x')
+        self.assertEqual('worker_count', e.parameter)
+        e = self.assertRaises(
+            exceptions.ShapeError, cluster_module.validate_counts, 0,
+            worker_count=1, metal_address_count='x')
+        self.assertEqual('metal_address_count', e.parameter)
+
+
+class ValidateCreateArgumentsTestCase(testtools.TestCase):
+    """validate_create_arguments() makes create()'s checks in create()'s order, and hands back what they read.
+
+    Each rule is pinned against its own validator above; what is pinned here
+    is the composition every caller shares: the order, so that the command
+    line, the Ansible module and create() refuse a doubly bad request for
+    the same reason, and the return value, which is what create() stages
+    and records.
+    """
+
+    def test_the_defaults_are_accepted(self):
+        staged, node_sizes = cluster_module.validate_create_arguments(
+            'banana', 1, 0, 0)
+        self.assertEqual([], staged)
+        self.assertEqual(
+            {'control_plane': cluster_module.DEFAULT_NODE_SIZE,
+             'worker': cluster_module.DEFAULT_NODE_SIZE}, node_sizes)
+
+    def test_the_sizes_come_back_in_the_recorded_shape(self):
+        _, node_sizes = cluster_module.validate_create_arguments(
+            'banana', 1, 1, 1, control_plane_cpus=4, worker_disk=60)
+        self.assertEqual(4, node_sizes['control_plane']['cpus'])
+        self.assertEqual(60, node_sizes['worker']['disk'])
+
+    def test_the_name_is_checked_first(self):
+        self.assertRaises(
+            exceptions.ClusterNameError,
+            cluster_module.validate_create_arguments, 'my.cluster', 0, -1, -1,
+            worker_memory=0, server_config={'token': 'x'})
+
+    def test_the_counts_are_checked_before_the_sizes(self):
+        self.assertRaises(
+            exceptions.ShapeError,
+            cluster_module.validate_create_arguments, 'banana', 0, 1, 1,
+            worker_memory=0)
+
+    def test_the_sizes_are_checked_before_the_configuration(self):
+        self.assertRaises(
+            exceptions.NodeSizeError,
+            cluster_module.validate_create_arguments, 'banana', 1, 1, 1,
+            worker_memory=0, server_config={'token': 'x'})
+
+    def test_the_counts_can_be_named_for_the_caller(self):
+        # How the Ansible module has a refusal name initial_workers, the
+        # option a play set, rather than create()'s worker_count.
+        e = self.assertRaises(
+            exceptions.ShapeError, cluster_module.validate_create_counts,
+            1, -1, 0, names=('control_plane_count', 'initial_workers',
+                             'metal_address_count'))
+        self.assertEqual('initial_workers', e.parameter)
+        self.assertEqual(0, e.floor)
+
+    def test_the_configuration_is_checked(self):
+        self.assertRaises(
+            exceptions.K3sConfigError,
+            cluster_module.validate_create_arguments, 'banana', 1, 1, 1,
+            agent_config={'node-name': 'w'})
+
+
+class ReservedClusterNameTestCase(testtools.TestCase):
+    """Cluster() refuses the names whose metadata key is one the package already uses.
+
+    The release caches live in the same namespace metadata document as the
+    clusters, under keys with the same prefix, so a cluster called
+    k3s_version_cache would read and write the k3s release cache. That is
+    refused on every verb, by the constructor, and nothing else about the
+    name is: a cluster which exists under a name create() would now refuse
+    has to stay reachable.
+    """
+
+    # Written out rather than derived from RESERVED_METADATA_KEYS, so that
+    # a key leaving the set is a change this file has to make on purpose.
+    RESERVED_NAMES = ('k3s_version_cache', 'longhorn_version_cache')
+
+    def test_the_reserved_keys_are_the_two_release_caches(self):
+        self.assertEqual(
+            frozenset((primitives.K3S_VERSION_CACHE_KEY,
+                       primitives.LONGHORN_VERSION_CACHE_KEY)),
+            primitives.RESERVED_METADATA_KEYS)
+        self.assertEqual(
+            frozenset(cluster_module.METADATA_KEY % name
+                      for name in self.RESERVED_NAMES),
+            primitives.RESERVED_METADATA_KEYS)
+
+    def test_the_cluster_list_cannot_collide(self):
+        # Why CLUSTER_LIST is not in the set: no name produces it.
+        prefix = cluster_module.METADATA_KEY % ''
+        self.assertFalse(primitives.CLUSTER_LIST.startswith(prefix))
+
+    def test_each_reserved_name_is_refused(self):
+        for name in self.RESERVED_NAMES:
+            client = mock.MagicMock()
+            e = self.assertRaises(
+                exceptions.ClusterNameError, Cluster, client, name, 'testns',
+                reporter=progress.CollectingReporter())
+            self.assertIsInstance(e, exceptions.K3sClusterException)
+            self.assertEqual('reserved', e.reason)
+            self.assertEqual(name, e.name)
+            self.assertEqual(cluster_module.METADATA_KEY % name,
+                             e.metadata_key)
+            self.assertIn(repr(name), str(e))
+            self.assertIn(cluster_module.METADATA_KEY % name, str(e))
+            # Refused before anything is asked of the API.
+            self.assertEqual([], client.mock_calls)
+
+    def test_a_tuple_name_does_not_break_the_reserved_check(self):
+        # A name is formatted into the key as one value. Formatted bare, a
+        # two-element tuple raised TypeError out of the constructor, and a
+        # one-element tuple was unpacked into its element -- so
+        # ('k3s_version_cache',) would have been refused as reserved. The
+        # name rule, which refuses a non-string, is create()'s to apply.
+        for name in (('a', 'b'), ('k3s_version_cache',)):
+            cluster = Cluster(mock.MagicMock(), name, 'testns',
+                              reporter=progress.CollectingReporter())
+            self.assertEqual(cluster_module.METADATA_KEY % (name,),
+                             cluster._metadata_key())
+
+    def test_an_ordinary_name_is_not_refused(self):
+        for name in ('banana', 'MyCluster'):
+            cluster = Cluster(mock.MagicMock(), name, 'testns',
+                              reporter=progress.CollectingReporter())
+            self.assertEqual(name, cluster.name)
+
+    def test_a_name_the_full_rule_refuses_is_not_refused(self):
+        # validate_cluster_name() is create()'s alone. A cluster which
+        # already exists under one of these has to stay possible to show,
+        # repair and delete, and every one of those verbs builds a Cluster.
+        for name in ('my.cluster', 'my_cluster', 'a' * 60, 'version_cache',
+                     'k3s_version_cache_2'):
+            cluster = Cluster(mock.MagicMock(), name, 'testns',
+                              reporter=progress.CollectingReporter())
+            self.assertEqual(name, cluster.name)
 
 
 # The keys each role refuses, written out rather than read from the

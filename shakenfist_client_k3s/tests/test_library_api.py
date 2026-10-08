@@ -9,6 +9,7 @@ and keep stdout for its own output.
 
 import copy
 import io
+import json
 import os
 import re
 import stat
@@ -104,6 +105,11 @@ class LibraryTestCase(testtools.TestCase):
         # cannot be wrong in the way the real thing can.
         self.subprocess_run.return_value.stdout = b''
         self.subprocess_run.return_value.stderr = b''
+        # delete()'s cleanup reads the kubeconfig before it deletes from
+        # it, so the read needs an answer; the entries create() would have
+        # written for this cluster are present unless a test says otherwise.
+        self.kubectl = fakes.FakeKubectl(['banana.testns'])
+        self.subprocess_run.side_effect = self.kubectl
         patcher = mock.patch('subprocess.run', self.subprocess_run)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -120,10 +126,13 @@ class LibraryTestCase(testtools.TestCase):
 
         The presence of a file here is what sends create() down its merge
         path rather than its write-a-new-file path, so both the merge tests
-        and the tests which assert the merge did not happen need one.
+        and the tests which assert the merge did not happen need one. It
+        is also what delete()'s cleanup needs before it runs kubectl at
+        all, so a test of that cleanup which did not ask create() for the
+        file writes this one instead.
         """
         kube_dir = os.path.join(self.home, '.kube')
-        os.makedirs(kube_dir)
+        os.makedirs(kube_dir, exist_ok=True)
         with open(self._kubeconfig_path(), 'w') as f:
             f.write(yaml.dump({
                 'apiVersion': 'v1',
@@ -212,42 +221,49 @@ class ClusterLifecycleTestCase(LibraryTestCase):
         c.create(1, 1, 1)
         self.assertTrue(c.show()['plugin_version'])
 
-    # Writing ~/.kube/config in create and unsetting it in delete used to
+    # Writing ~/.kube/config in create and removing it in delete used to
     # be pinned here as mandatory behaviour. Step 3e made both optional, so
     # they moved to OptionalKubeconfigTestCase, which asserts each of them
     # in both directions rather than only the one this class could.
 
-    def test_delete_does_not_run_the_unsets_through_a_shell(self):
+    def test_delete_does_not_run_the_kubectl_calls_through_a_shell(self):
         # A cluster name is a bare click.STRING on the CLI, and an Ansible
         # variable or an API request field to the library callers this phase
-        # exists for, with no validation on any of those paths. Built into a
-        # shell command line, a name like 'foo; rm -rf ~' would execute. The
-        # calls must therefore stay a list of arguments with shell unset.
+        # exists for, and only create() validates it. Built into a shell
+        # command line, a name like 'foo; touch /tmp/pwned' would execute.
+        # The calls must therefore stay a list of arguments with shell unset.
         c = Cluster(self.client, 'foo; touch /tmp/pwned', 'testns',
                     reporter=self.reporter)
         self.client.metadata[cluster_module.METADATA_KEY
                              % 'foo; touch /tmp/pwned'] = copy.deepcopy(DELETABLE_MD)
         self.client.metadata[primitives.CLUSTER_LIST] = [
             'foo; touch /tmp/pwned']
-        # update_kubeconfig, or the loop under test does not run at all and
-        # the assertions below iterate over nothing.
+        # Present in the kubeconfig, or the delete commands under test are
+        # never run and the assertions below iterate over the read alone.
+        self.kubectl.names = ['foo; touch /tmp/pwned.testns']
+        # update_kubeconfig and a file to clean, or the cleanup under test
+        # does not run at all.
+        path = self._write_existing_kubeconfig()
         c.delete(update_kubeconfig=True)
 
+        self.assertEqual(4, len(self.subprocess_run.call_args_list))
         for call in self.subprocess_run.call_args_list:
             self.assertIsInstance(call[0][0], list)
             self.assertNotIn('shell', call[1])
         self.assertEqual(
-            'clusters.foo; touch /tmp/pwned.testns',
-            self.subprocess_run.call_args_list[-1][0][0][-1])
+            fakes.cleanup_kubectl(path, ['config', 'delete-cluster', 'foo; touch /tmp/pwned.testns']),
+            self.subprocess_run.call_args_list[-1][0][0])
 
-    def test_delete_raises_when_kubectl_unset_fails(self):
+    def test_delete_raises_when_a_kubectl_delete_fails(self):
         c = self._cluster()
         c.create(1, 1, 1)
+        self._write_existing_kubeconfig()
         self.subprocess_run.return_value.returncode = 1
 
         e = self.assertRaises(exceptions.KubeconfigError, c.delete,
                               update_kubeconfig=True)
-        self.assertEqual('users.banana.testns', e.config_elem)
+        self.assertEqual('delete_failed', e.reason)
+        self.assertEqual('banana.testns', e.entry_name)
 
     def test_delete_leaves_a_network_it_was_given(self):
         # shakenfist/client-python-k3s#41: a network handed to
@@ -675,6 +691,120 @@ class K3sConfigTestCase(LibraryTestCase):
         self.assertEqual(self.AGENT, self._stored()['agent_config'])
 
 
+class NameAndCountRefusalTestCase(LibraryTestCase):
+    """create() and the expand verbs refuse a bad name or count before asking the API anything.
+
+    NodeSizingTestCase's claim for two more checks, made stronger: these
+    are refused before the release lookup as well as before the name is
+    registered, so the client is wrapped and asserted not to have been
+    called at all. The expand verbs refuse a count before they read the
+    metadata, which is why a refusal is a ShapeError even though no
+    cluster of this name exists here: the count is looked at first.
+    """
+
+    def setUp(self):
+        super(NameAndCountRefusalTestCase, self).setUp()
+        self.wrapped = mock.MagicMock(wraps=self.client)
+
+    def _assert_nothing_asked(self):
+        self.assertEqual([], self.wrapped.mock_calls)
+        self.assertFalse(primitives.get_k3s_release.called)
+        self.assertEqual({}, self.client.metadata)
+        self.assertEqual([], self.client.allocated_networks)
+        self.assertEqual({}, self.client.instances)
+
+    def _refused_create(self, exception, *counts, name='banana'):
+        c = Cluster(self.wrapped, name, 'testns', reporter=self.reporter)
+        e = self.assertRaises(exception, c.create, *counts)
+        self._assert_nothing_asked()
+        return e
+
+    def _refused_expand(self, verb, count):
+        c = Cluster(self.wrapped, 'banana', 'testns', reporter=self.reporter)
+        e = self.assertRaises(exceptions.ShapeError, getattr(c, verb), count)
+        self._assert_nothing_asked()
+        return e
+
+    def test_a_name_with_a_dot_registers_nothing(self):
+        e = self._refused_create(exceptions.ClusterNameError, 1, 1, 1,
+                                 name='my.cluster')
+        self.assertEqual('invalid_characters', e.reason)
+        self.assertEqual('my.cluster', e.name)
+
+    def test_a_name_with_an_underscore_registers_nothing(self):
+        e = self._refused_create(exceptions.ClusterNameError, 1, 1, 1,
+                                 name='my_cluster')
+        self.assertEqual('invalid_characters', e.reason)
+
+    def test_a_name_which_is_too_long_registers_nothing(self):
+        e = self._refused_create(exceptions.ClusterNameError, 1, 1, 1,
+                                 name='a' * 49)
+        self.assertEqual('too_long', e.reason)
+        self.assertEqual(48, e.max_length)
+
+    def test_no_control_plane_registers_nothing(self):
+        e = self._refused_create(exceptions.ShapeError, 0, 1, 1)
+        self.assertEqual('below_floor', e.reason)
+        self.assertEqual('control_plane_count', e.parameter)
+        self.assertEqual(1, e.floor)
+        self.assertEqual('control_plane_count must be at least 1, not 0.',
+                         str(e))
+
+    def test_a_negative_worker_count_registers_nothing(self):
+        e = self._refused_create(exceptions.ShapeError, 1, -1, 1)
+        self.assertEqual('worker_count', e.parameter)
+        self.assertEqual(0, e.floor)
+
+    def test_a_negative_address_count_registers_nothing(self):
+        e = self._refused_create(exceptions.ShapeError, 1, 1, -1)
+        self.assertEqual('metal_address_count', e.parameter)
+        self.assertEqual(0, e.floor)
+
+    def test_a_bool_count_registers_nothing(self):
+        e = self._refused_create(exceptions.ShapeError, True, 1, 1)
+        self.assertEqual('not_an_integer', e.reason)
+        self.assertEqual('control_plane_count', e.parameter)
+
+    def test_the_name_is_checked_before_the_counts(self):
+        self._refused_create(exceptions.ClusterNameError, 0, -1, -1,
+                             name='my.cluster')
+
+    def test_a_mixed_case_name_is_still_created(self):
+        # Documented in docs/usage.md: Shaken Fist accepts it, and k3s
+        # lowercases the host name for the node name.
+        c = Cluster(self.client, 'MixedCase', 'testns', reporter=self.reporter)
+        c.create(1, 1, 1)
+        self.assertEqual('created', c.show()['state'])
+        self.assertIn('k3s-MixedCase-node-001',
+                      [name for name, _, _, _ in self.client.instance_sizes])
+
+    def test_no_workers_and_no_addresses_are_still_created(self):
+        # The floor on create is zero for both: a cluster which runs its
+        # workloads on the control plane, with no load balancer pool yet,
+        # is one a caller can mean to build.
+        c = self._cluster()
+        c.create(1, 0, 0)
+        self.assertEqual('created', c.show()['state'])
+
+    def test_expand_workers_by_zero_reads_nothing(self):
+        e = self._refused_expand('expand_workers', 0)
+        self.assertEqual('worker_count', e.parameter)
+        self.assertEqual(1, e.floor)
+
+    def test_expand_workers_by_a_negative_count_reads_nothing(self):
+        e = self._refused_expand('expand_workers', -2)
+        self.assertEqual('below_floor', e.reason)
+
+    def test_expand_addresses_by_zero_reads_nothing(self):
+        e = self._refused_expand('expand_addresses', 0)
+        self.assertEqual('address_count', e.parameter)
+        self.assertEqual(1, e.floor)
+
+    def test_expand_addresses_by_a_negative_count_reads_nothing(self):
+        e = self._refused_expand('expand_addresses', -1)
+        self.assertEqual('below_floor', e.reason)
+
+
 class BindAddressClient(RecordingClient):
     """A client whose node wrote its kubeconfig for a configured bind-address.
 
@@ -866,28 +996,40 @@ class LocalKubeconfigFailureTestCase(LibraryTestCase):
             self.assertEqual('other', yaml.safe_load(f)['current-context'])
 
 
-def _is_kubectl_unset(command):
-    """Is this subprocess.run() first argument a 'kubectl config unset'?
+def _is_kubectl_delete(command):
+    """Is this subprocess.run() first argument a 'kubectl config delete-*'?
 
     The argument is a list rather than a shell string, so a prefix match on
-    a string does not work here. Matching on the list's leading elements
-    keeps this working whichever way a future change spells the call.
+    a string does not work here. Matching on the list's leading elements,
+    after any --kubeconfig, keeps this working whichever way a future
+    change spells the call.
     """
     if isinstance(command, str):
-        return command.startswith('kubectl config unset')
-    return list(command[:3]) == ['kubectl', 'config', 'unset']
+        return command.startswith('kubectl config delete-')
+    subcommand = fakes.kubectl_subcommand(command)
+    return (list(command[:1]) == ['kubectl'] and subcommand[:1] == ['config']
+            and len(subcommand) > 1 and subcommand[1].startswith('delete-'))
 
 
 def _is_kubectl_config_view(command):
-    """Is this subprocess.run() first argument create's merge command?
+    """Is this subprocess.run() first argument a 'kubectl config view'?
 
-    An argument list, like the unset calls. The string form is still
-    recognised so that this helper describes the call rather than the
+    That is create's merge, and the read delete() makes before it removes
+    anything. An argument list, like the delete calls. The string form is
+    still recognised so that this helper describes the call rather than the
     spelling of the day.
     """
     if isinstance(command, str):
         return command.startswith('kubectl config view')
-    return list(command[:3]) == ['kubectl', 'config', 'view']
+    return (list(command[:1]) == ['kubectl']
+            and fakes.kubectl_subcommand(command)[:2] == ['config', 'view'])
+
+
+def _is_kubectl(command):
+    """Is this subprocess.run() first argument any kubectl command at all?"""
+    if isinstance(command, str):
+        return command.startswith('kubectl')
+    return list(command[:1]) == ['kubectl']
 
 
 class OptionalKubeconfigTestCase(LibraryTestCase):
@@ -1006,66 +1148,130 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
                          [c['name'] for c in merged['clusters']])
         self.assertEqual('banana.testns', merged['current-context'])
 
-    def test_delete_unsets_nothing_by_default(self):
+    def test_delete_touches_no_kubeconfig_by_default(self):
         c = self._cluster()
         c.create(1, 1, 1, write_kubeconfig=True)
         c.delete()
 
-        self.assertEqual([], self._kubectl_calls(_is_kubectl_unset))
+        # Not even the read: "off" means no kubectl at all.
+        self.assertEqual([], self._kubectl_calls(_is_kubectl))
 
         # And the file create() wrote is still there, which is the cost of
         # the asymmetry rather than a bug: a caller which asked for the
         # write asks for the cleanup too.
         self.assertTrue(os.path.exists(self._kubeconfig_path()))
 
-    def test_delete_unsets_all_three_elements_when_asked(self):
+    def test_delete_removes_all_three_entries_when_asked(self):
         c = self._cluster()
         c.create(1, 1, 1)
+        path = self._write_existing_kubeconfig()
         c.delete(update_kubeconfig=True)
 
         self.assertEqual(
-            [['kubectl', 'config', 'unset', 'users.banana.testns'],
-             ['kubectl', 'config', 'unset', 'contexts.banana.testns'],
-             ['kubectl', 'config', 'unset', 'clusters.banana.testns']],
-            [call.args[0] for call in self._kubectl_calls(_is_kubectl_unset)])
+            [fakes.cleanup_kubectl(path, fakes.KUBECTL_CONFIG_VIEW_JSON),
+             fakes.cleanup_kubectl(path, ['config', 'delete-context', 'banana.testns']),
+             fakes.cleanup_kubectl(path, ['config', 'delete-user', 'banana.testns']),
+             fakes.cleanup_kubectl(path, ['config', 'delete-cluster', 'banana.testns'])],
+            [call.args[0] for call in self._kubectl_calls(_is_kubectl)])
 
-        # Argument lists rather than shell strings, because the cluster name
-        # interpolated into each element is caller supplied and unvalidated;
-        # and nothing else shelled out, since this create declined the write.
-        self.assertEqual(3, len(self.subprocess_run.call_args_list))
+        # Nothing else shelled out, since this create declined the write.
+        self.assertEqual(4, len(self.subprocess_run.call_args_list))
 
-    def test_the_unset_calls_capture_their_output(self):
-        # What KubectlUnsetLeakTestCase used to pin, inverted. sys.stdout is
-        # a Python object and these calls are child processes, so without
-        # capture_output kubectl's three 'Property "..." unset.' lines went
-        # to the process's file descriptor 1 whatever the reporter was doing
-        # -- which an Ansible module emitting JSON there cannot afford.
+    def test_the_cleanup_acts_on_the_file_create_writes(self):
+        # create() writes ~/.kube/config whatever KUBECONFIG says, so the
+        # cleanup has to act on that file too. Left to the caller's
+        # KUBECONFIG, it would read and edit some other file -- and find
+        # nothing, or remove a same-named entry that create() never wrote.
+        #
+        # With --kubeconfig given, kubectl loads that one file and ignores
+        # KUBECONFIG, so the flag is the whole of the redirect: the
+        # environment is inherited as it is, and KUBECONFIG is not set.
+        c = self._cluster()
+        with mock.patch.dict('os.environ', {'KUBECONFIG': '/elsewhere/config'}):
+            c.create(1, 1, 1, write_kubeconfig=True)
+            c.delete(update_kubeconfig=True)
+
+        calls = self._kubectl_calls(_is_kubectl)
+        self.assertEqual(4, len(calls))
+        for call in calls:
+            self.assertEqual(['kubectl', '--kubeconfig', self._kubeconfig_path()],
+                             call.args[0][:3], call)
+            self.assertNotIn('env', call.kwargs, call)
+
+    def test_a_home_directory_containing_a_colon_is_one_path(self):
+        # KUBECONFIG is an os.pathsep-separated list, so setting it to this
+        # path would hand kubectl two paths, neither of which is the file.
+        # As one element of the argument list it is taken literally.
+        # Inside the temporary home, so it is still cleaned up.
+        self.home = os.path.join(self.home, 'ho:me')
+        os.makedirs(self.home)
+        with mock.patch.dict('os.environ', {'HOME': self.home}):
+            path = self._write_existing_kubeconfig()
+            c = self._cluster()
+            c.create(1, 1, 1)
+            c.delete(update_kubeconfig=True)
+
+        self.assertIn(':', path)
+        calls = self._kubectl_calls(_is_kubectl)
+        self.assertEqual(4, len(calls))
+        for call in calls:
+            self.assertEqual(['kubectl', '--kubeconfig', path], call.args[0][:3], call)
+
+    def test_no_kubeconfig_file_means_nothing_to_clean(self):
+        # A cluster created without write_kubeconfig on a machine with no
+        # ~/.kube/config: there is nothing to remove, so no kubectl runs,
+        # and a machine without kubectl is not an error.
         c = self._cluster()
         c.create(1, 1, 1)
+        self.subprocess_run.side_effect = FileNotFoundError(2, 'No such file', 'kubectl')
+
         c.delete(update_kubeconfig=True)
 
-        calls = self._kubectl_calls(_is_kubectl_unset)
-        self.assertEqual(3, len(calls))
+        self.assertEqual([], self._kubectl_calls(_is_kubectl))
+        self.assertFalse(os.path.exists(self._kubeconfig_path()))
+        self.assertNotIn(MD_KEY, self.client.metadata)
+
+    def test_the_kubectl_calls_capture_their_output(self):
+        # What KubectlUnsetLeakTestCase used to pin, inverted. sys.stdout is
+        # a Python object and these calls are child processes, so without
+        # capture_output kubectl's 'deleted context ...' lines go to the
+        # process's file descriptor 1 whatever the reporter is doing --
+        # which an Ansible module emitting JSON there cannot afford. The
+        # read is included: its output is the whole kubeconfig.
+        c = self._cluster()
+        c.create(1, 1, 1)
+        self._write_existing_kubeconfig()
+        c.delete(update_kubeconfig=True)
+
+        calls = self._kubectl_calls(_is_kubectl)
+        self.assertEqual(4, len(calls))
         for call in calls:
             self.assertEqual(
                 True, call.kwargs.get('capture_output'),
-                'This kubectl config unset inherits file descriptor 1, so '
-                "its 'Property \"...\" unset.' line bypasses the reporter "
-                'and lands on the caller\'s stdout: %r' % (call,))
+                'This kubectl call inherits file descriptor 1, so its '
+                'output bypasses the reporter and lands on the caller\'s '
+                'stdout: %r' % (call,))
 
-    def test_the_captured_stdout_reaches_the_reporter(self):
+    def test_the_captured_output_reaches_the_reporter(self):
         # Captured is not discarded: the lines go where every other line
-        # delete() emits goes, at debug level.
+        # delete() emits goes, at debug level. stderr too, on success,
+        # because that is where kubectl warns that the context it removed
+        # was the current one.
         c = self._cluster()
         c.create(1, 1, 1)
+        self._write_existing_kubeconfig()
         self.subprocess_run.return_value.stdout = (
-            b'Property "users.banana.testns" unset.\n')
+            b'deleted context banana.testns from /home/u/.kube/config\n')
+        self.subprocess_run.return_value.stderr = (
+            b'warning: this removed your active context\n')
 
         verbose = progress.CollectingReporter(verbose=True)
         Cluster(self.client, 'banana', 'testns',
                 reporter=verbose).delete(update_kubeconfig=True)
 
-        self.assertIn('Property "users.banana.testns" unset.',
+        self.assertIn('deleted context banana.testns from /home/u/.kube/config',
+                      verbose.getvalue())
+        self.assertIn('warning: this removed your active context',
                       verbose.getvalue())
 
     def test_the_captured_stderr_is_carried_by_the_failure(self):
@@ -1073,6 +1279,7 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         # it failed used to reach the terminal by itself.
         c = self._cluster()
         c.create(1, 1, 1)
+        self._write_existing_kubeconfig()
         self.subprocess_run.return_value.returncode = 1
         self.subprocess_run.return_value.stderr = (
             b'error: unable to parse /home/u/.kube/config\n')
@@ -1080,13 +1287,208 @@ class OptionalKubeconfigTestCase(LibraryTestCase):
         e = self.assertRaises(exceptions.KubeconfigError, c.delete,
                               update_kubeconfig=True)
 
-        self.assertEqual('unset_failed', e.reason)
-        self.assertEqual('users.banana.testns', e.config_elem)
+        # The context is the first entry removed, so its failure is the one
+        # which surfaces.
+        self.assertEqual('delete_failed', e.reason)
+        self.assertEqual('delete-context', e.command)
+        self.assertEqual('banana.testns', e.entry_name)
         self.assertEqual('error: unable to parse /home/u/.kube/config\n',
                          e.stderr)
+        self.assertEqual(self._kubeconfig_path(), e.main_config_path)
         self.assertEqual(
-            'Could not unset kubectl config element users.banana.testns\n'
-            'error: unable to parse /home/u/.kube/config\n', str(e))
+            "Could not remove banana.testns from %s with "
+            "'kubectl config delete-context'\n"
+            'error: unable to parse /home/u/.kube/config\n'
+            % self._kubeconfig_path(),
+            str(e).split('The cluster has been deleted')[0])
+        self.assertIn('kubectl --kubeconfig %s config delete-context banana.testns'
+                      % self._kubeconfig_path(), str(e))
+
+
+class KubeconfigCleanupTestCase(LibraryTestCase):
+    """delete() removes kubeconfig entries by name, for every name that exists.
+
+    It used to run 'kubectl config unset users.<name>.<namespace>', and
+    unset takes a property path: after the first segment of the key,
+    kubectl reads each further segment as a possible field name of the
+    entry and stops the key at the first that matches. So a dotted cluster
+    name, or a perfectly valid one in a namespace called 'cluster', 'user'
+    or another kubeconfig field, failed -- after the cluster had been
+    destroyed, leaving stale entries that a re-run could no longer reach.
+    The delete-* commands take the name as one literal argument, which is
+    what the first two tests pin.
+
+    These are unit tests against a fake kubectl. The real kubectl is
+    exercised by the merge tier of CI, which deletes a live cluster with
+    the kubeconfig cleanup on.
+    """
+
+    def _delete(self, name, namespace):
+        # The cleanup only runs kubectl when there is a file to clean.
+        self._write_existing_kubeconfig()
+        self.client.metadata[cluster_module.METADATA_KEY % name] = (
+            copy.deepcopy(DELETABLE_MD))
+        self.client.metadata[primitives.CLUSTER_LIST] = [name]
+        Cluster(self.client, name, namespace,
+                reporter=self.reporter).delete(update_kubeconfig=True)
+
+    def _deletes(self):
+        # Without the leading 'kubectl --kubeconfig FILE': these tests are
+        # about the names, and the file is OptionalKubeconfigTestCase's.
+        return [fakes.kubectl_subcommand(call.args[0])
+                for call in self._kubectl_calls(_is_kubectl_delete)]
+
+    def test_a_namespace_named_like_a_kubeconfig_field(self):
+        self.kubectl.names = ['banana.cluster']
+        self._delete('banana', 'cluster')
+
+        self.assertEqual(
+            [['config', 'delete-context', 'banana.cluster'],
+             ['config', 'delete-user', 'banana.cluster'],
+             ['config', 'delete-cluster', 'banana.cluster']],
+            self._deletes())
+
+    def test_a_dotted_name_from_before_names_were_validated(self):
+        # create() refuses this name now, but clusters made before it did
+        # still have to be deletable, kubeconfig entries and all.
+        self.kubectl.names = ['my.cluster.testns']
+        self._delete('my.cluster', 'testns')
+
+        self.assertEqual(
+            [['config', 'delete-context', 'my.cluster.testns'],
+             ['config', 'delete-user', 'my.cluster.testns'],
+             ['config', 'delete-cluster', 'my.cluster.testns']],
+            self._deletes())
+
+    def test_entries_already_gone_are_not_deleted_again(self):
+        # delete-* fails on a name which is not there, where unset exited
+        # zero. A cluster created without write_kubeconfig, or one whose
+        # entries the user has already removed, has to succeed without
+        # running any of them -- and an unrelated entry is left alone.
+        self.kubectl.names = ['other']
+        self._delete('banana', 'testns')
+
+        self.assertEqual([], self._deletes())
+        self.assertEqual([fakes.KUBECTL_CONFIG_VIEW_JSON],
+                         [fakes.kubectl_subcommand(call.args[0])
+                          for call in self._kubectl_calls(_is_kubectl)])
+
+    def test_an_empty_kubeconfig_needs_no_deletes(self):
+        # kubectl reports an empty section as null rather than [].
+        self.kubectl.names = []
+        self._delete('banana', 'testns')
+
+        self.assertEqual([], self._deletes())
+
+    def test_only_the_entries_present_are_deleted(self):
+        # A partial earlier cleanup can leave any subset behind; this one
+        # left only the cluster.
+        self.kubectl.view_stdout = json.dumps({
+            'kind': 'Config', 'apiVersion': 'v1',
+            'clusters': [{'name': 'banana.testns', 'cluster': {}}],
+            'users': None, 'contexts': None,
+            'current-context': ''}).encode('utf-8')
+        self._delete('banana', 'testns')
+
+        self.assertEqual(
+            [['config', 'delete-cluster', 'banana.testns']],
+            self._deletes())
+
+    def test_the_kubeconfig_read_is_never_logged(self):
+        # Without --raw, kubectl config view redacts tokens, passwords and
+        # certificate data, but not an auth-provider's config or an exec
+        # plugin's env values -- and the read covers every cluster in the
+        # file, not only this one. A verbose delete must not log any of it.
+        # The kubectl output this cleanup is allowed to log is asserted
+        # too, so that this cannot pass because nothing was logged at all.
+        secrets = ['ID-TOKEN-SECRET', 'REFRESH-TOKEN-SECRET', 'EXEC-ENV-SECRET']
+        self.kubectl.view_stdout = json.dumps({
+            'kind': 'Config', 'apiVersion': 'v1',
+            'clusters': [{'name': 'banana.testns', 'cluster': {}},
+                         {'name': 'other', 'cluster': {}}],
+            'contexts': [{'name': 'banana.testns', 'context': {}}],
+            'users': [
+                {'name': 'banana.testns', 'user': {}},
+                {'name': 'oidc', 'user': {'auth-provider': {
+                    'name': 'oidc',
+                    'config': {'id-token': 'ID-TOKEN-SECRET',
+                               'refresh-token': 'REFRESH-TOKEN-SECRET'}}}},
+                {'name': 'aws', 'user': {'exec': {
+                    'command': 'aws-iam-authenticator',
+                    'env': [{'name': 'AWS_SECRET_ACCESS_KEY',
+                             'value': 'EXEC-ENV-SECRET'}]}}}],
+            'current-context': 'banana.testns'}).encode('utf-8')
+        self.kubectl.view_stderr = b'warning: from the read\n'
+        self.subprocess_run.return_value.stdout = b'deleted context banana.testns\n'
+        self.reporter = progress.CollectingReporter(verbose=True)
+
+        self._delete('banana', 'testns')
+
+        logged = self.reporter.getvalue()
+        self.assertIn('warning: from the read', logged)
+        self.assertIn('deleted context banana.testns', logged)
+        for secret in secrets:
+            self.assertNotIn(secret, logged)
+
+    def test_a_failed_read_raises_and_deletes_nothing(self):
+        self.kubectl.view_returncode = 1
+        self.kubectl.view_stderr = b'error: unable to parse /home/u/.kube/config\n'
+
+        e = self.assertRaises(exceptions.KubeconfigError, self._delete,
+                              'banana', 'testns')
+
+        self.assertEqual('view_failed', e.reason)
+        self.assertEqual(self._kubeconfig_path(), e.main_config_path)
+        self.assertEqual('banana.testns', e.entry_name)
+        self.assertEqual(1, e.returncode)
+        self.assertEqual('error: unable to parse /home/u/.kube/config\n',
+                         e.stderr)
+        self.assertEqual([], self._deletes())
+
+    def test_an_unparseable_read_raises_and_deletes_nothing(self):
+        for stdout in [b'not json', b'[]', b'{"users": [{"user": {}}]}']:
+            self.kubectl.view_stdout = stdout
+            self.subprocess_run.reset_mock()
+
+            e = self.assertRaises(exceptions.KubeconfigError, self._delete,
+                                  'banana', 'testns')
+
+            self.assertEqual('view_unparseable', e.reason, stdout)
+            self.assertEqual('banana.testns', e.entry_name, stdout)
+            self.assertTrue(e.detail, stdout)
+            self.assertEqual([], self._deletes())
+
+    def test_no_local_kubectl_is_a_reasoned_error(self):
+        # A machine which created its first cluster needed no kubectl,
+        # because there was nothing to merge into. Its delete used to end in
+        # a FileNotFoundError traceback, after the cluster had gone.
+        self.subprocess_run.side_effect = FileNotFoundError(2, 'No such file', 'kubectl')
+
+        e = self.assertRaises(exceptions.KubeconfigError, self._delete,
+                              'banana', 'testns')
+
+        self.assertEqual('missing_kubectl_on_delete', e.reason)
+        self.assertEqual('banana.testns', e.entry_name)
+        self.assertEqual(self._kubeconfig_path(), e.main_config_path)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+
+    def test_a_kubectl_which_cannot_run_is_a_reasoned_error(self):
+        # Present but not executable is a PermissionError rather than a
+        # FileNotFoundError, and is just as much a dead end. It must not
+        # escape as a traceback either, for the same reason: the cluster
+        # has already gone, and the message is the only place the
+        # remaining entries are named.
+        self.subprocess_run.side_effect = PermissionError(13, 'Permission denied', 'kubectl')
+
+        e = self.assertRaises(exceptions.KubeconfigError, self._delete,
+                              'banana', 'testns')
+
+        self.assertEqual('kubectl_unrunnable', e.reason)
+        self.assertEqual('banana.testns', e.entry_name)
+        self.assertEqual(self._kubeconfig_path(), e.main_config_path)
+        self.assertIn('Permission denied', e.detail)
+        self.assertIn('config delete-context banana.testns', str(e))
+        self.assertNotIn(MD_KEY, self.client.metadata)
 
 
 class ManifestStagingTestCase(LibraryTestCase):

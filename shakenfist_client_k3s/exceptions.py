@@ -27,6 +27,7 @@ hierarchy must not be caught by that machinery.
 """
 
 import json
+import shlex
 
 from shakenfist_client_k3s import progress
 
@@ -38,7 +39,7 @@ class K3sClusterException(Exception):
 class _ReasonedK3sException(K3sClusterException):
     """Base for the exceptions built through classmethods rather than directly.
 
-    Eight of the classes below describe several distinct failures that read
+    Ten of the classes below describe several distinct failures that read
     the same way to a caller: a manifest cannot be staged, a release
     lookup failed. Each is built through a classmethod per failure, each
     records which one ran in ``reason``, each renders a message its
@@ -51,7 +52,9 @@ class _ReasonedK3sException(K3sClusterException):
     on the default branch while this base class was being written, and is
     why the count in this docstring is worth keeping accurate rather than
     approximate. The eighth, ``ClusterMetadataError``, was written against
-    this base from the start.
+    this base from the start, and so were the ninth and tenth,
+    ``ClusterNameError`` and ``ShapeError``, which refuse an unusable
+    cluster name and an unusable node or address count.
     ``UnsupportedReleaseError`` named its three fields in its own
     ``__init__`` rather than taking ``**fields``; it declares them in
     ``FIELDS`` like the others now.
@@ -652,10 +655,10 @@ class NodeSizeError(K3sClusterException):
     That is the point of raising early: a size discovered to be unusable
     once the name is in the namespace's cluster list leaves a claimed name
     and a metadata document stuck in ``initial``, which only a delete
-    clears. The command line also refuses these with
-    ``click.IntRange(min=1)``, in click's own style, but a library caller
-    has no click, and an Ansible variable or a YAML document is exactly
-    where ``0``, ``'2'`` or ``yes`` comes from.
+    clears. This is the only floor: the command line passes the sizes
+    through as plain integers, so that it and a library caller are refused
+    by the same rule with the same message, and an Ansible variable or a
+    YAML document is exactly where ``0``, ``'2'`` or ``yes`` comes from.
 
     Only "not a positive integer" is refused. ``bool`` counts as not an
     integer, because ``True`` is an ``int`` in Python and would otherwise
@@ -684,6 +687,150 @@ class NodeSizeError(K3sClusterException):
     def __str__(self):
         return '%s %s must be a positive integer, not %r' % (
             self.role.replace('_', ' '), self.field, self.value)
+
+
+class ClusterNameError(_ReasonedK3sException):
+    """Raised when a cluster name cannot be used.
+
+    A cluster's name ends up in places whose rules this package does not
+    set: the namespace metadata key the cluster's state is stored under
+    (``METADATA_KEY`` in ``cluster.py``), and every node's Shaken Fist
+    instance name, ``k3s-<name>-node-<serial>``, which k3s in turn
+    lowercases into the Kubernetes node name. A name which breaks those
+    rules is not refused by anything until the first instance create, and
+    by then the name is registered and the node network allocated, so the
+    operator is left with an interrupted cluster to delete.
+    ``validate_cluster_name()`` in ``cluster.py`` checks the first two
+    refusals below before ``Cluster.create()`` asks the API for anything,
+    and ``Cluster.__init__`` makes the third on every verb. Construct via
+    the classmethods below, one per refusal:
+
+    - ``invalid_characters(name)``: the name is not made of ASCII letters,
+      digits and hyphens, starting and ending with a letter or a digit.
+      Shaken Fist refuses an instance name which is not a DNS host name or
+      which contains a dot, so a dot, an underscore or a space in the
+      cluster name fails the first node create. A hyphen at either end is
+      not legal in a DNS label, and one at the end would also run into the
+      ``-node-`` which follows the name, making the join ambiguous. Mixed
+      case is accepted, because Shaken Fist accepts it and k3s lowercases
+      the host name for the node name. The empty string and a value which
+      is not a string at all are refused with this reason too, rather than
+      reasons of their own: neither is a sequence of the characters a name
+      is allowed, and the message, which renders the value with ``repr()``
+      and says what is allowed, reads correctly for both.
+    - ``too_long(name, max_length)``: the name is longer than
+      ``max_length``, which is ``CLUSTER_NAME_MAX_LENGTH`` in
+      ``cluster.py``. Shaken Fist refuses an instance name longer than 63
+      characters, and the arithmetic from the instance name template to
+      the limit is beside that constant.
+    - ``reserved(name, metadata_key)``: the namespace metadata key a
+      cluster of this name would be stored under is one this package
+      already uses for something else, a release version cache. The keys
+      are listed in ``primitives.RESERVED_METADATA_KEYS``. Such a cluster's
+      state and the cache would be the same document: ``create()`` found
+      the cache, saw no ``state`` in it, and called the cluster
+      interrupted; ``delete()`` failed with a bare ``KeyError``; and a
+      library caller's ``set_metadata()`` overwrote the cache. This one is
+      raised by ``Cluster.__init__``, so every verb refuses it and not
+      only ``create()``. That strands nothing, because no cluster of such
+      a name could ever have been created. The other two refusals are
+      ``create()``'s alone, because a cluster which already exists under a
+      name they would refuse has to stay possible to show, repair and
+      delete. Both reserved names contain an underscore, so the full rule
+      would refuse them as well; the constructor runs first, so
+      ``reserved`` is what a library caller and the Ansible module see.
+      ``k3s create`` calls ``validate_create_arguments()`` before it
+      builds a ``Cluster``, so that a refusal leaves no namespace behind,
+      and reports ``invalid_characters``.
+
+    ``name`` is what was passed, unchanged, and every message renders it
+    with ``repr()``, so that an empty name, a trailing space or a control
+    character is visible rather than silently part of the sentence.
+    ``max_length`` is set by ``too_long()`` and ``metadata_key`` by
+    ``reserved()``; both are None otherwise. Which classmethod built an
+    instance is recorded in ``reason``.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
+    FIELDS = ('name', 'max_length', 'metadata_key')
+
+    @classmethod
+    def invalid_characters(cls, name):
+        message = (
+            'Cluster name %r cannot be used. A cluster name must be made of\n'
+            'letters, digits and hyphens, and must start and end with a letter\n'
+            "or a digit, because it becomes part of each node's instance name,\n"
+            'which Shaken Fist requires to be a DNS host name.'
+        ) % (name,)
+        return cls('invalid_characters', message, name=name)
+
+    @classmethod
+    def too_long(cls, name, max_length):
+        message = (
+            'Cluster name %r is %d characters long, and a cluster name can be\n'
+            "at most %d. Each node's instance name is k3s-<name>-node-<serial>,\n"
+            'and Shaken Fist refuses an instance name longer than 63 characters.'
+        ) % (name, len(name), max_length)
+        return cls('too_long', message, name=name, max_length=max_length)
+
+    @classmethod
+    def reserved(cls, name, metadata_key):
+        message = (
+            'Cluster name %r cannot be used. A cluster of that name would be\n'
+            'stored under the namespace metadata key %s,\n'
+            'where shakenfist_client_k3s keeps its own data. Choose another name.'
+        ) % (name, metadata_key)
+        return cls('reserved', message, name=name, metadata_key=metadata_key)
+
+
+class ShapeError(_ReasonedK3sException):
+    """Raised when a node or address count cannot be used.
+
+    A count is how many of something a verb is asked to build:
+    ``Cluster.create()``'s ``control_plane_count``, ``worker_count`` and
+    ``metal_address_count``, ``expand_workers()``'s ``worker_count`` and
+    ``expand_addresses()``'s ``address_count``. ``validate_counts()`` in
+    ``cluster.py`` checks them before the API is asked for anything, for
+    the reason ``NodeSizeError`` gives, and states each verb's floor and
+    why. Construct via the classmethods below, one per refusal:
+
+    - ``below_floor(parameter, value, floor)``: the count is an integer
+      below the floor its verb sets.
+    - ``not_an_integer(parameter, value, floor)``: the count is not an
+      ``int``, or is a ``bool``. ``True`` is an ``int`` in Python and
+      ``True >= 1`` holds, so without the check a YAML ``yes`` would build
+      one node and say nothing; a float is refused rather than truncated,
+      because rounding a request quietly in either direction is not what
+      was asked for. ``validate_node_sizes()`` makes the same refusals
+      for the same reasons.
+
+    ``parameter`` is the count's keyword argument name as the library
+    spells it -- except from the Ansible module, which has
+    ``validate_create_counts()`` name the counts after its own options,
+    ``initial_workers`` among them. ``value`` is what was passed,
+    unchanged, and ``floor`` is the smallest count the verb accepts. Both
+    classmethods set all three, and the messages render the value with
+    ``repr()`` so that ``'2'`` and ``2`` are told apart. Which classmethod
+    built an instance is recorded in ``reason``.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
+    FIELDS = ('parameter', 'value', 'floor')
+
+    @classmethod
+    def below_floor(cls, parameter, value, floor):
+        message = '%s must be at least %d, not %r.' % (parameter, floor, value)
+        return cls('below_floor', message, parameter=parameter, value=value,
+                   floor=floor)
+
+    @classmethod
+    def not_an_integer(cls, parameter, value, floor):
+        message = '%s must be an integer of at least %d, not %r, which is a %s.' % (
+            parameter, floor, value, type(value).__name__)
+        return cls('not_an_integer', message, parameter=parameter,
+                   value=value, floor=floor)
 
 
 class K3sConfigError(_ReasonedK3sException):
@@ -1093,15 +1240,39 @@ class KubeconfigError(_ReasonedK3sException):
       ``subprocess`` returns at the raise, and the second line is only
       rendered when it is non-empty, matching the original's conditional
       ``print()``.
-    - ``unset_failed(config_elem, stderr)``: raised by
-      ``Cluster.delete()`` when its ``kubectl config unset`` loop exits
-      non-zero for one config element. This is a separate rendering from
-      the two above -- it names a config element, not a config file path
-      -- but it is still local-kubectl-state, so it lives on this class
-      rather than on ``ClusterNotFoundError``. ``stderr`` is carried for
-      the same reason as ``merge_failed()``'s: the loop captures the
-      child's output, so kubectl's own account of why it failed reaches
-      nobody unless the exception renders it.
+    - ``missing_kubectl_on_delete(main_config_path, entry_name)``: raised
+      by ``Cluster.delete()`` when it was asked to clean up the local
+      kubeconfig and there is no local ``kubectl`` to do it with. That is
+      a machine which created its first cluster, which needs no
+      ``kubectl`` because there was nothing to merge into, and used to be
+      a ``FileNotFoundError`` traceback.
+    - ``kubectl_unrunnable(main_config_path, entry_name, detail)``: raised
+      by ``Cluster.delete()`` when a local ``kubectl`` is there but
+      starting it fails some other way -- it is not executable, say, which
+      is a ``PermissionError``. ``detail`` is the ``OSError``'s text.
+    - ``view_failed(main_config_path, entry_name, returncode, stderr)``:
+      raised by ``Cluster.delete()`` when the ``kubectl config view -o
+      json`` it reads the present entry names from exits non-zero.
+    - ``view_unparseable(main_config_path, entry_name, detail)``: raised
+      by ``Cluster.delete()`` when that view exits zero but its output is
+      not the JSON config document it should be; ``detail`` is the
+      parser's complaint. The output itself is not carried, because it
+      holds other clusters' credentials.
+    - ``delete_failed(main_config_path, command, entry_name, stderr)``:
+      raised by ``Cluster.delete()`` when one of its ``kubectl config
+      delete-context``, ``delete-user`` or ``delete-cluster`` calls exits
+      non-zero. ``command`` is the subcommand which failed.
+
+    These last five are the cleanup's failures, and all five happen
+    after the cluster's metadata has gone, so re-running ``delete``
+    raises ``ClusterNotFoundError`` before it reaches the cleanup again.
+    Each therefore carries ``main_config_path``, the file the cleanup
+    acts on, and ``entry_name``, the user, context and cluster name
+    ``create()`` gave the cluster there, and ends by saying which entries
+    may remain where and the commands which remove them. ``stderr`` is
+    carried for the same reason as ``merge_failed()``'s: the calls
+    capture the child's output, so kubectl's own account of why it failed
+    reaches nobody unless the exception renders it.
 
     As with ``ReleaseLookupError``, the union of the fields the
     classmethods set is declared explicitly, so which attributes an
@@ -1111,7 +1282,7 @@ class KubeconfigError(_ReasonedK3sException):
     #: The union of the fields the classmethods below set. See
     #: ``_ReasonedK3sException`` for why this is not left implicit.
     FIELDS = ('main_config_path', 'name', 'returncode', 'stderr',
-              'config_elem')
+              'command', 'entry_name', 'detail')
 
     @classmethod
     def missing_kubectl(cls, main_config_path, name):
@@ -1131,10 +1302,64 @@ class KubeconfigError(_ReasonedK3sException):
         return cls('merge_failed', message, main_config_path=main_config_path,
                    returncode=returncode, stderr=stderr)
 
-    @classmethod
-    def unset_failed(cls, config_elem, stderr=None):
-        lines = ['Could not unset kubectl config element %s' % config_elem]
+    @staticmethod
+    def _cleanup_failure(lines, main_config_path, entry_name, stderr=None):
+        """Render a cleanup failure: its own lines, kubectl's stderr, then the way out.
+
+        The way out is the same for all five: the cluster has gone, so
+        the entries have to be removed by hand. The commands name the file
+        with --kubeconfig, because that is the file the cleanup acted on
+        whatever the caller's KUBECONFIG says.
+        """
         if stderr:
-            lines.append(stderr)
-        message = '\n'.join(lines)
-        return cls('unset_failed', message, config_elem=config_elem, stderr=stderr)
+            lines.append(stderr.rstrip('\n'))
+        lines.append(
+            'The cluster has been deleted, but kubeconfig entries named %s\n'
+            'may remain in %s. Remove them with:' % (entry_name, main_config_path))
+        for command in ('delete-context', 'delete-user', 'delete-cluster'):
+            lines.append('    kubectl --kubeconfig %s config %s %s'
+                         % (shlex.quote(main_config_path), command, shlex.quote(entry_name)))
+        return '\n'.join(lines)
+
+    @classmethod
+    def missing_kubectl_on_delete(cls, main_config_path, entry_name):
+        message = cls._cleanup_failure(
+            ['A local kubectl binary is required to remove the cluster from\n'
+             '%s, but none was found.' % main_config_path],
+            main_config_path, entry_name)
+        return cls('missing_kubectl_on_delete', message,
+                   main_config_path=main_config_path, entry_name=entry_name)
+
+    @classmethod
+    def kubectl_unrunnable(cls, main_config_path, entry_name, detail):
+        message = cls._cleanup_failure(
+            ['Could not run the local kubectl to remove the cluster from\n'
+             '%s: %s' % (main_config_path, detail)],
+            main_config_path, entry_name)
+        return cls('kubectl_unrunnable', message, main_config_path=main_config_path,
+                   entry_name=entry_name, detail=detail)
+
+    @classmethod
+    def view_failed(cls, main_config_path, entry_name, returncode, stderr=None):
+        message = cls._cleanup_failure(
+            ['Could not read %s, return code %d' % (main_config_path, returncode)],
+            main_config_path, entry_name, stderr)
+        return cls('view_failed', message, main_config_path=main_config_path,
+                   entry_name=entry_name, returncode=returncode, stderr=stderr)
+
+    @classmethod
+    def view_unparseable(cls, main_config_path, entry_name, detail):
+        message = cls._cleanup_failure(
+            ['Could not parse %s as kubectl reported it: %s' % (main_config_path, detail)],
+            main_config_path, entry_name)
+        return cls('view_unparseable', message, main_config_path=main_config_path,
+                   entry_name=entry_name, detail=detail)
+
+    @classmethod
+    def delete_failed(cls, main_config_path, command, entry_name, stderr=None):
+        message = cls._cleanup_failure(
+            ["Could not remove %s from %s with 'kubectl config %s'"
+             % (entry_name, main_config_path, command)],
+            main_config_path, entry_name, stderr)
+        return cls('delete_failed', message, main_config_path=main_config_path,
+                   command=command, entry_name=entry_name, stderr=stderr)

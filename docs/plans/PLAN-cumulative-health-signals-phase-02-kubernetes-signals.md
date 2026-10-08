@@ -470,7 +470,7 @@ branch at `bdb0652`:
 [run 37668454070](https://github.com/shakenfist/client-python-k3s/actions/runs/37668454070).
 Its cluster deployment job passed, including both `health --strict`
 steps. Its sanity checks failed only on the sdist size gate in
-`tools/check-wheel-build.sh`, which `431579e` raised; see *Deviations*.
+`tools/check-wheel-build.sh`; see *Deviations*.
 
 The Ready wait, from the progress phases:
 
@@ -549,7 +549,9 @@ on a real cluster. kubectl accepted both go-templates on k3s
 - **The sdist size gate.** The merge tier failed the sdist byte bound
   (2355987 against 2200000). The growth is source and plans, spread over
   the phases, so `431579e` raised the bound to 2800000 as the gate's
-  comment directs.
+  comment directs. #121 then fixed it properly by pruning `docs/plans`
+  from the sdist, so merging develop took its bound and dropped the
+  raise.
 
 ## Back brief
 

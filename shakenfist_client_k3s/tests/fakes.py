@@ -12,7 +12,12 @@ the health verb both drive.
 """
 
 import io
+import json
+import os
+import subprocess
+import tempfile
 
+import mock
 from shakenfist_client import apiclient
 
 from shakenfist_client_k3s import cluster as cluster_module
@@ -57,6 +62,95 @@ users:
   user:
     token: banana
 """
+
+
+# What Cluster.delete() runs to learn which kubeconfig entries are present,
+# after the 'kubectl --kubeconfig FILE' which starts every cleanup call.
+KUBECTL_CONFIG_VIEW_JSON = ['config', 'view', '-o', 'json']
+
+
+def cleanup_kubectl(main_config_path, args):
+    """The argument list delete()'s cleanup runs for args, against main_config_path."""
+    return ['kubectl', '--kubeconfig', main_config_path] + list(args)
+
+
+def kubectl_subcommand(argv):
+    """argv without 'kubectl' and a leading '--kubeconfig FILE': what the call does, not to which file.
+
+    For matchers and for tests whose subject is the names a call carries.
+    Which file a cleanup call acts on is pinned separately, by
+    OptionalKubeconfigTestCase in test_library_api.
+    """
+    argv = list(argv[1:])
+    if argv[:1] == ['--kubeconfig']:
+        argv = argv[2:]
+    return argv
+
+
+def home_with_kubeconfig(testcase):
+    """Point HOME at a temporary directory holding a ~/.kube/config, and return its path.
+
+    delete()'s kubeconfig cleanup acts on ~/.kube/config and runs no
+    kubectl when there is no such file, so a test of the cleanup needs one
+    -- and needs it somewhere other than the operator's own home.
+    """
+    home = tempfile.TemporaryDirectory()
+    testcase.addCleanup(home.cleanup)
+    patcher = mock.patch.dict('os.environ', {'HOME': home.name})
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+
+    path = os.path.join(home.name, '.kube', 'config')
+    os.makedirs(os.path.dirname(path))
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(KUBECONFIG)
+    return path
+
+
+class FakeKubectl:
+    """The read half of a local kubectl, as a subprocess.run() side effect.
+
+    delete() reads the entry names present with ``kubectl config view -o
+    json`` and then runs a ``delete-*`` command only for those, so a fake
+    which answered every command with the same empty bytes would make the
+    cleanup do nothing and every test of it pass for the wrong reason. This
+    answers the read with the document kubectl prints for a kubeconfig
+    holding a user, context and cluster for each of ``names`` -- including
+    kubectl's null, rather than an empty list, for an empty section -- and
+    returns ``mock.DEFAULT`` for every other command, so the patched mock's
+    own ``return_value`` still decides how the delete commands and create's
+    merge behave.
+
+    It does not remove names as they are deleted: a test which wants the
+    entries gone says so by setting ``names``.
+    """
+
+    def __init__(self, names=()):
+        self.names = list(names)
+        self.view_returncode = 0
+        self.view_stdout = None
+        self.view_stderr = b''
+
+    def view_json(self):
+        def section(kind):
+            return [{'name': name, kind: {}} for name in self.names] or None
+
+        return json.dumps({
+            'kind': 'Config', 'apiVersion': 'v1',
+            'clusters': section('cluster'),
+            'users': section('user'),
+            'contexts': section('context'),
+            'current-context': self.names[0] if self.names else '',
+        }).encode('utf-8')
+
+    def __call__(self, args, **kwargs):
+        if list(args[:1]) != ['kubectl'] or kubectl_subcommand(args) != KUBECTL_CONFIG_VIEW_JSON:
+            return mock.DEFAULT
+        stdout = self.view_stdout
+        if stdout is None:
+            stdout = self.view_json()
+        return subprocess.CompletedProcess(
+            args, self.view_returncode, stdout, self.view_stderr)
 
 
 class FakeClusterClient:

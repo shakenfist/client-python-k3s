@@ -7,6 +7,7 @@ from shakenfist_client_k3s import exceptions
 from shakenfist_client_k3s import primitives
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.cluster import Cluster, DEFAULT_NODE_SIZE, read_k3s_config
+from shakenfist_client_k3s.cluster import validate_create_arguments
 
 
 def _bind_namespace_context(ctx, namespace):
@@ -190,24 +191,24 @@ def k3s_list(ctx, namespace=None, ):
                     'copied verbatim under its own name: nothing is templated, '
                     "and the order manifests are applied in is k3s's business "
                     "rather than this command's."))
-@click.option('--control-plane-cpus', type=click.IntRange(min=1),
+@click.option('--control-plane-cpus', type=click.INT,
               default=DEFAULT_NODE_SIZE['cpus'],
               help='The number of vCPUs for each control plane node.')
-@click.option('--control-plane-memory', type=click.IntRange(min=1),
+@click.option('--control-plane-memory', type=click.INT,
               default=DEFAULT_NODE_SIZE['memory'],
               help=('The memory for each control plane node, in MB. 2048 runs a '
                     'control plane but does not hold up under load; 4096 or more '
                     'is recommended.'))
-@click.option('--control-plane-disk', type=click.IntRange(min=1),
+@click.option('--control-plane-disk', type=click.INT,
               default=DEFAULT_NODE_SIZE['disk'],
               help='The disk for each control plane node, in GB.')
-@click.option('--worker-cpus', type=click.IntRange(min=1),
+@click.option('--worker-cpus', type=click.INT,
               default=DEFAULT_NODE_SIZE['cpus'],
               help='The number of vCPUs for each worker node.')
-@click.option('--worker-memory', type=click.IntRange(min=1),
+@click.option('--worker-memory', type=click.INT,
               default=DEFAULT_NODE_SIZE['memory'],
               help='The memory for each worker node, in MB.')
-@click.option('--worker-disk', type=click.IntRange(min=1),
+@click.option('--worker-disk', type=click.INT,
               default=DEFAULT_NODE_SIZE['disk'],
               help='The disk for each worker node, in GB.')
 @click.option('--server-config', type=click.Path(exists=True, dir_okay=False),
@@ -227,9 +228,13 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
                manifests=None, control_plane_cpus=None, control_plane_memory=None,
                control_plane_disk=None, worker_cpus=None, worker_memory=None,
                worker_disk=None, server_config=None, agent_config=None):
-    # The configuration files are read before the cluster context is bound
-    # because binding creates the namespace when --namespace names one that
-    # does not exist yet, and a bad file should not leave a namespace behind.
+    # Everything create() can refuse without the API is refused before the
+    # cluster context is bound, because binding creates the namespace when
+    # --namespace names one that does not exist yet, and a refused create
+    # should not leave a namespace behind. The configuration files are read
+    # first, because what is checked is the mapping they hold. create()
+    # makes the same checks again, by the same function, which costs
+    # nothing and is what covers a library caller.
     parsed_server_config = None
     if server_config:
         parsed_server_config = read_k3s_config(server_config, 'server')
@@ -237,25 +242,33 @@ def k3s_create(ctx, name=None, control_plane_count=None, worker_count=None,
     if agent_config:
         parsed_agent_config = read_k3s_config(agent_config, 'agent')
 
-    c = _bind_new_cluster_context(ctx, name, namespace)
-    # write_kubeconfig defaults to False in the library and True here: the
-    # command line's behaviour is unchanged, and a library caller does not
-    # have its ~/.kube/config edited unasked. Decision 6 of the phase 3 plan.
     # click hands multiple=True options over as a tuple, and the library
     # takes a list: the parameter is documented as a list of paths, and a
     # library caller has no reason to be handed one shape by the CLI and
     # asked for another.
+    checked = {
+        'manifests': list(manifests or []),
+        'control_plane_cpus': control_plane_cpus,
+        'control_plane_memory': control_plane_memory,
+        'control_plane_disk': control_plane_disk,
+        'worker_cpus': worker_cpus,
+        'worker_memory': worker_memory,
+        'worker_disk': worker_disk,
+        'server_config': parsed_server_config,
+        'agent_config': parsed_agent_config,
+    }
+    validate_create_arguments(name, control_plane_count, worker_count,
+                              metal_address_count, **checked)
+
+    c = _bind_new_cluster_context(ctx, name, namespace)
+    # write_kubeconfig defaults to False in the library and True here: the
+    # command line's behaviour is unchanged, and a library caller does not
+    # have its ~/.kube/config edited unasked. Decision 6 of the phase 3 plan.
     c.create(control_plane_count, worker_count, metal_address_count,
              network=network, refresh_version_cache=refresh_version_cache,
              release_channel=release_channel, sshkey=sshkey,
              install_metallb=metallb, install_longhorn=longhorn,
-             write_kubeconfig=kubeconfig, manifests=list(manifests or []),
-             control_plane_cpus=control_plane_cpus,
-             control_plane_memory=control_plane_memory,
-             control_plane_disk=control_plane_disk,
-             worker_cpus=worker_cpus, worker_memory=worker_memory,
-             worker_disk=worker_disk, server_config=parsed_server_config,
-             agent_config=parsed_agent_config)
+             write_kubeconfig=kubeconfig, **checked)
 
 
 @k3s.command(name='query-k3s-version',
