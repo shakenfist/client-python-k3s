@@ -20,6 +20,8 @@ import tempfile
 import mock
 from shakenfist_client import apiclient
 
+from shakenfist_client_k3s import cluster as cluster_module
+
 
 class FakeTty(io.StringIO):
     """A stream which claims to be a terminal.
@@ -154,10 +156,17 @@ class FakeKubectl:
 class FakeClusterClient:
     """Enough of the sf-client API surface for a whole cluster lifecycle.
 
-    Instances boot instantly, every agent operation completes successfully
-    at submission, file fetches return canned content, and deleting an
-    instance moves it straight to the deleted state so delete's wait loop
-    terminates.
+    Instances boot instantly, every agent operation completes at
+    submission -- successfully, unless a test has named a command to fail
+    with failing_command -- file fetches return canned content, and
+    deleting an instance moves it straight to the deleted state so delete's
+    wait loop terminates.
+
+    Every command succeeding includes the readiness waits create() and
+    expand_workers() run (nodes_ready_command()): exit 0 is what the real
+    command says once the node is Ready, so a fake which says it at once
+    is a cluster whose nodes were Ready immediately, which is the case the
+    lifecycle tests mean.
     """
 
     def __init__(self):
@@ -185,6 +194,16 @@ class FakeClusterClient:
         # -- cannot be made from separate per-call lists, because neither
         # knows where in the other its own calls fell.
         self.executed = []
+
+        # A substring which, when a command line contains it, makes that
+        # command complete with a non-zero return code and failing_stderr,
+        # which is what reap_execute() turns into CommandFailedError. None,
+        # the default, fails nothing. A substring rather than a whole
+        # command, because the commands worth failing are long and built
+        # from module constants, and what a test means is "the wait for
+        # this node" or "the k3s install", not every byte of either.
+        self.failing_command = None
+        self.failing_stderr = 'scripted failure'
 
         # What the caller asked us to destroy, so a test can assert on the
         # teardown as well as the build. Network allocation is recorded as
@@ -274,10 +293,14 @@ class FakeClusterClient:
 
     def instance_execute(self, instance_ref, commandline):
         self.executed.append((instance_ref, commandline))
+        result = {'return-code': 0, 'stdout': '', 'stderr': ''}
+        if self.failing_command and self.failing_command in commandline:
+            result = {'return-code': 1, 'stdout': '',
+                      'stderr': self.failing_stderr}
         return self._complete_aop(
             instance_ref,
             [{'command': 'execute', 'commandline': commandline}],
-            {'0': {'return-code': 0, 'stdout': '', 'stderr': ''}})
+            {'0': result})
 
     def instance_get(self, instance_ref, path):
         return self._complete_aop(
@@ -327,6 +350,62 @@ WORKER_SIGNALS_OUTPUT = (
     'LoadState=loaded\n'
     'ActiveState=activating\n')
 
+# What K3S_KUBERNETES_PROBE_COMMAND prints for a three node cluster on which
+# one container has been killed for running out of memory: a 'node' line per
+# node, then an 'oom' line for the container, in the shape kubectl rendered
+# the templates in when they were written. The node names are the ones the
+# health tests give their instances, lowercased as kubelet registers them,
+# so that HealthClient's default answer is a cluster whose every node is
+# registered and Ready, with one OOM kill on a worker, which leaves it
+# healthy. Unix seconds for each time are given beside it, worked out with
+# 'date -u' rather than with the code under test, so that the parser's
+# tests and health()'s are reading the same output.
+KUBERNETES_PROBE_OUTPUT = (
+    'node\tk3s-banana-node-001\tTrue\tFalse\tFalse\tFalse\t'
+    '2026-10-05T08:12:25Z\n'
+    'node\tk3s-banana-node-002\tTrue\tFalse\tFalse\tFalse\t'
+    '2026-10-05T08:13:02Z\n'
+    'node\tk3s-banana-node-003\tTrue\tFalse\tFalse\tFalse\t'
+    '2026-10-05T08:13:09Z\n'
+    'oom\tk3s-banana-node-002\tdefault\tmemory-hog-7d9f8b6c5-x2x7k\thog\t2\t'
+    '2026-10-06T21:40:11Z\n')
+KUBERNETES_PROBE_READINGS = {
+    'nodes': {
+        'k3s-banana-node-001': {
+            'ready': 'True',
+            'ready_since': 1791187945,
+            'memory_pressure': 'False',
+            'disk_pressure': 'False',
+            'pid_pressure': 'False',
+        },
+        'k3s-banana-node-002': {
+            'ready': 'True',
+            'ready_since': 1791187982,
+            'memory_pressure': 'False',
+            'disk_pressure': 'False',
+            'pid_pressure': 'False',
+        },
+        'k3s-banana-node-003': {
+            'ready': 'True',
+            'ready_since': 1791187989,
+            'memory_pressure': 'False',
+            'disk_pressure': 'False',
+            'pid_pressure': 'False',
+        },
+    },
+    'oom_killed': {
+        'k3s-banana-node-002': [
+            {
+                'namespace': 'default',
+                'pod': 'memory-hog-7d9f8b6c5-x2x7k',
+                'container': 'hog',
+                'restarts': 2,
+                'finished_at': 1791322811,
+            },
+        ],
+    },
+}
+
 
 class HealthClient(FakeClusterClient):
     """A scripted client which can be made unwell in each of the ways health() reports.
@@ -336,14 +415,21 @@ class HealthClient(FakeClusterClient):
     given completes with a return code of zero. A health check whose entire
     purpose is reporting bad news needs a client which can deliver some.
 
-    health() runs two kinds of command through the agent, and this answers
-    them separately, routed by command line: one starting 'kubectl ' is the
+    health() runs three kinds of command through the agent, and this answers
+    them separately, routed by command line: K3S_API_PROBE_COMMAND is the
     k3s API probe and answers from the ``probe_*`` attributes, exactly as it
-    did when it was the only command there was, and anything else is a
-    node's signals probe and answers from the ``signals_*`` attributes for
-    the instance it was sent to. Each operation keeps its own kind and
-    instance, so a pending kubectl probe and a complete signals probe -- or
-    the other way around -- can be in flight together, which is the shape
+    did when it was the only command there was;
+    K3S_KUBERNETES_PROBE_COMMAND is the Kubernetes probe and answers from
+    the ``kubernetes_*`` attributes; and anything else is a node's signals
+    probe and answers from the ``signals_*`` attributes for the instance it
+    was sent to. The first two are matched exactly, against the module's
+    constants rather than literals, so a test cannot pass against a command
+    health() no longer sends: a changed constant is a command this answers
+    as signals, whose output reads as no API answer and no Kubernetes node.
+    Both are kubectl, which is why routing on a 'kubectl ' prefix, as this
+    once did, would answer one with the other's output. Each operation
+    keeps its own kind and instance, so a pending probe of one kind and a
+    complete one of another can be in flight together, which is the shape
     of the cases worth testing.
 
     Submission and reading are modelled as the real server does them for
@@ -371,7 +457,7 @@ class HealthClient(FakeClusterClient):
         self.metadata_deletes = []
         self.deleted_instances = []
 
-        # What the kubectl probe does. Between them these cover the three
+        # What the API probe does. Between them these cover the three
         # ways it can fail: the command runs and exits non-zero, the agent
         # operation itself errors, and the API refuses to accept the
         # command at all. probe_state is the state the operation is in when
@@ -385,9 +471,18 @@ class HealthClient(FakeClusterClient):
         self.probe_state = 'complete'
         self.probe_raises = None
 
+        # What the Kubernetes probe does, in the same terms. Its default
+        # output is KUBERNETES_PROBE_OUTPUT above: every node the health
+        # tests name registered and Ready, and one OOM kill.
+        self.kubernetes_return_code = 0
+        self.kubernetes_stdout = KUBERNETES_PROBE_OUTPUT
+        self.kubernetes_stderr = ''
+        self.kubernetes_state = 'complete'
+        self.kubernetes_raises = None
+
         # What each node's signals probe does, keyed by instance uuid, so
         # one node can be made to fail while the others answer. The same
-        # three ways to fail as the kubectl probe, plus what the command
+        # three ways to fail as the API probe, plus what the command
         # prints. An instance with no entry answers as a healthy node would
         # when read: state 'complete', exit 0, and the realistic output above
         # for the role the command was built for.
@@ -416,8 +511,8 @@ class HealthClient(FakeClusterClient):
         # did not finish. The correct code reads a pending operation once
         # per second up to its timeout, which is well inside this. Counted
         # per operation rather than in total, so the limit scales with the
-        # number of operations in flight -- one per probed node and the
-        # kubectl one -- rather than assuming there is only one.
+        # number of operations in flight -- one per probed node and the two
+        # kubectl ones -- rather than assuming there is only one.
         self.agent_operation_reads = 0
         self.agent_operation_reads_by_uuid = {}
         self.max_agent_operation_reads = 60
@@ -444,11 +539,16 @@ class HealthClient(FakeClusterClient):
         answer always was, so a test may change an attribute between
         submission and the wait, or between one read and the next.
         """
-        if kind == 'kubectl':
+        if kind == 'api':
             return self.probe_state, {
                 '0': {'return-code': self.probe_return_code,
                       'stdout': self.probe_stdout,
                       'stderr': self.probe_stderr}}
+        if kind == 'kubernetes':
+            return self.kubernetes_state, {
+                '0': {'return-code': self.kubernetes_return_code,
+                      'stdout': self.kubernetes_stdout,
+                      'stderr': self.kubernetes_stderr}}
 
         # The default output follows the unit the command asked about,
         # which is how a real node's output follows its role: it prints
@@ -468,7 +568,7 @@ class HealthClient(FakeClusterClient):
         # whose agent is not connected, where the operation is accepted and
         # then never runs. A test which wants the wait to end sets the
         # state to a terminal one. An operation this fake did not hand out
-        # answers as the kubectl probe, which is what every operation was
+        # answers as the API probe, which is what every operation was
         # before there was more than one kind.
         self.calls.append(('read', operation_uuid))
         self.agent_operation_reads += 1
@@ -476,7 +576,7 @@ class HealthClient(FakeClusterClient):
         self.agent_operation_reads_by_uuid[operation_uuid] = reads
 
         kind, instance_ref, commandline = self.operations.get(
-            operation_uuid, ('kubectl', None, None))
+            operation_uuid, ('api', None, None))
         state, results = self._answer(kind, instance_ref, commandline)
         # The command the operation was submitted with, as the server
         # reports it on every read, so that a description of the operation
@@ -502,9 +602,12 @@ class HealthClient(FakeClusterClient):
         self.executed.append((instance_ref, commandline))
         self.calls.append(('execute', instance_ref, commandline))
 
-        kind = 'kubectl' if commandline.startswith('kubectl ') else 'signals'
-        raises = (self.probe_raises if kind == 'kubectl'
-                  else self.signals_raises.get(instance_ref))
+        if commandline == cluster_module.K3S_API_PROBE_COMMAND:
+            kind, raises = 'api', self.probe_raises
+        elif commandline == cluster_module.K3S_KUBERNETES_PROBE_COMMAND:
+            kind, raises = 'kubernetes', self.kubernetes_raises
+        else:
+            kind, raises = 'signals', self.signals_raises.get(instance_ref)
         if raises:
             raise raises
 

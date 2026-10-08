@@ -104,8 +104,8 @@ is public here is a compatibility surface for external callers. Everything else 
 `execute_and_await()`, `instance_os_update()`,
 `install_control_plane()`, `install_k3s_component()`,
 `install_extra_control_plane()`, `install_workers()`,
-`allocate_metallb_addresses()`, `configure_metallb_addresses()`,
-`setup_metallb()`, `setup_longhorn()`,
+`await_nodes_ready()`, `allocate_metallb_addresses()`,
+`configure_metallb_addresses()`, `setup_metallb()`, `setup_longhorn()`,
 `create_and_await_instances()`, `start_progress()`,
 `get_progress()`,
 `_interrupted_state()` and `_require_usable()` -- is internal
@@ -154,6 +154,33 @@ it. Skipping MetalLB or Longhorn, by contrast, is not a change to
 `setup_metallb()` or `setup_longhorn()`
 themselves -- they are exactly as unconditional as before -- it is
 `create()` deciding whether to call them at all.
+
+`create()` and `expand_workers()` return only once every node they
+added has registered with Kubernetes and reports `Ready`, so a
+`health()` straight afterwards sees those nodes as Kubernetes does
+rather than racing the last one's registration. `create()` waits for
+every node, after the last k3s install and before MetalLB and
+Longhorn; `expand_workers()` waits for the workers it added and no
+others. The wait is one command for all of those nodes, run on the
+first control plane node: it polls for up to about two minutes for
+every node to register, then gives one `kubectl wait
+--for=condition=Ready` five more. Its worst case, about nine minutes
+if the API server hangs on every poll, is the same for any number of
+nodes and fits inside the 600 seconds Shaken Fist allows an agent
+operation that asks for no deadline of its own, as this library
+never does; past that the server would expire it and the error would
+name the operation rather than the node. A node that is not `Ready`
+in time raises `CommandFailedError`, whose output names the nodes
+that had not registered, or kubectl's names those that were not
+`Ready`; the `instance` it names is the control plane node the wait
+ran on. After a `create()` that leaves the
+cluster in state `initial`, like any other failure part way through a
+create, with its kubeconfig already recorded so `get_kubeconfig()` can
+reach the cluster to ask why; `delete()` clears it. After an
+`expand_workers()` the cluster stays `created`, with the new workers
+in its metadata. A node is found by its instance's name, lowercased,
+because that is the name kubelet registers; `remove_worker()` finds
+the node it drains the same way.
 
 `create()`'s remaining keyword arguments (`refresh_version_cache`,
 `release_channel`, `sshkey`, `install_metallb`, `install_longhorn`,
@@ -295,6 +322,7 @@ a correct caller never needs to catch it.
 | `ClusterIncompleteError` | `get_kubeconfig()` is called on a cluster that exists but has not finished `create()` |
 | `WorkerNotFoundError` | `remove_worker()` is given a uuid that is not one of the cluster's workers |
 | `WorkerUnnamedError` | `remove_worker()` finds a worker whose instance record has no name, so the k3s node it became cannot be identified |
+| `NodeUnnamedError` | `create()` or `expand_workers()` finds a node it just added whose instance record has no name, so it cannot wait for that node to become `Ready` |
 | `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable or not decodable as UTF-8, not valid YAML or JSON, or a line colliding with the staging marker |
 | `GuestFileError` | a file this library writes onto a cluster node carries a line equal to the heredoc marker used to write it, so writing it would run the rest as commands on the node. The values that reach these bodies come from the namespace metadata document, which is third-party writable |
 | `SshKeyError` | `create(sshkey=...)` is given a path that cannot be read or decoded as UTF-8 |
@@ -307,7 +335,7 @@ a correct caller never needs to catch it.
 | `ClusterMetadataError` | a value read back out of the namespace metadata cannot be used -- `expand_addresses()` finds something in `routed_addresses` that is not an IP address, or the API hands back one that is not. Raised before any address is routed, because the addresses are charged for and the configuration they go into is written afterwards |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
-| `CommandFailedError` | an agent command completes with a non-zero return code |
+| `CommandFailedError` | an agent command completes with a non-zero return code, including the wait `create()` and `expand_workers()` make for a node that does not become `Ready` |
 | `KubeconfigError` | a local `~/.kube/config` merge fails (`merge_failed`), or `delete()`'s cleanup cannot read `~/.kube/config` (`view_failed`, `view_unparseable`) or remove an entry from it (`delete_failed`), or either needs a local `kubectl` and there is none (`missing_kubectl`, `missing_kubectl_on_delete`), or `delete()`'s finds one it cannot start (`kubectl_unrunnable`, carrying the `OSError`'s text as `detail`). The five cleanup reasons are raised after the cluster has gone, so a retry of `delete()` raises `ClusterNotFoundError`; each carries `main_config_path` and `entry_name`, and its message gives the `kubectl` commands that remove the entries by hand. A failed write of the file itself is an `OSError`. Before 0.3.0 the cleanup ran `kubectl config unset`, and a failure there was `unset_failed` carrying `config_elem`; from 0.3.0 both are gone, replaced by `delete_failed` and `entry_name` alongside the new `view_failed`, `view_unparseable`, `missing_kubectl_on_delete` and `kubectl_unrunnable` reasons |
 
 Each exception's docstring in `shakenfist_client_k3s/exceptions.py`
@@ -373,8 +401,10 @@ result.
 `kubectl` probe carries a timeout, and it is skipped altogether when
 the node it would run on is not up. Both are reported as
 `api['probed'] is False` with an explanatory `api['error']`, and
-neither raises. Every probe -- the `kubectl` one and one signals probe
-per healthy node (see "What `signals` reports", below) -- is submitted
+neither raises. Every probe -- two `kubectl` ones on the first control
+plane node (`kubectl get nodes` for `api`, and the Kubernetes read behind
+`kubernetes`; see "What `kubernetes` reports", below) and one signals
+probe per healthy node (see "What `signals` reports", below) -- is submitted
 before any is waited for, and all of them are waited for under one
 shared budget, so the waiting is bounded by one budget on a cluster of
 any size. That bounds the waiting, not the call: on top of it come one
@@ -386,11 +416,11 @@ ones are waited for, and one which has finished by the time it is
 collected costs a single read, so a healthy cluster waits for about the
 time its slowest probe takes rather than a second per node. An abandoned
 run does leave operations queued until the server's
-deadline ends them: up to one per probed node, plus the `kubectl` one
-on the control plane node. `api['error']` names the `kubectl`
-operation, and a caller polling `health()` in a loop should know that a
-later `expand_workers()` or `update_os()` waits for those alongside its
-own commands.
+deadline ends them: up to one per probed node, plus the two `kubectl`
+ones on the control plane node. `api['error']`, `kubernetes['error']` or
+a node's `signals['error']` names the abandoned operation, and a caller
+polling `health()` in a loop should know that a later `expand_workers()`
+or `update_os()` waits for those alongside its own commands.
 
 That wait is a delay and not a failure, and the mechanism is worth
 stating because the obvious implementation gets it wrong.
@@ -471,6 +501,114 @@ otherwise up reports it in `signals['error']` and leaves the node
 healthy, so a slow `du` cannot flip the Ansible module's gate or
 `--strict`.
 
+### What `kubernetes` reports
+
+What the Kubernetes API says about each node is read once, on the first
+control plane node, by a second read-only `kubectl` command beside the
+`api` one (which is unchanged, and whose `stdout` is still the
+`kubectl get nodes` table). It answers for every node, so the readings
+are filed on each node's entry under `kubernetes`, and the probe's own
+outcome is the top level `kubernetes`. The probe runs under the same
+rule as `api`: only when the first control plane node's instance exists,
+is created and has a ready agent. It is not part of `signals`, because
+`signals` is what a node says about itself through its own agent and
+never affects `healthy`; neither is true of `ready`.
+
+Every node entry carries a `kubernetes` dict with the same seven keys in
+every outcome:
+
+| Key | What it is |
+|---|---|
+| `registered` | `True` when a Kubernetes node has this node's name, `False` when the probe answered and none has. `None` when it could not be read. |
+| `ready` | The node's `Ready` condition status, as Kubernetes spells it: `'True'`, `'False'` or `'Unknown'`. These stay strings rather than becoming bools because `'Unknown'` is a third answer, meaning the node controller has stopped hearing from the kubelet, and a bool would have to lie about it in one direction. `None` when it could not be read, and when a registered node reports no `Ready` condition. |
+| `ready_since` | That condition's `lastTransitionTime`, in Unix seconds: when the node last became Ready or stopped being so. |
+| `memory_pressure`, `disk_pressure`, `pid_pressure` | The `MemoryPressure`, `DiskPressure` and `PIDPressure` condition statuses, as `ready` is. `None` when not read or not reported. |
+| `oom_killed` | A list of the containers on this node whose latest termination was an OOM kill, described below. `[]` when the probe answered and there are none. `None` when it could not be read, never `[]`, because an empty list is a claim that nothing was killed. |
+
+A node is matched to its Kubernetes node by its instance's name,
+lowercased, which is what kubelet registers it under and what
+`remove_worker()` matches on. Every key is `None` when:
+
+* the probe did not answer: it was skipped (the first control plane node
+  cannot answer), refused, abandoned at the shared deadline, failed, or
+  exited non-zero. This includes `registered` and `oom_killed`;
+* the node has no name, because its instance is gone; or
+* another node's name is the same once lowercased. Kubernetes holds one
+  node object for that name and nothing here can say which kubelet it
+  describes, so neither entry is given its readings, and the two equal
+  names beside each other in `nodes` are the explanation.
+
+A node whose name matches no Kubernetes node, with the probe answering,
+has `registered` `False`, no conditions, and `oom_killed` holding
+whatever kills were filed under that name, normally `[]`.
+
+Each element of `oom_killed` is:
+
+| Key | What it is |
+|---|---|
+| `namespace`, `pod`, `container` | Which container, including init containers. |
+| `restarts` | The container's `restartCount`, which is cumulative for the pod's lifetime. |
+| `finished_at` | When the terminated container finished, in Unix seconds. |
+
+This is the latest termination of containers that still exist, **not a
+count**. Kubernetes keeps only a container's most recent termination: one
+killed for running out of memory and since restarted cleanly is listed
+until it terminates again for another reason, and a deleted pod takes its
+record with it. So an entry going away means nothing on its own, and the
+list cannot be summed into a number that only goes up. To tell a new kill
+from one already seen, keep the previous report and compare entries by
+`namespace`, `pod` and `container`: a later `finished_at` for the same
+three is a new kill; the same `finished_at` is one you have seen. A pod
+that was deleted and recreated has a new name and so reads as new. This
+differs from `signals['oom_kills']`, which counts every kernel OOM kill
+on the machine since boot but cannot say which container it was.
+
+The top level `kubernetes` is the probe's own outcome:
+
+| Key | What it is |
+|---|---|
+| `probed` | The command ran at all. |
+| `answered` | ...and it exited zero. |
+| `error` | Why it did not answer, in the words `api['error']` uses, naming an abandoned operation by its uuid. `None` when it answered. |
+| `unmatched_nodes` | The sorted names of Kubernetes nodes which no node entry accounts for, typically the node object of an instance deleted out of band. A list, `[]` for none, and `None` when the probe did not answer. A node name two entries share is not listed, because an instance accounts for it. |
+
+Readings are raw and `health()` stores nothing, as for `signals`; the
+caller holds the baseline.
+
+#### What `healthy` requires
+
+The top level `healthy` is true when all of these hold:
+
+1. the cluster finished being built (it is not `interrupted`);
+2. every node exists, is `created` and has a ready agent -- every node's
+   own `healthy`;
+3. the k3s API answered (`api['answered']`);
+4. the Kubernetes probe answered (`kubernetes['answered']`); and
+5. every node's `kubernetes['ready']` is `'True'`.
+
+`'Unknown'` is not Ready, and neither is a node that is not registered, a
+node that could not be matched, or a readiness the probe could not read.
+Terms 4 and 5 were added by
+[shakenfist/client-python-k3s#76](https://github.com/shakenfist/client-python-k3s/issues/76):
+before them, a cluster whose kubelets were all `NotReady` reported
+healthy, and callers branching on `healthy` or `--strict` had to add
+their own `kubectl wait`. This is a change to what `healthy` means for
+existing callers. `create()` and `expand_workers()` wait for their nodes
+to be Ready (see above), so creating and then checking does not race.
+
+A node's own `healthy` does **not** take `ready`. It is Shaken Fist's
+view of the instance, and it is also what decides whether the node's
+agent is asked for `signals`, and a `NotReady` kubelet beside a working
+agent is exactly the node whose signals are worth reading. A cluster can
+therefore be unhealthy while every node entry is healthy, and each
+node's `kubernetes` says why.
+
+Not folded in, and reported instead: pressure conditions (a node under
+pressure is degraded rather than down, and whether that matters depends
+on the workload), `oom_killed` (history cannot be judged without a
+baseline) and `unmatched_nodes` (a stale node object is debris, not a
+broken cluster). `signals` also never affects `healthy`.
+
 ## Worked example
 
 This creates a one-node cluster, fetches its kubeconfig, and deletes
@@ -509,15 +647,17 @@ it raises.
 progress text `sf-client k3s create` prints, for example:
 
 ```
-[1/8] Creating node network
+[1/9] Creating node network
   created k3s-mycluster-node (uuid ...)
 ...
-[8/8] Setting up longhorn version 1.6.0
+[7/9] Waiting for 3 nodes to become Ready
+...
+[9/9] Setting up longhorn version 1.6.0
 Cluster mycluster is ready (... total)
 ```
 
 The total follows what the call actually does, so the command line's
-nine-phase create becomes eight here: the example above did not ask
+ten-phase create becomes nine here: the example above did not ask
 for `write_kubeconfig`, so there is no `Updating local kubeconfig`
 phase to count.
 

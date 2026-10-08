@@ -93,8 +93,11 @@ channel the plugin already uses for everything else:
   rather than forensics after it.
 - **The etcd data directory size.** 383 MB of data plus 80 MB of
   snapshots on a 2 GB node, growing, watched by nothing.
-- **`lastState.terminated.reason == OOMKilled` on pods.** Via the API
-  rather than the agent. Machine readable, timestamped, and it
+- **`lastState.terminated.reason == OOMKilled` on pods.** From the
+  Kubernetes API rather than from each node's own files -- though still
+  through `kubectl` on the first control plane node, since the plugin has
+  no Kubernetes client (phase 2's survey finding 2). It holds a
+  container's latest termination only, not a count (its finding 3). Machine readable, timestamped, and it
   distinguishes real damage from the first-boot ordering races every
   cluster carries -- a distinction a plain restart count cannot make,
   and which 33fl's `tools/k3s-health-check.py` currently has to
@@ -178,8 +181,8 @@ audit row is mandatory.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Agent-read signals | [PLAN-cumulative-health-signals-phase-01-agent-signals.md](PLAN-cumulative-health-signals-phase-01-agent-signals.md) -- `NRestarts` from `k3s` or `k3s-agent` by role, the `/proc/vmstat` OOM kill count, `MemTotal` and `MemAvailable`, the boot id and boot time, and the etcd data and snapshot directory sizes on control plane nodes, read by one agent operation per healthy node under the existing probe budget and reported raw under each node's `signals`. `healthy` is unchanged. Answers open questions 1, 2 and 3. (This row used to read the OOM count from `journalctl -k`.) | In progress | |
-| 2. API-read signals | `OOMKilled` terminations, and whatever else the API exposes that current state discards, placed per node where they belong to a node (phase 1 decision 1). Includes the node `Ready` condition from [#76](https://github.com/shakenfist/client-python-k3s/issues/76), which is current state rather than history and is the one reading that may reasonably change `healthy` -- decide that here | Proposed | |
+| 1. Agent-read signals | [PLAN-cumulative-health-signals-phase-01-agent-signals.md](PLAN-cumulative-health-signals-phase-01-agent-signals.md) -- `NRestarts` from `k3s` or `k3s-agent` by role, the `/proc/vmstat` OOM kill count, `MemTotal` and `MemAvailable`, the boot id and boot time, and the etcd data and snapshot directory sizes on control plane nodes, read by one agent operation per healthy node under the existing probe budget and reported raw under each node's `signals`. `healthy` is unchanged. Answers open questions 1, 2 and 3. (This row used to read the OOM count from `journalctl -k`.) | Complete | 78c9df1 |
+| 2. Kubernetes-read signals | [PLAN-cumulative-health-signals-phase-02-kubernetes-signals.md](PLAN-cumulative-health-signals-phase-02-kubernetes-signals.md) -- a second `kubectl` probe on the first control plane node, read through the agent, reporting each node's `Ready` and pressure conditions and the containers whose latest termination was `OOMKilled`, per node under `kubernetes`. The top level `healthy` gains "every node Ready" ([#76](https://github.com/shakenfist/client-python-k3s/issues/76)), and `create()` and `expand_workers()` wait for their nodes to be Ready so that it does not race. (This row used to say "API-read", and that the readings would bypass the agent; they cannot.) | In progress | |
 | 3. Live validation | Provoke each signal on a throwaway cluster and assert the verb reports it, in `tools/ci_deploy_test.sh` or by hand. 33fl's `tools/k3s-health-check.py` tier 3 is a ready-made way to provoke control plane OOM. Also confirm two things phase 1 took from source rather than observation: that restarting k3s by hand resets `NRestarts`, and that a pod exceeding its own memory limit increments `oom_kill` | Proposed | |
 | 4. Push audit | Run `PUSH-AUDIT.md` over the accumulated diff of phases 1-3 against `develop` | Proposed | |
 
@@ -558,6 +561,16 @@ chosen to defer to here, so that we do not forget them.
   `instance_execute()` has a `deadline_seconds` argument on its
   development branch but in no release; this needs the client floor
   raised once one ships (phase 1 survey finding 5).
+
+* Kubernetes Events, such as MetalLB's `AdditionalAssignFailed` from
+  the Situation above. The API server keeps them for an hour, so a
+  daily poll cannot see them, and `health()` cannot change that (phase 2
+  survey finding 4). Something that watches Events continuously could.
+* Container restart counts other than OOM kills. A sum over pods is not
+  a counter, because it goes down when a pod is deleted (phase 2
+  decision 7).
+* Merge the `api` and Kubernetes probes into one `kubectl` command once
+  a release can change `api['stdout']` (phase 2 decision 2).
 
 ### Bugs fixed during this work
 

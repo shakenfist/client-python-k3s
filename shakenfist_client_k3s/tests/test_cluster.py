@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 # The PyPI mock backport is used for consistency with the other tests in
 # this package, which support Python >= 3.7.
@@ -294,11 +295,17 @@ class ExpandWorkersTestCase(testtools.TestCase):
         client.create_instance.side_effect = list(new_instances)
         cluster = _make_cluster(client)
 
+        # await_nodes_ready() is patched out with the installs, because the
+        # question for it here is also which instances it is handed, and
+        # the bare MagicMock client has no instance names to build its
+        # commands from. AwaitNodesReadyTestCase covers the commands.
         with mock.patch.object(Cluster, 'await_boot'), \
                 mock.patch.object(Cluster, 'instance_os_update'), \
-                mock.patch.object(Cluster, 'install_k3s_component') as ikc:
+                mock.patch.object(Cluster, 'install_k3s_component') as ikc, \
+                mock.patch.object(Cluster, 'await_nodes_ready') as anr:
             cluster.expand_workers(worker_count)
 
+        self.await_nodes_ready = anr
         return cluster, ikc
 
     def test_only_the_new_worker_has_k3s_installed(self):
@@ -322,6 +329,19 @@ class ExpandWorkersTestCase(testtools.TestCase):
 
         ikc.assert_called_once_with(
             ['uuid-w-002', 'uuid-w-003'], 'node-token', 'agent')
+
+    def test_only_the_new_workers_are_waited_for(self):
+        # Decision 8 of the cumulative health signals phase 2 plan, and the
+        # same argument as the install above: a NotReady node which was
+        # already in the cluster is something health() reports, not a
+        # reason to fail an expand which did what it was asked.
+        cluster, _ = self._expand(
+            ['uuid-w-001', 'uuid-w-002'], 2,
+            [{'uuid': 'uuid-w-003', 'name': 'k3s-banana-node-003'},
+             {'uuid': 'uuid-w-004', 'name': 'k3s-banana-node-004'}])
+
+        self.await_nodes_ready.assert_called_once_with(
+            ['uuid-w-003', 'uuid-w-004'])
 
     def _built_sizes(self, cluster):
         """(cpus, memory, disk) for every create_instance() call, in order."""
@@ -427,32 +447,18 @@ class ExpandWorkersTestCase(testtools.TestCase):
         self.assertEqual([K3S_CONFIG], list(files))
 
 
-class CreateInstallsWorkersTestCase(testtools.TestCase):
-    """Creating a cluster installs k3s on every worker it just created.
+class CreateEnvironmentTestCase(testtools.TestCase):
+    """Shared setup for the tests which drive a whole create() against FakeClusterClient.
 
-    create() hands install_workers() md['worker_nodes'], and when this test
-    was written in step 3a that was the right list only by aliasing:
-    get_metadata() caches the metadata dictionary and set_metadata() stores
-    that same object, so the list create() was holding was the one
-    create_and_await_instances() had appended the new workers to. Nothing
-    at the call site said so, and making the cache copy on read would have
-    had create() install k3s on no workers at all and still report the
-    cluster ready.
-
-    Step 3c closed that: create() now picks the metadata up again after
-    each method which writes to it, so this assertion no longer rests on
-    the cache's identity semantics and holds whether the cache aliases or
-    copies. What is pinned here is the outcome rather than the mechanism --
-    the workers create() built are the workers it installs k3s on -- which
-    is the claim worth keeping either way.
-
-    A scripted fake rather than a MagicMock because create() drives wait
-    loops which compare dictionary values against literals; see
-    tests/fakes.py.
+    Nothing here asserts anything. It keeps create() off the network, out
+    of the operator's ~/.kube and away from a real kubectl, and makes its
+    waits instant, so that the subclasses are left with only their own
+    question. A base class with no tests of its own rather than a helper,
+    so that a subclass needs no setUp of its own.
     """
 
     def setUp(self):
-        super(CreateInstallsWorkersTestCase, self).setUp()
+        super(CreateEnvironmentTestCase, self).setUp()
         self.client = fakes.FakeClusterClient()
 
         patcher = mock.patch('time.sleep', lambda seconds: None)
@@ -484,6 +490,31 @@ class CreateInstallsWorkersTestCase(testtools.TestCase):
                 return_value=release)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+
+class CreateInstallsWorkersTestCase(CreateEnvironmentTestCase):
+    """Creating a cluster installs k3s on every worker it just created.
+
+    create() hands install_workers() md['worker_nodes'], and when this test
+    was written in step 3a that was the right list only by aliasing:
+    get_metadata() caches the metadata dictionary and set_metadata() stores
+    that same object, so the list create() was holding was the one
+    create_and_await_instances() had appended the new workers to. Nothing
+    at the call site said so, and making the cache copy on read would have
+    had create() install k3s on no workers at all and still report the
+    cluster ready.
+
+    Step 3c closed that: create() now picks the metadata up again after
+    each method which writes to it, so this assertion no longer rests on
+    the cache's identity semantics and holds whether the cache aliases or
+    copies. What is pinned here is the outcome rather than the mechanism --
+    the workers create() built are the workers it installs k3s on -- which
+    is the claim worth keeping either way.
+
+    A scripted fake rather than a MagicMock because create() drives wait
+    loops which compare dictionary values against literals; see
+    tests/fakes.py.
+    """
 
     def _create(self, control_plane_count, worker_count):
         cluster = _make_cluster(self.client)
@@ -531,6 +562,568 @@ class CreateInstallsWorkersTestCase(testtools.TestCase):
     def test_a_single_worker_cluster_still_installs_its_worker(self):
         _, workers, agent_calls = self._create(1, 1)
         self._assert_installed_on(workers, agent_calls)
+
+
+# The command the readiness wait sends, as a test expects to find it: built
+# by the function under test from the lowercased names, so that a test
+# comparing against it is asking "were these nodes waited for", and the
+# command's own shape is NodesReadyCommandTestCase's business.
+def _ready_command(node_names):
+    return cluster_module.nodes_ready_command(node_names)
+
+
+def _is_ready_wait(commandline):
+    """True for a command nodes_ready_command() built, whichever nodes it is for."""
+    return commandline.startswith("printf 'Waiting for node ")
+
+
+def _is_k3s_install(commandline):
+    """True for a command that runs the k3s installer, on any node in any role."""
+    return commandline.startswith('curl -sfL https://get.k3s.io | ')
+
+
+def _seconds(duration):
+    """Seconds in a kubectl duration this module writes, such as '300s'."""
+    if not duration.endswith('s'):
+        raise ValueError('not a duration in seconds: %r' % duration)
+    return int(duration[:-1])
+
+
+class NodeNameForInstanceTestCase(testtools.TestCase):
+    """A node is found by its instance's name, lowercased, or not at all."""
+
+    def test_the_name_is_lowercased(self):
+        self.assertEqual(
+            'k3s-mycluster-node-002',
+            cluster_module.node_name_for_instance(
+                {'uuid': 'inst-1', 'name': 'k3s-MyCluster-node-002'}))
+
+    def test_a_missing_or_empty_name_is_none_rather_than_a_guess(self):
+        for inst in ({'uuid': 'inst-1'}, {'uuid': 'inst-1', 'name': ''},
+                     {'uuid': 'inst-1', 'name': None}):
+            self.assertIsNone(cluster_module.node_name_for_instance(inst),
+                              inst)
+
+
+class NodesReadyCommandTestCase(testtools.TestCase):
+    """What the readiness wait sends, compared as a string.
+
+    NodesReadyCommandRunsTestCase below runs it; this pins the parts a
+    shell cannot be asked about, such as what the in-guest agent will
+    accept as the first word, and how long the command can take.
+    """
+
+    NAMES = ['k3s-banana-node-001', 'k3s-banana-node-002']
+
+    def test_the_first_word_is_an_executable(self):
+        # The agent looks the command line's first space separated word up
+        # with shutil.which() before it runs anything, and refuses a line
+        # whose first word is not on PATH. A variable assignment or 'until'
+        # would be refused there, on every node, at the end of a create.
+        command = cluster_module.nodes_ready_command(self.NAMES)
+        self.assertEqual('printf', command.split(' ')[0])
+
+    def test_both_waits_name_every_node(self):
+        command = cluster_module.nodes_ready_command(self.NAMES)
+        self.assertIn(
+            'kubectl get node k3s-banana-node-001 k3s-banana-node-002 '
+            '-o name --request-timeout=%s '
+            '--kubeconfig /etc/rancher/k3s/k3s.yaml'
+            % cluster_module.NODE_REGISTRATION_REQUEST_TIMEOUT, command)
+        self.assertTrue(command.endswith(
+            'kubectl wait --for=condition=Ready node/k3s-banana-node-001 '
+            'node/k3s-banana-node-002 --timeout=%s '
+            '--kubeconfig /etc/rancher/k3s/k3s.yaml'
+            % cluster_module.KUBECTL_NODE_READY_TIMEOUT), command)
+
+    def test_the_poll_is_bounded_by_the_constants(self):
+        command = cluster_module.nodes_ready_command(self.NAMES)
+        self.assertIn('[ "$attempt" -ge %d ]'
+                      % cluster_module.NODE_REGISTRATION_ATTEMPTS, command)
+        self.assertIn('sleep %d;'
+                      % cluster_module.NODE_REGISTRATION_INTERVAL_SECONDS,
+                      command)
+
+    def test_the_worst_case_fits_inside_the_agent_operation_deadline(self):
+        # Shaken Fist expires an agent operation 600 seconds after it was
+        # submitted when its creator asked for no deadline, which this
+        # plugin never does (AGENT_OPERATION_DEFAULT_DEADLINE). An expired
+        # wait reports the operation rather than the node, so the command
+        # has to give up first, with room left for the operation to have
+        # queued behind another one. The arithmetic is the comment beside
+        # the constants, recomputed so that changing one of them is a
+        # decision this test makes somebody notice.
+        attempts = cluster_module.NODE_REGISTRATION_ATTEMPTS
+        worst_case = (
+            attempts * _seconds(
+                cluster_module.NODE_REGISTRATION_REQUEST_TIMEOUT)
+            + (attempts - 1)
+            * cluster_module.NODE_REGISTRATION_INTERVAL_SECONDS
+            + _seconds(cluster_module.KUBECTL_NODE_READY_TIMEOUT))
+        self.assertEqual(535, worst_case)
+        self.assertLessEqual(worst_case, 600 - 60)
+
+    def test_every_appearance_of_every_name_is_quoted(self):
+        # Rule 1 at the top of cluster.py. The list appears four times --
+        # the first message, the poll, the loop which names the missing
+        # nodes, and the wait -- and each name has to be in its quoted form.
+        # Without a quote character of its own, a name's quoted form
+        # contains it verbatim, so every raw appearance being inside a
+        # quoted one is the two counts agreeing. A name with a quote in it
+        # is NodesReadyCommandRunsTestCase's, through a shell.
+        hostiles = ['node; touch /pwned #', 'node $(id) other']
+        command = cluster_module.nodes_ready_command(hostiles)
+        for hostile in hostiles:
+            quoted = shlex.quote(hostile)
+            self.assertNotEqual(hostile, quoted)
+            self.assertEqual(4, command.count(quoted), command)
+            self.assertEqual(command.count(quoted), command.count(hostile),
+                             command)
+
+
+class NodesReadyCommandRunsTestCase(testtools.TestCase):
+    """The readiness wait parses as POSIX shell and does what it says.
+
+    Run with the local /bin/sh, which is dash on Debian and Ubuntu as it is
+    on the nodes, with kubectl and sleep replaced by scripts on PATH. The
+    kubectl script behaves as the real one does with several names, which
+    was checked against k3s v1.31: 'get' prints 'node/<name>' for each node
+    it found and a NotFound line for each it did not, and exits 1 if there
+    was any; 'wait' prints 'condition met' or a timeout line per node, and
+    exits 1 if any timed out. Every node is NotFound until a scripted
+    attempt, a node named in NEVER stays NotFound, and a node named in
+    NOT_READY times out. Both scripts record what they were given, so the
+    tests can ask how many attempts were made and what each was about.
+    sleep is replaced so that two dozen attempts cost no time, and records
+    its argument so that the interval is asserted rather than assumed.
+    """
+
+    KUBECTL = (
+        '#!/bin/sh\n'
+        'printf \'%s\\n\' "$*" >> "$KUBECTL_LOG"\n'
+        'for a in "$@"; do printf \'[%s]\\n\' "$a"; done >> "$KUBECTL_ARGS"\n'
+        'verb=$1\n'
+        'shift 2\n'
+        'rc=0\n'
+        'for a in "$@"; do\n'
+        '    case "$a" in -*) break;; esac\n'
+        '    if [ "$verb" = get ]; then\n'
+        '        n=$(grep -c \'^get \' "$KUBECTL_LOG")\n'
+        '        if [ "$n" -le "$REGISTER_AFTER" ] || '
+        'printf \'%s\\n\' "$NEVER" | grep -q -x -F -- "$a"; then\n'
+        '            printf \'Error from server (NotFound): nodes "%s" not '
+        'found\\n\' "$a" >&2\n'
+        '            rc=1\n'
+        '        else\n'
+        '            printf \'node/%s\\n\' "$a"\n'
+        '        fi\n'
+        '    elif [ -n "$NOT_READY" ] && [ "${a#node/}" = "$NOT_READY" ]; then\n'
+        '        printf \'error: timed out waiting for the condition on '
+        'nodes/%s\\n\' "${a#node/}" >&2\n'
+        '        rc=1\n'
+        '    else\n'
+        '        printf \'%s condition met\\n\' "$a"\n'
+        '    fi\n'
+        'done\n'
+        'exit $rc\n')
+
+    SLEEP = '#!/bin/sh\nprintf \'%s\\n\' "$1" >> "$SLEEP_LOG"\n'
+
+    NAMES = ['k3s-mycluster-node-001', 'k3s-mycluster-node-002']
+
+    def setUp(self):
+        super().setUp()
+        if not os.path.exists('/bin/sh'):
+            self.skipTest('/bin/sh does not exist')
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.bin = os.path.join(self.tmp, 'bin')
+        os.mkdir(self.bin)
+        self.cwd = os.path.join(self.tmp, 'cwd')
+        os.mkdir(self.cwd)
+        for name, script in (('kubectl', self.KUBECTL), ('sleep', self.SLEEP)):
+            path = os.path.join(self.bin, name)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(script)
+            os.chmod(path, 0o755)
+
+    def _run(self, node_names, register_after=0, never='', not_ready=''):
+        env = dict(os.environ)
+        env['PATH'] = '%s:%s' % (self.bin, env.get('PATH', '/usr/bin:/bin'))
+        env['KUBECTL_LOG'] = os.path.join(self.tmp, 'kubectl.log')
+        env['KUBECTL_ARGS'] = os.path.join(self.tmp, 'kubectl.args')
+        env['SLEEP_LOG'] = os.path.join(self.tmp, 'sleep.log')
+        env['REGISTER_AFTER'] = str(register_after)
+        env['NEVER'] = never
+        env['NOT_READY'] = not_ready
+        return subprocess.run(
+            ['/bin/sh', '-c', cluster_module.nodes_ready_command(node_names)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, env=env, cwd=self.cwd)
+
+    def _lines(self, name):
+        path = os.path.join(self.tmp, name)
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding='utf-8') as f:
+            return f.read().splitlines()
+
+    def _calls(self, verb):
+        return [line for line in self._lines('kubectl.log')
+                if line.startswith(verb + ' ')]
+
+    def test_nodes_which_register_late_are_waited_for_together(self):
+        result = self._run(self.NAMES, register_after=2)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        # Two rounds of NotFound, then the one which found both, each asking
+        # about every node at once, and a sleep between each pair of
+        # attempts but not after the last.
+        self.assertEqual(
+            ['get node k3s-mycluster-node-001 k3s-mycluster-node-002 -o name '
+             '--request-timeout=%s --kubeconfig /etc/rancher/k3s/k3s.yaml'
+             % cluster_module.NODE_REGISTRATION_REQUEST_TIMEOUT] * 3,
+            self._calls('get'))
+        self.assertEqual(
+            [str(cluster_module.NODE_REGISTRATION_INTERVAL_SECONDS)] * 2,
+            self._lines('sleep.log'))
+        # One wait, for both.
+        self.assertEqual(
+            ['wait --for=condition=Ready node/k3s-mycluster-node-001 '
+             'node/k3s-mycluster-node-002 --timeout=%s '
+             '--kubeconfig /etc/rancher/k3s/k3s.yaml'
+             % cluster_module.KUBECTL_NODE_READY_TIMEOUT],
+            self._calls('wait'))
+
+        # The NotFound answers the poll absorbed are not on stderr, where
+        # they would bury the message that matters on a real failure.
+        self.assertNotIn('NotFound', result.stderr)
+
+    def test_a_node_which_never_registers_fails_naming_it(self):
+        result = self._run(self.NAMES, never='k3s-mycluster-node-002')
+        self.assertEqual(1, result.returncode)
+
+        attempts = cluster_module.NODE_REGISTRATION_ATTEMPTS
+        self.assertEqual(attempts, len(self._calls('get')))
+        self.assertEqual(attempts - 1, len(self._lines('sleep.log')))
+        # The poll giving up is the command's answer. Going on to 'kubectl
+        # wait' would fail a second time for the same reason, and the exit
+        # status would then be kubectl's rather than the poll's.
+        self.assertEqual([], self._calls('wait'))
+
+        # The missing node and only the missing node, then what kubectl
+        # said the last time, once, so that "never registered" can be told
+        # apart from "no API server to ask".
+        self.assertIn(
+            'Nodes did not register with Kubernetes after %d attempts, %d '
+            'seconds apart: k3s-mycluster-node-002. kubectl said: '
+            'node/k3s-mycluster-node-001\n'
+            'Error from server (NotFound): nodes "k3s-mycluster-node-002" '
+            'not found\n'
+            % (attempts, cluster_module.NODE_REGISTRATION_INTERVAL_SECONDS),
+            result.stderr)
+        self.assertEqual(1, result.stderr.count('NotFound'), result.stderr)
+
+    def test_a_name_which_prefixes_another_is_still_reported_missing(self):
+        # node-1 never registers and node-10 does. A substring match on
+        # kubectl's output would find 'node/k3s-x-node-1' inside
+        # 'node/k3s-x-node-10' and report nothing missing.
+        result = self._run(['k3s-x-node-1', 'k3s-x-node-10'],
+                           never='k3s-x-node-1')
+        self.assertEqual(1, result.returncode)
+        self.assertIn('seconds apart: k3s-x-node-1. kubectl said:',
+                      result.stderr)
+
+    def test_a_node_which_never_becomes_ready_fails_with_kubectls_reason(self):
+        result = self._run(self.NAMES, not_ready='k3s-mycluster-node-002')
+        self.assertEqual(1, result.returncode)
+        self.assertEqual(1, len(self._calls('get')))
+        self.assertEqual(1, len(self._calls('wait')))
+        self.assertIn('timed out waiting for the condition on '
+                      'nodes/k3s-mycluster-node-002', result.stderr)
+        self.assertNotIn('nodes/k3s-mycluster-node-001', result.stderr)
+
+    def test_a_hostile_name_reaches_kubectl_as_one_argument(self):
+        # Rule 1, asked of the shell rather than of a string. A name which
+        # escaped its quoting would split into several arguments, or run
+        # 'touch' in the working directory, which starts empty.
+        hostile = "node'; touch pwned; echo '$(touch pwned2) \"q\""
+        result = self._run(['k3s-mycluster-node-001', hostile],
+                           register_after=1)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        self.assertEqual([], os.listdir(self.cwd))
+        args = self._lines('kubectl.args')
+        self.assertEqual(2, args.count('[%s]' % hostile), args)
+        self.assertEqual(1, args.count('[node/%s]' % hostile), args)
+        self.assertIn('Waiting for node %s to register' % hostile,
+                      result.stdout)
+
+    def test_a_hostile_missing_name_is_reported_without_running_it(self):
+        # The loop which names the missing nodes is the fourth place the
+        # list appears, and the one reached only on failure.
+        hostile = "node'; touch pwned; echo '$(touch pwned2)"
+        result = self._run(['k3s-mycluster-node-001', hostile], never=hostile)
+        self.assertEqual(1, result.returncode)
+        self.assertEqual([], os.listdir(self.cwd))
+        self.assertIn('seconds apart: %s. kubectl said:' % hostile,
+                      result.stderr)
+
+
+class AwaitNodesReadyTestCase(testtools.TestCase):
+    """await_nodes_ready() waits on every node by its Kubernetes name, in one command."""
+
+    def setUp(self):
+        super(AwaitNodesReadyTestCase, self).setUp()
+        self.client = fakes.FakeClusterClient()
+        self.client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'control_plane_nodes': ['inst-cp1', 'inst-cp2'],
+            'worker_nodes': ['inst-w1']}
+        for instance_uuid, name in [('inst-cp1', 'k3s-MixedCase-node-001'),
+                                    ('inst-cp2', 'k3s-MixedCase-node-002'),
+                                    ('inst-w1', 'k3s-MixedCase-node-003')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+        self.cluster = _make_cluster(self.client)
+
+    def test_every_node_is_waited_for_in_one_command(self):
+        self.cluster.await_nodes_ready(['inst-cp1', 'inst-cp2', 'inst-w1'])
+
+        # One command however many nodes, so that the wait's worst case is
+        # one budget rather than one per node; lowercased, because that is
+        # the name kubelet registered; in the order the caller gave; on the
+        # first control plane node, which is where the kubeconfig is.
+        self.assertEqual(
+            [('inst-cp1', _ready_command(['k3s-mixedcase-node-001',
+                                          'k3s-mixedcase-node-002',
+                                          'k3s-mixedcase-node-003']))],
+            self.client.executed)
+        self.assertNotIn('MixedCase', self.client.executed[0][1])
+
+    def test_the_phase_counts_the_nodes(self):
+        self.cluster.await_nodes_ready(['inst-cp1', 'inst-cp2', 'inst-w1'])
+        self.assertIn('[1/1] Waiting for 3 nodes to become Ready',
+                      self.cluster.reporter.lines)
+
+    def test_a_failed_wait_raises_naming_the_node(self):
+        command = _ready_command(['k3s-mixedcase-node-002',
+                                  'k3s-mixedcase-node-003'])
+        self.client.failing_command = command
+        self.client.failing_stderr = (
+            'error: timed out waiting for the condition on '
+            'nodes/k3s-mixedcase-node-003')
+
+        e = self.assertRaises(exceptions.CommandFailedError,
+                              self.cluster.await_nodes_ready,
+                              ['inst-cp2', 'inst-w1'])
+        # The instance a CommandFailedError names is the one the command
+        # ran on, which is the control plane node, so the nodes waited for
+        # have to be in the command and the message.
+        self.assertEqual('inst-cp1', e.instance_uuid)
+        self.assertIn('node/k3s-mixedcase-node-003', e.commandline)
+        self.assertIn('nodes/k3s-mixedcase-node-003', str(e))
+
+    def test_an_unnamed_instance_is_refused_before_anything_is_sent(self):
+        self.client.instances['inst-w1']['name'] = ''
+        e = self.assertRaises(exceptions.NodeUnnamedError,
+                              self.cluster.await_nodes_ready,
+                              ['inst-cp2', 'inst-w1'])
+        self.assertEqual('inst-w1', e.instance_uuid)
+        self.assertEqual([], self.client.executed)
+
+    def test_no_nodes_sends_nothing(self):
+        self.cluster.await_nodes_ready([])
+        self.assertEqual([], self.client.executed)
+        self.assertIn('[1/1] Waiting for 0 nodes to become Ready',
+                      self.cluster.reporter.lines)
+
+
+class CreateAwaitsNodesReadyTestCase(CreateEnvironmentTestCase):
+    """create() waits for every node to be Ready after k3s and before MetalLB.
+
+    Decision 8 of the cumulative health signals phase 2 plan. The order is
+    asserted from the fake's one ordered log of executed commands, because
+    "after the last install and before MetalLB" is a claim about where in
+    one sequence the wait fell, which separate per-step records cannot
+    answer. The cluster name has a capital letter in it, so that a wait
+    aimed at the instance's name rather than the node's is a wait for a
+    node which does not exist, and fails here rather than after two
+    minutes on a real cluster.
+    """
+
+    def _create(self, control_plane_count, worker_count, **kwargs):
+        self.cluster = Cluster(self.client, 'MixedCase', 'testns',
+                               reporter=progress.CollectingReporter())
+        self.cluster.create(control_plane_count, worker_count, 1, **kwargs)
+
+    def _node_names(self):
+        return [inst['name'].lower() for inst in self.client.instances.values()]
+
+    def _waits(self):
+        return [(instance_uuid, commandline)
+                for instance_uuid, commandline in self.client.executed
+                if _is_ready_wait(commandline)]
+
+    def _indexes(self, predicate):
+        return [i for i, (_, commandline) in enumerate(self.client.executed)
+                if predicate(commandline)]
+
+    def _assert_wait_between_installs_and_metallb(self):
+        installs = self._indexes(_is_k3s_install)
+        waits = self._indexes(_is_ready_wait)
+        metallb = self._indexes(lambda c: 'metallb' in c)
+        longhorn = self._indexes(lambda c: 'longhorn' in c)
+        self.assertNotEqual([], installs)
+        self.assertEqual(1, len(waits), self.client.executed)
+        self.assertLess(max(installs), waits[0],
+                        'the nodes were waited for before the last k3s '
+                        'install')
+        for later in (metallb, longhorn):
+            if later:
+                self.assertLess(waits[0], min(later),
+                                'MetalLB or Longhorn was set up before every '
+                                'node was Ready')
+
+    def test_every_node_is_waited_for_by_its_kubernetes_name(self):
+        self._create(2, 2)
+
+        first_control_plane = list(self.client.instances)[0]
+        self.assertEqual(
+            [(first_control_plane, _ready_command(self._node_names()))],
+            self._waits())
+        self.assertEqual(
+            ['k3s-mixedcase-node-001', 'k3s-mixedcase-node-002',
+             'k3s-mixedcase-node-003', 'k3s-mixedcase-node-004'],
+            self._node_names())
+
+    def test_the_wait_is_after_the_last_install_and_before_metallb(self):
+        self._create(2, 2)
+        self._assert_wait_between_installs_and_metallb()
+
+    def test_a_cluster_with_no_workers_still_waits_for_its_control_plane(self):
+        # install_workers() runs with an empty list for this shape, so the
+        # last install is the control plane's.
+        self._create(1, 0)
+        self.assertEqual(
+            [_ready_command(['k3s-mixedcase-node-001'])],
+            [c for _, c in self._waits()])
+        self._assert_wait_between_installs_and_metallb()
+
+    def test_without_metallb_the_wait_is_still_before_longhorn(self):
+        self._create(1, 1, install_metallb=False)
+        self._assert_wait_between_installs_and_metallb()
+
+    def test_the_wait_is_its_own_phase(self):
+        self._create(1, 2)
+        self.assertIn(
+            'Waiting for 3 nodes to become Ready',
+            ' '.join(self.cluster.reporter.lines))
+
+    def test_a_failed_wait_leaves_the_cluster_interrupted(self):
+        self.client.failing_command = _ready_command(
+            ['k3s-mixedcase-node-001', 'k3s-mixedcase-node-002'])
+        self.client.failing_stderr = (
+            'error: timed out waiting for the condition on '
+            'nodes/k3s-mixedcase-node-002')
+
+        e = self.assertRaises(exceptions.CommandFailedError, self._create, 1, 1)
+        self.assertIn('node/k3s-mixedcase-node-002', e.commandline)
+        self.assertIn('nodes/k3s-mixedcase-node-002', str(e))
+
+        # What is recorded is what create() had finished when it stopped,
+        # and the state is what says it did not finish: 'initial', which
+        # every verb that needs a built cluster refuses and delete clears.
+        md = self.client.metadata[cluster_module.METADATA_KEY % 'MixedCase']
+        self.assertEqual('initial', md['state'])
+        self.assertEqual('initial', self.cluster._interrupted_state(md))
+        self.assertEqual(2, len(md['control_plane_nodes'] + md['worker_nodes']))
+
+        # Nothing after the wait ran. No addresses were routed, so there is
+        # nothing charged for that the failure has to account for.
+        self.assertEqual([], [c for _, c in self.client.executed
+                              if 'metallb' in c or 'longhorn' in c])
+        self.assertEqual([], md['routed_addresses'])
+
+        # The credentials were recorded before the wait, so the operator can
+        # still reach the cluster to ask why the node is not Ready.
+        self.assertIn('MixedCase.testns', self.cluster.get_kubeconfig())
+
+        # And a second create of the name says the cluster is interrupted,
+        # rather than that the name is merely taken.
+        again = Cluster(self.client, 'MixedCase', 'testns',
+                        reporter=progress.CollectingReporter())
+        self.assertRaises(exceptions.ClusterInterruptedError,
+                          again.create, 1, 1, 1)
+
+
+class ExpandWorkersAwaitsNodesReadyTestCase(testtools.TestCase):
+    """expand_workers() waits for the workers it added, and only those.
+
+    ExpandWorkersTestCase asserts which instances the wait is handed; this
+    drives the real wait against the scripted client, to see the command
+    it sends and what a failure leaves.
+    """
+
+    def setUp(self):
+        super(ExpandWorkersAwaitsNodesReadyTestCase, self).setUp()
+        self.client = fakes.FakeClusterClient()
+        self.client.instance_serial = 2
+        self.md = {
+            'name': 'MixedCase', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 3, 'node_network': 'net-1',
+            'node_token': 'node-token', 'server_token': 'server-token',
+            'k3s_version': 'v1.33', 'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4', 'join_address': '10.0.0.4',
+            'control_plane_nodes': ['inst-001'], 'worker_nodes': ['inst-002'],
+            'routed_addresses': []
+        }
+        self.client.metadata[
+            cluster_module.METADATA_KEY % 'MixedCase'] = self.md
+        for serial, instance_uuid in enumerate(['inst-001', 'inst-002'], 1):
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid,
+                'name': 'k3s-MixedCase-node-%03d' % serial,
+                'state': 'created', 'agent_state': 'ready'}
+        self.cluster = Cluster(self.client, 'MixedCase', 'testns',
+                               reporter=progress.CollectingReporter())
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_only_the_new_workers_are_waited_for(self):
+        self.cluster.expand_workers(2)
+
+        self.assertEqual(
+            [('inst-001', _ready_command(['k3s-mixedcase-node-003',
+                                          'k3s-mixedcase-node-004']))],
+            [(i, c) for i, c in self.client.executed if _is_ready_wait(c)])
+
+        # And after the new workers' k3s install, not before it.
+        installs = [i for i, (_, c) in enumerate(self.client.executed)
+                    if _is_k3s_install(c)]
+        waits = [i for i, (_, c) in enumerate(self.client.executed)
+                 if _is_ready_wait(c)]
+        self.assertLess(max(installs), min(waits))
+
+    def test_a_failed_wait_raises_and_leaves_the_cluster_usable(self):
+        self.client.failing_command = _ready_command(
+            ['k3s-mixedcase-node-003'])
+
+        e = self.assertRaises(exceptions.CommandFailedError,
+                              self.cluster.expand_workers, 1)
+        self.assertIn('node/k3s-mixedcase-node-003', e.commandline)
+
+        # The cluster was built and still is: its state is untouched, and
+        # the new worker is recorded, so health() reports it and delete()
+        # and remove-worker can reach it.
+        md = self.cluster.get_metadata()
+        self.assertEqual('created', md['state'])
+        self.assertEqual(['inst-002', 'inst-003'], md['worker_nodes'])
 
 
 class ActionLogClient(fakes.FakeClusterClient):
@@ -1432,22 +2025,23 @@ class HealthTestCase(testtools.TestCase):
     def test_a_healthy_cluster_reports_every_node(self):
         report = self.cluster.health()
 
-        # signals is mock.ANY here because its content has tests of its own
-        # in HealthSignalsTestCase; this one is about the node keys, and
+        # signals and kubernetes are mock.ANY here because their content has
+        # tests of its own in HealthSignalsTestCase and
+        # HealthKubernetesTestCase; this one is about the node keys, and
         # still pins that there are no others.
         self.assertEqual(
             [{'uuid': 'inst-cp1', 'role': 'control_plane',
               'name': 'k3s-banana-node-001', 'exists': True,
               'state': 'created', 'agent_state': 'ready', 'healthy': True,
-              'signals': mock.ANY},
+              'signals': mock.ANY, 'kubernetes': mock.ANY},
              {'uuid': 'inst-w1', 'role': 'worker',
               'name': 'k3s-banana-node-002', 'exists': True,
               'state': 'created', 'agent_state': 'ready', 'healthy': True,
-              'signals': mock.ANY},
+              'signals': mock.ANY, 'kubernetes': mock.ANY},
              {'uuid': 'inst-w2', 'role': 'worker',
               'name': 'k3s-banana-node-003', 'exists': True,
               'state': 'created', 'agent_state': 'ready', 'healthy': True,
-              'signals': mock.ANY}],
+              'signals': mock.ANY, 'kubernetes': mock.ANY}],
             report['nodes'])
         self.assertEqual('created', report['state'])
         self.assertFalse(report['interrupted'])
@@ -1458,16 +2052,18 @@ class HealthTestCase(testtools.TestCase):
     def test_the_api_is_probed_on_the_first_control_plane_node(self):
         report = self.cluster.health()
 
-        # Every node's signals are read through the agent too, so the
-        # kubectl probe is no longer the only command: it is the first, and
-        # the only kubectl.
+        # Every node's signals are read through the agent too, and
+        # Kubernetes is read beside the API probe, so the API probe is no
+        # longer the only command: it is the first, and the Kubernetes probe
+        # on the same node is the only other kubectl.
         self.assertEqual(
             ('inst-cp1',
              'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'),
             self.client.executed[0])
         self.assertEqual(
             [('inst-cp1',
-              'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml')],
+              'kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml'),
+             ('inst-cp1', cluster_module.K3S_KUBERNETES_PROBE_COMMAND)],
             [(instance_uuid, command)
              for instance_uuid, command in self.client.executed
              if command.startswith('kubectl')])
@@ -1500,6 +2096,7 @@ class HealthTestCase(testtools.TestCase):
         self.assertEqual(0, self.client.instance_serial)
         self.assertEqual(
             ['kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml',
+             cluster_module.K3S_KUBERNETES_PROBE_COMMAND,
              cluster_module.node_signals_command('control_plane'),
              cluster_module.node_signals_command('worker'),
              cluster_module.node_signals_command('worker')],
@@ -1557,7 +2154,11 @@ class HealthTestCase(testtools.TestCase):
                  'k3s_unit': 'k3s-agent', 'k3s_state': None,
                  'k3s_restarts': None, 'oom_kills': None,
                  'memory_total_bytes': None, 'memory_available_bytes': None,
-                 'etcd_bytes': None, 'etcd_snapshot_bytes': None}},
+                 'etcd_bytes': None, 'etcd_snapshot_bytes': None},
+             'kubernetes': {
+                 'registered': None, 'ready': None, 'ready_since': None,
+                 'memory_pressure': None, 'disk_pressure': None,
+                 'pid_pressure': None, 'oom_killed': None}},
             [n for n in report['nodes'] if n['uuid'] == 'inst-w1'][0])
         self.assertFalse(report['healthy'])
         self.assertEqual(3, len(report['nodes']))
@@ -3095,6 +3696,39 @@ class ShellQuotingTestCase(testtools.TestCase):
                              'the shell read the node name as a second '
                              'command: %s' % probe)
 
+    def test_the_awaited_node_name_is_quoted(self):
+        # The readiness wait create() and expand_workers() run, which
+        # addresses a node by the name its instance carries, as the drain
+        # above does and for the same reason needs quoting.
+        client = fakes.FakeClusterClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1']}
+        client.instances['inst-cp1'] = {
+            'uuid': 'inst-cp1', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        client.instances['inst-w1'] = {
+            'uuid': 'inst-w1', 'name': 'node;touch /pwned',
+            'state': 'created', 'agent_state': 'ready'}
+
+        _make_cluster(client).await_nodes_ready(['inst-w1'])
+
+        self.assertEqual(1, len(client.executed), client.executed)
+        wait = client.executed[0][1]
+        self.assertIn("kubectl get node 'node;touch /pwned' ", wait)
+        self.assertIn("node/'node;touch /pwned' ", wait)
+
+        # And through a shell. kubectl becomes true, so the poll succeeds at
+        # once and the wait does nothing, and every word of the line is
+        # still parsed the way a node's shell would parse it.
+        with tempfile.TemporaryDirectory() as tempdir:
+            probe = wait.replace('kubectl', 'true').replace('/pwned', 'pwned')
+            subprocess.run(['/bin/sh', '-c', probe], cwd=tempdir,
+                           capture_output=True)
+            self.assertEqual([], os.listdir(tempdir),
+                             'the shell read the node name as a second '
+                             'command: %s' % probe)
+
     def test_the_longhorn_version_is_quoted(self):
         # This one comes from a GitHub release lookup rather than from
         # anything this module wrote, which is the same trust position as
@@ -4015,6 +4649,614 @@ class NodeSignalsCommandRunsTestCase(testtools.TestCase):
         self.assertIn('etcd_snapshot_bytes=\n', result.stdout)
         self.assertIsNone(cluster_module.parse_node_signals(
             result.stdout, 'control_plane')['etcd_snapshot_bytes'])
+
+
+KUBECONFIG_PATH = '/etc/rancher/k3s/k3s.yaml'
+
+# A go-template action: everything between '{{' and '}}'. Neither template
+# holds a '}}' inside a string literal, so a non-greedy match finds each.
+GO_TEMPLATE_ACTION_RE = re.compile(r'{{(.*?)}}')
+GO_TEMPLATE_STRING_RE = re.compile(r'"[^"]*"')
+
+
+def _go_template_path(token):
+    """(root, [fields]) if token reads a field path, else None.
+
+    root is '' for a path from the dot, or the variable it starts from.
+    """
+    if token.startswith('.') and token != '.':
+        return '', token[1:].split('.')
+    if token.startswith('$') and '.' in token:
+        root, rest = token.split('.', 1)
+        return root, rest.split('.')
+    return None
+
+
+def _go_template_unguarded_reads(template):
+    """List every read in template which a missing field could break.
+
+    Three rules, each one kubectl's template engine needs for the probe to
+    survive an object which lacks a field (see _node_condition_template()
+    in cluster.py):
+
+    - a path two or more fields deep sits inside an 'if' on its parent,
+      in the same dot, so the parent is known to exist;
+    - 'eq' compares only a value an enclosing 'if' has tested, because
+      the oldest supported kubectl's eq fails on a missing one;
+    - a field printed on its own sits inside an 'if' on itself, or
+      kubectl's 'exists' for it, so a missing one prints an empty field
+      rather than '<no value>'.
+
+    Also reports blocks which do not balance. This is a check of the
+    template's shape, written because no Go template engine can be relied
+    on where the unit tests run; it is not a template engine, and step 2e
+    of the cumulative health signals phase 2 plan runs the real one.
+    """
+    problems = []
+    # (keyword, its argument as written), innermost last.
+    stack = []
+
+    def guarded(root, condition, also=None):
+        for keyword, argument in reversed(stack):
+            if keyword == 'if' and argument in (condition, also):
+                return True
+            # range and with move the dot, so an 'if' outside them tested
+            # some other object's field. A variable keeps its value.
+            if keyword in ('range', 'with') and root == '':
+                return False
+        return False
+
+    for match in GO_TEMPLATE_ACTION_RE.finditer(template):
+        action = match.group(1).strip()
+        tokens = GO_TEMPLATE_STRING_RE.sub('""', action).split()
+        keyword = tokens[0] if tokens[0] in ('if', 'range', 'with', 'end',
+                                             'else') else None
+
+        if keyword == 'end':
+            if not stack:
+                problems.append('an {{end}} closes nothing')
+            else:
+                stack.pop()
+            continue
+        if keyword == 'else':
+            problems.append('{{%s}} is not checked by this test' % action)
+            continue
+
+        for token in tokens:
+            path = _go_template_path(token)
+            if path and len(path[1]) > 1:
+                root, fields = path
+                parent = root + '.' + '.'.join(fields[:-1])
+                if not guarded(root, parent):
+                    problems.append('%s is read without testing %s'
+                                    % (token, parent))
+
+        if 'eq' in tokens:
+            operand = tokens[tokens.index('eq') + 1]
+            path = _go_template_path(operand)
+            if not path or not guarded(path[0], operand):
+                problems.append('eq compares %s without testing it'
+                                % operand)
+
+        path = _go_template_path(tokens[0])
+        if keyword is None and len(tokens) == 1 and path:
+            exists = None
+            if path[0] == '' and len(path[1]) == 1:
+                exists = 'exists . "%s"' % path[1][0]
+            if not guarded(path[0], tokens[0], exists):
+                problems.append('%s is printed without testing it'
+                                % tokens[0])
+
+        if keyword is not None:
+            stack.append((keyword, action[len(keyword):].strip()))
+
+    if stack:
+        problems.append('%d blocks are never closed' % len(stack))
+    return problems
+
+
+class KubernetesProbeCommandTestCase(testtools.TestCase):
+    """The command health() will run to read Kubernetes about every node.
+
+    Decision 9 of the cumulative health signals phase 2 plan: two kubectl
+    reads, each rendered by a go-template into one short line per fact,
+    joined so that either failing fails the command. No Go template engine
+    is available where these tests run, so the templates are checked for
+    the shape kubectl needs rather than rendered; they were rendered by
+    kubectl v1.21.1+k3s1 and v1.31.4+k3s1 when written, and step 2e of that
+    plan renders them on a real cluster.
+    """
+
+    def test_the_command_reads_nodes_then_pods(self):
+        self.assertEqual(
+            ['kubectl', 'get', 'nodes', '--kubeconfig', KUBECONFIG_PATH,
+             '-o', 'go-template=' + cluster_module.KUBERNETES_NODES_TEMPLATE,
+             '&&',
+             'kubectl', 'get', 'pods', '-A', '--kubeconfig', KUBECONFIG_PATH,
+             '-o', 'go-template=' + cluster_module.KUBERNETES_PODS_TEMPLATE],
+            shlex.split(cluster_module.K3S_KUBERNETES_PROBE_COMMAND))
+
+    def test_the_command_is_one_line(self):
+        # The agent takes one command line. The separators are Go string
+        # escapes, a backslash and a letter, for the template engine.
+        for character in ('\n', '\t', '\r'):
+            self.assertNotIn(
+                character, cluster_module.K3S_KUBERNETES_PROBE_COMMAND)
+
+    def test_each_template_is_one_single_quoted_word(self):
+        # Single quotes, because the templates are full of $ and double
+        # quotes; and no single quote inside either, so that shlex.quote()
+        # has nothing to escape and the operation log shows each template
+        # as it is.
+        for template in (cluster_module.KUBERNETES_NODES_TEMPLATE,
+                         cluster_module.KUBERNETES_PODS_TEMPLATE):
+            self.assertNotIn("'", template)
+            self.assertIn(" -o go-template='%s'" % template,
+                          cluster_module.K3S_KUBERNETES_PROBE_COMMAND)
+
+    def test_no_field_a_missing_one_could_break_is_read_unguarded(self):
+        for template in (cluster_module.KUBERNETES_NODES_TEMPLATE,
+                         cluster_module.KUBERNETES_PODS_TEMPLATE):
+            self.assertEqual([], _go_template_unguarded_reads(template))
+
+    def test_the_guard_check_finds_unguarded_reads(self):
+        # The check above passing is only worth something if it can fail.
+        for template in (
+                '{{.a.b}}',
+                '{{if .a}}{{end}}{{.a.b}}',
+                '{{if .a}}{{range .items}}{{.a.b}}{{end}}{{end}}',
+                '{{if eq .type "Ready"}}{{end}}',
+                '{{range .items}}{{.name}}{{end}}',
+                '{{if $pod}}{{$pod.spec.nodeName}}{{end}}',
+                '{{if .a}}',
+                '{{end}}'):
+            self.assertNotEqual(
+                [], _go_template_unguarded_reads(template), template)
+        # And a variable keeps its value inside a range.
+        self.assertEqual([], _go_template_unguarded_reads(
+            '{{if $pod.spec}}{{range .items}}{{if $pod.spec.nodeName}}'
+            '{{$pod.spec.nodeName}}{{end}}{{end}}{{end}}'))
+
+    def test_the_only_text_is_the_record_types(self):
+        # Everything else -- every separator and every value -- comes from
+        # an action, so the only literal text is each line's type.
+        self.assertEqual('node', GO_TEMPLATE_ACTION_RE.sub(
+            '', cluster_module.KUBERNETES_NODES_TEMPLATE))
+        # Two kinds of status, and two places a kill is reported in each.
+        self.assertEqual('oom' * 4, GO_TEMPLATE_ACTION_RE.sub(
+            '', cluster_module.KUBERNETES_PODS_TEMPLATE))
+
+    def test_each_line_has_its_records_fields(self):
+        # One tab fewer than the parser's field count for the type, the
+        # type itself being a field, and one newline.
+        nodes = cluster_module.KUBERNETES_NODES_TEMPLATE
+        self.assertEqual(6, nodes.count('{{"\\t"}}'))
+        self.assertEqual(1, nodes.count('{{"\\n"}}'))
+        pods = cluster_module.KUBERNETES_PODS_TEMPLATE
+        self.assertEqual(4 * 6, pods.count('{{"\\t"}}'))
+        self.assertEqual(4, pods.count('{{"\\n"}}'))
+
+    def test_every_condition_is_read(self):
+        nodes = cluster_module.KUBERNETES_NODES_TEMPLATE
+        for condition, count in (('Ready', 2), ('MemoryPressure', 1),
+                                 ('DiskPressure', 1), ('PIDPressure', 1)):
+            self.assertEqual(
+                count, nodes.count('{{if eq .type "%s"}}' % condition))
+        self.assertIn('{{.lastTransitionTime}}', nodes)
+
+    def test_both_states_of_every_container_are_read(self):
+        # Init containers too: one killed for OOM holds its pod in
+        # Init:CrashLoopBackOff, which is worth seeing.
+        pods = cluster_module.KUBERNETES_PODS_TEMPLATE
+        self.assertEqual(1, pods.count('{{range .status.containerStatuses}}'))
+        self.assertEqual(
+            1, pods.count('{{range .status.initContainerStatuses}}'))
+        for state in ('state', 'lastState'):
+            self.assertEqual(
+                2,
+                pods.count('{{if eq .%s.terminated.reason "OOMKilled"}}'
+                           % state))
+            self.assertEqual(
+                2, pods.count('{{.%s.terminated.finishedAt}}' % state))
+
+    def test_a_restart_count_of_zero_is_printed(self):
+        # 'if' is false for 0, which is the count of a container killed for
+        # the first time and not yet restarted, so the count is tested with
+        # kubectl's exists rather than for truth.
+        pods = cluster_module.KUBERNETES_PODS_TEMPLATE
+        self.assertEqual(
+            4, pods.count('{{if exists . "restartCount"}}'
+                          '{{.restartCount}}{{end}}'))
+        self.assertNotIn('{{if .restartCount}}', pods)
+
+    def test_a_container_killed_twice_is_reported_once_from_its_state(self):
+        # The second test runs only if the first did not print, so the
+        # newer of two kills is the one reported.
+        pods = cluster_module.KUBERNETES_PODS_TEMPLATE
+        state = ('{{if eq .state.terminated.reason "OOMKilled"}}'
+                 '{{$reported = true}}')
+        last = '{{if not $reported}}{{if .lastState}}'
+        for container in ('{{range .status.containerStatuses}}',
+                          '{{range .status.initContainerStatuses}}'):
+            body = pods[pods.index(container):]
+            self.assertIn(state, body)
+            self.assertIn(last, body)
+            self.assertLess(body.index(state), body.index(last))
+
+
+# Defined beside HealthClient, which answers the Kubernetes probe with them
+# by default, so that what the parser is tested on and what health() is
+# tested with are the same output: three nodes, then one OOM kill.
+KUBERNETES_PROBE_OUTPUT = fakes.KUBERNETES_PROBE_OUTPUT
+KUBERNETES_PROBE_READINGS = fakes.KUBERNETES_PROBE_READINGS
+NODE_LINE = KUBERNETES_PROBE_OUTPUT.splitlines()[0]
+OOM_LINE = [line for line in KUBERNETES_PROBE_OUTPUT.splitlines()
+            if line.startswith('oom\t')][0]
+
+
+def _with_field(line, index, value):
+    """line with its tab separated field index replaced by value."""
+    fields = line.split('\t')
+    fields[index] = value
+    return '\t'.join(fields)
+
+
+class KubernetesProbeCommandRunsTestCase(testtools.TestCase):
+    """The command parses as shell, and its templates reach kubectl intact.
+
+    The tests above compare the command with strings, which cannot tell
+    whether the shell hands each template to kubectl byte for byte, or
+    what '&&' does when a read fails. This runs it with the local /bin/sh
+    and a kubectl on PATH which records its arguments, prints what the
+    test gives it, and exits as the test says.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if not os.path.exists('/bin/sh'):
+            self.skipTest('/bin/sh does not exist')
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.log = os.path.join(tmp.name, 'calls')
+        bin_dir = os.path.join(tmp.name, 'bin')
+        os.mkdir(bin_dir)
+        kubectl = os.path.join(bin_dir, 'kubectl')
+        with open(kubectl, 'w', encoding='utf-8') as f:
+            f.write(
+                '#!%s\n'
+                'import json, os, sys\n'
+                'resource = sys.argv[2]\n'
+                "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as f:\n"
+                '    f.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                "sys.stdout.write(os.environ.get('FAKE_STDOUT_' + resource, ''))\n"
+                "sys.exit(int(os.environ.get('FAKE_EXIT_' + resource, '0')))\n"
+                % sys.executable)
+        os.chmod(kubectl, 0o755)
+
+        self.env = dict(os.environ)
+        self.env['PATH'] = '%s:%s' % (bin_dir,
+                                      self.env.get('PATH', '/usr/bin:/bin'))
+        self.env['FAKE_KUBECTL_LOG'] = self.log
+
+    def _run(self, **env):
+        self.env.update(env)
+        return subprocess.run(
+            ['/bin/sh', '-c', cluster_module.K3S_KUBERNETES_PROBE_COMMAND],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, env=self.env)
+
+    def _calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log, encoding='utf-8') as f:
+            return [json.loads(line) for line in f]
+
+    def test_both_reads_run_and_their_output_is_parsed(self):
+        nodes, pods = KUBERNETES_PROBE_OUTPUT.split('oom\t', 1)
+        result = self._run(FAKE_STDOUT_nodes=nodes,
+                           FAKE_STDOUT_pods='oom\t' + pods)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            [['get', 'nodes', '--kubeconfig', KUBECONFIG_PATH, '-o',
+              'go-template=' + cluster_module.KUBERNETES_NODES_TEMPLATE],
+             ['get', 'pods', '-A', '--kubeconfig', KUBECONFIG_PATH, '-o',
+              'go-template=' + cluster_module.KUBERNETES_PODS_TEMPLATE]],
+            self._calls())
+        self.assertEqual(
+            cluster_module.parse_kubernetes_readings(KUBERNETES_PROBE_OUTPUT),
+            cluster_module.parse_kubernetes_readings(result.stdout))
+
+    def test_a_failed_node_read_fails_the_command_and_reads_no_pods(self):
+        # A node list with no pod list would read as no OOM kills, and the
+        # other way round is no nodes at all, so neither half alone is an
+        # answer.
+        result = self._run(FAKE_EXIT_nodes='1')
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(['nodes'], [call[1] for call in self._calls()])
+
+    def test_a_failed_pod_read_fails_the_command(self):
+        result = self._run(FAKE_EXIT_pods='1')
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(['nodes', 'pods'],
+                         [call[1] for call in self._calls()])
+
+
+class ParseKubernetesReadingsTestCase(testtools.TestCase):
+    """What the Kubernetes probe's output becomes in health()'s report.
+
+    Decision 9 of the cumulative health signals phase 2 plan: every field
+    is validated, a record with any field which fails is dropped whole,
+    the first record for a node wins, and nothing the output holds may
+    make this raise.
+    """
+
+    def parse(self, stdout):
+        return cluster_module.parse_kubernetes_readings(stdout)
+
+    def assertReadsNothing(self, line):
+        self.assertEqual({'nodes': {}, 'oom_killed': {}}, self.parse(line),
+                         line)
+
+    def test_a_realistic_three_node_cluster(self):
+        self.assertEqual(KUBERNETES_PROBE_READINGS,
+                         self.parse(KUBERNETES_PROBE_OUTPUT))
+
+    def test_what_kubectl_printed(self):
+        # Lines kubectl v1.21.1+k3s1 printed with these templates, for a
+        # real node, a node object with no status, and a node object whose
+        # status was written to report Ready Unknown, MemoryPressure and no
+        # PIDPressure condition at all; and containers killed in each of
+        # the places a kill is reported, one with no finishedAt.
+        stdout = (
+            'node\t353896f35a22\tTrue\tFalse\tFalse\tFalse\t'
+            '2026-10-07T08:01:13Z\n'
+            'node\tempty-node\t\t\t\t\t\n'
+            'node\tghost-node.example\tUnknown\tTrue\tFalse\t\t'
+            '2026-10-05T08:12:25Z\n'
+            'oom\tghost-node.example\tdefault\toom-state\tc\t0\t'
+            '2026-10-05T08:12:25Z\n'
+            'oom\tghost-node.example\tkube-system\toom-last\tc\t5\t'
+            '2026-10-05T08:00:00Z\n'
+            'oom\tghost-node.example\tdefault\toom-init\tsidecar\t1000000\t'
+            '2026-10-05T07:45:00Z\n'
+            'oom\tghost-node.example\tdefault\toom-no-finish\tc\t1\t\n')
+        readings = self.parse(stdout)
+
+        self.assertEqual(
+            {
+                '353896f35a22': {
+                    'ready': 'True', 'ready_since': 1791360073,
+                    'memory_pressure': 'False', 'disk_pressure': 'False',
+                    'pid_pressure': 'False'},
+                'empty-node': {
+                    'ready': None, 'ready_since': None,
+                    'memory_pressure': None, 'disk_pressure': None,
+                    'pid_pressure': None},
+                'ghost-node.example': {
+                    'ready': 'Unknown', 'ready_since': 1791187945,
+                    'memory_pressure': 'True', 'disk_pressure': 'False',
+                    'pid_pressure': None},
+            },
+            readings['nodes'])
+        # The kill with no finishedAt is dropped: finished_at is how a
+        # caller tells a new kill from one it has seen, and decision 5
+        # promises it is always an int.
+        self.assertEqual(
+            [('default', 'oom-state', 'c', 0, 1791187945),
+             ('kube-system', 'oom-last', 'c', 5, 1791187200),
+             ('default', 'oom-init', 'sidecar', 1000000, 1791186300)],
+            [(entry['namespace'], entry['pod'], entry['container'],
+              entry['restarts'], entry['finished_at'])
+             for entry in readings['oom_killed']['ghost-node.example']])
+
+    def test_a_missing_condition_is_none_on_its_own(self):
+        for index, key in ((2, 'ready'), (3, 'memory_pressure'),
+                           (4, 'disk_pressure'), (5, 'pid_pressure'),
+                           (6, 'ready_since')):
+            node = self.parse(_with_field(NODE_LINE, index, ''))[
+                'nodes']['k3s-banana-node-001']
+            expected = dict(
+                KUBERNETES_PROBE_READINGS['nodes']['k3s-banana-node-001'])
+            expected[key] = None
+            self.assertEqual(expected, node, key)
+
+    def test_unknown_is_a_status(self):
+        # What the node controller reports when it has stopped hearing
+        # from the kubelet. A third value, not a False.
+        for index, key in ((2, 'ready'), (3, 'memory_pressure'),
+                           (4, 'disk_pressure'), (5, 'pid_pressure')):
+            node = self.parse(_with_field(NODE_LINE, index, 'Unknown'))[
+                'nodes']['k3s-banana-node-001']
+            self.assertEqual('Unknown', node[key])
+
+    def test_a_status_which_is_not_one_drops_the_node(self):
+        for value in ('true', 'TRUE', 'false', 'Maybe', 'True ish', '1',
+                      '<no value>', 'TrueTrue', 'Unknown\x00'):
+            for index in (2, 3, 4, 5):
+                self.assertReadsNothing(_with_field(NODE_LINE, index, value))
+
+    def test_an_invalid_name_drops_its_record(self):
+        for value in ('K3S-BANANA-NODE-001', '-node', 'node-', 'node_001',
+                      'node..one', '.node', 'node.', 'nöde', 'node 001',
+                      'node;rm -rf /', '<no value>', '\u0661'):
+            self.assertReadsNothing(_with_field(NODE_LINE, 1, value))
+            self.assertReadsNothing(_with_field(OOM_LINE, 1, value))
+            self.assertReadsNothing(_with_field(OOM_LINE, 3, value))
+        # A namespace or a container is one label, so a dot is not allowed
+        # there as it is in a node or pod name.
+        for index in (2, 4):
+            self.assertReadsNothing(_with_field(OOM_LINE, index, 'a.b'))
+            self.assertReadsNothing(_with_field(OOM_LINE, index, ''))
+        self.assertReadsNothing(_with_field(NODE_LINE, 1, ''))
+
+    def test_a_name_is_capped_at_its_kubernetes_length(self):
+        # 253 characters for a node or pod name, which may be several
+        # labels; 63 for a namespace or container, which is one.
+        subdomain = '.'.join(['a' * 63] * 4)
+        self.assertEqual(255, len(subdomain))
+        for name, kept in ((subdomain[:253], True), (subdomain[:254], False),
+                           ('a' * 253, True), ('a' * 254, False),
+                           ('a' * 5000, False)):
+            readings = self.parse(_with_field(NODE_LINE, 1, name))
+            self.assertEqual(kept, name in readings['nodes'], len(name))
+            readings = self.parse(_with_field(OOM_LINE, 3, name))
+            self.assertEqual(kept, bool(readings['oom_killed']), len(name))
+
+        for index in (2, 4):
+            for name, kept in (('a' * 63, True), ('a' * 64, False),
+                               ('a' * 62 + '-b', False)):
+                readings = self.parse(_with_field(OOM_LINE, index, name))
+                self.assertEqual(kept, bool(readings['oom_killed']),
+                                 (index, name))
+
+    def test_an_invalid_time_drops_its_record(self):
+        for value in ('2026-10-05 08:12:25Z', '2026-10-05T08:12:25',
+                      '2026-10-05T08:12:25.123Z', '2026-10-05T08:12:25+00:00',
+                      '2026-10-05t08:12:25z', '2026-02-30T08:12:25Z',
+                      '2026-13-05T08:12:25Z', '2026-10-05T24:00:00Z',
+                      '2026-10-05T08:12:60Z', '0000-10-05T08:12:25Z',
+                      '1791187945', '<no value>', '٢٠٢٦-10-05T08:12:25Z',
+                      '2026-10-05T08:12:25Z2026-10-05T08:12:25Z'):
+            self.assertReadsNothing(_with_field(NODE_LINE, 6, value))
+            self.assertReadsNothing(_with_field(OOM_LINE, 6, value))
+        # An OOM kill must say when, because that is how a caller tells a
+        # new one from one it has already seen.
+        self.assertReadsNothing(_with_field(OOM_LINE, 6, ''))
+
+    def test_a_time_is_unix_seconds_in_utc_whatever_the_local_zone(self):
+        # The API's times are UTC. Converting them as local time would be
+        # right only where the local zone is UTC, which is where tests
+        # usually run, so this test runs somewhere it is not: ten hours
+        # east, spelled as a POSIX rule rather than a zone name so that it
+        # needs no timezone database to mean that.
+        if not hasattr(time, 'tzset'):
+            self.skipTest('time.tzset() is not available here')
+        self.addCleanup(time.tzset)
+        patcher = mock.patch.dict(os.environ, {'TZ': 'AEST-10'})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        time.tzset()
+
+        for value, seconds in (('1970-01-01T00:00:00Z', 0),
+                               ('2024-02-29T23:59:59Z', 1709251199),
+                               ('2026-10-05T08:12:25Z', 1791187945)):
+            readings = self.parse(_with_field(NODE_LINE, 6, value))
+            self.assertEqual(
+                seconds,
+                readings['nodes']['k3s-banana-node-001']['ready_since'])
+            readings = self.parse(_with_field(OOM_LINE, 6, value))
+            self.assertEqual(
+                seconds,
+                readings['oom_killed']['k3s-banana-node-002'][0][
+                    'finished_at'])
+
+    def test_an_invalid_restart_count_drops_its_record(self):
+        # Each is something int() would refuse or, worse, accept: a sign,
+        # a float's spelling, a digit separator, non-ASCII digits, a value
+        # too long to serialise, and kubectl's placeholder for a field it
+        # could not find.
+        for value in ('', '-1', '+2', '2.0', '1e+06', '1_000', '\u0663',
+                      '9' * 21, '9' * 5000, '<no value>', 'two'):
+            self.assertReadsNothing(_with_field(OOM_LINE, 5, value))
+        readings = self.parse(_with_field(OOM_LINE, 5, '9' * 20))
+        self.assertEqual(
+            int('9' * 20),
+            readings['oom_killed']['k3s-banana-node-002'][0]['restarts'])
+
+    def test_one_bad_record_leaves_the_others(self):
+        stdout = KUBERNETES_PROBE_OUTPUT.replace(
+            '\tk3s-banana-node-001\tTrue', '\tk3s-banana-node-001\tMaybe')
+        readings = self.parse(stdout)
+        self.assertEqual(['k3s-banana-node-002', 'k3s-banana-node-003'],
+                         list(readings['nodes']))
+        self.assertEqual(KUBERNETES_PROBE_READINGS['oom_killed'],
+                         readings['oom_killed'])
+
+    def test_the_first_record_for_a_node_wins(self):
+        # The API does not let two nodes share a name, so a second line is
+        # not the API's. Valid, so that it is the order which keeps it out
+        # and not the validation.
+        stdout = KUBERNETES_PROBE_OUTPUT + (
+            'node\tk3s-banana-node-001\tFalse\tTrue\tTrue\tTrue\t'
+            '2026-10-06T21:40:11Z\n')
+        self.assertEqual(KUBERNETES_PROBE_READINGS, self.parse(stdout))
+
+    def test_a_node_is_not_matched_by_a_dropped_record(self):
+        # A first record which was dropped claims nothing, so a later valid
+        # one for the same name is read.
+        stdout = (_with_field(NODE_LINE, 2, 'Maybe') + '\n'
+                  + _with_field(NODE_LINE, 2, 'False') + '\n')
+        self.assertEqual(
+            'False',
+            self.parse(stdout)['nodes']['k3s-banana-node-001']['ready'])
+
+    def test_every_oom_kill_on_a_node_is_kept_in_order(self):
+        stdout = KUBERNETES_PROBE_OUTPUT + (
+            'oom\tk3s-banana-node-002\tkube-system\tcoredns-5d78c9869d-abcde\t'
+            'coredns\t0\t2026-10-05T08:12:25Z\n')
+        entries = self.parse(stdout)['oom_killed']['k3s-banana-node-002']
+        self.assertEqual(['hog', 'coredns'],
+                         [entry['container'] for entry in entries])
+
+    def test_an_oom_kill_on_a_node_with_no_node_line_is_kept(self):
+        # Which node an entry belongs to is health()'s question, not the
+        # parser's: it is filed under the name it gave, and no node
+        # reading is invented for it.
+        stdout = (KUBERNETES_PROBE_OUTPUT
+                  + _with_field(OOM_LINE, 1, 'k3s-banana-node-099') + '\n')
+        readings = self.parse(stdout)
+        self.assertEqual(
+            ['k3s-banana-node-001', 'k3s-banana-node-002',
+             'k3s-banana-node-003'],
+            sorted(readings['nodes']))
+        self.assertEqual(
+            [{'namespace': 'default', 'pod': 'memory-hog-7d9f8b6c5-x2x7k',
+              'container': 'hog', 'restarts': 2,
+              'finished_at': 1791322811}],
+            readings['oom_killed']['k3s-banana-node-099'])
+
+    def test_empty_output_reads_nothing(self):
+        for stdout in ('', None, '\n\n', '\t\t\n'):
+            self.assertEqual({'nodes': {}, 'oom_killed': {}},
+                             self.parse(stdout))
+
+    def test_trailing_whitespace_and_crlf_are_stripped(self):
+        stdout = KUBERNETES_PROBE_OUTPUT.replace('\n', ' \r\n').replace(
+            '\tTrue\t', '\t True \t')
+        self.assertEqual(KUBERNETES_PROBE_READINGS, self.parse(stdout))
+
+    def test_a_line_with_the_wrong_number_of_fields_is_dropped(self):
+        for line in (NODE_LINE, OOM_LINE):
+            self.assertReadsNothing(line + '\t')
+            self.assertReadsNothing(line + '\textra')
+            self.assertReadsNothing(line.rsplit('\t', 1)[0])
+            self.assertReadsNothing(line.replace('\t', ' '))
+
+    def test_lines_which_are_not_records_are_ignored(self):
+        stdout = ('error: the server does not have a resource type "nodez"\n'
+                  'pod\tdefault\tsomething\n'
+                  'NODE' + NODE_LINE[4:] + '\n'
+                  'nodes' + NODE_LINE[4:] + '\n'
+                  '\toom\n'
+                  + KUBERNETES_PROBE_OUTPUT)
+        self.assertEqual(KUBERNETES_PROBE_READINGS, self.parse(stdout))
+
+    def test_the_readings_serialise(self):
+        json.dumps(self.parse(KUBERNETES_PROBE_OUTPUT))
+
+    def test_no_string_makes_it_raise(self):
+        for stdout in ('\t', '\t' * 7, 'node', 'oom', 'node\t' * 7,
+                       'oom\t' * 7, '\x00\t\x00', 'node\t\udcff\tTrue',
+                       'node\tn\tTrue\tTrue\tTrue\tTrue\t\udcff',
+                       'oom\tn\tn\tn\tn\t\u00b2\t2026-10-05T08:12:25Z',
+                       'node\tn\tTrue\tTrue\tTrue\tTrue\t9999-12-31T23:59:59Z',
+                       '\u2028node\t\x85', 'x' * 100000,
+                       ('node\t' + 'a-' * 50000 + '\t\t\t\t\t')):
+            self.parse(stdout)
 
 
 # The framing every k3s configuration file is written with: a quoted
@@ -5075,6 +6317,7 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
 
         self.assertEqual(
             [('inst-cp1', self.KUBECTL),
+             ('inst-cp1', cluster_module.K3S_KUBERNETES_PROBE_COMMAND),
              ('inst-cp1', cluster_module.node_signals_command('control_plane'))],
             self.client.executed)
         self.assertTrue(report['api']['probed'])
@@ -5107,6 +6350,7 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
 
         self.assertEqual(
             [('inst-cp1', self.KUBECTL),
+             ('inst-cp1', cluster_module.K3S_KUBERNETES_PROBE_COMMAND),
              ('inst-cp1', cluster_module.node_signals_command('control_plane')),
              ('inst-w1', cluster_module.node_signals_command('worker'))],
             self.client.executed)
@@ -5147,6 +6391,17 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
         self.assertTrue(report['api']['probed'])
         self.assertFalse(report['api']['answered'])
         self.assertIn('expired state', report['api']['error'])
+
+
+def _kubernetes_node_lines(names, ready='True', oom=''):
+    """What the Kubernetes probe prints for nodes named names, and then oom.
+
+    Every node with ready as its Ready status, no pressure, and the same
+    Ready time; oom is appended as it is, for a test which wants a kill.
+    """
+    return ''.join(
+        'node\t%s\t%s\tFalse\tFalse\tFalse\t2026-10-05T08:12:25Z\n'
+        % (name, ready) for name in names) + oom
 
 
 # Decision 1 of the cumulative health signals phase 1 plan, written out
@@ -5229,22 +6484,26 @@ class HealthSignalsTestCase(testtools.TestCase):
             return fn(), clock[0] - 1000.0
 
     def _seven_nodes(self):
-        # One control plane node and six workers, all able to answer: eight
-        # probes, the kubectl one and seven signals.
+        # One control plane node and six workers, all able to answer: nine
+        # probes, the two kubectl ones and seven signals. Kubernetes knows
+        # all seven, so that the cluster can be healthy.
         self.md['worker_nodes'] = ['inst-w%d' % n for n in range(1, 7)]
         for n in range(3, 7):
             self.client.instances['inst-w%d' % n] = {
                 'uuid': 'inst-w%d' % n, 'name': 'k3s-banana-node-%03d' % (n + 1),
                 'state': 'created', 'agent_state': 'ready'}
+        self.client.kubernetes_stdout = _kubernetes_node_lines(
+            ['k3s-banana-node-%03d' % n for n in range(1, 8)])
 
     def _reads_by_operation(self):
-        # In submission order: aop-001 is the kubectl probe, and then each
-        # node's signals in node order.
+        # In submission order: aop-001 is the API probe, aop-002 the
+        # Kubernetes probe, and then each node's signals in node order.
         return [self.client.agent_operation_reads_by_uuid.get(uuid, 0)
                 for uuid in sorted(self.client.operations)]
 
     def _everything_pending(self):
         self.client.probe_state = 'queued'
+        self.client.kubernetes_state = 'queued'
         for instance_uuid in self.client.instances:
             self.client.signals_state[instance_uuid] = 'queued'
 
@@ -5352,15 +6611,21 @@ class HealthSignalsTestCase(testtools.TestCase):
 
     # Submission order and the one budget.
 
-    def test_the_kubectl_probe_is_submitted_first(self):
+    def test_the_api_probe_is_submitted_first_and_the_kubernetes_probe_second(self):
+        # Then every node's signals. On the first control plane node all
+        # three run, and its agent runs them in the order they arrive, so
+        # neither kubectl is queued behind a du.
         self._everything_pending()
 
         self._with_clock(self.cluster.health)
 
         self.assertEqual(
-            ('inst-cp1', cluster_module.K3S_API_PROBE_COMMAND),
-            self.client.executed[0])
-        self.assertEqual(4, len(self.client.executed))
+            [('inst-cp1', cluster_module.K3S_API_PROBE_COMMAND),
+             ('inst-cp1', cluster_module.K3S_KUBERNETES_PROBE_COMMAND),
+             ('inst-cp1', cluster_module.node_signals_command('control_plane')),
+             ('inst-w1', cluster_module.node_signals_command('worker')),
+             ('inst-w2', cluster_module.node_signals_command('worker'))],
+            self.client.executed)
 
     def test_every_probe_is_submitted_before_any_is_waited_for(self):
         self._everything_pending()
@@ -5368,39 +6633,44 @@ class HealthSignalsTestCase(testtools.TestCase):
         self._with_clock(self.cluster.health)
 
         kinds = [call[0] for call in self.client.calls]
-        self.assertEqual(4, kinds.count('execute'))
+        self.assertEqual(5, kinds.count('execute'))
         self.assertIn('read', kinds)
         self.assertNotIn('execute', kinds[kinds.index('read'):], kinds)
 
     def test_every_probe_pending_costs_one_budget_not_one_per_node(self):
         # Seven nodes, none of which ever answers. Waited for one after
-        # another this is eight budgets; submitted together against one
-        # deadline it is one.
+        # another this is nine budgets; submitted together against one
+        # deadline it is one, the extra Kubernetes probe included.
         self._seven_nodes()
         self._everything_pending()
 
         report, elapsed = self._with_clock(self.cluster.health)
 
-        self.assertEqual(8, len(self.client.executed))
+        self.assertEqual(9, len(self.client.executed))
         self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS, elapsed)
         # One read a second across one budget, and then one read each of
-        # the operations left. The kubectl probe is collected first, with
-        # the whole budget: a read and then a sleep each second, so reads at
-        # 0, 1, ..., 30 -- 31 of them, the last landing exactly on the
-        # deadline, after which the wait returns without sleeping. Each of
-        # the seven signals probes is collected after that with no time
-        # left, and is read once without sleeping, because the state it was
-        # handed is the one it was submitted in. 31 + 7 = 38, and it is
-        # exact rather than a range: fewer would mean a probe judged without
-        # being read, and more a wait which slept or read twice after the
-        # deadline.
-        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 1 + 7,
+        # the operations left. The API probe is collected first, with the
+        # whole budget: a read and then a sleep each second, so reads at 0,
+        # 1, ..., 30 -- 31 of them, the last landing exactly on the
+        # deadline, after which the wait returns without sleeping. The
+        # Kubernetes probe and each of the seven signals probes are
+        # collected after that with no time left, and each is read once
+        # without sleeping, because the state it was handed is the one it
+        # was submitted in. 31 + 1 + 7 = 39, and it is exact rather than a
+        # range: fewer would mean a probe judged without being read, and
+        # more a wait which slept or read twice after the deadline.
+        self.assertEqual(cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 1 + 1 + 7,
                          self.client.agent_operation_reads)
         self.assertEqual(
-            [cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 1] + [1] * 7,
+            [cluster_module.HEALTH_PROBE_TIMEOUT_SECONDS + 1] + [1] * 8,
             self._reads_by_operation())
 
         self.assertFalse(report['api']['probed'])
+        self.assertFalse(report['kubernetes']['probed'])
+        self.assertIn('the Kubernetes probe had not finished after 30 '
+                      'seconds (agent operation aop-002 is still queued)',
+                      report['kubernetes']['error'])
+        self.assertFalse(report['healthy'])
         for node in report['nodes']:
             self.assertFalse(node['signals']['probed'])
             self.assertIn('the node signals command had not finished after '
@@ -5424,7 +6694,7 @@ class HealthSignalsTestCase(testtools.TestCase):
 
         self.assertEqual(0, elapsed)
         self.assertEqual([], self.sleeps)
-        self.assertEqual([1] * 8, self._reads_by_operation())
+        self.assertEqual([1] * 9, self._reads_by_operation())
         self.assertTrue(report['healthy'])
         self.assertTrue(report['api']['answered'])
         self.assertEqual(7, len(report['nodes']))
@@ -5433,11 +6703,11 @@ class HealthSignalsTestCase(testtools.TestCase):
             self.assertIsNone(node['signals']['error'], node['uuid'])
 
     def test_a_slow_first_probe_costs_its_own_time_not_one_second_per_node(self):
-        # The kubectl probe is still running when it is first read, and
-        # done on its second, one sleep later. The signals probes ran
-        # alongside it on their nodes, so each has finished by the time it
-        # is collected and is read once without sleeping. The call takes
-        # the slowest probe's second, not that second plus one per node.
+        # The API probe is still running when it is first read, and done on
+        # its second, one sleep later. The Kubernetes probe and the signals
+        # probes ran alongside it, so each has finished by the time it is
+        # collected and is read once without sleeping. The call takes the
+        # slowest probe's second, not that second plus one per node.
         self._seven_nodes()
         self.client.probe_state = 'executing'
         original = self.client.get_agent_operation
@@ -5456,7 +6726,7 @@ class HealthSignalsTestCase(testtools.TestCase):
 
         self.assertEqual(1, elapsed)
         self.assertEqual([1], self.sleeps)
-        self.assertEqual([2] + [1] * 7, self._reads_by_operation())
+        self.assertEqual([2] + [1] * 8, self._reads_by_operation())
         self.assertTrue(report['healthy'])
         self.assertTrue(all(n['signals']['probed'] for n in report['nodes']))
 
@@ -5593,11 +6863,12 @@ class HealthSignalsTestCase(testtools.TestCase):
         signals = self._node(report, 'inst-cp1')['signals']
         self.assertFalse(signals['probed'])
         # The uuid of the operation left queued, as for the API probe: it
-        # is the thing a later await_idle() will wait on. aop-001 is the
-        # kubectl probe, submitted first; aop-002 is this node's signals.
+        # is the thing a later await_idle() will wait on. aop-001 is the API
+        # probe, submitted first, and aop-002 the Kubernetes probe; aop-003
+        # is this node's signals.
         self.assertEqual(
             'the node signals command had not finished after 0 seconds '
-            '(agent operation aop-002 is still queued), so the wait was '
+            '(agent operation aop-003 is still queued), so the wait was '
             'abandoned', signals['error'])
 
     def test_a_refused_signals_probe_leaves_the_cluster_healthy(self):
@@ -5687,6 +6958,482 @@ class HealthSignalsTestCase(testtools.TestCase):
             self.assertEqual(
                 cluster_module.node_signals_command('control_plane'),
                 dict(self.client.executed[1:])['inst-cp1'], server_config)
+
+
+# Decision 3 of the cumulative health signals phase 2 plan, written out
+# rather than taken from KUBERNETES_NODE_KEYS, for the reason SIGNALS_KEYS
+# is: a key added to or dropped from the constant is a change to a
+# documented return shape, which a test should notice rather than follow.
+KUBERNETES_KEYS = {
+    'registered', 'ready', 'ready_since', 'memory_pressure', 'disk_pressure',
+    'pid_pressure', 'oom_killed'}
+KUBERNETES_REPORT_KEYS = {'probed', 'answered', 'error', 'unmatched_nodes'}
+
+# What a node about which nothing could be read carries.
+KUBERNETES_UNREAD = dict.fromkeys(KUBERNETES_KEYS)
+
+# The one OOM kill in fakes.KUBERNETES_PROBE_OUTPUT, on k3s-banana-node-002.
+HOG_KILLED = {
+    'namespace': 'default', 'pod': 'memory-hog-7d9f8b6c5-x2x7k',
+    'container': 'hog', 'restarts': 2, 'finished_at': 1791322811}
+
+
+class HealthKubernetesTestCase(testtools.TestCase):
+    """health() reports what Kubernetes says of each node, and healthy takes Ready.
+
+    Decisions 1 to 6 of the cumulative health signals phase 2 plan: the
+    Kubernetes probe runs on the first control plane node under the API
+    probe's rule; each node carries a ``kubernetes`` dict with the same
+    seven keys whatever happened, matched by lowercased instance name; the
+    probe's outcome and any Kubernetes node no instance accounts for are
+    at the top level; and the top level ``healthy`` now requires every
+    node Ready, which is a change to a released contract and so is pinned
+    in both directions: what makes it False, and what must not.
+    """
+
+    def setUp(self):
+        super(HealthKubernetesTestCase, self).setUp()
+        self.client = fakes.HealthClient()
+
+        self.md = {
+            'name': 'banana',
+            'namespace': 'testns',
+            'state': 'created',
+            'node_serial': 4,
+            'node_network': 'net-1',
+            'node_token': 'node-token',
+            'k3s_version': 'v1.33',
+            'api_address_inner': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1'],
+            'worker_nodes': ['inst-w1', 'inst-w2'],
+            'routed_addresses': []
+        }
+        self.client.metadata[MD_KEY] = self.md
+
+        for instance_uuid, name in [('inst-cp1', 'k3s-banana-node-001'),
+                                    ('inst-w1', 'k3s-banana-node-002'),
+                                    ('inst-w2', 'k3s-banana-node-003')]:
+            self.client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': name, 'state': 'created',
+                'agent_state': 'ready'}
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.cluster = _make_cluster(self.client)
+
+    def _node(self, report, instance_uuid):
+        return [n for n in report['nodes'] if n['uuid'] == instance_uuid][0]
+
+    def _kubernetes(self, report, instance_uuid):
+        return self._node(report, instance_uuid)['kubernetes']
+
+    def _assert_the_shape(self, report):
+        self.assertEqual(7, len(KUBERNETES_KEYS))
+        self.assertNotEqual([], report['nodes'])
+        for node in report['nodes']:
+            self.assertEqual(KUBERNETES_KEYS, set(node['kubernetes']), node)
+        self.assertEqual(KUBERNETES_REPORT_KEYS, set(report['kubernetes']))
+
+    def _assert_nothing_read(self, report):
+        for node in report['nodes']:
+            self.assertEqual(KUBERNETES_UNREAD, node['kubernetes'], node)
+        self.assertFalse(report['kubernetes']['answered'])
+        self.assertIsNone(report['kubernetes']['unmatched_nodes'])
+        self.assertFalse(report['healthy'])
+
+    def _with_ready(self, instance_uuid, ready):
+        # The default output, with one node's Ready status replaced.
+        name = self.client.instances[instance_uuid]['name']
+        self.client.kubernetes_stdout = fakes.KUBERNETES_PROBE_OUTPUT.replace(
+            'node\t%s\tTrue\t' % name, 'node\t%s\t%s\t' % (name, ready))
+        self.assertNotEqual(fakes.KUBERNETES_PROBE_OUTPUT,
+                            self.client.kubernetes_stdout)
+
+    # The shape, in every outcome.
+
+    def test_a_healthy_cluster_has_the_keys(self):
+        self._assert_the_shape(self.cluster.health())
+
+    def test_a_gone_node_has_the_keys(self):
+        del self.client.instances['inst-w1']
+
+        self._assert_the_shape(self.cluster.health())
+
+    def test_an_unready_node_has_the_keys(self):
+        self.client.instances['inst-w2']['agent_state'] = 'not ready'
+        self._with_ready('inst-w1', 'False')
+
+        self._assert_the_shape(self.cluster.health())
+
+    def test_a_failed_probe_has_the_keys(self):
+        for attribute, value in (('kubernetes_return_code', 1),
+                                 ('kubernetes_state', 'error'),
+                                 ('kubernetes_raises',
+                                  fakes.not_found('inst-cp1'))):
+            client_value = getattr(self.client, attribute)
+            setattr(self.client, attribute, value)
+
+            report = _make_cluster(self.client).health()
+
+            self._assert_the_shape(report)
+            self._assert_nothing_read(report)
+            setattr(self.client, attribute, client_value)
+
+    def test_a_skipped_probe_has_the_keys(self):
+        self.client.instances['inst-cp1']['agent_state'] = None
+
+        report = self.cluster.health()
+
+        self._assert_the_shape(report)
+        self._assert_nothing_read(report)
+
+    def test_a_cluster_with_no_control_plane_has_the_keys(self):
+        # Workers and no control plane: an interrupted create can leave
+        # this, and there is nothing to ask.
+        self.md['control_plane_nodes'] = []
+
+        report = self.cluster.health()
+
+        self._assert_the_shape(report)
+        self._assert_nothing_read(report)
+
+    # What is read, and how it is matched.
+
+    def test_the_readings_reach_the_report(self):
+        report = self.cluster.health()
+
+        self.assertEqual(
+            {'registered': True, 'ready': 'True', 'ready_since': 1791187945,
+             'memory_pressure': 'False', 'disk_pressure': 'False',
+             'pid_pressure': 'False', 'oom_killed': []},
+            self._kubernetes(report, 'inst-cp1'))
+        self.assertEqual(
+            {'registered': True, 'ready': 'True', 'ready_since': 1791187982,
+             'memory_pressure': 'False', 'disk_pressure': 'False',
+             'pid_pressure': 'False', 'oom_killed': [HOG_KILLED]},
+            self._kubernetes(report, 'inst-w1'))
+        self.assertEqual(
+            {'probed': True, 'answered': True, 'error': None,
+             'unmatched_nodes': []},
+            report['kubernetes'])
+
+    def test_the_probe_runs_once_on_the_first_control_plane_node(self):
+        self.cluster.health()
+
+        self.assertEqual(
+            [('inst-cp1', cluster_module.K3S_KUBERNETES_PROBE_COMMAND)],
+            [(instance_uuid, command)
+             for instance_uuid, command in self.client.executed
+             if command == cluster_module.K3S_KUBERNETES_PROBE_COMMAND])
+
+    def test_a_node_is_matched_by_its_lowercased_instance_name(self):
+        # Shaken Fist keeps the capitals; kubelet registered the node
+        # without them.
+        self.client.instances['inst-w1']['name'] = 'K3S-Banana-Node-002'
+
+        report = self.cluster.health()
+
+        self.assertTrue(self._kubernetes(report, 'inst-w1')['registered'])
+        self.assertEqual([HOG_KILLED],
+                         self._kubernetes(report, 'inst-w1')['oom_killed'])
+        self.assertEqual([], report['kubernetes']['unmatched_nodes'])
+        self.assertTrue(report['healthy'])
+
+    def test_a_gone_node_reads_nothing_and_its_kubernetes_node_is_unmatched(self):
+        # Its instance has no name to match by, and the node object it left
+        # behind is accounted for by nobody.
+        del self.client.instances['inst-w1']
+
+        report = self.cluster.health()
+
+        self.assertEqual(KUBERNETES_UNREAD, self._kubernetes(report, 'inst-w1'))
+        self.assertEqual(['k3s-banana-node-002'],
+                         report['kubernetes']['unmatched_nodes'])
+        self.assertFalse(report['healthy'])
+
+    def test_an_unregistered_node_is_registered_false_with_no_conditions(self):
+        self.client.kubernetes_stdout = _kubernetes_node_lines(
+            ['k3s-banana-node-001', 'k3s-banana-node-002'])
+
+        report = self.cluster.health()
+
+        # The pods were read, so [] is a reading here, unlike the None of a
+        # probe which did not answer.
+        self.assertEqual(
+            {'registered': False, 'ready': None, 'ready_since': None,
+             'memory_pressure': None, 'disk_pressure': None,
+             'pid_pressure': None, 'oom_killed': []},
+            self._kubernetes(report, 'inst-w2'))
+        self.assertTrue(self._kubernetes(report, 'inst-w1')['registered'])
+
+    def test_unmatched_nodes_are_listed_sorted(self):
+        self.client.kubernetes_stdout = (
+            fakes.KUBERNETES_PROBE_OUTPUT
+            + _kubernetes_node_lines(['zz-left-behind', 'aa-left-behind']))
+
+        report = self.cluster.health()
+
+        self.assertEqual(['aa-left-behind', 'zz-left-behind'],
+                         report['kubernetes']['unmatched_nodes'])
+
+    def test_two_nodes_with_one_lowercased_name_are_not_given_its_readings(self):
+        # Kubernetes holds one node object for the name, and nothing here
+        # can say which instance's kubelet it describes. Neither is given
+        # its readings, so neither can make the cluster healthy with a
+        # Ready that may be the other's; and the node object is accounted
+        # for, by two instances, rather than unmatched.
+        self.client.instances['inst-w2']['name'] = 'K3S-BANANA-NODE-002'
+
+        report = self.cluster.health()
+
+        self.assertEqual(KUBERNETES_UNREAD, self._kubernetes(report, 'inst-w1'))
+        self.assertEqual(KUBERNETES_UNREAD, self._kubernetes(report, 'inst-w2'))
+        self.assertTrue(self._kubernetes(report, 'inst-cp1')['registered'])
+        self.assertEqual(['k3s-banana-node-003'],
+                         report['kubernetes']['unmatched_nodes'])
+        self.assertFalse(report['healthy'])
+
+    def test_a_kill_on_an_unregistered_node_is_still_reported_on_it(self):
+        # The pod's spec.nodeName names this node, so the kill is a fact
+        # about it whether or not its node record was read. An empty list
+        # here would claim nothing was killed.
+        self.client.kubernetes_stdout = _kubernetes_node_lines(
+            ['k3s-banana-node-001', 'k3s-banana-node-003'],
+            oom=fakes.KUBERNETES_PROBE_OUTPUT.splitlines(True)[-1])
+
+        report = self.cluster.health()
+
+        self.assertFalse(self._kubernetes(report, 'inst-w1')['registered'])
+        self.assertEqual([HOG_KILLED],
+                         self._kubernetes(report, 'inst-w1')['oom_killed'])
+
+    def test_a_kill_on_a_node_no_entry_has_is_reported_nowhere(self):
+        oom = _with_field(OOM_LINE, 1, 'k3s-banana-node-099') + '\n'
+        self.client.kubernetes_stdout = _kubernetes_node_lines(
+            ['k3s-banana-node-001', 'k3s-banana-node-002',
+             'k3s-banana-node-003'], oom=oom)
+
+        report = self.cluster.health()
+
+        for node in report['nodes']:
+            self.assertEqual([], node['kubernetes']['oom_killed'], node)
+        self.assertEqual([], report['kubernetes']['unmatched_nodes'])
+        self.assertNotIn('memory-hog', json.dumps(report))
+
+    def test_an_answer_with_no_nodes_is_believed(self):
+        self.client.kubernetes_stdout = ''
+
+        report = self.cluster.health()
+
+        self.assertTrue(report['kubernetes']['answered'])
+        self.assertEqual([], report['kubernetes']['unmatched_nodes'])
+        for node in report['nodes']:
+            self.assertFalse(node['kubernetes']['registered'], node)
+            self.assertEqual([], node['kubernetes']['oom_killed'], node)
+        self.assertFalse(report['healthy'])
+
+    # A probe which did not answer.
+
+    def test_a_probe_which_exits_non_zero_reads_nothing_it_printed(self):
+        # The node read succeeded and printed every node Ready, and the pod
+        # read then failed. Half of this answer is a claim that nothing was
+        # killed, so none of it is read.
+        self.client.kubernetes_return_code = 1
+        self.client.kubernetes_stderr = 'error: the server was unable to list pods'
+
+        report = self.cluster.health()
+
+        self._assert_nothing_read(report)
+        self.assertEqual(
+            {'probed': True, 'answered': False,
+             'error': 'the Kubernetes probe exited 1', 'unmatched_nodes': None},
+            report['kubernetes'])
+        # The rest of the report is as it was.
+        self.assertTrue(report['api']['answered'])
+        self.assertTrue(all(n['healthy'] for n in report['nodes']))
+
+    def test_an_errored_probe_is_named(self):
+        self.client.kubernetes_state = 'error'
+
+        report = self.cluster.health()
+
+        self.assertTrue(report['kubernetes']['probed'])
+        self.assertEqual('the agent operation for the Kubernetes probe entered '
+                         'the error state', report['kubernetes']['error'])
+        self._assert_nothing_read(report)
+
+    def test_a_refused_probe_is_reported_rather_than_raised(self):
+        self.client.kubernetes_raises = apiclient.APIException(
+            'the server is too busy to answer', 'POST',
+            'http://sf-1:13000/instances/inst-cp1/agent/execute', 503, 'busy')
+
+        report = self.cluster.health()
+
+        self.assertFalse(report['kubernetes']['probed'])
+        self.assertIn('APIException', report['kubernetes']['error'])
+        self.assertIn('inst-cp1', report['kubernetes']['error'])
+        self.assertTrue(report['api']['answered'])
+        self._assert_nothing_read(report)
+
+    def test_an_abandoned_probe_names_its_operation(self):
+        self.client.kubernetes_state = 'queued'
+
+        with mock.patch.object(cluster_module, 'HEALTH_PROBE_TIMEOUT_SECONDS', 0):
+            report = self.cluster.health()
+
+        # aop-001 is the API probe; aop-002 is this one.
+        self.assertFalse(report['kubernetes']['probed'])
+        self.assertEqual(
+            'the Kubernetes probe had not finished after 0 seconds (agent '
+            'operation aop-002 is still queued), so the wait was abandoned',
+            report['kubernetes']['error'])
+        self.assertTrue(report['api']['answered'])
+        self.assertTrue(all(n['signals']['probed'] for n in report['nodes']))
+        self._assert_nothing_read(report)
+
+    def test_a_skipped_probe_says_why_in_the_api_probe_s_words(self):
+        self.client.instances['inst-cp1']['agent_state'] = None
+
+        report = self.cluster.health()
+
+        self.assertNotIn(cluster_module.K3S_KUBERNETES_PROBE_COMMAND,
+                         [command for _, command in self.client.executed])
+        self.assertFalse(report['kubernetes']['probed'])
+        self.assertEqual(report['api']['error'], report['kubernetes']['error'])
+        self.assertIn('not in a state which can answer',
+                      report['kubernetes']['error'])
+
+    def test_no_control_plane_says_why_in_the_api_probe_s_words(self):
+        self.md['control_plane_nodes'] = []
+
+        report = self.cluster.health()
+
+        self.assertEqual([], [command for _, command in self.client.executed
+                              if command.startswith('kubectl')])
+        self.assertFalse(report['kubernetes']['probed'])
+        self.assertEqual(report['api']['error'], report['kubernetes']['error'])
+        self.assertIn('no control plane node', report['kubernetes']['error'])
+
+    # What healthy takes, and what it does not.
+
+    def test_every_node_ready_is_healthy(self):
+        report = self.cluster.health()
+
+        self.assertEqual(
+            ['True'] * 3, [n['kubernetes']['ready'] for n in report['nodes']])
+        self.assertTrue(report['healthy'])
+
+    def test_a_not_ready_node_is_unhealthy_and_its_node_entry_is_not(self):
+        # The node level healthy is Shaken Fist's view of the instance, and
+        # the gate for asking its agent anything. A NotReady kubelet beside
+        # a working agent is the node whose signals are worth reading.
+        self._with_ready('inst-w1', 'False')
+
+        report = self.cluster.health()
+
+        self.assertEqual('False', self._kubernetes(report, 'inst-w1')['ready'])
+        self.assertFalse(report['healthy'])
+        self.assertTrue(self._node(report, 'inst-w1')['healthy'])
+        self.assertTrue(self._node(report, 'inst-w1')['signals']['probed'])
+        self.assertTrue(all(n['healthy'] for n in report['nodes']))
+
+    def test_an_unknown_node_is_unhealthy(self):
+        # Unknown is the node controller no longer hearing from the
+        # kubelet, which is not Ready.
+        self._with_ready('inst-cp1', 'Unknown')
+
+        report = self.cluster.health()
+
+        self.assertEqual('Unknown',
+                         self._kubernetes(report, 'inst-cp1')['ready'])
+        self.assertFalse(report['healthy'])
+        self.assertTrue(self._node(report, 'inst-cp1')['healthy'])
+
+    def test_a_node_with_no_ready_condition_is_unhealthy(self):
+        self.client.kubernetes_stdout = fakes.KUBERNETES_PROBE_OUTPUT.replace(
+            'node\tk3s-banana-node-003\tTrue\tFalse\tFalse\tFalse\t'
+            '2026-10-05T08:13:09Z',
+            'node\tk3s-banana-node-003\t\tFalse\tFalse\tFalse\t')
+
+        report = self.cluster.health()
+
+        self.assertTrue(self._kubernetes(report, 'inst-w2')['registered'])
+        self.assertIsNone(self._kubernetes(report, 'inst-w2')['ready'])
+        self.assertFalse(report['healthy'])
+
+    def test_an_unregistered_node_is_unhealthy(self):
+        self.client.kubernetes_stdout = _kubernetes_node_lines(
+            ['k3s-banana-node-001', 'k3s-banana-node-003'])
+
+        report = self.cluster.health()
+
+        self.assertFalse(self._kubernetes(report, 'inst-w1')['registered'])
+        self.assertFalse(report['healthy'])
+        self.assertTrue(all(n['healthy'] for n in report['nodes']))
+
+    def test_a_failed_probe_is_unhealthy(self):
+        self.client.kubernetes_return_code = 1
+
+        report = self.cluster.health()
+
+        self.assertFalse(report['healthy'])
+        self.assertTrue(report['api']['answered'])
+        self.assertTrue(all(n['healthy'] for n in report['nodes']))
+
+    def test_a_pressure_condition_leaves_the_cluster_healthy(self):
+        for index, key in ((3, 'memory_pressure'), (4, 'disk_pressure'),
+                           (5, 'pid_pressure')):
+            self.client.kubernetes_stdout = fakes.KUBERNETES_PROBE_OUTPUT.replace(
+                NODE_LINE, _with_field(NODE_LINE, index, 'True'))
+
+            report = _make_cluster(self.client).health()
+
+            self.assertEqual('True', self._kubernetes(report, 'inst-cp1')[key])
+            self.assertTrue(report['healthy'], key)
+
+    def test_an_oom_kill_leaves_the_cluster_healthy(self):
+        report = self.cluster.health()
+
+        self.assertEqual([HOG_KILLED],
+                         self._kubernetes(report, 'inst-w1')['oom_killed'])
+        self.assertTrue(report['healthy'])
+
+    def test_an_unmatched_node_leaves_the_cluster_healthy(self):
+        self.client.kubernetes_stdout = (
+            fakes.KUBERNETES_PROBE_OUTPUT
+            + _kubernetes_node_lines(['k3s-banana-node-099']))
+
+        report = self.cluster.health()
+
+        self.assertEqual(['k3s-banana-node-099'],
+                         report['kubernetes']['unmatched_nodes'])
+        self.assertTrue(report['healthy'])
+
+    # Read only, and nothing raw.
+
+    def test_no_metadata_is_written(self):
+        before = copy.deepcopy(self.client.metadata)
+
+        self.cluster.health()
+
+        self.assertEqual(before, self.client.metadata)
+        self.assertEqual([], self.client.metadata_writes)
+        self.assertEqual([], self.client.metadata_deletes)
+        self.assertEqual([], self.client.deleted_instances)
+
+    def test_no_raw_command_output_reaches_the_report(self):
+        self.client.kubernetes_return_code = 1
+        self.client.kubernetes_stderr = 'error: you must be logged in'
+
+        report = self.cluster.health()
+
+        rendered = json.dumps(
+            [report['kubernetes']] + [n['kubernetes'] for n in report['nodes']])
+        self.assertNotIn('logged in', rendered)
+        self.assertNotIn('go-template', rendered)
+        self.assertNotIn('kubectl', rendered)
 
 
 class ActionLogFailingDrainClient(ActionLogClient):

@@ -78,8 +78,10 @@ description:
     and in particular the module never adds or removes worker nodes. See
     O(initial_workers) for why.
   - Creating a cluster takes tens of minutes, because it boots instances,
-    waits for their agents, installs k3s on each of them and then installs
-    metallb and Longhorn. The task blocks for all of it. Deleting one is
+    waits for their agents, installs k3s on each of them, waits for every
+    node to register with Kubernetes and report Ready, and then installs
+    metallb and Longhorn. The task blocks for all of it, so the health
+    report it returns is taken after every node was Ready. Deleting one is
     quicker but still waits for every instance to reach the deleted state.
 options:
   name:
@@ -315,9 +317,10 @@ health:
       C(none) when there is no cluster to report on, and also for
       O(state=absent), where the module does not probe a cluster it is about
       to destroy.
-    - Obtaining it submits read-only agent operations - one against the
-      first control plane node, to run C(kubectl get nodes) there, and one
-      signals command against every healthy node.
+    - Obtaining it submits read-only agent operations - two against the
+      first control plane node, to run C(kubectl get nodes) there and to
+      read each node's conditions and OOM-killed containers from the
+      Kubernetes API, and one signals command against every healthy node.
     - There is deliberately no return value carrying the cluster's raw
       namespace metadata, because that document holds the cluster's
       kubeconfig, its k3s node token and any SSH key it was built with.
@@ -350,10 +353,16 @@ health:
           states, and whether that node is healthy. Each also has a
           C(signals) dict of raw, cumulative readings taken from the node
           (boot, k3s restarts, kernel OOM kills, memory and, on control
-          plane nodes, etcd sizes), which never affect C(healthy). What
-          each reading means, and how to diff it against a baseline, is
-          documented in docs/library-api.md in the
-          shakenfist/client-python-k3s repository.
+          plane nodes, etcd sizes), which never affect C(healthy). Each
+          also has a C(kubernetes) dict of what Kubernetes says of the node
+          (C(registered), C(ready), C(ready_since), the three pressure
+          conditions and C(oom_killed)), all C(none) when that could not be
+          read. C(ready) of C(True) is a term of the top level C(healthy);
+          the node's own C(healthy) does not take it. What each reading
+          means, and how to diff it against a baseline, is documented in
+          docs/library-api.md in the shakenfist/client-python-k3s
+          repository, under "What signals reports" and "What kubernetes
+          reports".
       type: list
       elements: dict
     api:
@@ -362,10 +371,28 @@ health:
           C(kubectl get nodes) run against it. C(probed) false means the
           probe was not attempted, and C(error) says why.
       type: dict
+    kubernetes:
+      description:
+        - The outcome of the probe which reads the Kubernetes API through
+          the first control plane node, as C(probed), C(answered) and
+          C(error), and C(unmatched_nodes), the Kubernetes nodes no entry in
+          C(nodes) accounts for (C(none) when the probe did not answer). The
+          readings it took are on each entry in C(nodes). See
+          docs/library-api.md in the shakenfist/client-python-k3s
+          repository, under "What kubernetes reports".
+      type: dict
     healthy:
       description:
         - The conjunction of everything above - the cluster finished being
-          built, every node exists and is up, and the k3s API answered.
+          built, every node exists and is up, the k3s API answered, the
+          Kubernetes probe answered, and Kubernetes reports every node
+          Ready (C(ready) is C(True)). A node which is not registered or
+          whose readiness could not be read is not Ready. Pressure
+          conditions, OOM-killed containers and unmatched nodes are
+          reported and do not affect it. Before this release it did not
+          consider Kubernetes at all, so a cluster whose nodes were all
+          NotReady was healthy. See "What healthy requires" in
+          docs/library-api.md.
       type: bool
 log:
   description:

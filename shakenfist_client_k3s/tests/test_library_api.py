@@ -309,6 +309,9 @@ class CreatePhaseCountTestCase(LibraryTestCase):
     The totals below are one lower than they were before step 3e, because
     write_kubeconfig defaults to False: the default library create does not
     update the local kubeconfig, so it does not count that phase either.
+    They are one higher than they were before step 2b of the cumulative
+    health signals phase 2 plan, because every create now waits for its
+    nodes to become Ready, which is a phase whatever the cluster's shape.
     The command line, which passes True, is covered by
     K3sCreateSmokeTestCase in tests/test_progress.py.
     """
@@ -328,37 +331,37 @@ class CreatePhaseCountTestCase(LibraryTestCase):
         self.assertEqual(list(range(1, expected_total + 1)), indexes)
 
     def test_default_shape_allocates_a_network(self):
-        # Seven phases, plus one for creating the node network.
-        self._assert_phases(8, 1, 1, 1)
+        # Eight phases, plus one for creating the node network.
+        self._assert_phases(9, 1, 1, 1)
 
     def test_supplied_network_removes_a_phase(self):
-        self._assert_phases(7, 1, 1, 1, network='net-1')
+        self._assert_phases(8, 1, 1, 1, network='net-1')
 
     def test_extra_control_plane_nodes_add_a_phase(self):
-        self._assert_phases(9, 2, 1, 1)
+        self._assert_phases(10, 2, 1, 1)
 
     def test_both_adjustments_together(self):
-        self._assert_phases(8, 2, 1, 1, network='net-1')
+        self._assert_phases(9, 2, 1, 1, network='net-1')
 
     def test_no_metallb_removes_a_phase(self):
-        self._assert_phases(7, 1, 1, 1, install_metallb=False)
+        self._assert_phases(8, 1, 1, 1, install_metallb=False)
 
     def test_no_longhorn_removes_a_phase(self):
-        self._assert_phases(7, 1, 1, 1, install_longhorn=False)
+        self._assert_phases(8, 1, 1, 1, install_longhorn=False)
 
     def test_no_metallb_and_no_longhorn_removes_two_phases(self):
         self._assert_phases(
-            6, 1, 1, 1, install_metallb=False, install_longhorn=False)
+            7, 1, 1, 1, install_metallb=False, install_longhorn=False)
 
     def test_write_kubeconfig_adds_a_phase(self):
         # The command line's shape: every phase there is.
-        self._assert_phases(9, 1, 1, 1, write_kubeconfig=True)
+        self._assert_phases(10, 1, 1, 1, write_kubeconfig=True)
 
     def test_write_kubeconfig_composes_with_the_other_adjustments(self):
-        # The arithmetic is four independent adjustments to a base of eight,
+        # The arithmetic is four independent adjustments to a base of nine,
         # so the one added here has to survive the others moving.
         self._assert_phases(
-            8, 2, 1, 1, network='net-1', install_longhorn=False,
+            9, 2, 1, 1, network='net-1', install_longhorn=False,
             write_kubeconfig=True)
 
     def test_manifests_do_not_add_a_phase(self):
@@ -369,7 +372,7 @@ class CreatePhaseCountTestCase(LibraryTestCase):
         path = os.path.join(self.home, 'payload.yaml')
         with open(path, 'w') as f:
             f.write('kind: One\n')
-        self._assert_phases(8, 1, 1, 1, manifests=[path])
+        self._assert_phases(9, 1, 1, 1, manifests=[path])
 
 
 class OptionalMetallbLonghornTestCase(LibraryTestCase):

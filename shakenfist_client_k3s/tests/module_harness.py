@@ -264,13 +264,27 @@ def build_fake_client(spec):
         }
         client.get_namespace_metadata.side_effect = \
             raisers[spec['metadata_raises']]()
-    client.get_instance.return_value = {
-        'name': 'k3s-%s-node-001' % CLUSTER_NAME,
-        'state': spec['instance_state'],
-        'agent_state': 'ready',
-    }
+    # Each instance is named after its uuid, so that every node has a name
+    # of its own: health() matches nodes to Kubernetes nodes by name, and
+    # two instances sharing one are two nodes it cannot tell apart. Every
+    # name served is remembered, so that the Kubernetes probe below can
+    # report each of them registered and Ready.
+    names = []
+
+    def get_instance(instance_uuid):
+        name = 'k3s-%s-%s' % (CLUSTER_NAME, instance_uuid)
+        names.append(name)
+        return {
+            'name': name,
+            'state': spec['instance_state'],
+            'agent_state': 'ready',
+        }
+
+    client.get_instance.side_effect = get_instance
+
     # One completed agent operation, which is what health()'s kubectl probe
-    # of the first control plane node waits for.
+    # of the first control plane node waits for, and what every other
+    # command is answered with.
     operation = {
         'uuid': 'agent-op-uuid',
         'state': 'complete',
@@ -278,7 +292,26 @@ def build_fake_client(spec):
                           'stdout': 'NAME  STATUS\ncp-1  Ready\n',
                           'stderr': ''}},
     }
-    client.instance_execute.return_value = operation
+
+    # Except the Kubernetes probe, which says every node health() has read
+    # is registered and Ready, so that an existing healthy cluster reports
+    # healthy. Built when the probe is submitted, which is after health()
+    # has read every node. Matched against the module's constant rather
+    # than a literal, as tests/fakes.py's HealthClient is.
+    def instance_execute(instance_uuid, commandline):
+        if commandline != cluster_module.K3S_KUBERNETES_PROBE_COMMAND:
+            return operation
+        stdout = ''.join(
+            'node\t%s\tTrue\tFalse\tFalse\tFalse\t2026-10-05T08:12:25Z\n'
+            % name for name in names)
+        return {
+            'uuid': 'agent-op-uuid-kubernetes',
+            'state': 'complete',
+            'results': {'0': {'return-code': 0, 'stdout': stdout,
+                              'stderr': ''}},
+        }
+
+    client.instance_execute.side_effect = instance_execute
     client.get_agent_operation.return_value = operation
 
     # health() reads every node through get_instance(), so failing that is
