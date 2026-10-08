@@ -780,6 +780,54 @@ MUTATIONS = [
         '.test_the_floor_covers_every_referenced_symbol',
         'stestr',
     ),
+    # The merge tier's health signal provocations, in
+    # tools/ci_health_signals.py. Each check is what turns a provocation
+    # into an assertion, and one which quietly stops comparing still
+    # prints its readings and passes, so a live run would read the same.
+    # 'stestr' is enough: the tests load the tool from the tree, not from
+    # an installed package.
+    (
+        "a pod's limit kill has to raise the worker's oom_kills",
+        'tools/ci_health_signals.py',
+        'oom_after < oom_before + 1',
+        'oom_after < oom_before',
+        PKG + '.tests.test_ci_health_signals.CheckOomKillTestCase',
+        'stestr',
+    ),
+    (
+        'a provoked counter is only compared under an unchanged boot_id',
+        'tools/ci_health_signals.py',
+        "    if after['signals']['boot_id'] != before['signals']['boot_id']:",
+        '    if False:',
+        PKG + '.tests.test_ci_health_signals.CheckAutomaticRestartTestCase',
+        'stestr',
+    ),
+    (
+        'a NotReady worker has to make the cluster unhealthy',
+        'tools/ci_health_signals.py',
+        "    if report['healthy'] is not False:",
+        '    if False:',
+        PKG + '.tests.test_ci_health_signals.CheckNotReadyTestCase',
+        'stestr',
+    ),
+    (
+        "a NotReady worker has to leave the worker's own entry healthy",
+        'tools/ci_health_signals.py',
+        "    if worker['healthy'] is not True:",
+        '    if False:',
+        PKG + '.tests.test_ci_health_signals.CheckNotReadyTestCase',
+        'stestr',
+    ),
+    (
+        'disk pressure has to leave the cluster healthy',
+        'tools/ci_health_signals.py',
+        "    if report['healthy'] is not True:\n"
+        "        problems.append('healthy is %r under disk pressure",
+        "    if False:\n"
+        "        problems.append('healthy is %r under disk pressure",
+        PKG + '.tests.test_ci_health_signals.CheckDiskPressureTestCase',
+        'stestr',
+    ),
 ]
 
 
@@ -804,7 +852,16 @@ def run(test_id, runner, verbose):
         # --no-subunit-trace keeps the output readable when -v is on; the
         # return code is what this reads either way.
         argv = [stestr, 'run', '--no-subunit-trace', test_id]
-    proc = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True)
+    # No bytecode is written for a mutated file. Python trusts a cached
+    # .pyc whose recorded source mtime, in whole seconds, and size both
+    # match, so two mutations of one file which happen to be the same
+    # length, applied within the same second, run the first one's code
+    # under the second's name. That happened, and the survivor it reported
+    # was a property the suite does enforce. tox.ini sets the same for
+    # the 'tox' runner; the restore puts the original's mtime back, so its
+    # own cached bytecode stays valid.
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+    proc = subprocess.run(argv, cwd=ROOT, env=env, capture_output=True, text=True)
     if verbose:
         sys.stdout.write(proc.stdout[-4000:])
         sys.stdout.write(proc.stderr[-2000:])
