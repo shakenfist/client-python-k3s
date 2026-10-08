@@ -393,19 +393,19 @@ The live behaviour itself can only be checked by step 3b's run.
 
 ## Definition of done
 
-- [ ] `tox -epy3`, `tox -eflake8` and `pre-commit run --all-files`
+- [x] `tox -epy3`, `tox -eflake8` and `pre-commit run --all-files`
       pass. `python3 tools/mutation-check.py` reports every mutation
       caught, with more than the 85 on `develop` at `00109a6`.
-- [ ] Nothing under `shakenfist_client_k3s/` except `tests/` changed,
+- [x] Nothing under `shakenfist_client_k3s/` except `tests/` changed,
       unless *Deviations* records why:
       `git diff develop --stat -- shakenfist_client_k3s ':!shakenfist_client_k3s/tests'`
       is empty.
-- [ ] `tools/ci_deploy_test.sh` calls the tool exactly once, and the
+- [x] `tools/ci_deploy_test.sh` calls the tool exactly once, and the
       call is the last step before `Delete the minimal cluster`:
       `grep -n "ci_health_signals\|Delete the minimal cluster"
       tools/ci_deploy_test.sh` shows the two on consecutive `status`
       steps.
-- [ ] *Live results* records a merge tier run against this branch in
+- [x] *Live results* records a merge tier run against this branch in
       which every step from 4a to 4f passed. It quotes the printed
       readings, including the observed `k3s_restarts` after the hand
       start.
@@ -428,3 +428,73 @@ after a 25 minute run:
 - Decision 6, keeping the assertions in CI on every merge.
 
 Confirm both before step 3a starts.
+
+## Live results
+
+Merge tier run
+[37758352711](https://github.com/shakenfist/client-python-k3s/actions/runs/37758352711)
+against `7c95ed8` passed every step from 4a to 4f on its first
+dispatch. The provocation step took five minutes (11:29:10 to
+11:34:10 UTC), and the `Cluster deployment` job took 25 minutes in
+all. The readings the tool printed:
+
+| Step | Reading | Poll |
+|---|---|---|
+| 4a | `healthy=True`. Control plane: `k3s=active`, `k3s_restarts=0`, `oom_kills=0`, 817516544 of 2062454784 bytes available, `etcd_bytes=144831789`, `etcd_snapshot_bytes=4096`. Worker: `k3s-agent=active`, `k3s_restarts=0`, `oom_kills=0`, 1646391296 of 2062454784 bytes available. Both `ready='True'`, `disk_pressure='False'`. | none |
+| 4b | `ci-oom-7f8da425` `OOMKilled`, listed in `oom_killed` with `restarts=0` and an integer `finished_at`. Worker `oom_kills` 0 -> 2, `boot_id` unchanged, `healthy=True`. | 10 s to OOMKilled, 14 s more to listed |
+| 4c | Worker `k3s-agent` `active` again, `k3s_restarts` 0 -> 1, `boot_id` unchanged. | 35 s |
+| 4d stop | Worker `ready='Unknown'`. `healthy=False`, worker node `healthy=True`, `k3s_state='inactive'`. `health` exited 0, `health --strict` exited 1. | 55 s |
+| 4d start | `k3s_restarts` after the start by hand: **0**. Worker `ready='True'`, `healthy=True`, both `health` and `health --strict` exited 0. | 13 s |
+| 4e | Control plane `etcd_snapshot_bytes` 4096 -> 8683552. | none |
+| 4f | Worker `disk_pressure='True'`, `ready='True'`, `healthy=True`, `memory_pressure='False'`, `pid_pressure='False'`. | 15 s |
+
+What this settles:
+
+- **`NRestarts` resets on a start by hand.** systemd counted the
+  `Restart=always` restart in 4c, and the stop and start in 4d took
+  the count back to 0. The assertion stays as decision 4d wrote it,
+  and `docs/library-api.md` can state the reset as observed.
+- **`/proc/vmstat`'s `oom_kill` counts a cgroup kill.** It rose
+  while `boot_id` held, with no global OOM. It rose by **2** for one
+  container killed once, though (`restarts=0`, `restartPolicy:
+  Never`). So the counter counts kills the kernel makes, which a
+  single container death can exceed. A likely cause, not confirmed
+  here: the kubelet sets `memory.oom.group` on cgroup v2, and the
+  kernel then kills the victim again as a member of its group,
+  counting it twice. The assertion is "at least baseline plus 1", so
+  it holds whatever the cause. The docs should say the counter rises
+  rather than that it rises by one per container.
+- Every bound had room. The slowest poll was 4d's NotReady wait at
+  55 s against 180 s, which matches the 40 to 50 s grace period plus
+  a poll.
+
+## Deviations
+
+From the step 3a brief, all made in `7c95ed8`:
+
+- **`--kill-who`, not `--kill-whom`.** systemd only accepts
+  `--kill-whom` from 254, and Debian 12 ships 252. The run confirmed
+  that 252 accepts `--kill-who=main` and that systemd counts the
+  restart that follows. It did not check that the containers
+  survived.
+- **The NotReady wait accepts only `'False'` or `'Unknown'`.** "Not
+  `'True'`" would also have accepted None, which means the condition
+  was not read.
+- **4c compares with a report taken just before the kill,** not the
+  4a baseline, so that 4b cannot move the restart count it judges.
+- **The disk fill is a `df`/`fallocate` `sh -c` one-liner** that
+  computes the bytes to allocate for 3% free, and skips the
+  `fallocate` when the disk is already that full.
+- **The baseline checks a little more than 4a lists:** that memory
+  totals are positive, and the `k3s_unit` for each role.
+- **Five mutation entries, not four,** making 90. The fifth pins the
+  node-level `healthy` staying True for a NotReady worker.
+- **`tools/mutation-check.py` now runs stestr with
+  `PYTHONDONTWRITEBYTECODE=1`.** Two mutations of one file that kept
+  its size and were applied within the same second reused a cached
+  `.pyc`. The second mutation then ran the first's code, and a
+  property the tests do catch read as a survivor. This is outside
+  the brief, but without it the mutation count could not be trusted.
+
+None of 4a to 4f needed changing after the live run, and the run found
+nothing wrong in `health()`.
