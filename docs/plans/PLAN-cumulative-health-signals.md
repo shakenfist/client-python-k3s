@@ -184,7 +184,7 @@ audit row is mandatory.
 | 1. Agent-read signals | [PLAN-cumulative-health-signals-phase-01-agent-signals.md](PLAN-cumulative-health-signals-phase-01-agent-signals.md) -- `NRestarts` from `k3s` or `k3s-agent` by role, the `/proc/vmstat` OOM kill count, `MemTotal` and `MemAvailable`, the boot id and boot time, and the etcd data and snapshot directory sizes on control plane nodes, read by one agent operation per healthy node under the existing probe budget and reported raw under each node's `signals`. `healthy` is unchanged. Answers open questions 1, 2 and 3. (This row used to read the OOM count from `journalctl -k`.) | Complete | 78c9df1 |
 | 2. Kubernetes-read signals | [PLAN-cumulative-health-signals-phase-02-kubernetes-signals.md](PLAN-cumulative-health-signals-phase-02-kubernetes-signals.md) -- a second `kubectl` probe on the first control plane node, read through the agent, reporting each node's `Ready` and pressure conditions and the containers whose latest termination was `OOMKilled`, per node under `kubernetes`. The top level `healthy` gains "every node Ready" ([#76](https://github.com/shakenfist/client-python-k3s/issues/76)), and `create()` and `expand_workers()` wait for their nodes to be Ready so that it does not race. (This row used to say "API-read", and that the readings would bypass the agent; they cannot.) | Complete | 00109a6 |
 | 3. Live validation | [PLAN-cumulative-health-signals-phase-03-live-validation.md](PLAN-cumulative-health-signals-phase-03-live-validation.md) -- on the merge tier's minimal cluster, just before its delete, provoke a pod limit OOM kill, an automatic k3s-agent restart, a stopped kubelet (NotReady, and `health --strict` exiting 1), a hand restart, an etcd snapshot and disk pressure, and assert `Cluster.health()` reports each, from a tool that calls the library through `make_client()`. Confirms or corrects phase 1's two source-read claims: that a hand restart resets `NRestarts`, and that a pod limit kill counts in `oom_kill`. (This row used to call 33fl's `tools/k3s-health-check.py` tier 3 a ready-made way to provoke control plane OOM; its own docstring says the same batch sometimes OOMs and sometimes does not, so phase 3 declines it.) | Complete | bd9bead |
-| 4. Push audit | [PLAN-cumulative-health-signals-phase-04-push-audit.md](PLAN-cumulative-health-signals-phase-04-push-audit.md) -- run `PUSH-AUDIT.md` over the union of the three phase merges, `78c9df1`, `00109a6` and `bd9bead`, each diffed against its first parent, and judged at `bd9bead`. (This row used to say "the accumulated diff of phases 1-3 against `develop`", which is empty once they have merged.) | In progress | |
+| 4. Push audit | [PLAN-cumulative-health-signals-phase-04-push-audit.md](PLAN-cumulative-health-signals-phase-04-push-audit.md) -- run `PUSH-AUDIT.md` over the union of the three phase merges, `78c9df1`, `00109a6` and `bd9bead`, each diffed against its first parent, and judged at `bd9bead`. (This row used to say "the accumulated diff of phases 1-3 against `develop`", which is empty once they have merged.) | Complete | |
 
 <!-- shared-block: plan-push-audit-phase v3 -->
 Push audit phase (shared block; do not edit -- the canonical
@@ -529,6 +529,29 @@ because the following statements will be true:
 * `ARCHITECTURE.md`, `README.md`, and `AGENTS.md` have been
   updated if the change adds or modifies modules or CLI commands.
 
+Checked at the close of the push audit (phase 4), each against the
+tree rather than ticked:
+
+* `tox -epy3` (1005 tests), `tox -eflake8` and `pre-commit run
+  --all-files` pass, and the plugin imports cleanly.
+* Python >= 3.7 holds by reading only: the audit found no syntax or
+  standard library API newer than 3.7, in the package or in
+  `tools/ci_health_signals.py`, but nothing runs the suite on 3.7
+  (#82).
+* Unit tests cover the new parsing, error handling and rendering, with
+  the Shaken Fist API and the agent faked at the boundary, and
+  `tools/mutation-check.py` carries 101 mutations, all caught.
+* Style: flake8 at 120 columns is clean, and there are no triple single
+  quotes.
+* Live validation: phase 1's and phase 2's live checks, phase 3's
+  provocations on every merge, and the push audit's own
+  [dispatch](https://github.com/shakenfist/client-python-k3s/actions/runs/37885956506).
+* The documentation criterion is read narrowly. The plan added no
+  module and no command; it added fields to `health()`'s report and a
+  Ready wait to `create()` and `expand_workers()`. `README.md` and
+  `AGENTS.md` did not change, and `ARCHITECTURE.md`'s create flow and
+  health description each gained a clause.
+
 !!! note "In this project"
 
     The close-out sections below apply as written, with one
@@ -571,6 +594,37 @@ chosen to defer to here, so that we do not forget them.
   decision 7).
 * Merge the `api` and Kubernetes probes into one `kubectl` command once
   a release can change `api['stdout']` (phase 2 decision 2).
+* The provocations phase 3 declined (its decision 5): a global OOM on
+  the control plane, which 33fl's tier 3 shows is not deterministic;
+  memory and PID pressure, which sit next to the global OOM cliff, and
+  PID pressure probably needs a `pid.available` eviction threshold that
+  k3s's kubelet does not set; a reboot; and a probe failure. The push
+  audit found that the unregistered node refusal no longer holds inside
+  the stopped-kubelet window, and filed it with a hand-made Node for
+  `unmatched_nodes`:
+  [#126](https://github.com/shakenfist/client-python-k3s/issues/126).
+* Why one container's limit kill raised `oom_kills` by 2 in phase 3's
+  live run. The likely cause is the kubelet setting `memory.oom.group`,
+  so that the kernel kills the victim again as a member of its group,
+  but nothing has confirmed it. The docs only say the counter rises.
+* Phase 3's `systemctl kill --kill-who=main` run did not check that the
+  worker's containers survived the k3s-agent kill, which
+  `KillMode=process` should guarantee.
+* Reading a probe's output when Shaken Fist stored it as a blob, so
+  that a cluster of more than about 140 nodes, or one with many
+  OOM-killed containers, can be read rather than reported as not
+  answered: [#128](https://github.com/shakenfist/client-python-k3s/issues/128).
+* Splitting `cluster.py`, at 5,196 lines. The push audit named the
+  probe commands and their parsers as a clean seam, and declined to
+  split it inside an audit (phase 4 decision 8):
+  [#125](https://github.com/shakenfist/client-python-k3s/issues/125).
+* The collection module's health result is only tested healthy, and
+  its test harness would answer every probe with the API probe's
+  output: [#127](https://github.com/shakenfist/client-python-k3s/issues/127).
+* `_render_health()` prints the API probe's `kubectl get nodes` output
+  to the terminal raw, so a compromised first control plane node can
+  send escape sequences. Pre-existing, found by the push audit:
+  [#129](https://github.com/shakenfist/client-python-k3s/issues/129).
 
 ### Bugs fixed during this work
 
@@ -580,7 +634,42 @@ where one exists, for directly related issues that we should
 either resolve as part of this master plan or at least be aware of
 while planning it.
 
-...
+* `health()` reported a cluster whose kubelets were all `NotReady` as
+  healthy, because it never asked Kubernetes:
+  [#76](https://github.com/shakenfist/client-python-k3s/issues/76).
+  Fixed in phase 2, which added the Ready term to `healthy` and made
+  `create()` and `expand_workers()` wait for their nodes to be Ready.
+* Review on phases 1 and 2 found and fixed several defects in the new
+  code before it merged, among them probes judged on their
+  submission-time state after the deadline, collection costing a second
+  per node, and an uncapped reading breaking `json.dumps()` of the
+  report. Each phase plan's "Deviations and bugs fixed during this
+  work" section lists them.
+* Cross-repository: 33fl's tier 1 health check bug, found while
+  surveying phase 2, is
+  [Mach33Labs/33fl#938](https://github.com/Mach33Labs/33fl/issues/938).
+  It is filed there, not fixed here.
+
+The push audit (phase 4) fixed these in the plan's own code; the full
+triage is `docs/plans/audit-cumulative-health-signals/triage.md`:
+
+* Shaken Fist returns an agent command's stdout inline only up to
+  10 KiB, and stores longer output as a blob. `health()` read the
+  missing output as an empty answer, so on a cluster of about 140 nodes,
+  or one where a tenant had made enough OOM-killed containers, the
+  Kubernetes probe reported every node unregistered and nothing killed,
+  with no error. Such a probe now has not answered, and says why. Phase
+  2's survey had found no server-side limit; the limit is a reroute,
+  not a cap.
+* The Kubernetes probe printed two fields the API server does not
+  validate, a node condition's status and a container status's name, so
+  root on one node could forge another node's readiness, OOM kills and
+  `unmatched_nodes`. A status is now printed only when it is `True`,
+  `False` or `Unknown`, and a container's name comes from the pod's
+  spec.
+* Nothing in the merge tier checked that `expand-workers` waits for its
+  new workers to be Ready, because the script's own node count wait ran
+  straight after it. A `health --strict` now runs first.
 
 ### Back brief
 

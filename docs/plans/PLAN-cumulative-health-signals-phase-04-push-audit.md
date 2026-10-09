@@ -219,6 +219,79 @@ management session saves their findings files and commits them
 together, as `Record what the four audit lenses found.`, before 4f
 starts.
 
+## What running the phase found
+
+Four lenses produced 37 findings: code quality and style 17, tests 12,
+documentation 6, security 2. Six were rated `fix`: four plan-reference
+findings (CQ-1 to CQ-4), the missing live check that `expand-workers`
+waits for Ready (TC-1), and SEC-1. Triage
+(`audit-cumulative-health-signals/triage.md`) has 41 rows after
+merging three pairs and adding the unnumbered security finding, the
+rediscovered issues and one item for 4g. Of those rows, **24 were
+taken** in 22 commits, **5 declined**, **6 informational**, **5
+rediscovered issues** and **1 routed to 4g**. Five issues were filed:
+#125 (decision 8's seam), #126 (two declined live provocations), #127
+(the collection module's health tests), #128 (reading a probe's blob)
+and #129 (raw API probe output on the terminal). #105 and #89 got
+comments. The suite went from 988 tests to 1005, and
+`tools/mutation-check.py` from 90 mutations to 101, all caught.
+
+Because 4f changed the probe templates, `tools/ci_deploy_test.sh` and
+`tools/ci_health_signals.py`, the merge tier was dispatched on the
+branch at `6f0703c`. The
+[run](https://github.com/shakenfist/client-python-k3s/actions/runs/37885956506)
+passed first time, and its `Cluster deployment` job took 27 minutes.
+The new `health --strict` after `expand-workers` passed with all four
+nodes Ready. Every provocation passed, including the new baseline
+checks and `ready_since` moving across the stop and start (1791523125
+-> 1791523392). `oom_kills` again rose by 2 for one container killed
+once, so phase 3's reading was not a one-off.
+
+The most valuable finding was SEC-1, and phase 2's survey had looked
+for it and missed it. Shaken Fist returns an agent command's stdout
+inline only up to 10 KiB, and stores anything longer as a blob, so on
+a large cluster `health()` read the Kubernetes probe as "nothing
+registered, nothing killed". The "None, never an empty list, when
+unread" rule was applied to every parser and still failed one layer
+down, in what "unread" meant.
+
+### Survey finding 4 was wrong, and step 4a caught it
+
+The plan's survey claimed that `mutation-check.py`'s tox runner leaves
+the tox venv holding a mutation, and decision 9 planned to fix it. Step
+4a's verification run, and a single-entry run by the management
+session, both left the venv matching the tree. Decision 9 was withdrawn
+before 4f started. Phase 2's failure was most likely a stale install,
+which is #106. A survey claim about tooling behaviour should be
+reproduced before a decision is built on it.
+
+### SEC-2 was tested against real API servers
+
+No Go template engine runs in the unit tests, so 4f checked the
+template change against k3s v1.21.1 and v1.33.5 API servers in local
+containers, with forged node and pod statuses. The old templates let a
+forged status report a down node as Ready, invent a node, and add OOM
+kills; the new ones did none of that, and still listed real kills. The
+merge tier run then confirmed that a real cluster reads as before.
+
+### Phase 2's "one prose place" box was not literally true
+
+Phase 2's Definition of done said `oom_killed` and `ready` are defined
+in exactly one prose place. The `health()` docstring restated much of
+`docs/library-api.md` (DOC-5, CQ-5). 4f cut the docstring from 249
+lines to about 190 and pointed it at the docs, but "latest
+termination, not a count" is still said in the docstring,
+`docs/library-api.md` and `docs/usage.md`. That is recorded here
+rather than by editing phase 2's ticked box.
+
+### Lenses returning text worked
+
+The briefs told every lens to return findings as text, which the node
+customisation audit recommended. All four did, and the management
+session saved each file after spot-checking two to four findings
+against the tree and, for SEC-1, against Shaken Fist's source. No lens
+changed a file.
+
 ## Risks and mitigations
 
 1. **A lens audits #121's code as this plan's.** Phase 1's code at
