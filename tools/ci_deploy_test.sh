@@ -775,8 +775,7 @@ status 'Provoke each health signal on the minimal cluster'
 # stopped k3s-agent, an etcd snapshot, and a worker disk left full -- and
 # asserts that health() reports each. So it runs last, immediately before
 # the delete which cleans up after it, and on this cluster rather than the
-# main one, whose Longhorn and MetalLB a stopped kubelet would upset. See
-# docs/plans/PLAN-cumulative-health-signals-phase-03-live-validation.md.
+# main one, whose Longhorn and MetalLB a stopped kubelet would upset.
 # python3 is the venv activated above, which has the plugin installed, and
 # the tool's kubectl reaches this cluster through the KUBECONFIG exported
 # above.
