@@ -325,9 +325,10 @@ class FakeClusterClient:
 # What node_signals_command() prints on a healthy node of each role, for
 # HealthClient to answer the signals probe with and for the parser's tests
 # to read. Written by hand from what each source prints rather than captured
-# from a node, which is why the plan's live run exists. The worker's k3s
-# agent is mid-restart, because 'activating' is a state a real one is seen
-# in and the report has to carry it as it is.
+# from a node; tools/ci_health_signals.py checks the readings on real nodes
+# in the merge tier. The worker's k3s agent is mid-restart, because
+# 'activating' is a state a real one is seen in and the report has to carry
+# it as it is.
 SERVER_SIGNALS_OUTPUT = (
     'boot_id=3f0c3c4e-5b8e-4f43-9d1c-0d6a8f2b7e11\n'
     'booted_at=1759712345\n'
