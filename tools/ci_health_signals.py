@@ -227,6 +227,9 @@ def _baseline_node_problems(node):
     for key in ('oom_kills', 'k3s_restarts'):
         if not _is_count(signals[key]):
             problems.append('%s is %r, not an integer of 0 or more' % (_label(node, 'signals', key), signals[key]))
+    booted_at = signals['booted_at']
+    if not _is_count(booted_at) or booted_at <= 0:
+        problems.append('%s is %r, not more than 0' % (_label(node, 'signals', 'booted_at'), booted_at))
 
     total = signals['memory_total_bytes']
     available = signals['memory_available_bytes']
@@ -239,15 +242,24 @@ def _baseline_node_problems(node):
         problems.append('%s is %r, more than memory_total_bytes %r'
                         % (_label(node, 'signals', 'memory_available_bytes'), available, total))
 
+    # A control plane's snapshot directory may not exist yet, which reads
+    # None, so only the worker's is checked: it has no etcd at all.
     etcd_bytes = signals['etcd_bytes']
     if role == 'control_plane':
         if not _is_count(etcd_bytes) or etcd_bytes <= 0:
             problems.append('%s is %r, not more than 0' % (_label(node, 'signals', 'etcd_bytes'), etcd_bytes))
-    elif etcd_bytes is not None:
-        problems.append('%s is %r on a worker, not None' % (_label(node, 'signals', 'etcd_bytes'), etcd_bytes))
+    else:
+        for key in ('etcd_bytes', 'etcd_snapshot_bytes'):
+            if signals[key] is not None:
+                problems.append('%s is %r on a worker, not None' % (_label(node, 'signals', key), signals[key]))
 
     if kubernetes['ready'] != 'True':
         problems.append("%s is %r, not 'True'" % (_label(node, 'kubernetes', 'ready'), kubernetes['ready']))
+    ready_since = kubernetes['ready_since']
+    if not _is_count(ready_since) or ready_since <= 0:
+        problems.append('%s is %r, not more than 0' % (_label(node, 'kubernetes', 'ready_since'), ready_since))
+    if not isinstance(kubernetes['oom_killed'], list):
+        problems.append('%s is %r, not a list' % (_label(node, 'kubernetes', 'oom_killed'), kubernetes['oom_killed']))
     if kubernetes['disk_pressure'] != 'False':
         problems.append("%s is %r, not 'False'"
                         % (_label(node, 'kubernetes', 'disk_pressure'), kubernetes['disk_pressure']))
@@ -259,6 +271,12 @@ def check_baseline(report):
     problems = []
     if report['healthy'] is not True:
         problems.append('healthy is %r on a fresh cluster, not True' % (report['healthy'],))
+    # The CI clusters' names are mixed case and kubelet registers each node
+    # lowercased, so an empty list here is also the check that every node
+    # was matched by its lowercased name.
+    unmatched = report['kubernetes']['unmatched_nodes']
+    if unmatched != []:
+        problems.append('kubernetes.unmatched_nodes is %r on a fresh cluster, not []' % (unmatched,))
     for role in ('control_plane', 'worker'):
         problems.extend(_baseline_node_problems(find_node(report, role)))
     return _joined(problems)
@@ -456,6 +474,22 @@ def check_ready_again(report):
     if report['healthy'] is not True:
         problems.append('healthy is %r with the worker Ready again, not True' % (report['healthy'],))
     return _joined(problems)
+
+
+def check_ready_since_moved(before_report, report):
+    """Return None if the worker's ready_since is later than in before_report.
+
+    Kubernetes moves a condition's lastTransitionTime whenever its status
+    changes, so a worker which went NotReady and came back must report a
+    later one than it did before k3s-agent was stopped.
+    """
+    before = find_node(before_report, 'worker')['kubernetes']['ready_since']
+    worker = find_node(report, 'worker')
+    now = worker['kubernetes']['ready_since']
+    if not _is_count(before) or not _is_count(now) or now <= before:
+        return ('%s is %r, not later than the %r before k3s-agent was stopped'
+                % (_label(worker, 'kubernetes', 'ready_since'), now, before))
+    return None
 
 
 def check_restarts_reset(report):
@@ -730,7 +764,7 @@ def step_automatic_restart(cluster, read, worker_uuid):
            worker['signals']['k3s_restarts'], worker['signals']['boot_id']))
 
 
-def step_not_ready(cluster, read, name, worker_uuid):
+def step_not_ready(cluster, read, name, worker_uuid, baseline):
     """Stop the worker's k3s, check NotReady and --strict, then start it by hand and check again."""
     cluster.execute_and_await([worker_uuid], [STOP_COMMAND])
     report, elapsed = poll(read, check_kubelet_silent, NOT_READY_BOUND_SECONDS,
@@ -756,9 +790,12 @@ def step_not_ready(cluster, read, name, worker_uuid):
         % (worker['signals']['k3s_restarts'],))
 
     plain_rc, strict_rc = _health_exit_codes(name, 0)
-    say('k3s-agent started: worker ready=%r after %ds; healthy=%r; health exited %d, health --strict exited %d'
-        % (worker['kubernetes']['ready'], elapsed, report['healthy'], plain_rc, strict_rc))
+    say('k3s-agent started: worker ready=%r after %ds, ready_since %r -> %r; healthy=%r; '
+        'health exited %d, health --strict exited %d'
+        % (worker['kubernetes']['ready'], elapsed, find_node(baseline, 'worker')['kubernetes']['ready_since'],
+           worker['kubernetes']['ready_since'], report['healthy'], plain_rc, strict_rc))
     fail_if(check_restarts_reset(report))
+    fail_if(check_ready_since_moved(baseline, report))
 
 
 def step_snapshot(cluster, read):
@@ -807,7 +844,7 @@ def main(argv=None):
         worker_uuid = find_node(baseline, 'worker')['uuid']
         step_oom_kill(read, baseline)
         step_automatic_restart(cluster, read, worker_uuid)
-        step_not_ready(cluster, read, args.cluster, worker_uuid)
+        step_not_ready(cluster, read, args.cluster, worker_uuid, baseline)
         step_snapshot(cluster, read)
         step_disk_pressure(cluster, read, worker_uuid)
     except Failure as e:

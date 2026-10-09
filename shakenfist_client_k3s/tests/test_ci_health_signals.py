@@ -283,6 +283,41 @@ class CheckBaselineTestCase(_ToolTestCase):
             node_of(report, 'control_plane')['kubernetes']['disk_pressure'] = value
             self.assertFails(self.tool.check_baseline(report), 'control plane kubernetes.disk_pressure')
 
+    def test_no_boot_time(self):
+        for value in (0, None, '1791270000'):
+            report = healthy_report()
+            node_of(report, 'worker')['signals']['booted_at'] = value
+            self.assertFails(self.tool.check_baseline(report), 'worker signals.booted_at')
+
+    def test_a_snapshot_size_on_the_worker(self):
+        report = healthy_report()
+        node_of(report, 'worker')['signals']['etcd_snapshot_bytes'] = 4096
+        self.assertFails(self.tool.check_baseline(report), 'worker signals.etcd_snapshot_bytes', 'not None')
+
+    def test_no_snapshot_directory_on_the_control_plane_passes(self):
+        """k3s makes the directory with the first snapshot, so a fresh cluster may not have one."""
+        report = healthy_report()
+        node_of(report, 'control_plane')['signals']['etcd_snapshot_bytes'] = None
+        self.assertIsNone(self.tool.check_baseline(report))
+
+    def test_no_ready_time(self):
+        for value in (0, None):
+            report = healthy_report()
+            node_of(report, 'control_plane')['kubernetes']['ready_since'] = value
+            self.assertFails(self.tool.check_baseline(report), 'control plane kubernetes.ready_since')
+
+    def test_oom_killed_unread(self):
+        report = healthy_report()
+        node_of(report, 'worker')['kubernetes']['oom_killed'] = None
+        self.assertFails(self.tool.check_baseline(report), 'worker kubernetes.oom_killed', 'not a list')
+
+    def test_an_unmatched_node(self):
+        """A node registered under a name the lowercasing did not produce reads as unmatched."""
+        for value in (['k3s-ciMinimal-node-002'], None):
+            report = healthy_report()
+            report['kubernetes']['unmatched_nodes'] = value
+            self.assertFails(self.tool.check_baseline(report), 'kubernetes.unmatched_nodes')
+
     def test_every_problem_is_named(self):
         """One message for the whole report, so one CI run says everything that was wrong."""
         report = healthy_report()
@@ -552,6 +587,31 @@ class CheckReadyAgainTestCase(_ToolTestCase):
         report = healthy_report()
         node_of(report, 'worker')['signals']['k3s_state'] = 'activating'
         self.assertFails(self.tool.check_ready_again(report), 'worker signals.k3s_state')
+
+
+class CheckReadySinceMovedTestCase(_ToolTestCase):
+
+    def stopped_and_started(self, ready_since):
+        report = healthy_report()
+        node_of(report, 'worker')['kubernetes']['ready_since'] = ready_since
+        return report
+
+    def test_a_later_time_passes(self):
+        self.assertIsNone(self.tool.check_ready_since_moved(healthy_report(), self.stopped_and_started(1791270400)))
+
+    def test_the_same_time(self):
+        """The worker went NotReady and back, so Ready has transitioned twice since."""
+        self.assertFails(self.tool.check_ready_since_moved(healthy_report(), self.stopped_and_started(1791270100)),
+                         'worker kubernetes.ready_since', 'not later than the 1791270100')
+
+    def test_unreadable(self):
+        self.assertFails(self.tool.check_ready_since_moved(healthy_report(), self.stopped_and_started(None)),
+                         'worker kubernetes.ready_since', 'is None')
+
+    def test_the_control_plane_is_not_the_one_judged(self):
+        report = self.stopped_and_started(1791270400)
+        node_of(report, 'control_plane')['kubernetes']['ready_since'] = 1
+        self.assertIsNone(self.tool.check_ready_since_moved(healthy_report(), report))
 
 
 class CheckRestartsResetTestCase(_ToolTestCase):

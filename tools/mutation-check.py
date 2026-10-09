@@ -855,6 +855,22 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        "a fresh cluster's Kubernetes nodes are all matched",
+        'tools/ci_health_signals.py',
+        '    if unmatched != []:',
+        '    if False:',
+        PKG + '.tests.test_ci_health_signals.CheckBaselineTestCase',
+        'stestr',
+    ),
+    (
+        "a worker's NotReady and back has to move its ready_since",
+        'tools/ci_health_signals.py',
+        '    if not _is_count(before) or not _is_count(now) or now <= before:',
+        '    if not _is_count(before) or not _is_count(now) or now < before:',
+        PKG + '.tests.test_ci_health_signals.CheckReadySinceMovedTestCase',
+        'stestr',
+    ),
+    (
         'a readiness the probe could not read is not a silent kubelet',
         'tools/ci_health_signals.py',
         "NOT_READY_STATUSES = ('False', 'Unknown')",
