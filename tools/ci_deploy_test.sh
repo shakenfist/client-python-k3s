@@ -770,6 +770,18 @@ fi
 assert_refused worker_count \
     sf-client k3s expand-workers "${MINIMAL_CLUSTER}" --worker-count 0
 
+status 'Provoke each health signal on the minimal cluster'
+# Damages the cluster on purpose -- an OOM killed pod, a killed and then a
+# stopped k3s-agent, an etcd snapshot, and a worker disk left full -- and
+# asserts that health() reports each. So it runs last, immediately before
+# the delete which cleans up after it, and on this cluster rather than the
+# main one, whose Longhorn and MetalLB a stopped kubelet would upset. See
+# docs/plans/PLAN-cumulative-health-signals-phase-03-live-validation.md.
+# python3 is the venv activated above, which has the plugin installed, and
+# the tool's kubectl reaches this cluster through the KUBECONFIG exported
+# above.
+python3 tools/ci_health_signals.py "${MINIMAL_CLUSTER}"
+
 status 'Delete the minimal cluster'
 # delete --no-kubeconfig skips the kubeconfig cleanup, which is the half of
 # the flag create cannot exercise. The cleanup acts on ~/.kube/config, and
