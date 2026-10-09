@@ -701,7 +701,7 @@ def step_baseline(read):
     return baseline
 
 
-def step_oom_kill(read, baseline):
+def step_oom_kill(read, name, baseline):
     """Kill a pod at its own memory limit on the worker, and check the report counts and lists it."""
     worker = find_node(baseline, 'worker')
     # node_name_for_instance() takes an instance from the API, and its only
@@ -738,14 +738,17 @@ def step_oom_kill(read, baseline):
         read, lambda r: check_oom_killed_listed(r, pod_name), OOM_LISTED_BOUND_SECONDS,
         "the worker's kubernetes.oom_killed to list %s/%s/%s" % (OOM_NAMESPACE, pod_name, OOM_CONTAINER))
     fail_if(check_oom_kill(baseline, report, pod_name))
+    # The CLI renders the kill too, which no other step gives it.
+    plain_rc, strict_rc = _health_exit_codes(name, 0)
 
     after = find_node(report, 'worker')
     entry = _oom_entry(after, pod_name)
     say('pod limit kill: %s OOMKilled on %s after %ds, listed in oom_killed after %ds more '
-        '(restarts=%r, finished_at=%r); worker oom_kills %r -> %r; boot_id unchanged (%s); healthy=%r'
+        '(restarts=%r, finished_at=%r); worker oom_kills %r -> %r; boot_id unchanged (%s); healthy=%r; '
+        'health exited %d, health --strict exited %d'
         % (pod_name, node_name, pod_elapsed, listed_elapsed, entry['restarts'], entry['finished_at'],
            worker['signals']['oom_kills'], after['signals']['oom_kills'], after['signals']['boot_id'],
-           report['healthy']))
+           report['healthy'], plain_rc, strict_rc))
 
     kubectl('delete', 'pod', pod_name, '-n', OOM_NAMESPACE, '--wait=true', '--timeout=120s')
 
@@ -810,7 +813,7 @@ def step_snapshot(cluster, read):
            find_node(report, 'control_plane')['signals']['etcd_snapshot_bytes']))
 
 
-def step_disk_pressure(cluster, read, worker_uuid):
+def step_disk_pressure(cluster, read, name, worker_uuid):
     """Fill the worker's root filesystem to 3% free, and check DiskPressure is reported and not judged.
 
     Not undone: the kubelet takes minutes to clear the condition, and the
@@ -820,12 +823,16 @@ def step_disk_pressure(cluster, read, worker_uuid):
     report, elapsed = poll(read, check_disk_pressure_reported, DISK_PRESSURE_BOUND_SECONDS,
                            'the worker to report DiskPressure')
     fail_if(check_disk_pressure(report))
+    # The CLI renders a pressure condition which is True, which no other
+    # step gives it.
+    plain_rc, strict_rc = _health_exit_codes(name, 0)
     worker = find_node(report, 'worker')
     kubernetes = worker['kubernetes']
     say('disk pressure: worker disk_pressure=%r after %ds; ready=%r, healthy=%r, memory_pressure=%r, '
-        'pid_pressure=%r, memory_available_bytes=%r'
+        'pid_pressure=%r, memory_available_bytes=%r; health exited %d, health --strict exited %d'
         % (kubernetes['disk_pressure'], elapsed, kubernetes['ready'], report['healthy'],
-           kubernetes['memory_pressure'], kubernetes['pid_pressure'], worker['signals']['memory_available_bytes']))
+           kubernetes['memory_pressure'], kubernetes['pid_pressure'], worker['signals']['memory_available_bytes'],
+           plain_rc, strict_rc))
 
 
 def main(argv=None):
@@ -842,11 +849,11 @@ def main(argv=None):
         # Instance uuids do not change, so the baseline's are the ones to
         # send node commands to for the rest of the run.
         worker_uuid = find_node(baseline, 'worker')['uuid']
-        step_oom_kill(read, baseline)
+        step_oom_kill(read, args.cluster, baseline)
         step_automatic_restart(cluster, read, worker_uuid)
         step_not_ready(cluster, read, args.cluster, worker_uuid, baseline)
         step_snapshot(cluster, read)
-        step_disk_pressure(cluster, read, worker_uuid)
+        step_disk_pressure(cluster, read, args.cluster, worker_uuid)
     except Failure as e:
         # Caught only to print it without a traceback, which would say
         # nothing about the cluster; the run still ends here. Anything
