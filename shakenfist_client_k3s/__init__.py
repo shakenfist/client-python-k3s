@@ -519,16 +519,8 @@ def _render_signals(out, node):
     # 'unknown' rather than a TypeError or a fractional MiB, and a size is
     # shortened before it is turned into text rather than after. An int
     # thousands of digits long is not something health() can return, and
-    # is not defended against beyond that.
-    #
-    # A timestamp is different, because twenty digits is far more than
-    # datetime takes: a btime past the year 9999, or past what the
-    # platform's time_t holds, raises OverflowError, OSError or ValueError
-    # depending on where it overflows. That is a reading which cannot be
-    # shown rather than a reason to lose the whole report, and the parser's
-    # rule is that nothing about a node's output can raise, so the
-    # renderer's has to be too: such a btime is 'unknown', as one which
-    # could not be read is.
+    # is not defended against beyond that. A timestamp is different, and
+    # _utc_iso() says why.
     booted = _utc_iso(signals.get('booted_at'))
 
     readings = [

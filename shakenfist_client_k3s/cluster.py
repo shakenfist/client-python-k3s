@@ -418,6 +418,8 @@ NODE_SIGNAL_KEYS = (
 # It is also capped at twenty digits, which is as long as the largest
 # value any reading can hold: every one of them is a kernel or systemd
 # counter or size of at most 64 bits, and 2**64 - 1 has twenty digits.
+# parse_kubernetes_readings() holds a container's restartCount to the same
+# pattern, through _kubernetes_integer(): it is an int32, well inside it.
 # Uncapped, a garbage reading could be thousands of digits long, and the
 # report would then break whoever serialises it -- Python 3.11 and later
 # refuse to turn an int of more than 4300 digits into a string, and
@@ -986,7 +988,7 @@ KUBERNETES_NODES_TEMPLATE = (
     'node' + _KUBERNETES_TAB +
     # The node's name, from .metadata.name. Kubelet registers the node
     # under the guest's hostname, lowercased, which is how health() matches
-    # it with an instance (see remove_worker()).
+    # it with an instance (see node_name_for_instance()).
     '{{if .metadata}}{{if .metadata.name}}{{.metadata.name}}{{end}}{{end}}' +
     _KUBERNETES_TAB +
     # The four conditions' .status, in a fixed column order.
@@ -2714,10 +2716,11 @@ class Cluster:
     def _unprobed(self, instance_uuid, error):
         """Build health()'s ``api`` report for a probe which was not run.
 
-        Two callers, and the same shape for both, because a caller reading
-        the report must not have to tell "no control plane node to ask"
-        apart from "the node we would have asked is down" by which keys
-        are present. ``probed`` is False and ``error`` says which.
+        Two reasons a probe is not run -- no control plane node to ask, and
+        the node it would have asked is down -- and the same shape for both,
+        because a caller reading the report must not have to tell them
+        apart by which keys are present. ``probed`` is False and ``error``
+        says which.
 
         The Kubernetes probe is skipped under the same rule, on the same
         node, and is built here too, so that it is skipped in the same
