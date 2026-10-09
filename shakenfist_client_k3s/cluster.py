@@ -2639,7 +2639,7 @@ class Cluster:
             # outcome which leaves something behind on the cluster: the
             # command is still queued against the instance, and this is
             # where an operator or a polling caller finds out which one to
-            # look at. See health()'s docstring for what that costs.
+            # look at. docs/library-api.md says what that costs a caller.
             # The number of seconds named is the budget every probe's
             # deadline is measured from, rather than whatever was left of it
             # by the time this probe was collected.
@@ -4236,59 +4236,30 @@ class Cluster:
 
         ``signals`` is what the node says about itself, read through its
         agent by the command node_signals_command() builds; that function
-        and parse_node_signals() say where each reading comes from. Every
-        node entry carries it, always with the same keys. A node which was
-        not probed -- its instance is gone, or it is not in a state which
-        can answer -- says why in ``error``, in the words ``api`` uses for
-        a skipped probe. A reading which could not be taken is None on its
-        own and voids none of the others; ``error`` is for the probe as a
-        whole -- not run, abandoned, failed, exited non-zero, or its output
-        did not come back.
-        ``k3s_state`` and ``k3s_restarts`` are None when the unit is not
-        loaded, because systemd reports a restart count of zero for a unit
-        which does not exist and zero would be a claim. ``boot_id`` is None
-        unless it is a UUID, and is lowercased, and ``k3s_state`` unless it
-        is lowercase letters and hyphens, so that garbage on a node never
-        reads as a reboot or a state. The etcd sizes are always None on a
-        worker, and memory is converted from /proc/meminfo's kB so that
-        every size here is in bytes.
+        and parse_node_signals() say where each reading comes from, and
+        docs/library-api.md ("What signals reports") what each key means
+        and when it is None. Every node entry carries it, always with the
+        same keys, and a node which was not probed says why in ``error``, in
+        the words ``api`` uses for a skipped probe.
 
         The readings are raw and cumulative, and health() stores none of
         them: a verb whose contract is that it has no side effects beyond
         its probes does not grow a metadata write to remember the last
         answer, and "since anyone last asked" means nothing when the
         command line, a daily poll and an Ansible play all ask. A caller
-        which wants a delta keeps its own previous report as a baseline and
-        reads the counters by one rule: a changed ``boot_id``, or a counter
-        lower than its baseline under an unchanged one, voids the baseline,
-        and the current value is the delta. Every reading but the etcd sizes
-        resets at boot, which ``boot_id`` detects; systemd resets
-        ``k3s_restarts`` to 0 when an operator stops the unit and starts it
-        by hand, which only the lower-than-baseline half catches. ``oom_kills``
-        counts every OOM kill the kernel makes, cgroup kills included, so a
-        pod killed for exceeding its own memory limit increments it just as
-        a node running out of memory does.
+        which wants a delta keeps its own previous report as a baseline,
+        and docs/library-api.md gives the rule it reads the counters by.
 
         ``kubernetes`` on a node is what the Kubernetes API says of it, read
         on the first control plane node by K3S_KUBERNETES_PROBE_COMMAND and
-        parse_kubernetes_readings(), which say where each reading comes from.
-        Every node entry carries it, always with the same keys, matched to a
-        Kubernetes node by the name node_name_for_instance() gives it.
-        Condition statuses are Kubernetes' own strings, because 'Unknown' is
-        a third answer a bool would lie about. ``oom_killed`` lists the
-        containers on the node whose latest termination was an OOM kill: a
-        latest state, not a count, and a later ``finished_at`` for the same
-        namespace, pod and container is a new kill. When the probe did not
-        answer, every value is None, ``oom_killed`` included, since an empty
-        list would claim nothing was killed; when it answered and no
-        Kubernetes node has the name, ``registered`` is False and the
-        conditions None. A node with no name -- its instance is gone -- or
-        whose lowercased name another node shares cannot be matched, and
-        reads None throughout. The top level ``kubernetes`` is the probe's
-        own outcome, and ``unmatched_nodes`` the sorted names of Kubernetes
-        nodes no node entry accounts for, typically one left behind by an
-        instance deleted out of band; it is None when the probe did not
-        answer. docs/library-api.md defines each of these in full.
+        parse_kubernetes_readings(), which say where each reading comes
+        from, and matched to a Kubernetes node by the name
+        node_name_for_instance() gives it. Every node entry carries it,
+        always with the same keys. When the probe did not answer every value
+        is None, ``oom_killed`` included, since an empty list would claim
+        nothing was killed. The top level ``kubernetes`` is the probe's own
+        outcome. docs/library-api.md ("What kubernetes reports") defines
+        each key, and when it is None, in full.
 
         The top level ``healthy`` is the conjunction a caller would
         otherwise have to write itself: the cluster finished being built,
@@ -4337,22 +4308,13 @@ class Cluster:
         md['control_plane_nodes'] being empty is a finding about the API
         probe rather than an IndexError.
 
-        One thing this leaves behind, which matters to a caller polling it in
-        a loop: every probe submits an agent operation -- one on each node it
-        probes, and the two kubectl ones beside it on the first control plane
-        node -- and each one still waiting when the shared deadline passes is
-        abandoned while queued against its node. Nothing here reaps them,
-        because there is nothing to reap them with -- the commands may yet
-        run -- so the server's own deadline ends each one, and until then an
-        await_idle() in a later expand-workers or update-os waits for them
-        along with everything else. That is up to one operation per probed
-        node, plus two, rather than one in total. The uuid of each abandoned
-        operation is in its probe's ``error`` -- ``api['error']``,
-        ``kubernetes['error']``, or the node's ``signals['error']`` -- so that wait
-        can be accounted for rather than guessed at. This is bounded rather
-        than free: a reconcile loop polling health() against nodes whose
-        agents are intermittently slow pays for it in a delayed later verb,
-        not in a hang.
+        One thing this leaves behind: each probe still waiting when the
+        shared deadline passes is abandoned with its agent operation queued
+        against its node. Nothing here reaps them, because the commands may
+        yet run, so the server's own deadline ends each one, and until then
+        a later expand-workers or update-os waits for them. The uuid of each
+        is in its probe's ``error``, and docs/library-api.md says what that
+        costs a caller polling health() in a loop.
         """
         md = self.get_metadata()
         if not md:
