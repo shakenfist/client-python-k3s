@@ -60,3 +60,5 @@ Add `-- . ':!docs/plans'` to leave out the plan files.
 * `README.md` -- this file.
 * `scope-files.txt` -- the audit scope.
 * `verification.md` -- the mechanical checks.
+* `findings-*.md` -- what each of the four lenses found.
+* `triage.md` -- what was done about each finding, and why.
