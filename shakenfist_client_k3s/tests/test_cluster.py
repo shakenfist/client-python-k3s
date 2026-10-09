@@ -4274,6 +4274,14 @@ class NodeSignalsCommandTestCase(testtools.TestCase):
         self.assertEqual(2, command.count('du -sb'))
         self.assertIn('du -sb -- /srv/snapshots 2>/dev/null', command)
 
+        # Read last, because the directory is the one value here a caller
+        # chose: a name carrying a newline makes du print more than one line,
+        # and printed after every other reading, a forged key on that line
+        # loses to the real one, since the parser keeps the first.
+        self.assertTrue(command.endswith(
+            "; printf 'etcd_snapshot_bytes=%s\\n' "
+            '"$(du -sb -- /srv/snapshots 2>/dev/null | cut -f1)"'), command)
+
     def test_a_worker_ignores_the_snapshot_directory(self):
         self.assertEqual(
             cluster_module.node_signals_command('worker'),

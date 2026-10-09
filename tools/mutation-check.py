@@ -650,6 +650,17 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        "a caller's snapshot directory is read after every other signal",
+        PKG + '/cluster.py',
+        "            commands.append(_signal_reading(\n"
+        "                'etcd_snapshot_bytes',\n",
+        "            commands.insert(0, _signal_reading(\n"
+        "                'etcd_snapshot_bytes',\n",
+        PKG + '.tests.test_cluster.NodeSignalsCommandTestCase'
+        '.test_an_absolute_snapshot_directory_is_still_sized',
+        'stestr',
+    ),
+    (
         'the readiness wait gives up inside the agent operation deadline',
         PKG + '/cluster.py',
         'NODE_REGISTRATION_ATTEMPTS = 24\n',
