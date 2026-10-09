@@ -3,8 +3,13 @@ Usage: k3s query-longhorn-version [OPTIONS]
   Lookup the current longhorn version
 
 Options:
+  --release-channel TEXT          The k3s release channel to find a Longhorn
+                                  version for, as create takes it. Each Longhorn
+                                  chart supports a range of Kubernetes versions,
+                                  so the answer depends on it.
   --namespace TEXT                If you are an admin, you can control which
                                   namespace the version cache is retrieved from.
   --refresh-version-cache / --no-refresh-version-cache
-                                  Force a refresh of the longhorn version cache.
+                                  Force a refresh of the k3s and longhorn
+                                  version caches.
   --help                          Show this message and exit.

@@ -3749,20 +3749,19 @@ class ShellQuotingTestCase(testtools.TestCase):
                              'command: %s' % probe)
 
     def test_the_longhorn_version_is_quoted(self):
-        # This one comes from a GitHub release lookup rather than from
-        # anything this module wrote, which is the same trust position as
-        # the k3s channel above.
+        # This one comes from the Longhorn chart index rather than from
+        # anything this module wrote, by way of the metadata create()
+        # recorded it in, which namespace credentials can write. That is
+        # the same trust position as the k3s channel above.
         client = mock.MagicMock()
         client.get_namespace_metadata.return_value = {MD_KEY: {
             'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'longhorn_version': 'v1.9.0; touch /pwned',
             'control_plane_nodes': ['inst-cp1'], 'worker_nodes': []}}
         cluster = Cluster(client, 'banana', 'testns',
                           reporter=progress.CollectingReporter())
 
-        with mock.patch.object(cluster_module.primitives,
-                               'get_longhorn_release',
-                               return_value='v1.9.0; touch /pwned'), \
-                mock.patch.object(Cluster, 'execute_and_await') as ea:
+        with mock.patch.object(Cluster, 'execute_and_await') as ea:
             cluster.setup_longhorn()
 
         installs = [c for c in ea.call_args[0][1] if 'longhorn/longhorn' in c]

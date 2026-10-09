@@ -243,6 +243,15 @@ class ReleaseLookupErrorTestCase(testtools.TestCase):
         self.assertEqual(
             'Unable to determine the latest Longhorn release', str(e))
 
+    def test_no_compatible_longhorn_release(self):
+        e = exceptions.ReleaseLookupError.no_compatible_longhorn_release(
+            'v1.15.0+k3s1')
+        self.assertEqual('no_compatible_longhorn_release', e.reason)
+        self.assertEqual('v1.15.0+k3s1', e.k3s_version)
+        self.assertEqual(
+            'No Longhorn release supports k3s v1.15.0+k3s1: no Longhorn chart '
+            'states a kubeVersion which admits it', str(e))
+
 
 class AgentOperationErrorTestCase(testtools.TestCase):
     def test_with_command_and_results(self):
@@ -467,6 +476,7 @@ class TotalAttributesTestCase(testtools.TestCase):
 
         # Fields belonging to the other constructors.
         self.assertIsNone(e.error)
+        self.assertIsNone(e.k3s_version)
         self.assertIsNone(e.status_code)
         self.assertIsNone(e.product)
         self.assertIsNone(e.url)

@@ -127,7 +127,14 @@ unparsable body or a document of the wrong shape is a
 `latest` release (for example `v1.16-testing`) are skipped, and
 Longhorn chart versions which are deprecated, prereleases or not valid
 PEP 440 versions are ignored (`packaging.version.Version` is used for
-comparison). These
+comparison). The Longhorn lookup takes the k3s release and returns the
+newest chart whose `kubeVersion` admits it, because Helm refuses a
+chart outside that range; a constraint the small parser cannot read
+rules its chart out rather than in. `create()` makes both lookups
+before it builds anything or claims the cluster name, and records the
+Longhorn version as `longhorn_version` in the cluster metadata, which
+is what `setup_longhorn()` installs, so a lookup failure leaves nothing
+behind. These
 are namespace scoped rather than cluster scoped -- the commands behind
 them, `query-k3s-version` and `query-longhorn-version`, name no
 cluster -- so they stay module level functions taking a client, a
