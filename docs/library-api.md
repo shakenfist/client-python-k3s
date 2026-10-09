@@ -532,8 +532,9 @@ lowercased, which is what kubelet registers it under and what
 `remove_worker()` matches on. Every key is `None` when:
 
 * the probe did not answer: it was skipped (the first control plane node
-  cannot answer), refused, abandoned at the shared deadline, failed, or
-  exited non-zero. This includes `registered` and `oom_killed`;
+  cannot answer), refused, abandoned at the shared deadline, failed,
+  exited non-zero, or printed more than Shaken Fist returns inline (see
+  below). This includes `registered` and `oom_killed`;
 * the node has no name, because its instance is gone; or
 * another node's name is the same once lowercased. Kubernetes holds one
   node object for that name and nothing here can say which kubelet it
@@ -571,12 +572,23 @@ The top level `kubernetes` is the probe's own outcome:
 | Key | What it is |
 |---|---|
 | `probed` | The command ran at all. |
-| `answered` | ...and it exited zero. |
+| `answered` | ...and it exited zero, and its output came back. |
 | `error` | Why it did not answer, in the words `api['error']` uses, naming an abandoned operation by its uuid. `None` when it answered. |
 | `unmatched_nodes` | The sorted names of Kubernetes nodes which no node entry accounts for, typically the node object of an instance deleted out of band. A list, `[]` for none, and `None` when the probe did not answer. A node name two entries share is not listed, because an instance accounts for it. |
 
 Readings are raw and `health()` stores nothing, as for `signals`; the
 caller holds the baseline.
+
+Shaken Fist returns a command's output inline only up to 10 KiB, and
+stores anything longer as a blob, which `health()` does not read. A
+probe whose output was longer than that has not answered, and its
+`error` says so: reading it as empty would report every node
+unregistered and nothing killed. The Kubernetes probe prints about 70
+characters per node and about 80 per OOM-killed container, more with
+long names, so a cluster of about 140 nodes, or one with a hundred or
+so OOM-killed containers, reports the probe unanswered and the cluster
+unhealthy. `api` follows the same rule, and its `kubectl get nodes`
+table crosses the limit at a similar size.
 
 #### What `healthy` requires
 

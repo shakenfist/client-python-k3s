@@ -449,6 +449,14 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'a probe whose output Shaken Fist stored as a blob has not answered',
+        PKG + '/cluster.py',
+        "        elif probe['stdout'] is None:\n",
+        '        elif False:\n',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
         'the node level healthy does not take Kubernetes readiness',
         PKG + '/cluster.py',
         "            node['kubernetes']['oom_killed'] = readings['oom_killed'].get(name, [])\n",

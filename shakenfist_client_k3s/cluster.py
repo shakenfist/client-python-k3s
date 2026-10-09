@@ -1068,8 +1068,9 @@ _OOM_CONTAINER_TEMPLATE = (
 # container, init containers included, whose current or most recent
 # termination was an OOM kill, and nothing for any other container. That
 # is what keeps the output proportional to what it reports rather than to
-# the number of pods, which matters because nothing between the node and
-# this parser is known to bound a command's output (survey finding 9).
+# the number of pods, which matters because Shaken Fist returns a command's
+# output inline only up to 10 KiB, and a probe whose output is longer than
+# that cannot be read (see _collect_probe()).
 # $pod keeps the pod in reach from inside the ranges over its containers,
 # which move the dot onto each container's status in turn.
 KUBERNETES_PODS_TEMPLATE = (
@@ -2647,6 +2648,26 @@ class Cluster:
         if not probe['answered']:
             probe['error'] = ('%s exited %s'
                               % (name or "'%s'" % command, probe['return_code']))
+        elif probe['stdout'] is None:
+            # Shaken Fist returns a command's stdout inline only up to 10
+            # KiB. Anything longer is stored as a blob, and the result then
+            # carries stdout_blob and no stdout at all. Reading the missing
+            # stdout as empty would be the worst answer available: the
+            # Kubernetes probe would report every node unregistered and no
+            # container killed, which is a claim, and a tenant who can make
+            # enough OOM-killed containers could arrange it. So a command
+            # whose output did not come back has not answered, and says why.
+            probe['answered'] = False
+            if result.get('stdout_blob'):
+                probe['error'] = (
+                    '%s printed more than the 10 KiB Shaken Fist returns '
+                    'inline, so its output was stored as blob %s, which this '
+                    'version of the k3s plugin does not read'
+                    % (name or "'%s'" % command, result['stdout_blob']))
+            else:
+                probe['error'] = (
+                    '%s exited 0, but the agent operation recorded no output '
+                    'for it' % (name or "'%s'" % command))
         return probe
 
     def _unprobed(self, instance_uuid, error):
@@ -4174,7 +4195,7 @@ class Cluster:
                 ],
                 'api': {
                     'probed': bool,             # the command was run at all
-                    'answered': bool,           # ...and it exited zero
+                    'answered': bool,           # ...it exited zero, and its output came back
                     'instance_uuid': str or None,
                     'command': str or None,
                     'return_code': int or None,
@@ -4184,7 +4205,7 @@ class Cluster:
                 },
                 'kubernetes': {
                     'probed': bool,             # the Kubernetes probe was run at all
-                    'answered': bool,           # ...and it exited zero
+                    'answered': bool,           # ...it exited zero, and its output came back
                     'error': str or None,       # why it did not answer
                     'unmatched_nodes': list or None  # Kubernetes node names no node accounts for
                 },
@@ -4206,7 +4227,8 @@ class Cluster:
         can answer -- says why in ``error``, in the words ``api`` uses for
         a skipped probe. A reading which could not be taken is None on its
         own and voids none of the others; ``error`` is for the probe as a
-        whole -- not run, abandoned, failed, or exited non-zero.
+        whole -- not run, abandoned, failed, exited non-zero, or its output
+        did not come back.
         ``k3s_state`` and ``k3s_restarts`` are None when the unit is not
         loaded, because systemd reports a restart count of zero for a unit
         which does not exist and zero would be a claim. ``boot_id`` is None

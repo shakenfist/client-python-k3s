@@ -2186,6 +2186,27 @@ class HealthTestCase(testtools.TestCase):
         self.assertEqual(3, len(report['nodes']))
         self.assertTrue(all(n['healthy'] for n in report['nodes']))
 
+    def test_a_table_too_long_to_return_inline_is_not_an_answer(self):
+        # A cluster large enough that 'kubectl get nodes' prints more than
+        # Shaken Fist returns inline. The server stores the table as a
+        # blob and the result has no stdout, and that is not a k3s API
+        # which answered with nothing.
+        self.client.probe_stdout = 'NAME                  STATUS   ROLES\n' + ''.join(
+            'k3s-banana-node-%03d   Ready    <none>\n' % serial
+            for serial in range(1, 301))
+        self.assertGreater(len(self.client.probe_stdout),
+                           fakes.SIDECHANNEL_INLINE_LIMIT)
+
+        report = self.cluster.health()
+
+        self.assertTrue(report['api']['probed'])
+        self.assertFalse(report['api']['answered'])
+        self.assertEqual(0, report['api']['return_code'])
+        self.assertIsNone(report['api']['stdout'])
+        self.assertIn('stored as blob', report['api']['error'])
+        self.assertIn('kubectl get nodes', report['api']['error'])
+        self.assertFalse(report['healthy'])
+
     def test_an_errored_agent_operation_is_reported_rather_than_raised(self):
         # await_idle() raises AgentOperationError for this, which is why the
         # probe does not go through execute_and_await().
@@ -7253,6 +7274,45 @@ class HealthKubernetesTestCase(testtools.TestCase):
         # The rest of the report is as it was.
         self.assertTrue(report['api']['answered'])
         self.assertTrue(all(n['healthy'] for n in report['nodes']))
+
+    def test_output_too_long_to_return_inline_reads_nothing(self):
+        # Enough OOM-killed containers that the probe prints more than
+        # Shaken Fist returns inline, so the server stores the output as a
+        # blob and the result carries no stdout. Read as empty, that is
+        # every node unregistered and no container killed: a claim, and one
+        # a tenant who can create pods could arrange on purpose.
+        self.client.kubernetes_stdout = fakes.KUBERNETES_PROBE_OUTPUT + ''.join(
+            'oom\tk3s-banana-node-002\tdefault\tmemory-hog-%03d\thog\t1\t'
+            '2026-10-06T21:40:11Z\n' % serial for serial in range(200))
+        self.assertGreater(len(self.client.kubernetes_stdout),
+                           fakes.SIDECHANNEL_INLINE_LIMIT)
+
+        report = self.cluster.health()
+
+        self._assert_nothing_read(report)
+        self.assertEqual(
+            {'probed': True, 'answered': False,
+             'error': 'the Kubernetes probe printed more than the 10 KiB '
+                      'Shaken Fist returns inline, so its output was stored '
+                      'as blob blob-001, which this version of the k3s '
+                      'plugin does not read',
+             'unmatched_nodes': None},
+            report['kubernetes'])
+        # The rest of the report is as it was.
+        self.assertTrue(report['api']['answered'])
+        self.assertTrue(all(n['healthy'] for n in report['nodes']))
+
+    def test_a_result_with_no_output_reads_nothing(self):
+        # Exit 0 and neither stdout nor a blob: not something Shaken Fist
+        # records, and not an answer which printed nothing either.
+        self.client.kubernetes_stdout = None
+
+        report = self.cluster.health()
+
+        self._assert_nothing_read(report)
+        self.assertEqual('the Kubernetes probe exited 0, but the agent '
+                         'operation recorded no output for it',
+                         report['kubernetes']['error'])
 
     def test_an_errored_probe_is_named(self):
         self.client.kubernetes_state = 'error'

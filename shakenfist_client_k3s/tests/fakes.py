@@ -407,6 +407,12 @@ KUBERNETES_PROBE_READINGS = {
 }
 
 
+# The longest stream Shaken Fist's sidechannel returns inline in an
+# execute result, in characters: shakenfist/daemons/sidechannel/main.py
+# stores anything longer than 10 * KiB as a blob instead.
+SIDECHANNEL_INLINE_LIMIT = 10 * 1024
+
+
 class HealthClient(FakeClusterClient):
     """A scripted client which can be made unwell in each of the ways health() reports.
 
@@ -517,6 +523,9 @@ class HealthClient(FakeClusterClient):
         self.agent_operation_reads_by_uuid = {}
         self.max_agent_operation_reads = 60
 
+        # The blobs a stream too long to return inline was stored as.
+        self.blob_serial = 0
+
     def set_namespace_metadata_item(self, namespace, key, value):
         self.metadata_writes.append(key)
         return super(HealthClient, self).set_namespace_metadata_item(
@@ -541,14 +550,14 @@ class HealthClient(FakeClusterClient):
         """
         if kind == 'api':
             return self.probe_state, {
-                '0': {'return-code': self.probe_return_code,
-                      'stdout': self.probe_stdout,
-                      'stderr': self.probe_stderr}}
+                '0': self._execute_result(self.probe_return_code,
+                                          self.probe_stdout,
+                                          self.probe_stderr)}
         if kind == 'kubernetes':
             return self.kubernetes_state, {
-                '0': {'return-code': self.kubernetes_return_code,
-                      'stdout': self.kubernetes_stdout,
-                      'stderr': self.kubernetes_stderr}}
+                '0': self._execute_result(self.kubernetes_return_code,
+                                          self.kubernetes_stdout,
+                                          self.kubernetes_stderr)}
 
         # The default output follows the unit the command asked about,
         # which is how a real node's output follows its role: it prints
@@ -558,10 +567,28 @@ class HealthClient(FakeClusterClient):
         else:
             default_stdout = SERVER_SIGNALS_OUTPUT
         return self.signals_state.get(instance_ref, 'complete'), {
-            '0': {'return-code': self.signals_return_code.get(instance_ref, 0),
-                  'stdout': self.signals_stdout.get(instance_ref,
-                                                    default_stdout),
-                  'stderr': self.signals_stderr.get(instance_ref, '')}}
+            '0': self._execute_result(
+                self.signals_return_code.get(instance_ref, 0),
+                self.signals_stdout.get(instance_ref, default_stdout),
+                self.signals_stderr.get(instance_ref, ''))}
+
+    def _execute_result(self, return_code, stdout, stderr):
+        """Return one command's result as Shaken Fist's sidechannel records it.
+
+        The server keeps a stream longer than 10 KiB out of the result: it
+        stores it as a blob, and the result carries the blob's uuid under
+        stdout_blob or stderr_blob and has no stdout or stderr key at all.
+        A test which wants a probe whose output did not come back inline
+        sets that output longer than the limit, as a real cluster would.
+        """
+        result = {'return-code': return_code}
+        for stream, text in (('stdout', stdout), ('stderr', stderr)):
+            if text is not None and len(text) > SIDECHANNEL_INLINE_LIMIT:
+                self.blob_serial += 1
+                result['%s_blob' % stream] = 'blob-%03d' % self.blob_serial
+            else:
+                result[stream] = text
+        return result
 
     def get_agent_operation(self, operation_uuid):
         # A probe which is still pending stays pending: this is the node
