@@ -602,8 +602,8 @@ MUTATIONS = [
     (
         'a count of one renders singular',
         PKG + '/__init__.py',
-        "        return '%s %s%s' % (_count(reading), noun, '' if singular else 's')",
-        "        return '%s %ss' % (_count(reading), noun)",
+        "    return '%s %s%s' % (_count(reading), noun, '' if singular else 's')",
+        "    return '%s %ss' % (_count(reading), noun)",
         PKG + '.tests.test_commands.HealthRenderingReporterTestCase',
         'stestr',
     ),
@@ -742,8 +742,8 @@ MUTATIONS = [
     (
         'an OOM kill count of one renders singular',
         PKG + '/__init__.py',
-        "            'restart' if _is_count(restarts) and restarts == 1 else 'restarts'))",
-        "            'restarts'))",
+        "            _counted(kill.get('restarts'), 'restart')))",
+        "            '%s restarts' % _count(kill.get('restarts'))))",
         PKG + '.tests.test_commands.HealthRenderingReporterTestCase',
         'stestr',
     ),
