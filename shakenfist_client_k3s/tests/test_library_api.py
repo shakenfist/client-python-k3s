@@ -309,11 +309,10 @@ class CreatePhaseCountTestCase(LibraryTestCase):
     The totals below are one lower than they were before step 3e, because
     write_kubeconfig defaults to False: the default library create does not
     update the local kubeconfig, so it does not count that phase either.
-    They are one higher than they were before step 2b of the cumulative
-    health signals phase 2 plan, because every create now waits for its
-    nodes to become Ready, which is a phase whatever the cluster's shape.
-    The command line, which passes True, is covered by
-    K3sCreateSmokeTestCase in tests/test_progress.py.
+    They count one phase for the Ready wait, because every create waits for
+    its nodes to become Ready, whatever the cluster's shape. The command
+    line, which passes True, is covered by K3sCreateSmokeTestCase in
+    tests/test_progress.py.
     """
 
     def _phase_totals(self, *args, **kwargs):

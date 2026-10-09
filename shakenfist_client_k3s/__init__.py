@@ -499,13 +499,6 @@ def _render_signals(out, node):
                   % (signals.get('error') or 'unknown'))
         return
 
-    def counted(reading, noun):
-        # Singular for exactly one, and plural for everything else: zero,
-        # other counts, and 'unknown', which reads as "an unknown number
-        # of restarts". _is_count() first, so that True is not one.
-        singular = _is_count(reading) and reading == 1
-        return '%s %s%s' % (_count(reading), noun, '' if singular else 's')
-
     def mib(reading):
         return str(reading // 1048576) if _is_count(reading) else 'unknown'
 
@@ -519,24 +512,16 @@ def _render_signals(out, node):
     # 'unknown' rather than a TypeError or a fractional MiB, and a size is
     # shortened before it is turned into text rather than after. An int
     # thousands of digits long is not something health() can return, and
-    # is not defended against beyond that.
-    #
-    # A timestamp is different, because twenty digits is far more than
-    # datetime takes: a btime past the year 9999, or past what the
-    # platform's time_t holds, raises OverflowError, OSError or ValueError
-    # depending on where it overflows. That is a reading which cannot be
-    # shown rather than a reason to lose the whole report, and the parser's
-    # rule is that nothing about a node's output can raise, so the
-    # renderer's has to be too: such a btime is 'unknown', as one which
-    # could not be read is.
+    # is not defended against beyond that. A timestamp is different, and
+    # _utc_iso() says why.
     booted = _utc_iso(signals.get('booted_at'))
 
     readings = [
         'booted %s' % booted,
         '%s %s, %s' % (
             _text(signals.get('k3s_unit')), _text(signals.get('k3s_state')),
-            counted(signals.get('k3s_restarts'), 'restart')),
-        counted(signals.get('oom_kills'), 'OOM kill'),
+            _counted(signals.get('k3s_restarts'), 'restart')),
+        _counted(signals.get('oom_kills'), 'OOM kill'),
         '%s of %s MiB available' % (
             mib(signals.get('memory_available_bytes')),
             mib(signals.get('memory_total_bytes')))]
@@ -566,6 +551,17 @@ def _text(reading):
 
 def _count(reading):
     return str(reading) if _is_count(reading) else 'unknown'
+
+
+def _counted(reading, noun):
+    """A count and its noun, singular for exactly one.
+
+    Plural for everything else: zero, other counts, and 'unknown', which
+    reads as "an unknown number of restarts". _is_count() first, so that
+    True is not one.
+    """
+    singular = _is_count(reading) and reading == 1
+    return '%s %s%s' % (_count(reading), noun, '' if singular else 's')
 
 
 def _utc_iso(reading):
@@ -675,12 +671,10 @@ def _render_kubernetes(out, node, probe):
     for kill in oom_killed:
         if not isinstance(kill, dict):
             kill = {}
-        restarts = kill.get('restarts')
-        out.write('            OOM killed: %s/%s %s at %s, %s %s\n' % (
+        out.write('            OOM killed: %s/%s %s at %s, %s\n' % (
             _text(kill.get('namespace')), _text(kill.get('pod')),
             _text(kill.get('container')), _utc_iso(kill.get('finished_at')),
-            _count(restarts),
-            'restart' if _is_count(restarts) and restarts == 1 else 'restarts'))
+            _counted(kill.get('restarts'), 'restart')))
 
 
 @k3s.command(name='delete', help='Destroy a k3s cluster')

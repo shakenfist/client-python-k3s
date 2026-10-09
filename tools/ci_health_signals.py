@@ -10,16 +10,15 @@ instance, and that is how tools/ci_deploy_test.sh runs it, on the merge
 tier's minimal cluster. Run it by hand only against a throwaway cluster
 you are about to delete.
 
-Phases 1 and 2 of the cumulative health signals plan added readings to
-Cluster.health() which come from systemd, the kernel and the kubelet, and
-their live runs only ever saw a fresh cluster: no counter went up, no
-condition went True, no OOM kill was listed. Whether each reading moves
-when the thing it reads happens is a question only a real node can
-answer, so this provokes each one and asserts the report says so.
-Decisions 1 to 7 of
-docs/plans/PLAN-cumulative-health-signals-phase-03-live-validation.md are
-the design, and decision 4 is the specification of every step, 4a to 4f,
-in the order they run here.
+Cluster.health() reports readings which come from systemd, the kernel and
+the kubelet, and on a fresh cluster none of them moves: no counter goes
+up, no condition goes True, no OOM kill is listed. Whether each reading
+moves when the thing it reads happens is a question only a real node can
+answer, so this provokes each one and asserts the report says so. The
+steps run in this order: a baseline, a pod killed at its own memory
+limit, an automatic restart of the worker's k3s, the worker's k3s stopped
+and then started by hand, an etcd snapshot, and disk pressure on the
+worker.
 
 It reads what an Ansible play or a daily poll reads: Cluster.health()'s
 dict, through a client from make_client()'s own configuration discovery,
@@ -33,9 +32,10 @@ The judgements are the check_*() functions: each takes reports and
 returns None, or a message naming the reading which was wrong. They are
 pure so that they can be unit tested, in
 shakenfist_client_k3s/tests/test_ci_health_signals.py. What they cannot
-test is whether the plan guessed systemd, the kernel and the kubelet
-right; only a live run says that, which is why every step prints the
-readings it compared even when it passes.
+test is whether systemd, the kernel and the kubelet still behave as the
+checks expect on the k3s release the merge tier installs that day; only
+a live run says that, which is why every step prints the readings it
+compared even when it passes.
 
 Every wait is a poll of health() with a bound, never a fixed sleep, and a
 poll which gives up prints what it last read. The first failure ends the
@@ -65,11 +65,12 @@ from shakenfist_client_k3s.cluster import node_name_for_instance
 # mostly spent reading.
 POLL_INTERVAL_SECONDS = 5
 
-# Decision 4's bounds. Each is several times what the step is expected to
-# take, because the node lifecycle controller's grace period, the kubelet's
-# eviction cadence and systemd's RestartSec all vary by k3s release, and the
-# merge tier installs whichever release the channel resolves to that day.
-# A slow run should pass; a wrong guess should fail with the readings.
+# How long each wait may take. Each is several times what the step is
+# expected to take, because the node lifecycle controller's grace period,
+# the kubelet's eviction cadence and systemd's RestartSec all vary by k3s
+# release, and the merge tier installs whichever release the channel
+# resolves to that day. A slow run should pass; a wrong guess should fail
+# with the readings.
 OOM_POD_BOUND_SECONDS = 180
 OOM_LISTED_BOUND_SECONDS = 60
 RESTART_BOUND_SECONDS = 120
@@ -77,8 +78,8 @@ NOT_READY_BOUND_SECONDS = 180
 READY_BOUND_SECONDS = 180
 DISK_PRESSURE_BOUND_SECONDS = 180
 
-# The pod killed at its own memory limit (decision 4b). The image is the
-# one ci_deploy_test.sh's ci-web already pulls, from registry.k8s.io rather
+# The pod killed at its own memory limit. The image is the one
+# ci_deploy_test.sh's ci-web already pulls, from registry.k8s.io rather
 # than Docker Hub, whose anonymous pull limits the under-cloud's shared
 # egress address runs into. tail on /dev/zero buffers a line which never
 # ends, so its memory grows until the limit stops it.
@@ -102,12 +103,12 @@ STOP_COMMAND = 'systemctl stop k3s-agent'
 START_COMMAND = 'systemctl start k3s-agent'
 SNAPSHOT_COMMAND = 'k3s etcd-snapshot save'
 
-# Decision 4f fills the worker's root filesystem until this much of it is
-# free. k3s's kubelet reports DiskPressure below 5% free, and the stock
-# kubelet below 10%, so 3% is past both. It is not filled further, because
-# the agent and the signals probe still have to work for anyone to see the
-# pressure: on a 50 GB disk 3% is about 1.5 GB, and root can also use the
-# filesystem's reserved blocks.
+# The disk pressure step fills the worker's root filesystem until this
+# much of it is free. k3s's kubelet reports DiskPressure below 5% free, and
+# the stock kubelet below 10%, so 3% is past both. It is not filled
+# further, because the agent and the signals probe still have to work for
+# anyone to see the pressure: on a 50 GB disk 3% is about 1.5 GB, and root
+# can also use the filesystem's reserved blocks.
 DISK_FREE_PERCENT = 3
 DISK_FILL_PATH = '/ci-health-signals.fill'
 
@@ -134,7 +135,7 @@ SUBPROCESS_TIMEOUT_SECONDS = 300
 
 
 class Failure(Exception):
-    """A step found something other than what decision 4 says it should."""
+    """A step found something other than what it provoked should have produced."""
 
 
 def say(text):
@@ -177,7 +178,7 @@ def find_node(report, role):
     """Return the one node in report with role, found by role and never by name.
 
     The minimal cluster has exactly one control plane node and one worker,
-    and decision 4 means those two when it says "the control plane" and
+    and the steps mean those two when they say "the control plane" and
     "the worker". A cluster shaped otherwise makes both phrases ambiguous,
     so this raises Failure rather than choosing one.
     """
@@ -204,13 +205,13 @@ def _boot_problems(before, after):
 
 
 def _baseline_node_problems(node):
-    """Return what is wrong with one node of a fresh cluster's report (decision 4a)."""
+    """Return what is wrong with one node of a fresh cluster's report."""
     role = node['role']
     signals = node['signals']
     kubernetes = node['kubernetes']
     problems = []
 
-    # Not one of decision 4a's terms, but the explanation for most of them
+    # Not a reading of its own, but the explanation for most of them
     # failing at once: a probe which did not run leaves every reading None.
     if signals['error'] is not None:
         problems.append('%s is %r' % (_label(node, 'signals', 'error'), signals['error']))
@@ -226,6 +227,9 @@ def _baseline_node_problems(node):
     for key in ('oom_kills', 'k3s_restarts'):
         if not _is_count(signals[key]):
             problems.append('%s is %r, not an integer of 0 or more' % (_label(node, 'signals', key), signals[key]))
+    booted_at = signals['booted_at']
+    if not _is_count(booted_at) or booted_at <= 0:
+        problems.append('%s is %r, not more than 0' % (_label(node, 'signals', 'booted_at'), booted_at))
 
     total = signals['memory_total_bytes']
     available = signals['memory_available_bytes']
@@ -238,15 +242,24 @@ def _baseline_node_problems(node):
         problems.append('%s is %r, more than memory_total_bytes %r'
                         % (_label(node, 'signals', 'memory_available_bytes'), available, total))
 
+    # A control plane's snapshot directory may not exist yet, which reads
+    # None, so only the worker's is checked: it has no etcd at all.
     etcd_bytes = signals['etcd_bytes']
     if role == 'control_plane':
         if not _is_count(etcd_bytes) or etcd_bytes <= 0:
             problems.append('%s is %r, not more than 0' % (_label(node, 'signals', 'etcd_bytes'), etcd_bytes))
-    elif etcd_bytes is not None:
-        problems.append('%s is %r on a worker, not None' % (_label(node, 'signals', 'etcd_bytes'), etcd_bytes))
+    else:
+        for key in ('etcd_bytes', 'etcd_snapshot_bytes'):
+            if signals[key] is not None:
+                problems.append('%s is %r on a worker, not None' % (_label(node, 'signals', key), signals[key]))
 
     if kubernetes['ready'] != 'True':
         problems.append("%s is %r, not 'True'" % (_label(node, 'kubernetes', 'ready'), kubernetes['ready']))
+    ready_since = kubernetes['ready_since']
+    if not _is_count(ready_since) or ready_since <= 0:
+        problems.append('%s is %r, not more than 0' % (_label(node, 'kubernetes', 'ready_since'), ready_since))
+    if not isinstance(kubernetes['oom_killed'], list):
+        problems.append('%s is %r, not a list' % (_label(node, 'kubernetes', 'oom_killed'), kubernetes['oom_killed']))
     if kubernetes['disk_pressure'] != 'False':
         problems.append("%s is %r, not 'False'"
                         % (_label(node, 'kubernetes', 'disk_pressure'), kubernetes['disk_pressure']))
@@ -254,17 +267,23 @@ def _baseline_node_problems(node):
 
 
 def check_baseline(report):
-    """Decision 4a: a fresh cluster is healthy and every reading has the shape it should."""
+    """A fresh cluster is healthy and every reading has the shape it should."""
     problems = []
     if report['healthy'] is not True:
         problems.append('healthy is %r on a fresh cluster, not True' % (report['healthy'],))
+    # The CI clusters' names are mixed case and kubelet registers each node
+    # lowercased, so an empty list here is also the check that every node
+    # was matched by its lowercased name.
+    unmatched = report['kubernetes']['unmatched_nodes']
+    if unmatched != []:
+        problems.append('kubernetes.unmatched_nodes is %r on a fresh cluster, not []' % (unmatched,))
     for role in ('control_plane', 'worker'):
         problems.extend(_baseline_node_problems(find_node(report, role)))
     return _joined(problems)
 
 
 def oom_pod_manifest(pod_name, node_name):
-    """Return decision 4b's pod, as the dict kubectl apply is handed as JSON.
+    """Return the pod to kill at its own memory limit, as the dict kubectl apply is handed as JSON.
 
     nodeName bypasses the scheduler, so the pod runs on the worker whatever
     the scheduler would have chosen, and so it is the worker's oom_kills
@@ -327,7 +346,7 @@ def pod_finished_otherwise(pod):
 
 
 def _oom_entry(node, pod_name):
-    """Return node's oom_killed entry for decision 4b's pod and container, or None."""
+    """Return node's oom_killed entry for the killed pod's container, or None."""
     for entry in node['kubernetes']['oom_killed'] or []:
         if (entry.get('namespace') == OOM_NAMESPACE and entry.get('pod') == pod_name
                 and entry.get('container') == OOM_CONTAINER):
@@ -336,7 +355,7 @@ def _oom_entry(node, pod_name):
 
 
 def check_oom_killed_listed(report, pod_name):
-    """Return None once the worker's oom_killed lists decision 4b's container."""
+    """Return None once the worker's oom_killed lists the killed pod's container."""
     worker = find_node(report, 'worker')
     if _oom_entry(worker, pod_name) is None:
         return ('%s has no entry for %s/%s/%s: %s'
@@ -346,11 +365,11 @@ def check_oom_killed_listed(report, pod_name):
 
 
 def check_oom_kill(baseline, report, pod_name):
-    """Decision 4b: a pod killed at its own memory limit is counted, listed, and not judged.
+    """A pod killed at its own memory limit is counted, listed, and not judged.
 
-    oom_kills having to rise is the claim phase 1 took from kernel source
-    and never observed: that /proc/vmstat's oom_kill counts a cgroup kill
-    as well as a global one.
+    oom_kills has to rise because /proc/vmstat's oom_kill counts a kill at
+    a cgroup's own limit as well as one made when the whole node runs out
+    of memory.
     """
     before = find_node(baseline, 'worker')
     worker = find_node(report, 'worker')
@@ -378,7 +397,7 @@ def check_oom_kill(baseline, report, pod_name):
 
 
 def check_automatic_restart(before_report, report):
-    """Decision 4c: systemd restarting a killed k3s-agent is counted, and is not a reboot."""
+    """A killed k3s-agent which systemd restarts is counted, and is not a reboot."""
     before = find_node(before_report, 'worker')
     worker = find_node(report, 'worker')
     problems = []
@@ -405,13 +424,12 @@ def check_kubelet_silent(report):
 
 
 def check_not_ready(report):
-    """Decision 4d: a stopped kubelet makes the cluster unhealthy and leaves the node's own entry healthy.
+    """A stopped kubelet makes the cluster unhealthy and leaves the node's own entry healthy.
 
-    The two healthy terms are the point (decision 6 of the phase 2 plan
-    for the first, decision 3 for the second): readiness is folded into
-    the cluster's healthy and kept out of the node's, which is Shaken
-    Fist's view of the instance and the gate on whether its agent is
-    asked anything.
+    The two healthy terms are the point: readiness is folded into the
+    cluster's healthy and kept out of the node's, which is Shaken Fist's
+    view of the instance and the gate on whether its agent is asked
+    anything.
     """
     worker = find_node(report, 'worker')
     problems = []
@@ -430,7 +448,7 @@ def check_not_ready(report):
 
 
 def check_health_exit_codes(plain_rc, strict_rc, expected_strict_rc):
-    """Decision 4d: sf-client k3s health exits 0, and with --strict exits 0 or 1 by healthy.
+    """sf-client k3s health exits 0, and with --strict exits 0 or 1 by healthy.
 
     The plain command's 0 matters as much as --strict's 1: it is the
     documented contract that only --strict turns the report into an exit
@@ -445,7 +463,7 @@ def check_health_exit_codes(plain_rc, strict_rc, expected_strict_rc):
 
 
 def check_ready_again(report):
-    """Decision 4d: once k3s-agent is started by hand, the worker is Ready and the cluster healthy."""
+    """Once k3s-agent is started by hand, the worker is Ready and the cluster healthy."""
     worker = find_node(report, 'worker')
     problems = []
     if worker['kubernetes']['ready'] != 'True':
@@ -458,13 +476,29 @@ def check_ready_again(report):
     return _joined(problems)
 
 
-def check_restarts_reset(report):
-    """Decision 4d: systemd resets NRestarts when the unit is started by hand.
+def check_ready_since_moved(before_report, report):
+    """Return None if the worker's ready_since is later than in before_report.
 
-    This is what docs/library-api.md currently says systemd is understood
-    to do, and it has never been observed. If a live run says otherwise,
-    the docs are wrong rather than the code, and this check is changed to
-    pin what was observed (step 3b of the plan).
+    Kubernetes moves a condition's lastTransitionTime whenever its status
+    changes, so a worker which went NotReady and came back must report a
+    later one than it did before k3s-agent was stopped.
+    """
+    before = find_node(before_report, 'worker')['kubernetes']['ready_since']
+    worker = find_node(report, 'worker')
+    now = worker['kubernetes']['ready_since']
+    if not _is_count(before) or not _is_count(now) or now <= before:
+        return ('%s is %r, not later than the %r before k3s-agent was stopped'
+                % (_label(worker, 'kubernetes', 'ready_since'), now, before))
+    return None
+
+
+def check_restarts_reset(report):
+    """Systemd resets NRestarts when the unit is started by hand.
+
+    docs/library-api.md tells a caller to expect this, and it is why a
+    counter lower than its baseline voids the baseline. If a k3s or
+    systemd release stops doing it, the docs are wrong rather than the
+    code.
     """
     worker = find_node(report, 'worker')
     restarts = worker['signals']['k3s_restarts']
@@ -475,7 +509,7 @@ def check_restarts_reset(report):
 
 
 def check_snapshot_saved(before_report, report):
-    """Decision 4e: an etcd snapshot makes the control plane's etcd_snapshot_bytes grow.
+    """An etcd snapshot makes the control plane's etcd_snapshot_bytes grow.
 
     A snapshot directory which did not exist before reads None, which
     health() reports rather than 0, and is compared as though it were
@@ -502,12 +536,12 @@ def check_disk_pressure_reported(report):
 
 
 def check_disk_pressure(report):
-    """Decision 4f: disk pressure is reported, and judged by nothing.
+    """Disk pressure is reported, and judged by nothing.
 
-    A node under pressure is degraded rather than down (decision 6 of the
-    phase 2 plan), so it stays Ready and the cluster stays healthy. The
-    other two pressure conditions are checked so that the reading which
-    went True is known to be the disk's, not all three at once.
+    A node under pressure is degraded rather than down, so it stays Ready
+    and the cluster stays healthy. The other two pressure conditions are
+    checked so that the reading which went True is known to be the
+    disk's, not all three at once.
     """
     worker = find_node(report, 'worker')
     kubernetes = worker['kubernetes']
@@ -576,8 +610,8 @@ def poll(read, predicate, bound, describe, role='worker', interval=POLL_INTERVAL
     None when the state being waited for holds and otherwise says what
     does not hold yet. describe says what is being waited for. Returns the
     report which satisfied predicate and how long that took, which the
-    step prints, because how long each wait took is what step 3b uses to
-    judge the bounds.
+    step prints, so that the log shows how close each wait came to its
+    bound.
 
     When the bound passes, raises Failure with describe, what predicate
     last said, and role's node's last signals and kubernetes entries and
@@ -592,7 +626,7 @@ def poll(read, predicate, bound, describe, role='worker', interval=POLL_INTERVAL
 
 
 def disk_fill_command(free_percent=DISK_FREE_PERCENT, path=DISK_FILL_PATH):
-    """Return decision 4f's command, which fills the root filesystem until free_percent of it is free.
+    """Return the command which fills the root filesystem until free_percent of it is free.
 
     df -P prints one line per filesystem whatever the device name's
     length, and its size and available columns are statfs's f_blocks and
@@ -658,17 +692,17 @@ def _summary(node):
 
 
 def step_baseline(read):
-    """4a. Take one report of the untouched cluster, check it, and return it as the baseline."""
+    """Take one report of the untouched cluster, check it, and return it as the baseline."""
     baseline = read()
     fail_if(check_baseline(baseline))
-    say('4a baseline: healthy=%r; control plane: %s; worker: %s'
+    say('baseline: healthy=%r; control plane: %s; worker: %s'
         % (baseline['healthy'], _summary(find_node(baseline, 'control_plane')),
            _summary(find_node(baseline, 'worker'))))
     return baseline
 
 
-def step_oom_kill(read, baseline):
-    """4b. Kill a pod at its own memory limit on the worker, and check the report counts and lists it."""
+def step_oom_kill(read, name, baseline):
+    """Kill a pod at its own memory limit on the worker, and check the report counts and lists it."""
     worker = find_node(baseline, 'worker')
     # node_name_for_instance() takes an instance from the API, and its only
     # input is the name, which the report's node entry carries as it was
@@ -704,41 +738,44 @@ def step_oom_kill(read, baseline):
         read, lambda r: check_oom_killed_listed(r, pod_name), OOM_LISTED_BOUND_SECONDS,
         "the worker's kubernetes.oom_killed to list %s/%s/%s" % (OOM_NAMESPACE, pod_name, OOM_CONTAINER))
     fail_if(check_oom_kill(baseline, report, pod_name))
+    # The CLI renders the kill too, which no other step gives it.
+    plain_rc, strict_rc = _health_exit_codes(name, 0)
 
     after = find_node(report, 'worker')
     entry = _oom_entry(after, pod_name)
-    say('4b pod limit kill: %s OOMKilled on %s after %ds, listed in oom_killed after %ds more '
-        '(restarts=%r, finished_at=%r); worker oom_kills %r -> %r; boot_id unchanged (%s); healthy=%r'
+    say('pod limit kill: %s OOMKilled on %s after %ds, listed in oom_killed after %ds more '
+        '(restarts=%r, finished_at=%r); worker oom_kills %r -> %r; boot_id unchanged (%s); healthy=%r; '
+        'health exited %d, health --strict exited %d'
         % (pod_name, node_name, pod_elapsed, listed_elapsed, entry['restarts'], entry['finished_at'],
            worker['signals']['oom_kills'], after['signals']['oom_kills'], after['signals']['boot_id'],
-           report['healthy']))
+           report['healthy'], plain_rc, strict_rc))
 
     kubectl('delete', 'pod', pod_name, '-n', OOM_NAMESPACE, '--wait=true', '--timeout=120s')
 
 
 def step_automatic_restart(cluster, read, worker_uuid):
-    """4c. SIGKILL the worker's k3s, and check systemd's restart of it is counted."""
-    # A report from just before the kill rather than 4a's, so that the
-    # comparison is with the counter as it stood when the kill happened.
+    """SIGKILL the worker's k3s, and check systemd's restart of it is counted."""
+    # A report from just before the kill rather than the baseline, so that
+    # the comparison is with the counter as it stood when the kill happened.
     before = read()
     cluster.execute_and_await([worker_uuid], [KILL_COMMAND])
     report, elapsed = poll(read, lambda r: check_automatic_restart(before, r), RESTART_BOUND_SECONDS,
                            "systemd to restart the worker's k3s-agent and count it")
     worker = find_node(report, 'worker')
-    say('4c automatic restart: worker k3s-agent %s after %ds, k3s_restarts %r -> %r; boot_id unchanged (%s)'
+    say('automatic restart: worker k3s-agent %s after %ds, k3s_restarts %r -> %r; boot_id unchanged (%s)'
         % (worker['signals']['k3s_state'], elapsed, find_node(before, 'worker')['signals']['k3s_restarts'],
            worker['signals']['k3s_restarts'], worker['signals']['boot_id']))
 
 
-def step_not_ready(cluster, read, name, worker_uuid):
-    """4d. Stop the worker's k3s, check NotReady and --strict, then start it by hand and check again."""
+def step_not_ready(cluster, read, name, worker_uuid, baseline):
+    """Stop the worker's k3s, check NotReady and --strict, then start it by hand and check again."""
     cluster.execute_and_await([worker_uuid], [STOP_COMMAND])
     report, elapsed = poll(read, check_kubelet_silent, NOT_READY_BOUND_SECONDS,
                            'Kubernetes to stop calling the worker Ready')
     fail_if(check_not_ready(report))
     plain_rc, strict_rc = _health_exit_codes(name, 1)
     worker = find_node(report, 'worker')
-    say('4d stopped: worker ready=%r after %ds; healthy=%r, worker node healthy=%r, k3s_state=%r; '
+    say('k3s-agent stopped: worker ready=%r after %ds; healthy=%r, worker node healthy=%r, k3s_state=%r; '
         'health exited %d, health --strict exited %d'
         % (worker['kubernetes']['ready'], elapsed, report['healthy'], worker['healthy'],
            worker['signals']['k3s_state'], plain_rc, strict_rc))
@@ -748,34 +785,36 @@ def step_not_ready(cluster, read, name, worker_uuid):
                            'the worker to be Ready again after starting k3s-agent by hand')
     worker = find_node(report, 'worker')
 
-    # Printed as soon as it is read, before anything below can fail, and
-    # whatever it is, because this is the reading step 3b exists to observe:
-    # the docs' claim about systemd is settled by this number, not by the
-    # pass or fail. A poll which gave up above has already printed it among
-    # the worker's signals.
-    say('4d k3s_restarts after the start by hand: %r (docs/library-api.md expects 0)'
+    # Printed as soon as it is read, before anything below can fail, so
+    # that a run in which systemd stopped resetting the count shows what it
+    # left. A poll which gave up above has already printed it among the
+    # worker's signals.
+    say('k3s_restarts after the start by hand: %r (0 expected)'
         % (worker['signals']['k3s_restarts'],))
 
     plain_rc, strict_rc = _health_exit_codes(name, 0)
-    say('4d started: worker ready=%r after %ds; healthy=%r; health exited %d, health --strict exited %d'
-        % (worker['kubernetes']['ready'], elapsed, report['healthy'], plain_rc, strict_rc))
+    say('k3s-agent started: worker ready=%r after %ds, ready_since %r -> %r; healthy=%r; '
+        'health exited %d, health --strict exited %d'
+        % (worker['kubernetes']['ready'], elapsed, find_node(baseline, 'worker')['kubernetes']['ready_since'],
+           worker['kubernetes']['ready_since'], report['healthy'], plain_rc, strict_rc))
     fail_if(check_restarts_reset(report))
+    fail_if(check_ready_since_moved(baseline, report))
 
 
 def step_snapshot(cluster, read):
-    """4e. Take an etcd snapshot on the control plane, and check etcd_snapshot_bytes grows."""
+    """Take an etcd snapshot on the control plane, and check etcd_snapshot_bytes grows."""
     before = read()
     control_plane_uuid = find_node(before, 'control_plane')['uuid']
     cluster.execute_and_await([control_plane_uuid], [SNAPSHOT_COMMAND])
     report = read()
     fail_if(check_snapshot_saved(before, report))
-    say('4e etcd snapshot: control plane etcd_snapshot_bytes %r -> %r'
+    say('etcd snapshot: control plane etcd_snapshot_bytes %r -> %r'
         % (find_node(before, 'control_plane')['signals']['etcd_snapshot_bytes'],
            find_node(report, 'control_plane')['signals']['etcd_snapshot_bytes']))
 
 
-def step_disk_pressure(cluster, read, worker_uuid):
-    """4f. Fill the worker's root filesystem to 3% free, and check DiskPressure is reported and not judged.
+def step_disk_pressure(cluster, read, name, worker_uuid):
+    """Fill the worker's root filesystem to 3% free, and check DiskPressure is reported and not judged.
 
     Not undone: the kubelet takes minutes to clear the condition, and the
     cluster's delete removes the file with the instance.
@@ -784,12 +823,16 @@ def step_disk_pressure(cluster, read, worker_uuid):
     report, elapsed = poll(read, check_disk_pressure_reported, DISK_PRESSURE_BOUND_SECONDS,
                            'the worker to report DiskPressure')
     fail_if(check_disk_pressure(report))
+    # The CLI renders a pressure condition which is True, which no other
+    # step gives it.
+    plain_rc, strict_rc = _health_exit_codes(name, 0)
     worker = find_node(report, 'worker')
     kubernetes = worker['kubernetes']
-    say('4f disk pressure: worker disk_pressure=%r after %ds; ready=%r, healthy=%r, memory_pressure=%r, '
-        'pid_pressure=%r, memory_available_bytes=%r'
+    say('disk pressure: worker disk_pressure=%r after %ds; ready=%r, healthy=%r, memory_pressure=%r, '
+        'pid_pressure=%r, memory_available_bytes=%r; health exited %d, health --strict exited %d'
         % (kubernetes['disk_pressure'], elapsed, kubernetes['ready'], report['healthy'],
-           kubernetes['memory_pressure'], kubernetes['pid_pressure'], worker['signals']['memory_available_bytes']))
+           kubernetes['memory_pressure'], kubernetes['pid_pressure'], worker['signals']['memory_available_bytes'],
+           plain_rc, strict_rc))
 
 
 def main(argv=None):
@@ -806,11 +849,11 @@ def main(argv=None):
         # Instance uuids do not change, so the baseline's are the ones to
         # send node commands to for the rest of the run.
         worker_uuid = find_node(baseline, 'worker')['uuid']
-        step_oom_kill(read, baseline)
+        step_oom_kill(read, args.cluster, baseline)
         step_automatic_restart(cluster, read, worker_uuid)
-        step_not_ready(cluster, read, args.cluster, worker_uuid)
+        step_not_ready(cluster, read, args.cluster, worker_uuid, baseline)
         step_snapshot(cluster, read)
-        step_disk_pressure(cluster, read, worker_uuid)
+        step_disk_pressure(cluster, read, args.cluster, worker_uuid)
     except Failure as e:
         # Caught only to print it without a traceback, which would say
         # nothing about the cluster; the run still ends here. Anything
@@ -819,7 +862,7 @@ def main(argv=None):
         say('FAILED: %s' % e)
         return 1
 
-    say('Every provoked signal was reported as decision 4 expects.')
+    say('Every provoked signal was reported as expected.')
     return 0
 
 

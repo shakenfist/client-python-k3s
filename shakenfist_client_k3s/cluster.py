@@ -128,12 +128,20 @@ AGENT_OP_KNOWN_STATES = (AGENT_OP_PENDING_STATES + AGENT_OP_FAILED_STATES
 # only: the API round trips around it -- one per node to read its
 # instance, one per probe to submit it, and the reads of each operation --
 # are serial and not bounded by it, so on a slow Shaken Fist API the call
-# as a whole can take longer. The server's own deadline
-# would bound the wait eventually, but ten minutes of silence is not a
-# health check: a 'kubectl get nodes' on a cluster which is answering
-# returns in well under a second, and the node signals command reads a few
-# files and sizes two directories, so a node which has not answered in
-# thirty is the answer rather than a slow one.
+# as a whole can take longer.
+#
+# It is a ceiling rather than a cost. Probes are collected one after
+# another, but every command runs on its node while an earlier one is
+# waited for, and each operation is read before the wait considers
+# sleeping, so a probe which has finished by its turn costs one read and
+# no sleep. A healthy cluster waits for about its slowest probe -- a second
+# or two whatever its size -- not the sum.
+#
+# The server's own deadline would bound the wait eventually, but ten
+# minutes of silence is not a health check: a 'kubectl get nodes' on a
+# cluster which is answering returns in well under a second, and the node
+# signals command reads a few files and sizes two directories, so a node
+# which has not answered in thirty is the answer rather than a slow one.
 HEALTH_PROBE_TIMEOUT_SECONDS = 30
 
 # The command health() runs on the first control plane node to ask whether
@@ -361,8 +369,7 @@ K3S_RELEASE_FLOOR = (1, 21, 1)
 # 'k3s-agent'. Asking a worker about 'k3s' is not an error -- systemctl
 # reports a unit which does not exist as LoadState=not-found and
 # NRestarts=0, which reads as "never restarted" -- and that is why the
-# unit is chosen by role rather than assumed (survey finding 2 of
-# docs/plans/PLAN-cumulative-health-signals-phase-01-agent-signals.md).
+# unit is chosen by role rather than assumed.
 K3S_UNIT_BY_ROLE = {
     'control_plane': 'k3s',
     'worker': 'k3s-agent',
@@ -384,12 +391,11 @@ K3S_ETCD_DIR = '/var/lib/rancher/k3s/server/db/etcd'
 K3S_ETCD_SNAPSHOT_DIR = '/var/lib/rancher/k3s/server/db/snapshots'
 
 # The readings parse_node_signals() returns: the keys of the ``signals``
-# dict health() reports on each node, less ``probed`` and ``error`` (decision
-# 1 of the cumulative health signals phase 1 plan). Named here so that the
-# report for a node which was never probed can be built with exactly the
-# keys of one which was, which is the rule the ``api`` report already
-# follows: a caller must not have to work out what happened from which
-# keys exist.
+# dict health() reports on each node, less ``probed`` and ``error``. Named
+# here so that the report for a node which was never probed can be built
+# with exactly the keys of one which was, which is the rule the ``api``
+# report already follows: a caller must not have to work out what happened
+# from which keys exist.
 NODE_SIGNAL_KEYS = (
     'boot_id',
     'booted_at',
@@ -412,6 +418,8 @@ NODE_SIGNAL_KEYS = (
 # It is also capped at twenty digits, which is as long as the largest
 # value any reading can hold: every one of them is a kernel or systemd
 # counter or size of at most 64 bits, and 2**64 - 1 has twenty digits.
+# parse_kubernetes_readings() holds a container's restartCount to the same
+# pattern, through _kubernetes_integer(): it is an int32, well inside it.
 # Uncapped, a garbage reading could be thousands of digits long, and the
 # report would then break whoever serialises it -- Python 3.11 and later
 # refuse to turn an int of more than 4300 digits into a string, and
@@ -750,7 +758,7 @@ def node_signals_command(role, snapshot_dir=None):
 
     du's errors are discarded because a snapshot directory which does not
     exist is an expected state, not a fault -- k3s creates it with the first
-    snapshot -- and decision 6 reports it as None rather than as 0. The
+    snapshot -- and it is reported as None rather than as 0. The
     other readings' errors are left on stderr: none of them is expected to
     fail, so one which does is worth finding in the agent operation log.
     '--' ends du's options, so that a snapshot directory beginning with a
@@ -842,8 +850,7 @@ def parse_node_signals(stdout, role):
     stdout holds. A reading the output does not carry, or carries in a
     form which is not a reading, is None on its own and voids none of the
     others. None of it is judged: these are facts for a caller who has a
-    baseline to compare them with (decisions 2 and 3 of the cumulative
-    health signals phase 1 plan).
+    baseline to compare them with.
 
     Lines are split on their first '=', so a value containing one is kept
     whole -- and, since no reading contains one, is then not a reading,
@@ -941,14 +948,33 @@ def _node_condition_template(condition, field):
     false. The outer .status is the node's, the inner one the
     condition's: range moves the dot onto each condition.
 
+    A condition's status is printed only once eq has matched it against
+    one of Kubernetes' three, so a status which is none of them prints
+    nothing and reads as None. The API server does not validate a
+    condition's status, and the kubelet credentials root holds on any
+    node can write that node's conditions. text/template prints a string
+    as it is, so a status carrying a newline would start a record of its
+    own, and the nodes are listed by name, so a forged record for a
+    later node would be read before its real one and win. Every other
+    field the templates print is a name the API validates or a typed
+    value (see KUBERNETES_NAME_RE), or, for a container's name, is taken
+    from the pod's spec (see _oom_line_template()). eq with more than two
+    arguments is true when the first equals any of the rest.
+
     condition and field are this module's literals, so nothing here is
     caller data.
     """
+    if field == 'status':
+        value = ('{{if eq .status "True" "False" "Unknown"}}{{.status}}'
+                 '{{end}}')
+    else:
+        value = '{{.%s}}' % field
     return ('{{if .status}}{{range .status.conditions}}'
             '{{if .type}}{{if eq .type "%(condition)s"}}'
-            '{{if .%(field)s}}{{.%(field)s}}{{end}}'
+            '{{if .%(field)s}}%(value)s{{end}}'
             '{{end}}{{end}}'
-            '{{end}}{{end}}' % {'condition': condition, 'field': field})
+            '{{end}}{{end}}'
+            % {'condition': condition, 'field': field, 'value': value})
 
 
 # The go-template 'kubectl get nodes' renders with: one line per Kubernetes
@@ -962,7 +988,7 @@ KUBERNETES_NODES_TEMPLATE = (
     'node' + _KUBERNETES_TAB +
     # The node's name, from .metadata.name. Kubelet registers the node
     # under the guest's hostname, lowercased, which is how health() matches
-    # it with an instance (see remove_worker()).
+    # it with an instance (see node_name_for_instance()).
     '{{if .metadata}}{{if .metadata.name}}{{.metadata.name}}{{end}}{{end}}' +
     _KUBERNETES_TAB +
     # The four conditions' .status, in a fixed column order.
@@ -977,17 +1003,27 @@ KUBERNETES_NODES_TEMPLATE = (
     '{{end}}')
 
 
-def _oom_line_template(state):
+def _oom_line_template(state, spec_containers):
     """Build the go-template fragment which prints an 'oom' line from one termination.
 
     The dot is a container's status (an element of a pod's
-    .status.containerStatuses or .status.initContainerStatuses) and $pod is
-    the pod it belongs to. state is 'state' or 'lastState', the two places
-    a container's termination is reported: the one it is in now, and the
-    one before that. The line is 'oom', the node the pod was scheduled on,
-    the pod's namespace and name, the container's name, its restart count,
-    and when the termination finished. The last field is the only one
-    which differs between the two states, which is why this takes one.
+    .status.containerStatuses or .status.initContainerStatuses), $status
+    is the same status, and $pod is the pod it belongs to. state is
+    'state' or 'lastState', the two places a container's termination is
+    reported: the one it is in now, and the one before that. The line is
+    'oom', the node the pod was scheduled on, the pod's namespace and name,
+    the container's name, its restart count, and when the termination
+    finished. The last field is the only one which differs between the two
+    states, which is why this takes one.
+
+    The container's name is the one in the pod's spec -- spec_containers
+    is 'containers' or 'initContainers', the list the status belongs to --
+    whose name equals the status's, rather than the status's own. The API
+    server validates a spec's container names, and does not check that a
+    status names a container the spec has, so a node's kubelet, and root
+    on that node, can write any string there, a newline included. A status
+    which names no container in the spec prints an empty name, and
+    parse_kubernetes_readings() drops the line.
 
     Every map is tested before a field below it is read, for the reasons
     _node_condition_template() gives. restartCount is the exception, and
@@ -1016,8 +1052,12 @@ def _oom_line_template(state):
         '{{$pod.metadata.namespace}}{{end}}{{end}}' + _KUBERNETES_TAB +
         '{{if $pod.metadata}}{{if $pod.metadata.name}}'
         '{{$pod.metadata.name}}{{end}}{{end}}' + _KUBERNETES_TAB +
-        # The container's name and restart count, from its status.
-        '{{if .name}}{{.name}}{{end}}' + _KUBERNETES_TAB +
+        # The container's name, from the pod's spec, and its restart
+        # count, from its status. range moves the dot onto each container
+        # in the spec, which is why the status is $status there.
+        '{{if .name}}{{if $pod.spec}}{{range $pod.spec.%(spec)s}}'
+        '{{if .name}}{{if eq .name $status.name}}{{.name}}{{end}}{{end}}'
+        '{{end}}{{end}}{{end}}' % {'spec': spec_containers} + _KUBERNETES_TAB +
         '{{if exists . "restartCount"}}{{.restartCount}}{{end}}' +
         _KUBERNETES_TAB + finished_at + _KUBERNETES_NEWLINE)
 
@@ -1039,56 +1079,66 @@ def _oom_terminated_template(state):
 
 _KUBERNETES_OOM_TEST_END = '{{end}}{{end}}{{end}}{{end}}'
 
-# What the pods template prints for one container status: an 'oom' line if
-# the container's current state, or failing that its last one, is a
-# termination whose reason is OOMKilled, and nothing otherwise.
-#
-# A container which has been killed and not yet restarted has the kill in
-# .state; one which has been restarted since, or is in CrashLoopBackOff
-# waiting to be, has it in .lastState. Both are read (survey finding 3 of
-# the cumulative health signals phase 2 plan). When both are OOM kills the
-# container has been killed twice running, and .state's is reported because
-# it is the newer of the two: a caller tells a new kill from one it has
-# already seen by its finished_at, and the older one's would read as no
-# change. $reported is how the second test knows the first printed;
-# assigning to a variable declared outside the if is Go 1.11 template
-# syntax, which every kubectl this plugin supports has.
-_OOM_CONTAINER_TEMPLATE = (
-    '{{$reported := false}}' +
-    _oom_terminated_template('state') +
-    '{{$reported = true}}' + _oom_line_template('state') +
-    _KUBERNETES_OOM_TEST_END +
-    '{{if not $reported}}' +
-    _oom_terminated_template('lastState') +
-    _oom_line_template('lastState') +
-    _KUBERNETES_OOM_TEST_END +
-    '{{end}}')
+
+def _oom_container_template(spec_containers):
+    """Build what the pods template prints for one container status.
+
+    That is an 'oom' line if the container's current state, or failing
+    that its last one, is a termination whose reason is OOMKilled, and
+    nothing otherwise. spec_containers is the list in the pod's spec which
+    the status belongs to, 'containers' or 'initContainers', from which
+    _oom_line_template() takes the container's name.
+
+    A container which has been killed and not yet restarted has the kill
+    in .state; one which has been restarted since, or is in
+    CrashLoopBackOff waiting to be, has it in .lastState, so both are
+    read. When both are OOM kills the container has been killed twice
+    running, and .state's is reported because it is the newer of the two:
+    a caller tells a new kill from one it has already seen by its
+    finished_at, and the older one's would read as no change. $reported is
+    how the second test knows the first printed; assigning to a variable
+    declared outside the if is Go 1.11 template syntax, which every
+    kubectl this plugin supports has.
+    """
+    return (
+        '{{$status := .}}{{$reported := false}}' +
+        _oom_terminated_template('state') +
+        '{{$reported = true}}' + _oom_line_template('state', spec_containers) +
+        _KUBERNETES_OOM_TEST_END +
+        '{{if not $reported}}' +
+        _oom_terminated_template('lastState') +
+        _oom_line_template('lastState', spec_containers) +
+        _KUBERNETES_OOM_TEST_END +
+        '{{end}}')
+
 
 # The go-template 'kubectl get pods -A' renders with: one 'oom' line per
 # container, init containers included, whose current or most recent
 # termination was an OOM kill, and nothing for any other container. That
 # is what keeps the output proportional to what it reports rather than to
-# the number of pods, which matters because nothing between the node and
-# this parser is known to bound a command's output (survey finding 9).
+# the number of pods, which matters because Shaken Fist returns a command's
+# output inline only up to 10 KiB, and a probe whose output is longer than
+# that cannot be read (see _collect_probe()).
 # $pod keeps the pod in reach from inside the ranges over its containers,
 # which move the dot onto each container's status in turn.
 KUBERNETES_PODS_TEMPLATE = (
     '{{range .items}}{{$pod := .}}{{if .status}}'
-    '{{range .status.containerStatuses}}' + _OOM_CONTAINER_TEMPLATE +
+    '{{range .status.containerStatuses}}' +
+    _oom_container_template('containers') +
     '{{end}}'
-    '{{range .status.initContainerStatuses}}' + _OOM_CONTAINER_TEMPLATE +
+    '{{range .status.initContainerStatuses}}' +
+    _oom_container_template('initContainers') +
     '{{end}}'
     '{{end}}{{end}}')
 
 # The command health() runs on the first control plane node to read every
 # Kubernetes node's conditions and every container's latest OOM kill from
-# the Kubernetes API (decision 9 of the cumulative health signals phase 2
-# plan). A constant: no caller data enters it, so rule 1 above has nothing
-# to quote. Each template is passed through shlex.quote() all the same,
-# because the templates are full of $, double quotes and braces which the
-# shell must not touch, and quote() single quotes them; that the templates
-# contain no single quote of their own keeps the result readable in the
-# agent operation log rather than full of quote() escapes.
+# the Kubernetes API. A constant: no caller data enters it, so rule 1 above
+# has nothing to quote. Each template is passed through shlex.quote() all
+# the same, because the templates are full of $, double quotes and braces
+# which the shell must not touch, and quote() single quotes them; that the
+# templates contain no single quote of their own keeps the result readable
+# in the agent operation log rather than full of quote() escapes.
 #
 # The two reads are joined with '&&' so that the command exits non-zero if
 # either fails, and the pods are not read at all if the nodes cannot be.
@@ -1112,9 +1162,12 @@ K3S_KUBERNETES_PROBE_COMMAND = (
 # beginning and ending with a letter or digit, at most 253 characters in
 # all. A namespace or a container is named with a single such label, at
 # most 63 characters. These are Kubernetes' own rules
-# (IsDNS1123Subdomain and IsDNS1123Label in apimachinery), so the API
-# cannot hold a name either refuses, and a line carrying one is not
-# something the API printed.
+# (IsDNS1123Subdomain and IsDNS1123Label in apimachinery), which the API
+# server applies to an object's name and namespace, to a pod's
+# spec.nodeName and to the container names in its spec, so a line
+# carrying a name either refuses is not something the API printed. It
+# does not apply them to the container names in a pod's status, which
+# is why the pods template prints the spec's name instead.
 #
 # The caps matter beyond tidiness. A name is a key a caller looks up and
 # a string that flows on into the Ansible module's result and every log
@@ -1131,8 +1184,7 @@ KUBERNETES_LABEL_RE = re.compile(r'\A[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\Z')
 # The values a node condition's status can have. They are Kubernetes'
 # strings and are reported as they are rather than as bools, because
 # 'Unknown' -- the node controller has stopped hearing from the kubelet --
-# is a third answer a bool would have to lie about (decision 3 of the
-# cumulative health signals phase 2 plan).
+# is a third answer a bool would have to lie about.
 KUBERNETES_CONDITION_STATUSES = frozenset(('True', 'False', 'Unknown'))
 
 # The form the Kubernetes API writes a timestamp in: RFC 3339, in UTC,
@@ -1303,24 +1355,23 @@ def parse_kubernetes_readings(stdout):
     as Unix seconds; ready_since is None when there is no Ready condition.
     restarts is the container's restartCount, which is for the pod's
     lifetime. oom_killed holds each node's entries in the order kubectl
-    printed them, and has no key for a node with none. These are the
-    readings decisions 3 and 5 of the cumulative health signals phase 2
-    plan describe; matching them with instances is health()'s job, so an
-    entry for a node with no 'node' line is kept rather than judged here.
+    printed them, and has no key for a node with none. Matching them with
+    instances is health()'s job, so an entry for a node with no 'node' line
+    is kept rather than judged here.
 
     The output comes from the Kubernetes API by way of kubectl and a node
-    which may be unwell, so it is validated rather than trusted (decision
-    9 of that plan). Lines are split on tabs and each field is stripped,
-    so a CRLF or a trailing space does not make a reading unparsable. A
-    line whose type is neither 'node' nor 'oom' is ignored, which is how a
-    stray line is survived. A line any field of which fails validation is
-    dropped whole (see _kubernetes_record()). Names must be Kubernetes
-    names (KUBERNETES_NAME_RE and KUBERNETES_LABEL_RE), statuses one of
+    which may be unwell, so it is validated rather than trusted. Lines are
+    split on tabs and each field is stripped, so a CRLF or a trailing space
+    does not make a reading unparsable. A line whose type is neither 'node'
+    nor 'oom' is ignored, which is how a stray line is survived. A line any
+    field of which fails validation is dropped whole (see
+    _kubernetes_record()). Names must be Kubernetes names
+    (KUBERNETES_NAME_RE and KUBERNETES_LABEL_RE), statuses one of
     KUBERNETES_CONDITION_STATUSES, times RFC 3339 UTC to the second, and
     counts NODE_SIGNAL_INTEGER_RE's. For a node named twice, the first
     record wins, as the first occurrence of a key does in
-    parse_node_signals(): the API does not let two nodes share a name, so
-    a second line is not the API's, and the first was printed before it.
+    parse_node_signals(): the API does not let two nodes share a name, so a
+    second line is not the API's, and the first was printed before it.
 
     stdout of None is read as empty. Nothing here raises for any string.
     """
@@ -1341,12 +1392,12 @@ def parse_kubernetes_readings(stdout):
     return {'nodes': nodes, 'oom_killed': oom_killed}
 
 
-# The keys of the ``kubernetes`` dict health() reports on each node
-# (decision 3 of the cumulative health signals phase 2 plan): whether a
-# Kubernetes node has the node's name, the readings parse_kubernetes_readings()
-# files under that name, and its OOM kills. Named here, as NODE_SIGNAL_KEYS
-# is, so that a node about which nothing could be read is reported with
-# exactly the keys of one about which everything could.
+# The keys of the ``kubernetes`` dict health() reports on each node: whether
+# a Kubernetes node has the node's name, the readings
+# parse_kubernetes_readings() files under that name, and its OOM kills.
+# Named here, as NODE_SIGNAL_KEYS is, so that a node about which nothing
+# could be read is reported with exactly the keys of one about which
+# everything could.
 KUBERNETES_NODE_KEYS = (
     'registered',
     'ready',
@@ -2557,15 +2608,8 @@ class Cluster:
         time left: aop is the operation as submitted, and so pending however
         long ago the command finished, and judging it on that would report
         every probe collected after a slow first one as abandoned.
-
-        Collection is one probe after another, but the commands are not:
-        every one was submitted before the first is collected, and runs on
-        its node while an earlier one is waited for. A probe which finished
-        while its turn came round is read once and costs no sleep, so
-        collecting N probes waits about as long as the slowest of them, not
-        the sum, and sleeps no longer than the shared budget in all. The
-        reads themselves are API round trips which that budget does not
-        bound; see health()'s docstring.
+        HEALTH_PROBE_TIMEOUT_SECONDS says why collecting probes one after
+        another costs about the slowest of them rather than the sum.
 
         name is how the error messages refer to the command. Left None, they
         quote the command line, which for 'kubectl get nodes' is the clearest
@@ -2597,7 +2641,7 @@ class Cluster:
             # outcome which leaves something behind on the cluster: the
             # command is still queued against the instance, and this is
             # where an operator or a polling caller finds out which one to
-            # look at. See health()'s docstring for what that costs.
+            # look at. docs/library-api.md says what that costs a caller.
             # The number of seconds named is the budget every probe's
             # deadline is measured from, rather than whatever was left of it
             # by the time this probe was collected.
@@ -2647,31 +2691,46 @@ class Cluster:
         if not probe['answered']:
             probe['error'] = ('%s exited %s'
                               % (name or "'%s'" % command, probe['return_code']))
+        elif probe['stdout'] is None:
+            # Shaken Fist returns a command's stdout inline only up to 10
+            # KiB. Anything longer is stored as a blob, and the result then
+            # carries stdout_blob and no stdout at all. Reading the missing
+            # stdout as empty would be the worst answer available: the
+            # Kubernetes probe would report every node unregistered and no
+            # container killed, which is a claim, and a tenant who can make
+            # enough OOM-killed containers could arrange it. So a command
+            # whose output did not come back has not answered, and says why.
+            probe['answered'] = False
+            if result.get('stdout_blob'):
+                probe['error'] = (
+                    '%s printed more than the 10 KiB Shaken Fist returns '
+                    'inline, so its output was stored as blob %s, which this '
+                    'version of the k3s plugin does not read'
+                    % (name or "'%s'" % command, result['stdout_blob']))
+            else:
+                probe['error'] = (
+                    '%s exited 0, but the agent operation recorded no output '
+                    'for it' % (name or "'%s'" % command))
         return probe
 
     def _unprobed(self, instance_uuid, error):
         """Build health()'s ``api`` report for a probe which was not run.
 
-        Two callers, and the same shape for both, because a caller reading
-        the report must not have to tell "no control plane node to ask"
-        apart from "the node we would have asked is down" by which keys
-        are present. ``probed`` is False and ``error`` says which.
+        Two reasons a probe is not run -- no control plane node to ask, and
+        the node it would have asked is down -- and the same shape for both,
+        because a caller reading the report must not have to tell them
+        apart by which keys are present. ``probed`` is False and ``error``
+        says which.
 
         The Kubernetes probe is skipped under the same rule, on the same
         node, and is built here too, so that it is skipped in the same
         words; _kubernetes_from_probe() then keeps only what the top level
         ``kubernetes`` report carries.
+
+        Built from _new_probe(), so that a key added there is a key every
+        outcome has.
         """
-        return {
-            'probed': False,
-            'answered': False,
-            'instance_uuid': instance_uuid,
-            'command': None,
-            'return_code': None,
-            'stdout': None,
-            'stderr': None,
-            'error': error
-        }
+        return dict(self._new_probe(instance_uuid, None), probed=False, error=error)
 
     def _cannot_answer(self, subject, node):
         """Say why a probe was not run on a node which is not able to answer it.
@@ -2698,11 +2757,11 @@ class Cluster:
         to work out what happened from which keys exist. Every reading is
         None, because none was taken, except ``k3s_unit``, which is not a
         reading but the name of the unit one would have been taken from,
-        and is known from the role alone.
+        and is known from the role alone, which is what parse_node_signals()
+        returns for no output at all.
         """
         signals = {'probed': False, 'error': error}
-        signals.update(dict.fromkeys(NODE_SIGNAL_KEYS))
-        signals['k3s_unit'] = k3s_unit_for_role(role)
+        signals.update(parse_node_signals(None, role))
         return signals
 
     def _signals_from_probe(self, role, probe):
@@ -2740,18 +2799,15 @@ class Cluster:
     def _kubernetes_from_probe(self, probe, nodes):
         """Give every node entry its ``kubernetes`` readings, and build the top level report.
 
-        probe is the Kubernetes probe's report in ``api``'s shape: collected,
-        refused at submission, or built by _unprobed() for one which was not
-        run. Every entry in nodes is given a ``kubernetes`` dict with exactly
-        KUBERNETES_NODE_KEYS, and the return value is health()'s top level
-        ``kubernetes``. Decisions 3 to 5 of the cumulative health signals
-        phase 2 plan are the rules, and they are written out where each is
-        applied below.
+        probe is the Kubernetes probe's report in ``api``'s shape:
+        collected, refused at submission, or built by _unprobed() for one
+        which was not run. Every entry in nodes is given a ``kubernetes``
+        dict with exactly KUBERNETES_NODE_KEYS, and the return value is
+        health()'s top level ``kubernetes``. The rules are written out where
+        each is applied below.
 
-        Only ``probed`` and ``error`` are kept from the probe, as they are
-        for ``signals``: the command line, its stdout and its stderr are raw
-        material, and the stdout of a busy cluster's pod read is not
-        something to hand to every caller of health().
+        Only ``probed``, ``answered`` and ``error`` are kept from the probe,
+        for the reason _signals_from_probe() gives.
         """
         kubernetes = {
             'probed': probe['probed'],
@@ -2785,7 +2841,7 @@ class Cluster:
         # The entry carries that name under the same key the instance
         # representation does, read by _node_health(), so this costs no
         # second get_instance(). An instance which is gone has no name, and
-        # nothing can be said about it (decision 4).
+        # nothing can be said about it.
         names = [node_name_for_instance(node) for node in nodes]
 
         # Shaken Fist does not make instance names unique, and the lowercasing
@@ -2809,30 +2865,29 @@ class Cluster:
 
             # A name with no node record is a node Kubernetes does not know:
             # registered False, and no condition, since there is no node
-            # object to have one (decision 3).
+            # object to have one.
             node_readings = readings['nodes'].get(name)
             node['kubernetes'] = self._unread_kubernetes()
             node['kubernetes']['registered'] = node_readings is not None
             node['kubernetes'].update(node_readings or {})
 
             # Every kill the pods read filed under this node's name, which
-            # is the pod's spec.nodeName (decision 5), and [] for none: the
-            # pods were read, so an empty list is now a reading. Taken by
-            # name whether or not the node was registered, because a kill
-            # attributed to this node is a fact about it either way, and
-            # dropping one because its node record was dropped would be the
-            # empty list claiming something nobody read.
+            # is the pod's spec.nodeName, and [] for none: the pods were
+            # read, so an empty list is now a reading. Taken by name whether
+            # or not the node was registered, because a kill attributed to
+            # this node is a fact about it either way, and dropping one
+            # because its node record was dropped would be the empty list
+            # claiming something nobody read.
             node['kubernetes']['oom_killed'] = readings['oom_killed'].get(name, [])
 
         # Every Kubernetes node no entry accounts for -- typically the node
         # object of an instance deleted out of band -- is listed rather than
         # dropped, because dropping it would look exactly like there being
         # none. Sorted, so that two reports of the same cluster compare
-        # equal. Kills filed under a name no entry has go nowhere (decision
-        # 5): there is no node entry to report them on, and none is invented
-        # for them. If their node has a node record it is listed here, which
-        # is where a caller looks next; if it has none, there is nothing to
-        # list.
+        # equal. Kills filed under a name no entry has go nowhere: there is
+        # no node entry to report them on, and none is invented for them. If
+        # their node has a node record it is listed here, which is where a
+        # caller looks next; if it has none, there is nothing to list.
         kubernetes['unmatched_nodes'] = sorted(set(readings['nodes']) - set(claims))
         return kubernetes
 
@@ -3198,10 +3253,7 @@ class Cluster:
         a moment later for a node which simply had not got there yet. The
         k3s installer returns once the service has started, which is before
         the kubelet has registered the node and well before the node
-        reports Ready, and nothing waited for either until decision 8 of
-        PLAN-cumulative-health-signals-phase-02-kubernetes-signals.md: the
-        callers which needed Ready nodes, this repo's CI among them, each
-        waited for themselves.
+        reports Ready.
 
         Like install_workers(), there is no default: a caller says which
         nodes it means, and expand_workers() means only the ones it made.
@@ -3220,14 +3272,9 @@ class Cluster:
         remove_worker() tolerates, and the client's
         ResourceNotFoundException says so.
 
-        Then one command for every node (nodes_ready_command()), run on the
-        first control plane node, which is where kubectl has the cluster's
-        admin kubeconfig. One command rather than one per node, because
-        commands sent together run one after another on the agent, and
-        each per node wait would have been charged against Shaken Fist's
-        agent operation deadline in turn; one command waits for every node
-        under one budget, which NODE_REGISTRATION_ATTEMPTS shows fits inside
-        that deadline for a cluster of any size. A node which does not
+        Then one command for every node (nodes_ready_command(), which says
+        why it is one), run on the first control plane node, which is where
+        kubectl has the cluster's admin kubeconfig. A node which does not
         register or become Ready in time makes the command exit non-zero,
         and execute_and_await() raises CommandFailedError carrying it, with
         the poll's message naming the nodes which had not registered or
@@ -3836,12 +3883,8 @@ class Cluster:
         md['kubeconfig'] = yaml.dump(kc)
         self.set_metadata(md)
 
-        # Wait for every node to register with Kubernetes and report Ready,
-        # per decision 8 of the phase 2 cumulative health signals plan. That
-        # plan's decision 6 makes health() call a cluster unhealthy while
-        # any node is not, so a create which returned before then would hand
-        # its caller a cluster that fails its first health check for no
-        # reason but timing.
+        # Wait for every node to register with Kubernetes and report Ready;
+        # the docstring says why, and what a failure leaves behind.
         #
         # Every node, control plane included, and one call rather than one
         # per role, because nothing about readiness differs by role and the
@@ -3861,12 +3904,6 @@ class Cluster:
         # registered, so a node which had not yet would be left out of the
         # rollout that is meant to check it. Longhorn follows MetalLB, so it
         # is after this too.
-        #
-        # A failure raises out of here with md['state'] still 'initial',
-        # which is the truth about the cluster: everything this function has
-        # recorded so far is complete and correct, and the state is what
-        # says the build did not finish. 'sf-client k3s delete' is the way
-        # out, as it is for every other failure mid-create.
         self.await_nodes_ready(
             md['control_plane_nodes'] + md['worker_nodes'])
 
@@ -4090,36 +4127,17 @@ class Cluster:
 
         Nor does it hang. Each probe -- the k3s API probe and the Kubernetes
         probe on the first control plane node, and a signals probe on every
-        node -- is only attempted when the node it would be run on looks
-        able to answer -- the node entry this method has just built says
-        whether the instance exists, is created and has a ready agent -- and
-        they share one wall clock timeout even then. An agent operation
-        queued against an instance whose agent is not connected never leaves
-        its queued state, so a probe which is attempted anyway waits forever
-        on exactly the cluster this verb exists to describe. Every probe is submitted
-        before any is waited for, and every one is waited for against a
-        single deadline, HEALTH_PROBE_TIMEOUT_SECONDS from before the first
-        submission, so the waiting is bounded by one budget on a cluster of
-        any size rather than one per node. That bounds the waiting, not the
-        call: on top of it come one API round trip per node to read its
-        instance, one per probe to submit it, and the reads of each
-        operation, all serial, so on a slow Shaken Fist API the wall time
-        can exceed the budget. A skipped probe and an abandoned one are
-        both ``probed`` False with an ``error`` saying which, so a caller
-        never has to tell them apart by which keys are present. A probe
-        collected after that deadline has passed is still read from the
-        server once, without waiting, so one which finished while an earlier
-        probe used up the budget is reported as it finished rather than as
-        abandoned.
-
-        The budget is a ceiling rather than a cost. Probes are collected one
-        after another, but each operation is read before the wait considers
-        sleeping, and every command is running on its node while an earlier
-        one is waited for, so a probe which has finished by its turn costs
-        one read and no sleep. A healthy cluster therefore waits for about
-        the time its slowest probe takes -- typically a second or two
-        whatever its size -- rather than a second per node, plus the API
-        round trips above.
+        node -- is only attempted when the node entry this method has just
+        built says the instance exists, is created and has a ready agent: an
+        agent operation queued against an instance whose agent is not
+        connected never leaves its queued state, so a probe attempted anyway
+        would wait forever on exactly the cluster this verb exists to
+        describe. Every probe is then waited for against one shared
+        deadline, HEALTH_PROBE_TIMEOUT_SECONDS from before the first
+        submission, whose comment says what that bounds and what it costs. A
+        skipped probe and an abandoned one are both ``probed`` False with an
+        ``error`` saying which, so a caller never has to tell them apart by
+        which keys are present.
 
         The report is::
 
@@ -4174,7 +4192,7 @@ class Cluster:
                 ],
                 'api': {
                     'probed': bool,             # the command was run at all
-                    'answered': bool,           # ...and it exited zero
+                    'answered': bool,           # ...it exited zero, and its output came back
                     'instance_uuid': str or None,
                     'command': str or None,
                     'return_code': int or None,
@@ -4184,7 +4202,7 @@ class Cluster:
                 },
                 'kubernetes': {
                     'probed': bool,             # the Kubernetes probe was run at all
-                    'answered': bool,           # ...and it exited zero
+                    'answered': bool,           # ...it exited zero, and its output came back
                     'error': str or None,       # why it did not answer
                     'unmatched_nodes': list or None  # Kubernetes node names no node accounts for
                 },
@@ -4200,66 +4218,37 @@ class Cluster:
 
         ``signals`` is what the node says about itself, read through its
         agent by the command node_signals_command() builds; that function
-        and parse_node_signals() say where each reading comes from. Every
-        node entry carries it, always with the same keys. A node which was
-        not probed -- its instance is gone, or it is not in a state which
-        can answer -- says why in ``error``, in the words ``api`` uses for
-        a skipped probe. A reading which could not be taken is None on its
-        own and voids none of the others; ``error`` is for the probe as a
-        whole -- not run, abandoned, failed, or exited non-zero.
-        ``k3s_state`` and ``k3s_restarts`` are None when the unit is not
-        loaded, because systemd reports a restart count of zero for a unit
-        which does not exist and zero would be a claim. ``boot_id`` is None
-        unless it is a UUID, and is lowercased, and ``k3s_state`` unless it
-        is lowercase letters and hyphens, so that garbage on a node never
-        reads as a reboot or a state. The etcd sizes are always None on a
-        worker, and memory is converted from /proc/meminfo's kB so that
-        every size here is in bytes.
+        and parse_node_signals() say where each reading comes from, and
+        docs/library-api.md ("What signals reports") what each key means
+        and when it is None. Every node entry carries it, always with the
+        same keys, and a node which was not probed says why in ``error``, in
+        the words ``api`` uses for a skipped probe.
 
         The readings are raw and cumulative, and health() stores none of
         them: a verb whose contract is that it has no side effects beyond
         its probes does not grow a metadata write to remember the last
         answer, and "since anyone last asked" means nothing when the
         command line, a daily poll and an Ansible play all ask. A caller
-        which wants a delta keeps its own previous report as a baseline and
-        reads the counters by one rule: a changed ``boot_id``, or a counter
-        lower than its baseline under an unchanged one, voids the baseline,
-        and the current value is the delta. Every reading but the etcd sizes
-        resets at boot, which ``boot_id`` detects; systemd is understood to
-        clear ``k3s_restarts`` when an operator restarts the unit by hand,
-        which only the lower-than-baseline half catches. ``oom_kills``
-        counts every OOM kill the kernel makes, cgroup kills included, so a
-        pod killed for exceeding its own memory limit increments it just as
-        a node running out of memory does.
+        which wants a delta keeps its own previous report as a baseline,
+        and docs/library-api.md gives the rule it reads the counters by.
 
         ``kubernetes`` on a node is what the Kubernetes API says of it, read
         on the first control plane node by K3S_KUBERNETES_PROBE_COMMAND and
-        parse_kubernetes_readings(), which say where each reading comes from.
-        Every node entry carries it, always with the same keys, matched to a
-        Kubernetes node by the name node_name_for_instance() gives it.
-        Condition statuses are Kubernetes' own strings, because 'Unknown' is
-        a third answer a bool would lie about. ``oom_killed`` lists the
-        containers on the node whose latest termination was an OOM kill: a
-        latest state, not a count, and a later ``finished_at`` for the same
-        namespace, pod and container is a new kill. When the probe did not
-        answer, every value is None, ``oom_killed`` included, since an empty
-        list would claim nothing was killed; when it answered and no
-        Kubernetes node has the name, ``registered`` is False and the
-        conditions None. A node with no name -- its instance is gone -- or
-        whose lowercased name another node shares cannot be matched, and
-        reads None throughout. The top level ``kubernetes`` is the probe's
-        own outcome, and ``unmatched_nodes`` the sorted names of Kubernetes
-        nodes no node entry accounts for, typically one left behind by an
-        instance deleted out of band; it is None when the probe did not
-        answer. docs/library-api.md defines each of these in full.
+        parse_kubernetes_readings(), which say where each reading comes
+        from, and matched to a Kubernetes node by the name
+        node_name_for_instance() gives it. Every node entry carries it,
+        always with the same keys. When the probe did not answer every value
+        is None, ``oom_killed`` included, since an empty list would claim
+        nothing was killed. The top level ``kubernetes`` is the probe's own
+        outcome. docs/library-api.md ("What kubernetes reports") defines
+        each key, and when it is None, in full.
 
         The top level ``healthy`` is the conjunction a caller would
         otherwise have to write itself: the cluster finished being built,
         every node in it exists and is up, the k3s API answered, the
         Kubernetes probe answered, and Kubernetes reports every node
-        ``ready`` 'True' (decision 6 of the cumulative health signals phase
-        2 plan). 'Unknown' is not Ready, and nor is a node which is not
-        registered, a node which could not be matched, or readiness the
+        ``ready`` 'True'. 'Unknown' is not Ready, and nor is a node which is
+        not registered, a node which could not be matched, or readiness the
         probe could not read. The probe's own term is implied by the
         readiness one, since a probe which did not answer leaves every
         ``ready`` None, and is stated anyway: it is the reason, and it keeps
@@ -4301,22 +4290,13 @@ class Cluster:
         md['control_plane_nodes'] being empty is a finding about the API
         probe rather than an IndexError.
 
-        One thing this leaves behind, which matters to a caller polling it in
-        a loop: every probe submits an agent operation -- one on each node it
-        probes, and the two kubectl ones beside it on the first control plane
-        node -- and each one still waiting when the shared deadline passes is
-        abandoned while queued against its node. Nothing here reaps them,
-        because there is nothing to reap them with -- the commands may yet
-        run -- so the server's own deadline ends each one, and until then an
-        await_idle() in a later expand-workers or update-os waits for them
-        along with everything else. That is up to one operation per probed
-        node, plus two, rather than one in total. The uuid of each abandoned
-        operation is in its probe's ``error`` -- ``api['error']``,
-        ``kubernetes['error']``, or the node's ``signals['error']`` -- so that wait
-        can be accounted for rather than guessed at. This is bounded rather
-        than free: a reconcile loop polling health() against nodes whose
-        agents are intermittently slow pays for it in a delayed later verb,
-        not in a hang.
+        One thing this leaves behind: each probe still waiting when the
+        shared deadline passes is abandoned with its agent operation queued
+        against its node. Nothing here reaps them, because the commands may
+        yet run, so the server's own deadline ends each one, and until then
+        a later expand-workers or update-os waits for them. The uuid of each
+        is in its probe's ``error``, and docs/library-api.md says what that
+        costs a caller polling health() in a loop.
         """
         md = self.get_metadata()
         if not md:
@@ -4328,34 +4308,20 @@ class Cluster:
             for instance_uuid in md.get(md_key) or []:
                 nodes.append(self._node_health(instance_uuid, role))
 
-        # One deadline for every probe, taken before the first is submitted
-        # so that the budget covers the submissions as well as the waits.
-        # Everything is submitted before anything is waited for, so the
-        # waits overlap rather than queue: the first probe collected waits
-        # for whatever is left of the budget, and each one after it only for
-        # whatever is left after that, which is what bounds this call's
-        # waiting at one budget on a cluster of any size rather than one per
-        # node. Its waiting, not its wall time: the get_instance() calls
-        # above happen before the deadline is taken, and nothing bounds the
-        # submissions below or the reads of each operation, every one a
-        # serial API round trip, so on a slow Shaken Fist API the call takes
-        # longer than the budget. Within that bound it costs about the
-        # slowest probe, not the sum: each wait reads its operation before
-        # it sleeps, so one which finished while an earlier probe was waited
-        # for costs no sleep. Taking it here starts every probe's clock a
-        # little early, by however long the submissions before it take -- a
-        # few API calls -- which decision 8 of the cumulative health signals
-        # phase 1 plan accepts.
+        # One deadline for every probe (see HEALTH_PROBE_TIMEOUT_SECONDS),
+        # taken before the first is submitted so that the budget covers the
+        # submissions as well as the waits. That starts every probe's clock a
+        # little early, by the few API calls of the submissions before it,
+        # which is negligible against a thirty second budget.
         deadline = time.monotonic() + HEALTH_PROBE_TIMEOUT_SECONDS
 
-        # The k3s API is asked through the first control plane node, which an
-        # interrupted create may never have made. That is a finding rather
-        # than an error, so it is reported the same way a kubectl which
-        # exits non-zero is. The Kubernetes probe is asked through the same
-        # node under the same rule (decision 1 of the cumulative health
-        # signals phase 2 plan): the API server answers for every node, so
-        # one node asking it is enough, and it is skipped in the same words
-        # when that node cannot answer.
+        # The k3s API is asked through the first control plane node, which
+        # an interrupted create may never have made. That is a finding
+        # rather than an error, so it is reported the same way a kubectl
+        # which exits non-zero is. The Kubernetes probe is asked through the
+        # same node under the same rule: the API server answers for every
+        # node, so one node asking it is enough, and it is skipped in the
+        # same words when that node cannot answer.
         #
         # The order of submission is the API probe, then the Kubernetes
         # probe, then every node's signals. On the first control plane node
@@ -4843,9 +4809,8 @@ class Cluster:
         # is handed only those: the nodes already in the cluster are not
         # this call's business, and one of them being NotReady is something
         # health() reports rather than a reason to fail an expand which did
-        # what it was asked. Decision 8 of the phase 2 cumulative health
-        # signals plan. A failure raises out of here with the new workers
-        # already recorded in md['worker_nodes'], which
+        # what it was asked. A failure raises out of here with the new
+        # workers already recorded in md['worker_nodes'], which
         # create_and_await_instances() did as it made each one, so health()
         # reports them and delete() removes them; nothing else is written.
         self.await_nodes_ready(new_workers)

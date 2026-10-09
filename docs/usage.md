@@ -548,23 +548,28 @@ since boot, available memory, and on control plane nodes the size of
 etcd and its snapshots. Nothing on it is judged -- there are no
 markers and no thresholds, and it never changes whether the node or
 the cluster is reported healthy -- because whether a number is a
-problem depends on what the cluster is for. A node that could not be
-read says `signals: not read` and why. The counts are cumulative
+problem depends on what the cluster is for. A reading the node could
+not give is `unknown`, and a probe which ran but failed adds its reason
+in parentheses at the end of the line. A node that could not be read
+at all says `signals: not read` and why. The counts are cumulative
 since boot, so compare against an earlier report to see what changed;
 see [What `signals` reports](library-api.md#what-signals-reports) for
 what each reading is and how to diff it.
 
 The `kubernetes:` line beneath it is what Kubernetes says of that node,
 read once through the first control plane node: `Ready since <time>`
-(or `NotReady (False)` / `NotReady (Unknown)`), then each pressure
-condition that is true -- `MemoryPressure`, `DiskPressure`,
-`PIDPressure` -- or `no pressure`. Each container whose latest
-termination was an OOM kill is a further indented `OOM killed:` line
-naming the pod, container, time and the pod's restart count. A node
-Kubernetes has no record of says `kubernetes: not registered`. One that
-could not be read says `kubernetes: not read` and why: the probe did not
-answer, the instance no longer exists so there is no name to match, or
-another node has the same name. After the `k3s API:` lines,
+(or `NotReady (False)` / `NotReady (Unknown)`, or `readiness unknown`
+when it could not be read), then each pressure condition that is true
+-- `MemoryPressure`, `DiskPressure`, `PIDPressure` -- or `no pressure`.
+A pressure condition which is neither true nor false is named with
+`unknown` beside it, and then the line does not say `no pressure`.
+Each container whose latest termination was an OOM kill is a further
+indented `OOM killed:` line naming the pod, container, time and the
+pod's restart count. A node Kubernetes has no record of says
+`kubernetes: not registered`. One that could not be read says
+`kubernetes: not read` and why: the probe did not answer, the instance
+no longer exists so there is no name to match, or another node has the
+same name. After the `k3s API:` lines,
 `Kubernetes: unmatched nodes a, b` names any Kubernetes node no
 instance accounts for, and `Kubernetes probe: did not answer (...)`
 says why every node was unread. As with signals, nothing is judged on
@@ -631,8 +636,8 @@ for the reason. Pressure, OOM-killed containers and unmatched Kubernetes
 nodes are reported and do not affect it, because whether they matter
 depends on the workload. `create` and `expand-workers` wait for the
 nodes they add to be `Ready` before returning, so `create` followed by
-`health --strict` does not race the last node's registration. This
-changed in the release after v0.2.0, which ignored readiness
+`health --strict` does not race the last node's registration. Up to
+v0.2.0, `healthy` ignored readiness
 ([shakenfist/client-python-k3s#76](https://github.com/shakenfist/client-python-k3s/issues/76));
 [What `healthy` requires](library-api.md#what-healthy-requires) is the
 full list.

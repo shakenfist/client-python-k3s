@@ -64,7 +64,12 @@ branch's merge queue, and on a manual `workflow_dispatch`.
 that a create on the `v1.20` release channel is refused as older than
 the release floor without registering the name, then creates a real
 k3s cluster, verifies it serves a LoadBalancer service, expands its
-workers and addresses, and deletes it. That cluster is built with
+workers and addresses, and deletes it. `health --strict` runs after
+each create and straight after `expand-workers`, and because `healthy`
+requires every node `Ready`, the minimal cluster's run (which nothing
+has waited before) and the `expand-workers` one (before the script's
+own node wait) also check that those verbs waited for their nodes.
+That cluster is built with
 non-default node sizes and with `--server-config` and `--agent-config`,
 and the script asserts that the sizes reached both the cluster metadata
 and Shaken Fist, that Traefik and servicelb are absent, that each role's
@@ -78,11 +83,13 @@ leave in place. Some of the node
 customisation behaviour is covered by unit tests only: the refusal of
 keys the plugin owns, the configuration files on a node and the order
 k3s reads them in, and the zero-worker cluster that is never tainted.
-The minimal cluster is then damaged on purpose by
-`tools/ci_health_signals.py`: a pod OOM-killed at its memory limit, a
-SIGKILLed k3s-agent, a stopped kubelet and a nearly full disk. It
-asserts that `health()` reports each, and that `health --strict` exits
-1 while the kubelet is stopped.
+Last, immediately before its delete, the minimal cluster is damaged on
+purpose by `tools/ci_health_signals.py`: a pod OOM-killed at its memory
+limit, a SIGKILLed k3s-agent, a stopped kubelet, an etcd snapshot, and a
+disk filled to 3% free, which it leaves full for the delete to remove.
+It asserts that `health()` reports each, that `health --strict` exits 1
+while the kubelet is stopped and 0 otherwise, and that a fresh cluster's
+readings all have the shape they should.
 The script runs on an ephemeral VM runner, in that runner's own
 per-job Shaken Fist namespace on the under-cloud, so everything the
 test creates dies with the runner. A full run is 20-30 minutes.

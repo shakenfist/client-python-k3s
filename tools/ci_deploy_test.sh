@@ -89,9 +89,11 @@ trap on_exit EXIT
 
 wait_for_nodes() {
     # kubectl wait --for=condition=Ready --all only considers nodes that
-    # have already registered with the API server, and immediately after
-    # a create or expand the newest node may not have yet. Poll for the
-    # expected count first, then wait for readiness.
+    # have already registered with the API server. create and
+    # expand-workers wait for the nodes they build to be Ready before
+    # they return, so the count should already be right; it is polled for
+    # anyway, then readiness waited for, so that this stays a check of
+    # the node count which does not rest on the verb under test.
     expected=$1
     for _ in $(seq 30); do
         if [ "$(kubectl get nodes --no-headers | wc -l)" -ge "${expected}" ]; then
@@ -540,6 +542,10 @@ assert_instance_size 'worker' "${first_worker}" \
 status 'Expand the cluster with an extra worker'
 before_workers=$(worker_uuids | sort)
 sf-client k3s expand-workers "${CLUSTER}" --worker-count 1
+# expand-workers waits for the workers it adds to be Ready before it
+# returns, so the cluster is healthy now, before wait_for_nodes below has
+# waited for anything itself. --strict makes that an assertion.
+sf-client k3s health "${CLUSTER}" --strict
 wait_for_nodes 4
 after_workers=$(worker_uuids | sort)
 new_worker=$(comm -13 <(echo "${before_workers}") <(echo "${after_workers}"))
@@ -775,8 +781,7 @@ status 'Provoke each health signal on the minimal cluster'
 # stopped k3s-agent, an etcd snapshot, and a worker disk left full -- and
 # asserts that health() reports each. So it runs last, immediately before
 # the delete which cleans up after it, and on this cluster rather than the
-# main one, whose Longhorn and MetalLB a stopped kubelet would upset. See
-# docs/plans/PLAN-cumulative-health-signals-phase-03-live-validation.md.
+# main one, whose Longhorn and MetalLB a stopped kubelet would upset.
 # python3 is the venv activated above, which has the plugin installed, and
 # the tool's kubectl reaches this cluster through the KUBECONFIG exported
 # above.
