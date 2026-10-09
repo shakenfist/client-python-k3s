@@ -384,7 +384,7 @@ class CheckOomKillTestCase(_ToolTestCase):
         self.assertIsNone(self.tool.check_oom_kill(healthy_report(), oom_killed_report(oom_kills=3), POD))
 
     def test_the_kill_was_not_counted(self):
-        """This is the cgroup kill claim: phase 1 read it from kernel source and never saw it."""
+        """A kill at a pod's own memory limit is a kill the kernel counts, not only a node running out."""
         self.assertFails(self.tool.check_oom_kill(healthy_report(), oom_killed_report(oom_kills=0), POD),
                          'worker signals.oom_kills', 'is 0', 'baseline 0 plus 1')
 

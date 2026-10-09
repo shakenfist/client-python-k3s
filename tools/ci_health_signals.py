@@ -33,9 +33,10 @@ The judgements are the check_*() functions: each takes reports and
 returns None, or a message naming the reading which was wrong. They are
 pure so that they can be unit tested, in
 shakenfist_client_k3s/tests/test_ci_health_signals.py. What they cannot
-test is whether the plan guessed systemd, the kernel and the kubelet
-right; only a live run says that, which is why every step prints the
-readings it compared even when it passes.
+test is whether systemd, the kernel and the kubelet still behave as the
+checks expect on the k3s release the merge tier installs that day; only
+a live run says that, which is why every step prints the readings it
+compared even when it passes.
 
 Every wait is a poll of health() with a bound, never a fixed sleep, and a
 poll which gives up prints what it last read. The first failure ends the
@@ -348,9 +349,9 @@ def check_oom_killed_listed(report, pod_name):
 def check_oom_kill(baseline, report, pod_name):
     """Decision 4b: a pod killed at its own memory limit is counted, listed, and not judged.
 
-    oom_kills having to rise is the claim phase 1 took from kernel source
-    and never observed: that /proc/vmstat's oom_kill counts a cgroup kill
-    as well as a global one.
+    oom_kills has to rise because /proc/vmstat's oom_kill counts a kill at
+    a cgroup's own limit as well as one made when the whole node runs out
+    of memory.
     """
     before = find_node(baseline, 'worker')
     worker = find_node(report, 'worker')
@@ -461,10 +462,10 @@ def check_ready_again(report):
 def check_restarts_reset(report):
     """Decision 4d: systemd resets NRestarts when the unit is started by hand.
 
-    This is what docs/library-api.md currently says systemd is understood
-    to do, and it has never been observed. If a live run says otherwise,
-    the docs are wrong rather than the code, and this check is changed to
-    pin what was observed (step 3b of the plan).
+    docs/library-api.md tells a caller to expect this, and it is why a
+    counter lower than its baseline voids the baseline. If a k3s or
+    systemd release stops doing it, the docs are wrong rather than the
+    code.
     """
     worker = find_node(report, 'worker')
     restarts = worker['signals']['k3s_restarts']
@@ -748,12 +749,11 @@ def step_not_ready(cluster, read, name, worker_uuid):
                            'the worker to be Ready again after starting k3s-agent by hand')
     worker = find_node(report, 'worker')
 
-    # Printed as soon as it is read, before anything below can fail, and
-    # whatever it is, because this is the reading step 3b exists to observe:
-    # the docs' claim about systemd is settled by this number, not by the
-    # pass or fail. A poll which gave up above has already printed it among
-    # the worker's signals.
-    say('4d k3s_restarts after the start by hand: %r (docs/library-api.md expects 0)'
+    # Printed as soon as it is read, before anything below can fail, so
+    # that a run in which systemd stopped resetting the count shows what it
+    # left. A poll which gave up above has already printed it among the
+    # worker's signals.
+    say('4d k3s_restarts after the start by hand: %r (0 expected)'
         % (worker['signals']['k3s_restarts'],))
 
     plain_rc, strict_rc = _health_exit_codes(name, 0)

@@ -4293,9 +4293,9 @@ class Cluster:
         reads the counters by one rule: a changed ``boot_id``, or a counter
         lower than its baseline under an unchanged one, voids the baseline,
         and the current value is the delta. Every reading but the etcd sizes
-        resets at boot, which ``boot_id`` detects; systemd is understood to
-        clear ``k3s_restarts`` when an operator restarts the unit by hand,
-        which only the lower-than-baseline half catches. ``oom_kills``
+        resets at boot, which ``boot_id`` detects; systemd resets
+        ``k3s_restarts`` to 0 when an operator stops the unit and starts it
+        by hand, which only the lower-than-baseline half catches. ``oom_kills``
         counts every OOM kill the kernel makes, cgroup kills included, so a
         pod killed for exceeding its own memory limit increments it just as
         a node running out of memory does.
