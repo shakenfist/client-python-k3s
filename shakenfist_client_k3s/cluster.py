@@ -2809,10 +2809,8 @@ class Cluster:
         health()'s top level ``kubernetes``. The rules are written out where
         each is applied below.
 
-        Only ``probed`` and ``error`` are kept from the probe, as they are
-        for ``signals``: the command line, its stdout and its stderr are raw
-        material, and the stdout of a busy cluster's pod read is not
-        something to hand to every caller of health().
+        Only ``probed``, ``answered`` and ``error`` are kept from the probe,
+        for the reason _signals_from_probe() gives.
         """
         kubernetes = {
             'probed': probe['probed'],
@@ -3277,14 +3275,9 @@ class Cluster:
         remove_worker() tolerates, and the client's
         ResourceNotFoundException says so.
 
-        Then one command for every node (nodes_ready_command()), run on the
-        first control plane node, which is where kubectl has the cluster's
-        admin kubeconfig. One command rather than one per node, because
-        commands sent together run one after another on the agent, and
-        each per node wait would have been charged against Shaken Fist's
-        agent operation deadline in turn; one command waits for every node
-        under one budget, which NODE_REGISTRATION_ATTEMPTS shows fits inside
-        that deadline for a cluster of any size. A node which does not
+        Then one command for every node (nodes_ready_command(), which says
+        why it is one), run on the first control plane node, which is where
+        kubectl has the cluster's admin kubeconfig. A node which does not
         register or become Ready in time makes the command exit non-zero,
         and execute_and_await() raises CommandFailedError carrying it, with
         the poll's message naming the nodes which had not registered or
@@ -3893,10 +3886,8 @@ class Cluster:
         md['kubeconfig'] = yaml.dump(kc)
         self.set_metadata(md)
 
-        # Wait for every node to register with Kubernetes and report Ready.
-        # health() calls a cluster unhealthy while any node is not, so a
-        # create which returned before then would hand its caller a cluster
-        # that fails its first health check for no reason but timing.
+        # Wait for every node to register with Kubernetes and report Ready;
+        # the docstring says why, and what a failure leaves behind.
         #
         # Every node, control plane included, and one call rather than one
         # per role, because nothing about readiness differs by role and the
@@ -3916,12 +3907,6 @@ class Cluster:
         # registered, so a node which had not yet would be left out of the
         # rollout that is meant to check it. Longhorn follows MetalLB, so it
         # is after this too.
-        #
-        # A failure raises out of here with md['state'] still 'initial',
-        # which is the truth about the cluster: everything this function has
-        # recorded so far is complete and correct, and the state is what
-        # says the build did not finish. 'sf-client k3s delete' is the way
-        # out, as it is for every other failure mid-create.
         self.await_nodes_ready(
             md['control_plane_nodes'] + md['worker_nodes'])
 

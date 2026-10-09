@@ -347,19 +347,14 @@ class NodeUnnamedError(K3sClusterException):
     ``cluster.py``), so an instance representation with no usable
     ``name`` is one whose node cannot be asked after.
 
-    A separate class from ``WorkerUnnamedError`` rather than that one
-    reused, because the node may be a control plane node, and because what
-    could not be done is a wait rather than a drain. Nothing is destroyed
-    either way, and every name is resolved before any wait is submitted,
-    so this fires before the first one starts.
-
-    Not reachable from the Shaken Fist API as it stands, for the reason
-    ``WorkerUnnamedError`` gives, and the instance in question is one the
-    same call created minutes earlier. It exists so that a caller which
-    catches ``K3sClusterException`` is not handed an ``AttributeError`` from
-    the last minutes of a create, and so that the wait never guesses a
-    name: a guessed name is a node which is never found, and two minutes
-    of polling before a message which blames the node.
+    A separate class from ``WorkerUnnamedError`` because the node may be a
+    control plane node, and what could not be done is a wait rather than a
+    drain. Every name is resolved before any wait is submitted, so this
+    fires before the first one starts. Not reachable from the Shaken Fist
+    API as it stands, for the reason ``WorkerUnnamedError`` gives; it
+    exists so that a caller catching ``K3sClusterException`` is not handed
+    an ``AttributeError``, and so that the wait never guesses a name (see
+    ``Cluster.await_nodes_ready()``).
     """
 
     def __init__(self, name, instance_uuid):
