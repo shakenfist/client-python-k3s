@@ -410,6 +410,30 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'the node condition columns are printed in the order they are parsed',
+        PKG + '/cluster.py',
+        "    _node_condition_template('MemoryPressure', 'status') + _KUBERNETES_TAB +\n"
+        "    _node_condition_template('DiskPressure', 'status') + _KUBERNETES_TAB +\n"
+        "    _node_condition_template('PIDPressure', 'status') + _KUBERNETES_TAB +\n",
+        "    _node_condition_template('PIDPressure', 'status') + _KUBERNETES_TAB +\n"
+        "    _node_condition_template('DiskPressure', 'status') + _KUBERNETES_TAB +\n"
+        "    _node_condition_template('MemoryPressure', 'status') + _KUBERNETES_TAB +\n",
+        PKG + '.tests.test_cluster.KubernetesProbeCommandTestCase'
+        '.test_the_node_columns_are_in_the_order_the_parser_reads',
+        'stestr',
+    ),
+    (
+        'the oom columns are printed in the order they are parsed',
+        PKG + '/cluster.py',
+        "        '{{if exists . \"restartCount\"}}{{.restartCount}}{{end}}' +\n"
+        "        _KUBERNETES_TAB + finished_at + _KUBERNETES_NEWLINE)\n",
+        "        finished_at +\n"
+        "        _KUBERNETES_TAB + '{{if exists . \"restartCount\"}}{{.restartCount}}{{end}}' + _KUBERNETES_NEWLINE)\n",
+        PKG + '.tests.test_cluster.KubernetesProbeCommandTestCase'
+        '.test_the_oom_columns_are_in_the_order_the_parser_reads',
+        'stestr',
+    ),
+    (
         'a restart count of zero is printed by the pods template',
         PKG + '/cluster.py',
         """        '{{if exists . "restartCount"}}{{.restartCount}}{{end}}' +""",

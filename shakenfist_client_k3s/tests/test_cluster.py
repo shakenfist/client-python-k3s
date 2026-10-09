@@ -4865,6 +4865,52 @@ class KubernetesProbeCommandTestCase(testtools.TestCase):
                 count, nodes.count('{{if eq .type "%s"}}' % condition))
         self.assertIn('{{.lastTransitionTime}}', nodes)
 
+    def test_the_node_columns_are_in_the_order_the_parser_reads(self):
+        # A column printed in the wrong place still validates -- every
+        # condition's status is a status -- so nothing else would notice
+        # MemoryPressure and PIDPressure swapped, here or live, where both
+        # read False.
+        sources = {
+            ('Ready', 'status'): 'ready',
+            ('MemoryPressure', 'status'): 'memory_pressure',
+            ('DiskPressure', 'status'): 'disk_pressure',
+            ('PIDPressure', 'status'): 'pid_pressure',
+            ('Ready', 'lastTransitionTime'): 'ready_since',
+        }
+        columns = cluster_module.KUBERNETES_NODES_TEMPLATE.split('{{"\\t"}}')
+        printed = ['name' if '{{.metadata.name}}' in columns[1] else None]
+        for column in columns[2:]:
+            condition = re.findall(r'eq \.type "(\w+)"', column)
+            field = re.findall(r'{{\.(status|lastTransitionTime)}}', column)
+            self.assertEqual(1, len(condition), column)
+            self.assertEqual(1, len(field), column)
+            printed.append(sources.get((condition[0], field[0])))
+        self.assertEqual(
+            [key for key, _ in cluster_module._KUBERNETES_RECORDS['node']],
+            printed)
+
+    def test_the_oom_columns_are_in_the_order_the_parser_reads(self):
+        sources = (
+            ('{{$pod.spec.nodeName}}', 'node'),
+            ('{{$pod.metadata.namespace}}', 'namespace'),
+            ('{{$pod.metadata.name}}', 'pod'),
+            ('{{if eq .name $status.name}}', 'container'),
+            ('{{.restartCount}}', 'restarts'),
+            ('.terminated.finishedAt}}', 'finished_at'),
+        )
+        lines = cluster_module.KUBERNETES_PODS_TEMPLATE.split('oom{{"\\t"}}')[1:]
+        self.assertEqual(4, len(lines))
+        for line in lines:
+            columns = line.split('{{"\\n"}}')[0].split('{{"\\t"}}')
+            printed = []
+            for column in columns:
+                keys = [key for marker, key in sources if marker in column]
+                self.assertEqual(1, len(keys), column)
+                printed.append(keys[0])
+            self.assertEqual(
+                [key for key, _ in cluster_module._KUBERNETES_RECORDS['oom']],
+                printed)
+
     def test_both_states_of_every_container_are_read(self):
         # Init containers too: one killed for OOM holds its pod in
         # Init:CrashLoopBackOff, which is worth seeing.
