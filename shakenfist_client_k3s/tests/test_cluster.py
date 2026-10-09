@@ -4890,6 +4890,40 @@ class KubernetesProbeCommandTestCase(testtools.TestCase):
                           '{{.restartCount}}{{end}}'))
         self.assertNotIn('{{if .restartCount}}', pods)
 
+    def test_a_condition_status_is_printed_only_once_eq_has_matched_it(self):
+        # The API server does not validate a condition's status, and a
+        # node's kubelet credentials can write one carrying a newline,
+        # which would start a forged record for another node. So the
+        # status is printed only when it equals one of Kubernetes' three
+        # (eq is true when its first argument equals any of the rest), and
+        # anything else prints nothing. These were rendered against
+        # forged statuses by kubectl v1.21.1+k3s1 and v1.33.5+k3s1.
+        nodes = cluster_module.KUBERNETES_NODES_TEMPLATE
+        matched = ('{{if eq .status "True" "False" "Unknown"}}{{.status}}'
+                   '{{end}}')
+        self.assertEqual(4, nodes.count(matched))
+        self.assertEqual(4, nodes.count('{{.status}}'))
+
+    def test_a_container_name_is_taken_from_the_pod_spec(self):
+        # The API server does not check that a container status names a
+        # container in the spec, so the status's name is only compared,
+        # and the spec's -- which the API does validate -- is printed. A
+        # status naming no container in the spec prints an empty name,
+        # which the parser drops.
+        pods = cluster_module.KUBERNETES_PODS_TEMPLATE
+        printed = '{{if eq .name $status.name}}{{.name}}{{end}}'
+        self.assertEqual(4, pods.count(printed))
+        self.assertEqual(4, pods.count('{{.name}}'))
+        self.assertNotIn('{{$status.name}}', pods)
+
+        # Each kind of status is matched against its own list in the spec.
+        init = pods.index('{{range .status.initContainerStatuses}}')
+        for body, spec in ((pods[:init], 'containers'),
+                           (pods[init:], 'initContainers')):
+            self.assertEqual(
+                2, body.count('{{range $pod.spec.%s}}{{if .name}}%s'
+                              % (spec, printed)), spec)
+
     def test_a_container_killed_twice_is_reported_once_from_its_state(self):
         # The second test runs only if the first did not print, so the
         # newer of two kills is the one reported.

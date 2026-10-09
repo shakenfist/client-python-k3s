@@ -941,14 +941,33 @@ def _node_condition_template(condition, field):
     false. The outer .status is the node's, the inner one the
     condition's: range moves the dot onto each condition.
 
+    A condition's status is printed only once eq has matched it against
+    one of Kubernetes' three, so a status which is none of them prints
+    nothing and reads as None. The API server does not validate a
+    condition's status, and the kubelet credentials root holds on any
+    node can write that node's conditions. text/template prints a string
+    as it is, so a status carrying a newline would start a record of its
+    own, and the nodes are listed by name, so a forged record for a
+    later node would be read before its real one and win. Every other
+    field the templates print is a name the API validates or a typed
+    value (see KUBERNETES_NAME_RE), or, for a container's name, is taken
+    from the pod's spec (see _oom_line_template()). eq with more than two
+    arguments is true when the first equals any of the rest.
+
     condition and field are this module's literals, so nothing here is
     caller data.
     """
+    if field == 'status':
+        value = ('{{if eq .status "True" "False" "Unknown"}}{{.status}}'
+                 '{{end}}')
+    else:
+        value = '{{.%s}}' % field
     return ('{{if .status}}{{range .status.conditions}}'
             '{{if .type}}{{if eq .type "%(condition)s"}}'
-            '{{if .%(field)s}}{{.%(field)s}}{{end}}'
+            '{{if .%(field)s}}%(value)s{{end}}'
             '{{end}}{{end}}'
-            '{{end}}{{end}}' % {'condition': condition, 'field': field})
+            '{{end}}{{end}}'
+            % {'condition': condition, 'field': field, 'value': value})
 
 
 # The go-template 'kubectl get nodes' renders with: one line per Kubernetes
@@ -977,17 +996,27 @@ KUBERNETES_NODES_TEMPLATE = (
     '{{end}}')
 
 
-def _oom_line_template(state):
+def _oom_line_template(state, spec_containers):
     """Build the go-template fragment which prints an 'oom' line from one termination.
 
     The dot is a container's status (an element of a pod's
-    .status.containerStatuses or .status.initContainerStatuses) and $pod is
-    the pod it belongs to. state is 'state' or 'lastState', the two places
-    a container's termination is reported: the one it is in now, and the
-    one before that. The line is 'oom', the node the pod was scheduled on,
-    the pod's namespace and name, the container's name, its restart count,
-    and when the termination finished. The last field is the only one
-    which differs between the two states, which is why this takes one.
+    .status.containerStatuses or .status.initContainerStatuses), $status
+    is the same status, and $pod is the pod it belongs to. state is
+    'state' or 'lastState', the two places a container's termination is
+    reported: the one it is in now, and the one before that. The line is
+    'oom', the node the pod was scheduled on, the pod's namespace and name,
+    the container's name, its restart count, and when the termination
+    finished. The last field is the only one which differs between the two
+    states, which is why this takes one.
+
+    The container's name is the one in the pod's spec -- spec_containers
+    is 'containers' or 'initContainers', the list the status belongs to --
+    whose name equals the status's, rather than the status's own. The API
+    server validates a spec's container names, and does not check that a
+    status names a container the spec has, so a node's kubelet, and root
+    on that node, can write any string there, a newline included. A status
+    which names no container in the spec prints an empty name, and
+    parse_kubernetes_readings() drops the line.
 
     Every map is tested before a field below it is read, for the reasons
     _node_condition_template() gives. restartCount is the exception, and
@@ -1016,8 +1045,12 @@ def _oom_line_template(state):
         '{{$pod.metadata.namespace}}{{end}}{{end}}' + _KUBERNETES_TAB +
         '{{if $pod.metadata}}{{if $pod.metadata.name}}'
         '{{$pod.metadata.name}}{{end}}{{end}}' + _KUBERNETES_TAB +
-        # The container's name and restart count, from its status.
-        '{{if .name}}{{.name}}{{end}}' + _KUBERNETES_TAB +
+        # The container's name, from the pod's spec, and its restart
+        # count, from its status. range moves the dot onto each container
+        # in the spec, which is why the status is $status there.
+        '{{if .name}}{{if $pod.spec}}{{range $pod.spec.%(spec)s}}'
+        '{{if .name}}{{if eq .name $status.name}}{{.name}}{{end}}{{end}}'
+        '{{end}}{{end}}{{end}}' % {'spec': spec_containers} + _KUBERNETES_TAB +
         '{{if exists . "restartCount"}}{{.restartCount}}{{end}}' +
         _KUBERNETES_TAB + finished_at + _KUBERNETES_NEWLINE)
 
@@ -1039,30 +1072,38 @@ def _oom_terminated_template(state):
 
 _KUBERNETES_OOM_TEST_END = '{{end}}{{end}}{{end}}{{end}}'
 
-# What the pods template prints for one container status: an 'oom' line if
-# the container's current state, or failing that its last one, is a
-# termination whose reason is OOMKilled, and nothing otherwise.
-#
-# A container which has been killed and not yet restarted has the kill in
-# .state; one which has been restarted since, or is in CrashLoopBackOff
-# waiting to be, has it in .lastState. Both are read (survey finding 3 of
-# the cumulative health signals phase 2 plan). When both are OOM kills the
-# container has been killed twice running, and .state's is reported because
-# it is the newer of the two: a caller tells a new kill from one it has
-# already seen by its finished_at, and the older one's would read as no
-# change. $reported is how the second test knows the first printed;
-# assigning to a variable declared outside the if is Go 1.11 template
-# syntax, which every kubectl this plugin supports has.
-_OOM_CONTAINER_TEMPLATE = (
-    '{{$reported := false}}' +
-    _oom_terminated_template('state') +
-    '{{$reported = true}}' + _oom_line_template('state') +
-    _KUBERNETES_OOM_TEST_END +
-    '{{if not $reported}}' +
-    _oom_terminated_template('lastState') +
-    _oom_line_template('lastState') +
-    _KUBERNETES_OOM_TEST_END +
-    '{{end}}')
+
+def _oom_container_template(spec_containers):
+    """Build what the pods template prints for one container status.
+
+    That is an 'oom' line if the container's current state, or failing
+    that its last one, is a termination whose reason is OOMKilled, and
+    nothing otherwise. spec_containers is the list in the pod's spec which
+    the status belongs to, 'containers' or 'initContainers', from which
+    _oom_line_template() takes the container's name.
+
+    A container which has been killed and not yet restarted has the kill
+    in .state; one which has been restarted since, or is in
+    CrashLoopBackOff waiting to be, has it in .lastState, so both are
+    read. When both are OOM kills the container has been killed twice
+    running, and .state's is reported because it is the newer of the two:
+    a caller tells a new kill from one it has already seen by its
+    finished_at, and the older one's would read as no change. $reported is
+    how the second test knows the first printed; assigning to a variable
+    declared outside the if is Go 1.11 template syntax, which every
+    kubectl this plugin supports has.
+    """
+    return (
+        '{{$status := .}}{{$reported := false}}' +
+        _oom_terminated_template('state') +
+        '{{$reported = true}}' + _oom_line_template('state', spec_containers) +
+        _KUBERNETES_OOM_TEST_END +
+        '{{if not $reported}}' +
+        _oom_terminated_template('lastState') +
+        _oom_line_template('lastState', spec_containers) +
+        _KUBERNETES_OOM_TEST_END +
+        '{{end}}')
+
 
 # The go-template 'kubectl get pods -A' renders with: one 'oom' line per
 # container, init containers included, whose current or most recent
@@ -1075,9 +1116,11 @@ _OOM_CONTAINER_TEMPLATE = (
 # which move the dot onto each container's status in turn.
 KUBERNETES_PODS_TEMPLATE = (
     '{{range .items}}{{$pod := .}}{{if .status}}'
-    '{{range .status.containerStatuses}}' + _OOM_CONTAINER_TEMPLATE +
+    '{{range .status.containerStatuses}}' +
+    _oom_container_template('containers') +
     '{{end}}'
-    '{{range .status.initContainerStatuses}}' + _OOM_CONTAINER_TEMPLATE +
+    '{{range .status.initContainerStatuses}}' +
+    _oom_container_template('initContainers') +
     '{{end}}'
     '{{end}}{{end}}')
 
@@ -1113,9 +1156,12 @@ K3S_KUBERNETES_PROBE_COMMAND = (
 # beginning and ending with a letter or digit, at most 253 characters in
 # all. A namespace or a container is named with a single such label, at
 # most 63 characters. These are Kubernetes' own rules
-# (IsDNS1123Subdomain and IsDNS1123Label in apimachinery), so the API
-# cannot hold a name either refuses, and a line carrying one is not
-# something the API printed.
+# (IsDNS1123Subdomain and IsDNS1123Label in apimachinery), which the API
+# server applies to an object's name and namespace, to a pod's
+# spec.nodeName and to the container names in its spec, so a line
+# carrying a name either refuses is not something the API printed. It
+# does not apply them to the container names in a pod's status, which
+# is why the pods template prints the spec's name instead.
 #
 # The caps matter beyond tidiness. A name is a key a caller looks up and
 # a string that flows on into the Ansible module's result and every log

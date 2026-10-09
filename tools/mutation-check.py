@@ -391,6 +391,25 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'a node condition status is printed only once it is one of the three',
+        PKG + '/cluster.py',
+        '''        value = ('{{if eq .status "True" "False" "Unknown"}}{{.status}}'\n'''
+        "                 '{{end}}')\n",
+        "        value = '{{.status}}'\n",
+        PKG + '.tests.test_cluster.KubernetesProbeCommandTestCase',
+        'stestr',
+    ),
+    (
+        "an OOM kill's container name is the pod spec's, not the status's",
+        PKG + '/cluster.py',
+        "        '{{if .name}}{{if $pod.spec}}{{range $pod.spec.%(spec)s}}'\n"
+        "        '{{if .name}}{{if eq .name $status.name}}{{.name}}{{end}}{{end}}'\n"
+        "        '{{end}}{{end}}{{end}}' % {'spec': spec_containers} + _KUBERNETES_TAB +\n",
+        "        '{{if .name}}{{.name}}{{end}}' + _KUBERNETES_TAB +\n",
+        PKG + '.tests.test_cluster.KubernetesProbeCommandTestCase',
+        'stestr',
+    ),
+    (
         'a restart count of zero is printed by the pods template',
         PKG + '/cluster.py',
         """        '{{if exists . "restartCount"}}{{.restartCount}}{{end}}' +""",
