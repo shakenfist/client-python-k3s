@@ -2726,17 +2726,11 @@ class Cluster:
         node, and is built here too, so that it is skipped in the same
         words; _kubernetes_from_probe() then keeps only what the top level
         ``kubernetes`` report carries.
+
+        Built from _new_probe(), so that a key added there is a key every
+        outcome has.
         """
-        return {
-            'probed': False,
-            'answered': False,
-            'instance_uuid': instance_uuid,
-            'command': None,
-            'return_code': None,
-            'stdout': None,
-            'stderr': None,
-            'error': error
-        }
+        return dict(self._new_probe(instance_uuid, None), probed=False, error=error)
 
     def _cannot_answer(self, subject, node):
         """Say why a probe was not run on a node which is not able to answer it.
@@ -2763,11 +2757,11 @@ class Cluster:
         to work out what happened from which keys exist. Every reading is
         None, because none was taken, except ``k3s_unit``, which is not a
         reading but the name of the unit one would have been taken from,
-        and is known from the role alone.
+        and is known from the role alone, which is what parse_node_signals()
+        returns for no output at all.
         """
         signals = {'probed': False, 'error': error}
-        signals.update(dict.fromkeys(NODE_SIGNAL_KEYS))
-        signals['k3s_unit'] = k3s_unit_for_role(role)
+        signals.update(parse_node_signals(None, role))
         return signals
 
     def _signals_from_probe(self, role, probe):
