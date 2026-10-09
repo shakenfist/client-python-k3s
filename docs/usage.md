@@ -631,8 +631,8 @@ for the reason. Pressure, OOM-killed containers and unmatched Kubernetes
 nodes are reported and do not affect it, because whether they matter
 depends on the workload. `create` and `expand-workers` wait for the
 nodes they add to be `Ready` before returning, so `create` followed by
-`health --strict` does not race the last node's registration. This
-changed in the release after v0.2.0, which ignored readiness
+`health --strict` does not race the last node's registration. Up to
+v0.2.0, `healthy` ignored readiness
 ([shakenfist/client-python-k3s#76](https://github.com/shakenfist/client-python-k3s/issues/76));
 [What `healthy` requires](library-api.md#what-healthy-requires) is the
 full list.

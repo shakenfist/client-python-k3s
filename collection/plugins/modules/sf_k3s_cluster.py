@@ -389,9 +389,9 @@ health:
           Ready (C(ready) is C(True)). A node which is not registered or
           whose readiness could not be read is not Ready. Pressure
           conditions, OOM-killed containers and unmatched nodes are
-          reported and do not affect it. Before this release it did not
-          consider Kubernetes at all, so a cluster whose nodes were all
-          NotReady was healthy. See "What healthy requires" in
+          reported and do not affect it. Up to v0.2.0 it did not consider
+          Kubernetes at all, so a cluster whose nodes were all NotReady
+          was healthy. See "What healthy requires" in
           docs/library-api.md.
       type: bool
 log:
