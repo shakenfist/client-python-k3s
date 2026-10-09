@@ -687,7 +687,8 @@ MUTATIONS = [
         PKG + '/cluster.py',
         '        self.await_nodes_ready(new_workers)\n',
         "        self.await_nodes_ready(md['worker_nodes'])\n",
-        PKG + '.tests.test_cluster.ExpandWorkersTestCase',
+        PKG + '.tests.test_cluster.ExpandWorkersAwaitsNodesReadyTestCase'
+        '.test_only_the_new_workers_are_waited_for',
         'stestr',
     ),
     (
@@ -851,6 +852,30 @@ MUTATIONS = [
         "    if after['signals']['boot_id'] != before['signals']['boot_id']:",
         '    if False:',
         PKG + '.tests.test_ci_health_signals.CheckAutomaticRestartTestCase',
+        'stestr',
+    ),
+    (
+        'a readiness the probe could not read is not a silent kubelet',
+        'tools/ci_health_signals.py',
+        "NOT_READY_STATUSES = ('False', 'Unknown')",
+        "NOT_READY_STATUSES = ('False', 'Unknown', None)",
+        PKG + '.tests.test_ci_health_signals.CheckKubeletSilentTestCase',
+        'stestr',
+    ),
+    (
+        'a killed k3s-agent has to be restarted exactly once',
+        'tools/ci_health_signals.py',
+        '    if not _is_count(restarts_before) or restarts != restarts_before + 1:',
+        '    if not _is_count(restarts_before) or restarts < restarts_before + 1:',
+        PKG + '.tests.test_ci_health_signals.CheckAutomaticRestartTestCase',
+        'stestr',
+    ),
+    (
+        'an etcd snapshot has to make the snapshot directory grow',
+        'tools/ci_health_signals.py',
+        '    if not _is_count(now) or now <= floor:',
+        '    if not _is_count(now) or now < floor:',
+        PKG + '.tests.test_ci_health_signals.CheckSnapshotSavedTestCase',
         'stestr',
     ),
     (
