@@ -1,14 +1,13 @@
 """The judgements tools/ci_health_signals.py makes about health() reports.
 
-The tool provokes each health signal on a real cluster in the merge tier
-and asserts that Cluster.health() reports it. What it provokes, and what
-systemd, the kernel and the kubelet then do, can only be checked by
-running it against a cluster: step 3b of
-docs/plans/PLAN-cumulative-health-signals-phase-03-live-validation.md
-does that, and nothing here guesses at it. What can be checked here is
-that each check_*() function fails when the reading it is about is wrong,
-and says which reading -- because a check which cannot fail turns the
-merge tier's provocations into a slow way of printing numbers.
+The tool provokes each health signal on a real cluster in the merge tier and
+asserts that Cluster.health() reports it. What it provokes, and what
+systemd, the kernel and the kubelet then do, can only be checked by running
+it against a cluster, which the merge tier does, and nothing here guesses at
+it. What can be checked here is that each check_*() function fails when the
+reading it is about is wrong, and says which reading -- because a check
+which cannot fail turns the merge tier's provocations into a slow way of
+printing numbers.
 
 The reports are built by hand in the shape health()'s docstring and
 docs/library-api.md give, rather than produced by health() against the
@@ -89,7 +88,7 @@ def _node(role, name, uuid, boot_id, unit, etcd_bytes, etcd_snapshot_bytes):
 
 
 def healthy_report():
-    """A fresh minimal cluster, as decision 4a expects to find it: one control plane node and one worker."""
+    """A fresh minimal cluster, as the baseline expects to find it: one control plane node and one worker."""
     return {
         'name': 'ciMinimal',
         'namespace': 'ci',
@@ -126,7 +125,7 @@ def node_of(report, role):
 
 
 def oom_killed_report(**worker_signals):
-    """A report taken after decision 4b's kill: the container is listed and the counter has moved."""
+    """A report taken after the pod's limit kill: the container is listed and the counter has moved."""
     report = healthy_report()
     worker = node_of(report, 'worker')
     worker['kubernetes']['oom_killed'] = [
@@ -175,7 +174,7 @@ class FindNodeTestCase(_ToolTestCase):
         self.assertIn('found 0', str(e))
 
     def test_refuses_two_of_a_role(self):
-        """Decision 4 means the one worker; with two, which one it means is ambiguous."""
+        """The steps mean the one worker; with two, which one they mean is ambiguous."""
         report = healthy_report()
         second = copy.deepcopy(node_of(report, 'worker'))
         second['name'] = 'k3s-ciMinimal-node-003'
@@ -227,7 +226,7 @@ class CheckBaselineTestCase(_ToolTestCase):
                 self.assertFails(self.tool.check_baseline(report), 'worker signals.%s' % key)
 
     def test_counters_above_zero_pass(self):
-        """Decision 4a asks for integers of 0 or more, not 0: a cluster may already have restarted."""
+        """The baseline asks for integers of 0 or more, not 0: a cluster may already have restarted."""
         report = healthy_report()
         node_of(report, 'worker')['signals']['k3s_restarts'] = 2
         node_of(report, 'control_plane')['signals']['oom_kills'] = 3
@@ -500,7 +499,7 @@ class CheckAutomaticRestartTestCase(_ToolTestCase):
 
 
 def not_ready_report(ready='Unknown'):
-    """A report taken with the worker's k3s-agent stopped, as decision 4d expects it."""
+    """A report taken with the worker's k3s-agent stopped, as the tool expects it."""
     report = healthy_report()
     worker = node_of(report, 'worker')
     worker['kubernetes']['ready'] = ready
@@ -656,7 +655,7 @@ class CheckSnapshotSavedTestCase(_ToolTestCase):
 
 
 def disk_pressure_report():
-    """A report taken with the worker's disk full, as decision 4f expects it."""
+    """A report taken with the worker's disk full, as the tool expects it."""
     report = healthy_report()
     node_of(report, 'worker')['kubernetes']['disk_pressure'] = 'True'
     return report

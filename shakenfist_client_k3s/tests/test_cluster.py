@@ -331,8 +331,7 @@ class ExpandWorkersTestCase(testtools.TestCase):
             ['uuid-w-002', 'uuid-w-003'], 'node-token', 'agent')
 
     def test_only_the_new_workers_are_waited_for(self):
-        # Decision 8 of the cumulative health signals phase 2 plan, and the
-        # same argument as the install above: a NotReady node which was
+        # The same argument as the install above: a NotReady node which was
         # already in the cluster is something health() reports, not a
         # reason to fail an expand which did what it was asked.
         cluster, _ = self._expand(
@@ -945,14 +944,13 @@ class AwaitNodesReadyTestCase(testtools.TestCase):
 class CreateAwaitsNodesReadyTestCase(CreateEnvironmentTestCase):
     """create() waits for every node to be Ready after k3s and before MetalLB.
 
-    Decision 8 of the cumulative health signals phase 2 plan. The order is
-    asserted from the fake's one ordered log of executed commands, because
-    "after the last install and before MetalLB" is a claim about where in
-    one sequence the wait fell, which separate per-step records cannot
-    answer. The cluster name has a capital letter in it, so that a wait
-    aimed at the instance's name rather than the node's is a wait for a
-    node which does not exist, and fails here rather than after two
-    minutes on a real cluster.
+    The order is asserted from the fake's one ordered log of executed
+    commands, because "after the last install and before MetalLB" is a claim
+    about where in one sequence the wait fell, which separate per-step
+    records cannot answer. The cluster name has a capital letter in it, so
+    that a wait aimed at the instance's name rather than the node's is a
+    wait for a node which does not exist, and fails here rather than after
+    two minutes on a real cluster.
     """
 
     def _create(self, control_plane_count, worker_count, **kwargs):
@@ -4170,13 +4168,12 @@ class HeredocDelimiterTestCase(testtools.TestCase):
 class NodeSignalsCommandTestCase(testtools.TestCase):
     """The command health() will run on each node to take its signals.
 
-    Decisions 5 and 6 of the cumulative health signals phase 1 plan: the
-    k3s unit is chosen by role, because a worker's is k3s-agent and asking
-    it about k3s reports a unit which does not exist as never having
+    The k3s unit is chosen by role, because a worker's is k3s-agent and
+    asking it about k3s reports a unit which does not exist as never having
     restarted; and etcd is sized on control plane nodes only, at the
-    caller's etcd-snapshot-dir when there is one. That directory is the
-    one value in the command which is not a literal of cluster.py, so it
-    is the one rule 1 applies to.
+    caller's etcd-snapshot-dir when there is one. That directory is the one
+    value in the command which is not a literal of cluster.py, so it is the
+    one rule 1 applies to.
     """
 
     def test_a_control_plane_node_reads_k3s_and_etcd(self):
@@ -4303,10 +4300,10 @@ WORKER_SIGNALS_OUTPUT = fakes.WORKER_SIGNALS_OUTPUT
 class ParseNodeSignalsTestCase(testtools.TestCase):
     """What a node's signals output becomes in health()'s report.
 
-    Decision 1 of the cumulative health signals phase 1 plan: always the
-    same keys, a reading which could not be taken is None on its own, and
-    a zero is only reported where it was measured. The output comes from a
-    node which may be unwell, so nothing a node prints may make this raise.
+    Always the same keys, a reading which could not be taken is None on its
+    own, and a zero is only reported where it was measured. The output comes
+    from a node which may be unwell, so nothing a node prints may make this
+    raise.
     """
 
     def test_a_realistic_server_output(self):
@@ -4710,8 +4707,8 @@ def _go_template_unguarded_reads(template):
 
     Also reports blocks which do not balance. This is a check of the
     template's shape, written because no Go template engine can be relied
-    on where the unit tests run; it is not a template engine, and step 2e
-    of the cumulative health signals phase 2 plan runs the real one.
+    on where the unit tests run; it is not a template engine, and the
+    merge tier runs the real one.
     """
     problems = []
     # (keyword, its argument as written), innermost last.
@@ -4779,13 +4776,12 @@ def _go_template_unguarded_reads(template):
 class KubernetesProbeCommandTestCase(testtools.TestCase):
     """The command health() will run to read Kubernetes about every node.
 
-    Decision 9 of the cumulative health signals phase 2 plan: two kubectl
-    reads, each rendered by a go-template into one short line per fact,
-    joined so that either failing fails the command. No Go template engine
-    is available where these tests run, so the templates are checked for
-    the shape kubectl needs rather than rendered; they were rendered by
-    kubectl v1.21.1+k3s1 and v1.31.4+k3s1 when written, and step 2e of that
-    plan renders them on a real cluster.
+    Two kubectl reads, each rendered by a go-template into one short line
+    per fact, joined so that either failing fails the command. No Go
+    template engine is available where these tests run, so the templates are
+    checked for the shape kubectl needs rather than rendered; they were
+    rendered by kubectl v1.21.1+k3s1 and v1.33.5+k3s1 when last changed, and
+    the merge tier renders them on a real cluster.
     """
 
     def test_the_command_reads_nodes_then_pods(self):
@@ -5089,10 +5085,9 @@ class KubernetesProbeCommandRunsTestCase(testtools.TestCase):
 class ParseKubernetesReadingsTestCase(testtools.TestCase):
     """What the Kubernetes probe's output becomes in health()'s report.
 
-    Decision 9 of the cumulative health signals phase 2 plan: every field
-    is validated, a record with any field which fails is dropped whole,
-    the first record for a node wins, and nothing the output holds may
-    make this raise.
+    Every field is validated, a record with any field which fails is dropped
+    whole, the first record for a node wins, and nothing the output holds
+    may make this raise.
     """
 
     def parse(self, stdout):
@@ -5144,7 +5139,7 @@ class ParseKubernetesReadingsTestCase(testtools.TestCase):
             },
             readings['nodes'])
         # The kill with no finishedAt is dropped: finished_at is how a
-        # caller tells a new kill from one it has seen, and decision 5
+        # caller tells a new kill from one it has seen, and the report
         # promises it is always an int.
         self.assertEqual(
             [('default', 'oom-state', 'c', 0, 1791187945),
@@ -6505,10 +6500,9 @@ def _kubernetes_node_lines(names, ready='True', oom=''):
         % (name, ready) for name in names) + oom
 
 
-# Decision 1 of the cumulative health signals phase 1 plan, written out
-# rather than taken from NODE_SIGNAL_KEYS, so that a key added to or dropped
-# from the constant is a change to a documented return shape that a test
-# notices rather than one it follows.
+# Written out rather than taken from NODE_SIGNAL_KEYS, so that a key added
+# to or dropped from the constant is a change to a documented return shape
+# that a test notices rather than one it follows.
 SIGNALS_KEYS = {
     'probed', 'error', 'boot_id', 'booted_at', 'k3s_unit', 'k3s_state',
     'k3s_restarts', 'oom_kills', 'memory_total_bytes',
@@ -6518,8 +6512,7 @@ SIGNALS_KEYS = {
 class HealthSignalsTestCase(testtools.TestCase):
     """health() reads every node's signals, and they change nothing else.
 
-    Decisions 1, 3, 7 and 8 of the cumulative health signals phase 1 plan:
-    each node carries a ``signals`` dict with the same twelve keys whatever
+    Each node carries a ``signals`` dict with the same twelve keys whatever
     happened; only a node able to answer is asked; every probe is
     submitted before any is waited for and all share one deadline; and no
     reading, and no failure to take one, moves ``healthy``. The last is the
@@ -7061,10 +7054,10 @@ class HealthSignalsTestCase(testtools.TestCase):
                 dict(self.client.executed[1:])['inst-cp1'], server_config)
 
 
-# Decision 3 of the cumulative health signals phase 2 plan, written out
-# rather than taken from KUBERNETES_NODE_KEYS, for the reason SIGNALS_KEYS
-# is: a key added to or dropped from the constant is a change to a
-# documented return shape, which a test should notice rather than follow.
+# Written out rather than taken from KUBERNETES_NODE_KEYS, for the reason
+# SIGNALS_KEYS is: a key added to or dropped from the constant is a change
+# to a documented return shape, which a test should notice rather than
+# follow.
 KUBERNETES_KEYS = {
     'registered', 'ready', 'ready_since', 'memory_pressure', 'disk_pressure',
     'pid_pressure', 'oom_killed'}
@@ -7082,14 +7075,13 @@ HOG_KILLED = {
 class HealthKubernetesTestCase(testtools.TestCase):
     """health() reports what Kubernetes says of each node, and healthy takes Ready.
 
-    Decisions 1 to 6 of the cumulative health signals phase 2 plan: the
-    Kubernetes probe runs on the first control plane node under the API
+    The Kubernetes probe runs on the first control plane node under the API
     probe's rule; each node carries a ``kubernetes`` dict with the same
     seven keys whatever happened, matched by lowercased instance name; the
-    probe's outcome and any Kubernetes node no instance accounts for are
-    at the top level; and the top level ``healthy`` now requires every
-    node Ready, which is a change to a released contract and so is pinned
-    in both directions: what makes it False, and what must not.
+    probe's outcome and any Kubernetes node no instance accounts for are at
+    the top level; and the top level ``healthy`` now requires every node
+    Ready, which is a change to a released contract and so is pinned in both
+    directions: what makes it False, and what must not.
     """
 
     def setUp(self):
