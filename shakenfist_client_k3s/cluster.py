@@ -128,12 +128,20 @@ AGENT_OP_KNOWN_STATES = (AGENT_OP_PENDING_STATES + AGENT_OP_FAILED_STATES
 # only: the API round trips around it -- one per node to read its
 # instance, one per probe to submit it, and the reads of each operation --
 # are serial and not bounded by it, so on a slow Shaken Fist API the call
-# as a whole can take longer. The server's own deadline
-# would bound the wait eventually, but ten minutes of silence is not a
-# health check: a 'kubectl get nodes' on a cluster which is answering
-# returns in well under a second, and the node signals command reads a few
-# files and sizes two directories, so a node which has not answered in
-# thirty is the answer rather than a slow one.
+# as a whole can take longer.
+#
+# It is a ceiling rather than a cost. Probes are collected one after
+# another, but every command runs on its node while an earlier one is
+# waited for, and each operation is read before the wait considers
+# sleeping, so a probe which has finished by its turn costs one read and
+# no sleep. A healthy cluster waits for about its slowest probe -- a second
+# or two whatever its size -- not the sum.
+#
+# The server's own deadline would bound the wait eventually, but ten
+# minutes of silence is not a health check: a 'kubectl get nodes' on a
+# cluster which is answering returns in well under a second, and the node
+# signals command reads a few files and sizes two directories, so a node
+# which has not answered in thirty is the answer rather than a slow one.
 HEALTH_PROBE_TIMEOUT_SECONDS = 30
 
 # The command health() runs on the first control plane node to ask whether
@@ -2598,15 +2606,8 @@ class Cluster:
         time left: aop is the operation as submitted, and so pending however
         long ago the command finished, and judging it on that would report
         every probe collected after a slow first one as abandoned.
-
-        Collection is one probe after another, but the commands are not:
-        every one was submitted before the first is collected, and runs on
-        its node while an earlier one is waited for. A probe which finished
-        while its turn came round is read once and costs no sleep, so
-        collecting N probes waits about as long as the slowest of them, not
-        the sum, and sleeps no longer than the shared budget in all. The
-        reads themselves are API round trips which that budget does not
-        bound; see health()'s docstring.
+        HEALTH_PROBE_TIMEOUT_SECONDS says why collecting probes one after
+        another costs about the slowest of them rather than the sum.
 
         name is how the error messages refer to the command. Left None, they
         quote the command line, which for 'kubectl get nodes' is the clearest
@@ -4144,36 +4145,17 @@ class Cluster:
 
         Nor does it hang. Each probe -- the k3s API probe and the Kubernetes
         probe on the first control plane node, and a signals probe on every
-        node -- is only attempted when the node it would be run on looks
-        able to answer -- the node entry this method has just built says
-        whether the instance exists, is created and has a ready agent -- and
-        they share one wall clock timeout even then. An agent operation
-        queued against an instance whose agent is not connected never leaves
-        its queued state, so a probe which is attempted anyway waits forever
-        on exactly the cluster this verb exists to describe. Every probe is submitted
-        before any is waited for, and every one is waited for against a
-        single deadline, HEALTH_PROBE_TIMEOUT_SECONDS from before the first
-        submission, so the waiting is bounded by one budget on a cluster of
-        any size rather than one per node. That bounds the waiting, not the
-        call: on top of it come one API round trip per node to read its
-        instance, one per probe to submit it, and the reads of each
-        operation, all serial, so on a slow Shaken Fist API the wall time
-        can exceed the budget. A skipped probe and an abandoned one are
-        both ``probed`` False with an ``error`` saying which, so a caller
-        never has to tell them apart by which keys are present. A probe
-        collected after that deadline has passed is still read from the
-        server once, without waiting, so one which finished while an earlier
-        probe used up the budget is reported as it finished rather than as
-        abandoned.
-
-        The budget is a ceiling rather than a cost. Probes are collected one
-        after another, but each operation is read before the wait considers
-        sleeping, and every command is running on its node while an earlier
-        one is waited for, so a probe which has finished by its turn costs
-        one read and no sleep. A healthy cluster therefore waits for about
-        the time its slowest probe takes -- typically a second or two
-        whatever its size -- rather than a second per node, plus the API
-        round trips above.
+        node -- is only attempted when the node entry this method has just
+        built says the instance exists, is created and has a ready agent: an
+        agent operation queued against an instance whose agent is not
+        connected never leaves its queued state, so a probe attempted anyway
+        would wait forever on exactly the cluster this verb exists to
+        describe. Every probe is then waited for against one shared
+        deadline, HEALTH_PROBE_TIMEOUT_SECONDS from before the first
+        submission, whose comment says what that bounds and what it costs. A
+        skipped probe and an abandoned one are both ``probed`` False with an
+        ``error`` saying which, so a caller never has to tell them apart by
+        which keys are present.
 
         The report is::
 
@@ -4382,23 +4364,11 @@ class Cluster:
             for instance_uuid in md.get(md_key) or []:
                 nodes.append(self._node_health(instance_uuid, role))
 
-        # One deadline for every probe, taken before the first is submitted
-        # so that the budget covers the submissions as well as the waits.
-        # Everything is submitted before anything is waited for, so the
-        # waits overlap rather than queue: the first probe collected waits
-        # for whatever is left of the budget, and each one after it only for
-        # whatever is left after that, which is what bounds this call's
-        # waiting at one budget on a cluster of any size rather than one per
-        # node. Its waiting, not its wall time: the get_instance() calls
-        # above happen before the deadline is taken, and nothing bounds the
-        # submissions below or the reads of each operation, every one a
-        # serial API round trip, so on a slow Shaken Fist API the call takes
-        # longer than the budget. Within that bound it costs about the
-        # slowest probe, not the sum: each wait reads its operation before
-        # it sleeps, so one which finished while an earlier probe was waited
-        # for costs no sleep. Taking it here starts every probe's clock a
-        # little early, by however long the submissions before it take -- a
-        # few API calls, which is negligible against a thirty second budget.
+        # One deadline for every probe (see HEALTH_PROBE_TIMEOUT_SECONDS),
+        # taken before the first is submitted so that the budget covers the
+        # submissions as well as the waits. That starts every probe's clock a
+        # little early, by the few API calls of the submissions before it,
+        # which is negligible against a thirty second budget.
         deadline = time.monotonic() + HEALTH_PROBE_TIMEOUT_SECONDS
 
         # The k3s API is asked through the first control plane node, which
