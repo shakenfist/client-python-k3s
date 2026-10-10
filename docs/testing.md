@@ -9,8 +9,14 @@ pre-commit run --all-files
 ```
 
 Unit tests live in `shakenfist_client_k3s/tests/` and mock the Shaken
-Fist API, the k3s update API and the Longhorn chart index. They cannot
-reach the orchestration path -- whether a cluster actually assembles is
+Fist API, the k3s update API and the Longhorn chart index. The test
+package refuses any internet socket connection (see
+`shakenfist_client_k3s/tests/__init__.py`). A test that forgets a stub
+therefore fails straight away with `NetworkAccessRefused`, naming the
+address it tried to reach. Without the guard it would pass until that
+site went down (#133). A test which calls `create()` must stub both
+`primitives.get_k3s_release` and `primitives.get_longhorn_release`.
+The unit tests cannot reach the orchestration path -- whether a cluster actually assembles is
 only answerable against a live Shaken Fist cloud, which is what the
 merge tier of CI is for.
 

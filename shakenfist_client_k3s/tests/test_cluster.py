@@ -8013,6 +8013,18 @@ class StagedManifestsAreWhatWasValidatedTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # create() looks up the k3s release before it reads the sshkey or
+        # stages a manifest, and the Longhorn release after; unstubbed,
+        # each is a real request to update.k3s.io or charts.longhorn.io
+        # (#133).
+        for target, release in [('get_k3s_release', 'v1.33.4+k3s1'),
+                                ('get_longhorn_release', '1.6.0')]:
+            patcher = mock.patch(
+                'shakenfist_client_k3s.primitives.%s' % target,
+                return_value=release)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
         self.client = fakes.FakeClusterClient()
 
     def _writes(self):
@@ -8113,6 +8125,18 @@ class SshKeyIsReadThroughTheHierarchyTestCase(testtools.TestCase):
         patcher = mock.patch('time.sleep', lambda seconds: None)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+        # create() looks up the k3s release before it reads the sshkey or
+        # stages a manifest, and the Longhorn release after; unstubbed,
+        # each is a real request to update.k3s.io or charts.longhorn.io
+        # (#133).
+        for target, release in [('get_k3s_release', 'v1.33.4+k3s1'),
+                                ('get_longhorn_release', '1.6.0')]:
+            patcher = mock.patch(
+                'shakenfist_client_k3s.primitives.%s' % target,
+                return_value=release)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         self.client = fakes.FakeClusterClient()
 
