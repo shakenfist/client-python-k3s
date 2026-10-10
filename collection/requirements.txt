@@ -18,7 +18,11 @@
 #
 # 0.3.0 is the release which added validate_create_counts(),
 # validate_create_arguments(), ShapeError and ClusterNameError, which the
-# module calls to refuse bad arguments before it changes anything.
+# module calls to refuse bad arguments before it changes anything. It is
+# also the first release whose Cluster.create() takes server_config and
+# agent_config, which the module passes; the node sizes it passes are
+# older. test_collection_floor.py, named below, cannot see keyword
+# arguments, so that half was checked by hand against v0.2.0's source.
 #
 # Raise this floor in the commit that first makes the module call a verb
 # newer than 0.3.0 introduced -- not before, and not automatically.

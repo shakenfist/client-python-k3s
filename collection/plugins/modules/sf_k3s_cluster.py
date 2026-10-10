@@ -138,10 +138,14 @@ options:
         module owns only "a cluster of at least this shape exists". Both
         writing to one namespace metadata document is the race that a
         reconciling worker count parameter would be.
-      - The default of 0 builds a cluster with control plane nodes only,
-        which is what a play that hands the cluster straight to such a
-        scaler wants. It is deliberately not the command line's default of
-        2. Must be an integer of at least 0.
+      - The default of 0 builds a cluster with control plane nodes only. It
+        is deliberately not the command line's default of 2. Must be an
+        integer of at least 0.
+      - A cluster created with no workers never gets the control plane
+        C(NoSchedule) taint, and stays untainted after workers are added,
+        so workloads schedule onto its control plane nodes. Create with at
+        least 1 to have the taint, even when a scaler will manage the
+        workers afterwards. See O(server_config).
     required: false
     default: 0
     type: int
@@ -163,6 +167,69 @@ options:
     required: false
     default: 5
     type: int
+  control_plane_cpus:
+    description:
+      - How many vCPUs each control plane node gets, when this module
+        creates the cluster. Like O(initial_workers), this is a creation
+        parameter - changing it for a cluster which already exists does
+        nothing, and no node is ever resized.
+      - The six size options default to the size every node was built at
+        before they existed. Each must be an integer of at least 1.
+    required: false
+    default: 2
+    type: int
+    version_added: 0.3.0
+  control_plane_memory:
+    description:
+      - How much memory each control plane node gets, in MB, when this
+        module creates the cluster. A creation parameter, like
+        O(control_plane_cpus).
+      - The default runs a control plane but does not hold up under load.
+        Ask for at least 4096 for one you intend to rely on; the "Sizing"
+        section of docs/usage.md in the shakenfist/client-python-k3s
+        repository gives the measurement.
+    required: false
+    default: 2048
+    type: int
+    version_added: 0.3.0
+  control_plane_disk:
+    description:
+      - How much disk each control plane node gets, in GB, when this module
+        creates the cluster. A creation parameter, like
+        O(control_plane_cpus).
+    required: false
+    default: 50
+    type: int
+    version_added: 0.3.0
+  worker_cpus:
+    description:
+      - How many vCPUs each worker node gets, when this module creates the
+        cluster. A creation parameter, like O(control_plane_cpus).
+      - The cluster records the three worker sizes, so a worker added later
+        by C(sf-client k3s expand-workers) or a scaler is built at the size
+        the cluster was created with.
+    required: false
+    default: 2
+    type: int
+    version_added: 0.3.0
+  worker_memory:
+    description:
+      - How much memory each worker node gets, in MB, when this module
+        creates the cluster. A creation parameter, and recorded for later
+        workers, like O(worker_cpus).
+    required: false
+    default: 2048
+    type: int
+    version_added: 0.3.0
+  worker_disk:
+    description:
+      - How much disk each worker node gets, in GB, when this module creates
+        the cluster. A creation parameter, and recorded for later workers,
+        like O(worker_cpus).
+    required: false
+    default: 50
+    type: int
+    version_added: 0.3.0
   network:
     description:
       - The name or UUID of an existing Shaken Fist network to attach the
@@ -215,6 +282,47 @@ options:
     required: false
     type: list
     elements: path
+  server_config:
+    description:
+      - k3s configuration for every control plane node, as a mapping of k3s
+        configuration keys spelled as k3s's own C(config.yaml) spells them
+        (C(disable), C(node-label), C(node-taint) and so on), when this
+        module creates the cluster. It is written onto each node as a file
+        k3s reads after the plugin's own configuration, so a key here
+        replaces the plugin's default for it, and a key ending in C(+)
+        appends to it.
+      - A creation parameter, like O(initial_workers). Nothing rewrites a
+        running node, so changing this for a cluster which already exists
+        does nothing.
+      - When the cluster is created with at least one worker the plugin
+        taints control plane nodes
+        C(node-role.kubernetes.io/control-plane:NoSchedule), and a
+        C(node-taint) of C([]) here removes the taint. Setting C(node-taint)
+        is not a way to keep workloads off a cluster created with no
+        workers - metallb's controller and Longhorn do not tolerate the
+        taint, so the create fails waiting for metallb, and without metallb
+        Longhorn never starts. Create with O(initial_workers) of at least 1
+        instead.
+      - Keys the plugin sets itself or depends on are refused, as is a value
+        which cannot be stored as JSON unchanged, before anything is built.
+        The "k3s configuration" section of docs/usage.md in the
+        shakenfist/client-python-k3s repository lists the refused keys and
+        why. The mapping is recorded in the cluster's metadata and shown by
+        C(sf-client k3s show), so keep credentials out of it.
+    required: false
+    type: dict
+    version_added: 0.3.0
+  agent_config:
+    description:
+      - k3s configuration for every worker node, in the same form as
+        O(server_config), when this module creates the cluster. A creation
+        parameter, like O(server_config).
+      - The cluster records it, so a worker added later by
+        C(sf-client k3s expand-workers) or a scaler is configured the same
+        way.
+    required: false
+    type: dict
+    version_added: 0.3.0
   api_url:
     description:
       - Base URL of the Shaken Fist API (for example
@@ -246,13 +354,15 @@ author:
 """
 
 EXAMPLES = r"""
-- name: Ensure a CI runner cluster exists, with workers left to the conductor
+- name: Ensure a CI runner cluster exists, with further workers left to the conductor
   shakenfist.k3s.sf_k3s_cluster:
     name: ci-runners
     namespace: ci
     state: present
     control_plane_count: 1
-    initial_workers: 0
+    control_plane_memory: 4096
+    # At least one, so the control plane is tainted and runners stay off it.
+    initial_workers: 1
   delegate_to: localhost
   register: cluster
 
@@ -278,6 +388,20 @@ EXAMPLES = r"""
     namespace: ci
     manifests:
       - files/ingress-nginx.yaml
+  delegate_to: localhost
+
+- name: Create a cluster with larger workers, no Traefik and labelled nodes
+  shakenfist.k3s.sf_k3s_cluster:
+    name: labelled
+    namespace: ci
+    initial_workers: 2
+    worker_cpus: 4
+    worker_memory: 8192
+    server_config:
+      disable: [traefik]
+      node-label: [role=control-plane]
+    agent_config:
+      node-label: [role=worker]
   delegate_to: localhost
 
 - name: Report what would change, without changing it
@@ -532,6 +656,14 @@ def _present(module, cluster, reporter, mutation):
             'worker_count': module.params['initial_workers'],
             'metal_address_count': module.params['metal_address_count'],
             'manifests': module.params['manifests'],
+            'control_plane_cpus': module.params['control_plane_cpus'],
+            'control_plane_memory': module.params['control_plane_memory'],
+            'control_plane_disk': module.params['control_plane_disk'],
+            'worker_cpus': module.params['worker_cpus'],
+            'worker_memory': module.params['worker_memory'],
+            'worker_disk': module.params['worker_disk'],
+            'server_config': module.params['server_config'],
+            'agent_config': module.params['agent_config'],
         }
 
         # create() makes these checks itself, first, but a refusal raised
@@ -642,6 +774,18 @@ def run_module():
         'install_metallb': {'default': True, 'type': 'bool'},
         'install_longhorn': {'default': True, 'type': 'bool'},
         'manifests': {'required': False, 'type': 'list', 'elements': 'path'},
+        # The sizes default to sf_cluster.DEFAULT_NODE_SIZE, written out
+        # because this spec is built before the HAS_SF_K3S check, so the
+        # library may not be importable here. CreateTestCase pins that the
+        # two agree.
+        'control_plane_cpus': {'default': 2, 'type': 'int'},
+        'control_plane_memory': {'default': 2048, 'type': 'int'},
+        'control_plane_disk': {'default': 50, 'type': 'int'},
+        'worker_cpus': {'default': 2, 'type': 'int'},
+        'worker_memory': {'default': 2048, 'type': 'int'},
+        'worker_disk': {'default': 50, 'type': 'int'},
+        'server_config': {'required': False, 'type': 'dict'},
+        'agent_config': {'required': False, 'type': 'dict'},
 
         # The connection, declared here rather than imported from a shared
         # module_utils. This collection ships one module, so a shared
