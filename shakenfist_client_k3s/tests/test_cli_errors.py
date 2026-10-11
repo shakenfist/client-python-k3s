@@ -59,10 +59,17 @@ K3S_CHANNELS = {'data': [{'name': 'stable', 'latest': 'v1.33.4+k3s1'}]}
 
 
 def _version_cache():
-    """A k3s version cache fresh enough that create does not fetch releases."""
+    """Release caches fresh enough that create does not fetch releases.
+
+    Both of them, because create() looks up the Longhorn chart as well as
+    the k3s release before it checks the name (#119). With only the k3s
+    cache, each create test here fetched the real Longhorn chart index.
+    """
     return {
         primitives.K3S_VERSION_CACHE_KEY: {
-            'updated': time.time(), 'releases': {'stable': 'v1.33.4+k3s1'}}
+            'updated': time.time(), 'releases': {'stable': 'v1.33.4+k3s1'}},
+        primitives.LONGHORN_VERSION_CACHE_KEY: {
+            'updated': time.time(), 'charts': {'1.9.0': '>=1.25.0-0'}}
     }
 
 

@@ -1552,14 +1552,17 @@ class CreateOverInterruptedClusterTestCase(testtools.TestCase):
         # order of create()'s two guards matter.
         self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
 
-        # create() looks up the k3s release before it looks at the name,
-        # and checks it against K3S_RELEASE_FLOOR, so this is a release
-        # rather than a channel name.
-        patcher = mock.patch(
-            'shakenfist_client_k3s.primitives.get_k3s_release',
-            return_value='v1.33.4+k3s1')
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # create() looks up the k3s release and the Longhorn chart before
+        # it looks at the name, and checks the k3s one against
+        # K3S_RELEASE_FLOOR, so that is a release rather than a channel
+        # name.
+        for target, release in [('get_k3s_release', 'v1.33.4+k3s1'),
+                                ('get_longhorn_release', '1.6.0')]:
+            patcher = mock.patch(
+                'shakenfist_client_k3s.primitives.%s' % target,
+                return_value=release)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         self.cluster = _make_cluster(self.client)
 
