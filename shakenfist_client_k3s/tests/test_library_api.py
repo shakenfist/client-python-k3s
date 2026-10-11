@@ -84,18 +84,7 @@ class LibraryTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # The release lookups are namespace scoped functions with their own
-        # tests, and left real they would both reach the internet and write
-        # a version cache into the namespace metadata these tests assert on.
-        # A real release rather than a channel name, because create()
-        # refuses one it cannot parse (check_k3s_release()).
-        for target, release in [('get_k3s_release', 'v1.33.4+k3s1'),
-                                ('get_longhorn_release', '1.6.0')]:
-            patcher = mock.patch(
-                'shakenfist_client_k3s.primitives.%s' % target,
-                return_value=release)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        fakes.stub_release_lookups(self)
 
         self.subprocess_run = mock.MagicMock()
         self.subprocess_run.return_value.returncode = 0

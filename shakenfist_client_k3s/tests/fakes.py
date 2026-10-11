@@ -87,6 +87,25 @@ def kubectl_subcommand(argv):
     return argv
 
 
+def stub_release_lookups(testcase, k3s='v1.33.4+k3s1', longhorn='1.6.0'):
+    """Stub the k3s and Longhorn release lookups for the rest of a test.
+
+    create() makes both. Left real they reach update.k3s.io and
+    charts.longhorn.io, which the test package refuses (network_guard.py),
+    and write a version cache into namespace metadata a test may be
+    asserting on; they have their own tests in test_primitives.py. The k3s
+    default is a real release rather than a channel name, because create()
+    refuses one it cannot parse (check_k3s_release()).
+    """
+    for target, release in [('get_k3s_release', k3s),
+                            ('get_longhorn_release', longhorn)]:
+        patcher = mock.patch(
+            'shakenfist_client_k3s.primitives.%s' % target,
+            return_value=release)
+        patcher.start()
+        testcase.addCleanup(patcher.stop)
+
+
 def home_with_kubeconfig(testcase):
     """Point HOME at a temporary directory holding a ~/.kube/config, and return its path.
 

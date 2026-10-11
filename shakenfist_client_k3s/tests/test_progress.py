@@ -739,15 +739,10 @@ class K3sCreateSmokeTestCase(testtools.TestCase):
         self.addCleanup(home.cleanup)
         self.home = home.name
 
-        for target, kwargs in [
-                ('shakenfist_client_k3s.primitives.get_k3s_release',
-                 {'return_value': 'v1.33.4+k3s1'}),
-                ('shakenfist_client_k3s.primitives.get_longhorn_release',
-                 {'return_value': '1.6.0'}),
-                ('time.sleep', {'new': lambda seconds: None})]:
-            patcher = mock.patch(target, **kwargs)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        fakes.stub_release_lookups(self)
+        patcher = mock.patch('time.sleep', new=lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         patcher = mock.patch.dict('os.environ', {'HOME': self.home})
         patcher.start()
