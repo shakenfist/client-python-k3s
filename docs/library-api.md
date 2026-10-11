@@ -240,6 +240,11 @@ methods: `primitives.list_clusters(client, namespace)`,
 Pass `get_longhorn_release()` the k3s release as `k3s_version=` to get
 the newest Longhorn chart that release can run, which is what `create()`
 installs; without it the newest chart is returned whatever it supports.
+When their cache has expired and the upstream cannot answer, both
+return the expired copy rather than raise, and write a warning to the
+reporter -- so a library caller, and the Ansible module's `log`, sees
+it there and not as an exception. A `force_cache_update=True` call
+never does. `docs/usage.md` says which failures count and why.
 
 ## The reporter
 
@@ -336,7 +341,7 @@ a correct caller never needs to catch it.
 | `UnsupportedReleaseError` | `create()` resolves a k3s release older than `v1.21.1+k3s1`, or one it cannot parse, right after the channel lookup and before anything is built or the name is registered |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
 | `ClusterMetadataError` | a value read back out of the namespace metadata cannot be used -- `expand_addresses()` finds something in `routed_addresses` that is not an IP address, or the API hands back one that is not. Raised before any address is routed, because the addresses are charged for and the configuration they go into is written afterwards |
-| `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable |
+| `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable, and no expired cached copy can stand in for it |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code, including the wait `create()` and `expand_workers()` make for a node that does not become `Ready` |
 | `KubeconfigError` | a local `~/.kube/config` merge fails (`merge_failed`), or `delete()`'s cleanup cannot read `~/.kube/config` (`view_failed`, `view_unparseable`) or remove an entry from it (`delete_failed`), or either needs a local `kubectl` and there is none (`missing_kubectl`, `missing_kubectl_on_delete`), or `delete()`'s finds one it cannot start (`kubectl_unrunnable`, carrying the `OSError`'s text as `detail`). The five cleanup reasons are raised after the cluster has gone, so a retry of `delete()` raises `ClusterNotFoundError`; each carries `main_config_path` and `entry_name`, and its message gives the `kubectl` commands that remove the entries by hand. A failed write of the file itself is an `OSError`. Before 0.3.0 the cleanup ran `kubectl config unset`, and a failure there was `unset_failed` carrying `config_elem`; from 0.3.0 both are gone, replaced by `delete_failed` and `entry_name` alongside the new `view_failed`, `view_unparseable`, `missing_kubectl_on_delete` and `kubectl_unrunnable` reasons |
