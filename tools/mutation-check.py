@@ -809,6 +809,23 @@ MUTATIONS = [
         'tox',
     ),
     (
+        'the Ansible module refuses a bad node size or k3s key when it would create the cluster',
+        'collection/plugins/modules/sf_k3s_cluster.py',
+        '            sf_cluster.validate_create_arguments(cluster.name, **shape)\n',
+        '            pass\n',
+        PKG + '.tests.test_ansible_module.CreationArgumentTestCase',
+        'tox',
+    ),
+    (
+        "the Ansible module's default node sizes are the library's",
+        'collection/plugins/modules/sf_k3s_cluster.py',
+        "        'worker_memory': {'default': 2048, 'type': 'int'},\n",
+        "        'worker_memory': {'default': 4096, 'type': 'int'},\n",
+        PKG + '.tests.test_ansible_module.CreateTestCase'
+        '.test_the_default_sizes_are_the_librarys',
+        'tox',
+    ),
+    (
         "delete -v does not log the kubeconfig read, which carries other clusters' credentials",
         PKG + '/cluster.py',
         'main_config_path, fqcn, log_stdout=False)',

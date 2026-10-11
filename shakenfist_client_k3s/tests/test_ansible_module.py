@@ -26,6 +26,7 @@ microseconds. A Python interpreter start plus an ansible.module_utils
 import is most of that. The alternative was faster and would have tested
 something else.
 """
+import ast
 import json
 import os
 import subprocess
@@ -33,8 +34,10 @@ import sys
 import tempfile
 
 import testtools
+import yaml
 
 from shakenfist_client_k3s import client as sf_client
+from shakenfist_client_k3s import cluster as sf_cluster
 from shakenfist_client_k3s import exceptions as sf_exceptions
 from shakenfist_client_k3s import progress
 from shakenfist_client_k3s.tests import module_harness
@@ -486,7 +489,9 @@ class IdempotencyTestCase(ModuleTestCase):
         run = self.run_module(
             base_params(control_plane_count=3, metal_address_count=99,
                         release_channel='v1.26', install_longhorn=False,
-                        install_metallb=False),
+                        install_metallb=False, control_plane_memory=8192,
+                        worker_cpus=8, server_config={'disable': ['traefik']},
+                        agent_config={'node-label': ['role=worker']}),
             cluster_exists=True)
 
         self.assertFalse(run.changed)
@@ -566,9 +571,10 @@ class CreateTestCase(ModuleTestCase):
 
         initial_workers becomes create()'s worker_count on the path which
         creates a cluster; otherwise it is read only by the floor check
-        made before a client is built. The default is 0 rather
-        than the command line's 2, because a play which hands the cluster
-        straight to a scaler wants control plane nodes and nothing else.
+        made before a client is built. The default is 0 rather than the
+        command line's 2, which builds control plane nodes and nothing
+        else, and docs/collection.md says why a play handing the cluster to
+        a scaler should still ask for at least 1.
         """
         run = self.run_module(base_params(initial_workers=4),
                               cluster_exists=False, fake_create=True)
@@ -587,7 +593,12 @@ class CreateTestCase(ModuleTestCase):
             base_params(initial_workers=2, control_plane_count=3,
                         metal_address_count=9, network='borrowed-net',
                         release_channel='v1.26', install_metallb=False,
-                        install_longhorn=False),
+                        install_longhorn=False, control_plane_cpus=3,
+                        control_plane_memory=4096, control_plane_disk=60,
+                        worker_cpus=5, worker_memory=8192, worker_disk=70,
+                        server_config={'disable': ['traefik'],
+                                       'node-taint': []},
+                        agent_config={'node-label': ['role=worker']}),
             cluster_exists=False, fake_create=True)
 
         self.assertEqual(
@@ -599,8 +610,60 @@ class CreateTestCase(ModuleTestCase):
              'sshkey': 'None',
              'install_metallb': 'False',
              'install_longhorn': 'False',
-             'manifests': 'None'},
+             'manifests': 'None',
+             'control_plane_cpus': '3',
+             'control_plane_memory': '4096',
+             'control_plane_disk': '60',
+             'worker_cpus': '5',
+             'worker_memory': '8192',
+             'worker_disk': '70',
+             'server_config': "{'disable': ['traefik'], 'node-taint': []}",
+             'agent_config': "{'node-label': ['role=worker']}"},
             run.create_kwargs)
+
+    def test_the_default_sizes_are_the_librarys(self):
+        """The spec writes DEFAULT_NODE_SIZE out, so this is what keeps them equal.
+
+        The module cannot read the library's constant into its argument
+        spec, which is built before the guarded import is checked, so a
+        change to DEFAULT_NODE_SIZE would otherwise leave the module
+        building nodes at the old size while its documentation said the
+        defaults were the library's. No configuration is passed either,
+        which create() takes as none.
+        """
+        run = self.run_module(base_params(), cluster_exists=False,
+                              fake_create=True)
+
+        expected = {'server_config': 'None', 'agent_config': 'None'}
+        for role in ('control_plane', 'worker'):
+            for field, value in sf_cluster.DEFAULT_NODE_SIZE.items():
+                expected['%s_%s' % (role, field)] = repr(value)
+        self.assertEqual(
+            expected,
+            {k: v for k, v in run.create_kwargs.items() if k in expected})
+
+    def test_the_documented_default_sizes_are_the_librarys(self):
+        """ansible-doc renders DOCUMENTATION, so its defaults must agree too.
+
+        Read from the module's source rather than by importing it, which
+        would need ansible.module_utils in this process.
+        """
+        with open(MODULE, encoding='utf-8') as f:
+            tree = ast.parse(f.read())
+        documentation = None
+        for node in tree.body:
+            if (isinstance(node, ast.Assign)
+                    and [t.id for t in node.targets] == ['DOCUMENTATION']):
+                documentation = yaml.safe_load(node.value.value)
+        self.assertIsNotNone(documentation)
+
+        for role in ('control_plane', 'worker'):
+            for field, value in sf_cluster.DEFAULT_NODE_SIZE.items():
+                option = '%s_%s' % (role, field)
+                self.assertEqual(
+                    value, documentation['options'][option]['default'],
+                    '%s is documented with a default other than the '
+                    "library's" % option)
 
     def test_create_is_not_asked_to_touch_the_local_machine(self):
         """write_kubeconfig and refresh_version_cache stay at their defaults.
@@ -871,6 +934,64 @@ class NameRuleTestCase(ModuleTestCase):
         self.assertFalse(run.failed)
         self.assertFalse(run.result['changed'])
         self.assertNotIn('Cluster name', run.msg)
+
+
+class CreationArgumentTestCase(ModuleTestCase):
+    """The node sizes and k3s configuration are refused only when this run would create.
+
+    They are creation parameters, so they are checked where the name is,
+    by validate_create_arguments() on the create path and before
+    mutation.creating(): a refusal fails the task with changed false and
+    the advice for a refused argument, and check mode predicts it. A
+    cluster which already exists is reported as found whatever they say,
+    because nothing reads them for one.
+    """
+
+    REFUSED = ("Nothing was changed. Correct the task's parameters, or the "
+               'files they name, before running it again.')
+
+    def test_a_size_below_one_is_refused(self):
+        run = self.run_module(base_params(control_plane_memory=0),
+                              cluster_exists=False, expect_failure=True)
+
+        self.assertEqual(
+            '%s %s' % (sf_exceptions.NodeSizeError.not_positive_integer(
+                'control_plane', 'memory', 0), self.REFUSED),
+            run.msg)
+        self.assertIs(False, run.result['changed'])
+        self.assertNotIn('create', run.cluster_calls)
+        self.assertNothingMutated(run)
+
+    def test_an_owned_k3s_key_is_refused(self):
+        run = self.run_module(base_params(agent_config={'token': 'abc'}),
+                              cluster_exists=False, expect_failure=True)
+
+        self.assertEqual(
+            '%s %s' % (sf_exceptions.K3sConfigError.owned_key(
+                'agent', 'token'), self.REFUSED),
+            run.msg)
+        self.assertIs(False, run.result['changed'])
+        self.assertNothingMutated(run)
+
+    def test_check_mode_predicts_the_refusal(self):
+        run = self.run_module(
+            base_params(worker_disk=-1, **{'_ansible_check_mode': True}),
+            cluster_exists=False, expect_failure=True)
+
+        self.assertIn('worker disk must be a positive integer, not -1',
+                      run.msg)
+        self.assertIs(False, run.result['changed'])
+        self.assertNothingMutated(run)
+
+    def test_an_existing_cluster_is_not_refused(self):
+        run = self.run_module(
+            base_params(control_plane_memory=0,
+                        server_config={'cluster-init': False}),
+            cluster_exists=True)
+
+        self.assertFalse(run.failed)
+        self.assertFalse(run.changed)
+        self.assertNothingMutated(run)
 
 
 class ReservedNameTestCase(ModuleTestCase):

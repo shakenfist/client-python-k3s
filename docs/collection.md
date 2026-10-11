@@ -79,13 +79,14 @@ from memory of the version floor.
 - hosts: localhost
   gather_facts: false
   tasks:
-    - name: Ensure a CI runner cluster exists, with workers left to the conductor
+    - name: Ensure a CI runner cluster exists, with further workers left to the conductor
       shakenfist.k3s.sf_k3s_cluster:
         name: ci-runners
         namespace: ci
         state: present
         control_plane_count: 1
-        initial_workers: 0
+        control_plane_memory: 4096
+        initial_workers: 1
       register: cluster
 
     - name: Fail the play if the cluster is not healthy
@@ -94,19 +95,33 @@ from memory of the version floor.
         fail_msg: "{{ cluster.health }}"
 ```
 
-A cluster created with no workers, as this one is and as
-`initial_workers` defaults to, is never given the control plane
-`NoSchedule` taint, and stays untainted after workers are added, so
-pods can schedule onto its control plane node (see "k3s configuration"
-in `docs/usage.md`). The module cannot yet pass the k3s configuration
-or node sizes the command line can. Until it does, a control plane
-that must stay clear of workloads needs `initial_workers` of at least
-one.
+Two choices in that task are deliberate. `control_plane_memory: 4096`
+is the floor the "Sizing" section of `docs/usage.md` recommends for a
+control plane you rely on; the default, 2048 MB, is the size every node
+was built at before the option existed, and a burst of pods has taken
+the API server down on it.
+
+`initial_workers: 1` is what gets the control plane its
+`node-role.kubernetes.io/control-plane:NoSchedule` taint, so CI runner
+pods schedule onto workers rather than beside etcd and the API server.
+The plugin writes the taint only when the cluster is created with
+workers, and a cluster created with none stays untainted after workers
+are added (see "k3s configuration" in `docs/usage.md`). Setting
+`node-taint` in `server_config` on a zero-worker cluster is not a
+substitute: MetalLB's controller and Longhorn do not tolerate the
+taint, so with only the control plane to run on, the create fails
+after five minutes waiting for MetalLB's controller, and without
+MetalLB, Longhorn installs but never starts. One worker gives them
+somewhere to run. That sets a
+floor for whatever scales the cluster afterwards, too: a scaler which
+removes the last worker is allowed to, but leaves MetalLB's controller
+and Longhorn with nowhere to run until another worker joins.
 
 This and the module's own `EXAMPLES` string are the same playbook
 shapes; `EXAMPLES` additionally shows an administrator connecting with
-explicit credentials, a manifest applied at first boot, a check-mode
-run, and `state: absent`. Every task needs `delegate_to: localhost` (or
+explicit credentials, a manifest applied at first boot, larger workers
+with k3s configuration for each role, a check-mode run, and
+`state: absent`. Every task needs `delegate_to: localhost` (or
 an equivalent local connection) when the play's own hosts are not the
 control node, because the module talks to the Shaken Fist API from
 wherever it runs, not from a target host's network.
@@ -240,27 +255,47 @@ be writing the same unlocked document from two different ideas of
 what it should contain, and whichever wrote last would win,
 silently undoing the other's most recent change. `initial_workers`
 avoids that by existing only once, at the one moment -- creation --
-when there is no other writer yet: its default of `0` builds a
-cluster with control plane nodes only, which is what a play that hands
-the cluster straight to such a scaler wants, rather than the command
-line's default of `2`.
+when there is no other writer yet. Its default of `0` builds a
+cluster with control plane nodes only, rather than the command line's
+default of `2`; a play that hands the cluster to a scaler should still
+ask for `1`, for the taint reason the worked playbook above gives.
 
 The module checks `name` only when it would create the cluster, so a
 cluster that already exists under a name `create` would now refuse is
 still found, reported unchanged and deletable (the two release cache
-names are refused for every state). The counts are checked at
-`state: present` before a client is built, so a bad count fails the
-same way in check mode as in a real run, and names the module's own
-parameter (`initial_workers`, not `worker_count`).
+names are refused for every state). The node sizes and the k3s
+configuration are checked at the same point and for the same reason:
+a refused size or key fails the task with `changed: false` before
+anything is built, check mode predicts the refusal, and a cluster that
+already exists is reported as found whatever they say. The counts are
+checked at `state: present` before a client is built, so a bad count
+fails the same way in check mode as in a real run, and names the
+module's own parameter (`initial_workers`, not `worker_count`).
 
 Every other shape parameter the module takes -- `control_plane_count`,
-`metal_address_count`, `network`, `release_channel`, `sshkey`,
-`install_metallb`, `install_longhorn` and `manifests` -- is creation-time
-only in the same sense, but for a simpler reason: none of them is a
-verb this library has. There is no call that adds a control plane
-node to a built cluster or swaps its network, so there is nothing for
-the module to reconcile even if it wanted to. Workers are the one
-singled out above because they are the one with a competing writer.
+`metal_address_count`, the six node sizes (`control_plane_cpus`,
+`control_plane_memory`, `control_plane_disk`, `worker_cpus`,
+`worker_memory`, `worker_disk`), `server_config`, `agent_config`,
+`network`, `release_channel`, `sshkey`, `install_metallb`,
+`install_longhorn` and `manifests` -- is creation-time only in the same
+sense, but for a simpler reason: none of them is a verb this library
+has. There is no call that adds a control plane node to a built
+cluster, resizes a node, rewrites a running node's k3s configuration or
+swaps its network, so there is nothing for the module to reconcile even
+if it wanted to; changing one of them on a cluster that exists does
+nothing. Workers are the one singled out above because they are the
+one with a competing writer. The cluster does record the worker sizes
+and `agent_config` it was created with, so a worker the scaler adds
+later is built and configured to match.
+
+The sizes default to the library's `DEFAULT_NODE_SIZE` (2 vCPUs,
+2048 MB, 50 GB), and `server_config` and `agent_config` take the same
+mappings `--server-config` and `--agent-config` read from a file, with
+the same refused keys; `docs/usage.md` documents both. Both mappings
+are stored in the cluster's metadata and are module parameters, so
+anything in them can reach a play's logs; keep credentials out of
+them. The options are new in 0.3.0, the first release whose
+`Cluster.create()` takes the k3s configuration.
 
 ## What an interrupted cluster does
 
