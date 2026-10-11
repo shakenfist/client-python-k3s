@@ -229,7 +229,14 @@ jobs:
     # sizing fault, which is exactly how shakenfist#3696 stayed
     # invisible for months. 2 GB on at most one concurrent runner is
     # the cheaper side of that trade.
-    runs-on: [self-hosted, vm, debian-13, s]
+    #
+    # The token is s-cluster rather than s because this job builds a
+    # multi-node cluster of VMs. The runner's own footprint is still s
+    # (s-cluster is identical to it); the token only gives the job its
+    # own pending pool, so its large capacity claim does not inflate
+    # the claims of lint runners on s. See shakenfist/private-ci
+    # docs/capacity-claims.md, "Cloud-building jobs".
+    runs-on: [self-hosted, vm, debian-13, s-cluster]
     # A full create is 15-25 minutes and the script carries its own
     # per-phase timeouts; agent operation failures abort within one poll
     # interval, so this is a backstop rather than an expected duration.

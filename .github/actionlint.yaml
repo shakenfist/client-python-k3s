@@ -10,6 +10,7 @@ self-hosted-runner:
     - vm
     - xs
     - s
+    - s-cluster
 
 # Ignore certain shellcheck rules from run: blocks in workflow files.
 # These are overly pedantic for CI workflow scripts where the inputs are
