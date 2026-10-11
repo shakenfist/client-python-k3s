@@ -2184,11 +2184,11 @@ class HealthTestCase(testtools.TestCase):
         self.assertEqual(3, len(report['nodes']))
         self.assertTrue(all(n['healthy'] for n in report['nodes']))
 
-    def test_a_table_too_long_to_return_inline_is_not_an_answer(self):
+    def test_a_table_too_long_to_return_inline_is_read_from_its_blob(self):
         # A cluster large enough that 'kubectl get nodes' prints more than
         # Shaken Fist returns inline. The server stores the table as a
-        # blob and the result has no stdout, and that is not a k3s API
-        # which answered with nothing.
+        # blob and the result has no stdout, and the table is read from
+        # the blob: a large cluster is not an unhealthy one.
         self.client.probe_stdout = 'NAME                  STATUS   ROLES\n' + ''.join(
             'k3s-banana-node-%03d   Ready    <none>\n' % serial
             for serial in range(1, 301))
@@ -2198,12 +2198,65 @@ class HealthTestCase(testtools.TestCase):
         report = self.cluster.health()
 
         self.assertTrue(report['api']['probed'])
+        self.assertTrue(report['api']['answered'])
+        self.assertIsNone(report['api']['error'])
+        self.assertEqual(self.client.probe_stdout, report['api']['stdout'])
+        self.assertIn(('blob', 'blob-001'), self.client.calls)
+        self.assertTrue(report['healthy'])
+
+    def test_a_table_too_long_to_read_is_not_an_answer(self):
+        # Output over the cap is not truncated into a shorter table, and
+        # the error names the command and the blob.
+        row = 'k3s-banana-node-%06d   Ready    <none>\n'
+        self.client.probe_stdout = 'NAME                  STATUS   ROLES\n' + ''.join(
+            row % serial for serial in range(
+                cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES // len(row % 0) + 1))
+        self.assertGreater(len(self.client.probe_stdout),
+                           cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES)
+
+        report = self.cluster.health()
+
+        self.assertTrue(report['api']['probed'])
         self.assertFalse(report['api']['answered'])
         self.assertEqual(0, report['api']['return_code'])
         self.assertIsNone(report['api']['stdout'])
-        self.assertIn('stored as blob', report['api']['error'])
-        self.assertIn('kubectl get nodes', report['api']['error'])
+        self.assertEqual(
+            "'%s' printed more than the 1024 KiB this version of the k3s "
+            'plugin reads, so its output, which Shaken Fist stored as blob '
+            'blob-001, was not read' % cluster_module.K3S_API_PROBE_COMMAND,
+            report['api']['error'])
         self.assertFalse(report['healthy'])
+
+    def test_a_failed_kubectl_s_long_output_is_read_too(self):
+        # A failed kubectl's output is the explanation, so it is read
+        # from its blob as inline output would be kept.
+        self.client.probe_return_code = 1
+        self.client.probe_stdout = 'x' * (fakes.SIDECHANNEL_INLINE_LIMIT + 1)
+
+        report = self.cluster.health()
+
+        self.assertFalse(report['api']['answered'])
+        self.assertEqual(self.client.probe_stdout, report['api']['stdout'])
+        self.assertEqual("'%s' exited 1" % cluster_module.K3S_API_PROBE_COMMAND,
+                         report['api']['error'])
+
+    def test_a_failed_kubectl_whose_output_cannot_be_read_says_both(self):
+        self.client.probe_return_code = 1
+        self.client.probe_stdout = 'x' * (fakes.SIDECHANNEL_INLINE_LIMIT + 1)
+        self.client.blob_raises = apiclient.APIException(
+            'the server is too busy to answer', 'GET',
+            'http://sf-1:13000/blobs/blob-001/data', 503, 'busy')
+
+        report = self.cluster.health()
+
+        self.assertFalse(report['api']['answered'])
+        self.assertIsNone(report['api']['stdout'])
+        self.assertEqual(
+            "'%s' exited 1 and printed more than the 10 KiB Shaken Fist "
+            'returns inline, and its output could not be read from blob '
+            'blob-001, where it was stored: APIException: the server is too '
+            'busy to answer' % cluster_module.K3S_API_PROBE_COMMAND,
+            report['api']['error'])
 
     def test_an_errored_agent_operation_is_reported_rather_than_raised(self):
         # await_idle() raises AgentOperationError for this, which is why the
@@ -6665,6 +6718,27 @@ class HealthSignalsTestCase(testtools.TestCase):
         self.assertEqual(0, self._node(report, 'inst-w1')['signals']['k3s_restarts'])
         self.assertEqual(7, self._node(report, 'inst-w2')['signals']['k3s_restarts'])
 
+    def test_output_too_long_to_return_inline_is_read_whatever_the_exit_code(self):
+        # The readings are parsed whether or not the command exited zero,
+        # and that includes output Shaken Fist stored as a blob. A node
+        # printing this much is not a healthy one, but each reading it did
+        # print is still a reading. The padding is lines the parser
+        # ignores, as it ignores any key it does not know.
+        self.client.signals_stdout['inst-w2'] = fakes.WORKER_SIGNALS_OUTPUT + ''.join(
+            'padding_%05d=x\n' % serial for serial in range(1000))
+        self.assertGreater(len(self.client.signals_stdout['inst-w2']),
+                           fakes.SIDECHANNEL_INLINE_LIMIT)
+        self.client.signals_return_code['inst-w2'] = 1
+
+        report = self.cluster.health()
+
+        signals = self._node(report, 'inst-w2')['signals']
+        self.assertTrue(signals['probed'])
+        self.assertEqual('the node signals command exited 1', signals['error'])
+        self.assertEqual('activating', signals['k3s_state'])
+        self.assertEqual(2010264 * 1024, signals['memory_total_bytes'])
+        self.assertTrue(report['healthy'])
+
     def test_a_gone_node_is_not_asked_and_says_why(self):
         del self.client.instances['inst-w1']
 
@@ -7355,17 +7429,96 @@ class HealthKubernetesTestCase(testtools.TestCase):
         self.assertTrue(report['api']['answered'])
         self.assertTrue(all(n['healthy'] for n in report['nodes']))
 
-    def test_output_too_long_to_return_inline_reads_nothing(self):
+    # Output too long to return inline.
+
+    def _oom_lines(self, count, pod='memory-hog-%06d'):
+        return ''.join(
+            ('oom\tk3s-banana-node-002\tdefault\t' + pod + '\thog\t1\t'
+             '2026-10-06T21:40:11Z\n') % serial for serial in range(count))
+
+    def _blob_reads(self):
+        return [call for call in self.client.calls if call[0] == 'blob']
+
+    def test_output_returned_inline_reads_no_blob(self):
+        # Reading a blob is an API round trip the shared deadline does not
+        # bound, so a probe which answered inline costs none.
+        report = self.cluster.health()
+
+        self.assertTrue(report['kubernetes']['answered'])
+        self.assertEqual([], self._blob_reads())
+
+    def test_output_too_long_to_return_inline_is_read_from_its_blob(self):
         # Enough OOM-killed containers that the probe prints more than
         # Shaken Fist returns inline, so the server stores the output as a
-        # blob and the result carries no stdout. Read as empty, that is
-        # every node unregistered and no container killed: a claim, and one
-        # a tenant who can create pods could arrange on purpose.
-        self.client.kubernetes_stdout = fakes.KUBERNETES_PROBE_OUTPUT + ''.join(
-            'oom\tk3s-banana-node-002\tdefault\tmemory-hog-%03d\thog\t1\t'
-            '2026-10-06T21:40:11Z\n' % serial for serial in range(200))
+        # blob and the result carries no stdout. It is read from the blob,
+        # every kill included: before, this reported the probe unanswered
+        # and the cluster unhealthy, which a tenant who can create pods
+        # could arrange on purpose.
+        self.client.kubernetes_stdout = (
+            fakes.KUBERNETES_PROBE_OUTPUT + self._oom_lines(200))
         self.assertGreater(len(self.client.kubernetes_stdout),
                            fakes.SIDECHANNEL_INLINE_LIMIT)
+
+        report = self.cluster.health()
+
+        self.assertEqual(
+            {'probed': True, 'answered': True, 'error': None,
+             'unmatched_nodes': []},
+            report['kubernetes'])
+        self.assertEqual([('blob', 'blob-001')], self._blob_reads())
+        self.assertEqual(201, len(self._kubernetes(report, 'inst-w1')['oom_killed']))
+        self.assertEqual('True', self._kubernetes(report, 'inst-w2')['ready'])
+        self.assertTrue(report['healthy'])
+
+    def test_output_exactly_at_the_read_limit_is_read(self):
+        # The cap is the most that is read, not the first size refused.
+        # The padding is a line the parser does not believe, as it would
+        # any garbage, so the readings are the default output's.
+        limit = cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES
+        output = fakes.KUBERNETES_PROBE_OUTPUT + self._oom_lines(5000)
+        self.assertLess(len(output), limit)
+        self.client.kubernetes_stdout = output + 'x' * (limit - len(output) - 1) + '\n'
+        self.assertEqual(limit, len(self.client.kubernetes_stdout.encode('utf-8')))
+
+        report = self.cluster.health()
+
+        self.assertTrue(report['kubernetes']['answered'], report['kubernetes'])
+        self.assertEqual(5001, len(self._kubernetes(report, 'inst-w1')['oom_killed']))
+        self.assertTrue(report['healthy'])
+
+    def test_output_over_the_read_limit_reads_nothing(self):
+        # Over the cap, nothing is read: a pod list cut short would read
+        # as fewer kills, and read as empty as no kills and no nodes. The
+        # read stops at the cap rather than taking the whole blob and then
+        # refusing it, because the blob's size is the node's choice.
+        limit = cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES
+        self.client.kubernetes_stdout = fakes.KUBERNETES_PROBE_OUTPUT + self._oom_lines(
+            3 * limit // len(self._oom_lines(1)))
+        self.assertGreater(len(self.client.kubernetes_stdout), 3 * limit - 100)
+
+        report = self.cluster.health()
+
+        self._assert_nothing_read(report)
+        self.assertEqual(
+            {'probed': True, 'answered': False,
+             'error': 'the Kubernetes probe printed more than the 1024 KiB '
+                      'this version of the k3s plugin reads, so its output, '
+                      'which Shaken Fist stored as blob blob-001, was not read',
+             'unmatched_nodes': None},
+            report['kubernetes'])
+        self.assertLessEqual(self.client.blob_bytes_served, limit + 8192)
+        # The rest of the report is as it was.
+        self.assertTrue(report['api']['answered'])
+        self.assertTrue(all(n['healthy'] for n in report['nodes']))
+
+    def test_a_blob_which_cannot_be_read_reads_nothing(self):
+        # The probe ran, so it is probed; its answer could not be had, so
+        # it has not answered. Neither healthy nor a traceback.
+        self.client.kubernetes_stdout = (
+            fakes.KUBERNETES_PROBE_OUTPUT + self._oom_lines(200))
+        self.client.blob_raises = apiclient.ResourceNotFoundException(
+            'blob not found', 'GET', '/blobs/blob-001/data', 404,
+            'blob not found')
 
         report = self.cluster.health()
 
@@ -7373,18 +7526,29 @@ class HealthKubernetesTestCase(testtools.TestCase):
         self.assertEqual(
             {'probed': True, 'answered': False,
              'error': 'the Kubernetes probe printed more than the 10 KiB '
-                      'Shaken Fist returns inline, so its output was stored '
-                      'as blob blob-001, which this version of the k3s '
-                      'plugin does not read',
+                      'Shaken Fist returns inline, and its output could not '
+                      'be read from blob blob-001, where it was stored: '
+                      'ResourceNotFoundException: blob not found',
              'unmatched_nodes': None},
             report['kubernetes'])
-        # The rest of the report is as it was.
         self.assertTrue(report['api']['answered'])
-        self.assertTrue(all(n['healthy'] for n in report['nodes']))
+
+    def test_a_blob_which_is_not_utf8_reads_nothing(self):
+        # Not something Shaken Fist's sidechannel writes, so not believed.
+        self.client.kubernetes_stdout = b'\xff' * (fakes.SIDECHANNEL_INLINE_LIMIT + 1)
+
+        report = self.cluster.health()
+
+        self._assert_nothing_read(report)
+        self.assertEqual(
+            'the Kubernetes probe printed output which is not valid UTF-8, '
+            'stored as blob blob-001, so it was not read',
+            report['kubernetes']['error'])
 
     def test_a_result_with_no_output_reads_nothing(self):
         # Exit 0 and neither stdout nor a blob: not something Shaken Fist
-        # records, and not an answer which printed nothing either.
+        # records, and not an answer which printed nothing either. There is
+        # no blob to read, and none is asked for.
         self.client.kubernetes_stdout = None
 
         report = self.cluster.health()
@@ -7393,6 +7557,7 @@ class HealthKubernetesTestCase(testtools.TestCase):
         self.assertEqual('the Kubernetes probe exited 0, but the agent '
                          'operation recorded no output for it',
                          report['kubernetes']['error'])
+        self.assertEqual([], self._blob_reads())
 
     def test_an_errored_probe_is_named(self):
         self.client.kubernetes_state = 'error'

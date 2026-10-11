@@ -409,8 +409,10 @@ before any is waited for, and all of them are waited for under one
 shared budget, so the waiting is bounded by one budget on a cluster of
 any size. That bounds the waiting, not the call: on top of it come one
 API round trip per node to read its instance, one per probe to submit
-it, and the reads of each operation, all made one after another, so on
-a slow Shaken Fist API the wall time can exceed the budget. The budget
+it, the reads of each operation, and a read of the blob for each probe
+whose output was too long to return inline (see "Output too long to
+return inline", below), all made one after another, so on a slow Shaken
+Fist API the wall time can exceed the budget. The budget
 is a ceiling, not a cost: every command runs on its node while earlier
 ones are waited for, and one which has finished by the time it is
 collected costs a single read, so a healthy cluster waits for about the
@@ -459,7 +461,7 @@ command, so it lives on that machine's entry.
 | Key | What it is, and where it comes from |
 |---|---|
 | `probed` | The command ran at all. |
-| `error` | Why it did not, or why it failed: the instance is gone, the node is not up, the probe was abandoned at the deadline, the operation failed, or the command exited non-zero. A node that was not probed says why in the words `api['error']` uses for a skipped probe. `None` when the probe ran cleanly. |
+| `error` | Why it did not, or why it failed: the instance is gone, the node is not up, the probe was abandoned at the deadline, the operation failed, the command exited non-zero, or its output could not be read (see "Output too long to return inline", below). A node that was not probed says why in the words `api['error']` uses for a skipped probe. `None` when the probe ran cleanly. |
 | `boot_id` | `/proc/sys/kernel/random/boot_id`, which changes at every boot. Only a UUID (8-4-4-4-12 hexadecimal) is reported, in lowercase; anything else the node prints is `None`, so that garbage never reads as a reboot. |
 | `booted_at` | `btime` from `/proc/stat`, in Unix seconds. The same fact as `boot_id`, in a form a person can read. |
 | `k3s_unit` | The systemd unit k3s runs as: `k3s` on control plane nodes and `k3s-agent` on workers. Reported so that a reader does not have to know the installer's naming. |
@@ -533,8 +535,9 @@ lowercased, which is what kubelet registers it under and what
 
 * the probe did not answer: it was skipped (the first control plane node
   cannot answer), refused, abandoned at the shared deadline, failed,
-  exited non-zero, or printed more than Shaken Fist returns inline (see
-  below). This includes `registered` and `oom_killed`;
+  exited non-zero, or printed output which could not be read (see
+  "Output too long to return inline", below). This includes `registered`
+  and `oom_killed`;
 * the node has no name, because its instance is gone; or
 * another node's name is the same once lowercased. Kubernetes holds one
   node object for that name and nothing here can say which kubelet it
@@ -579,16 +582,44 @@ The top level `kubernetes` is the probe's own outcome:
 Readings are raw and `health()` stores nothing, as for `signals`; the
 caller holds the baseline.
 
+#### Output too long to return inline
+
 Shaken Fist returns a command's output inline only up to 10 KiB, and
-stores anything longer as a blob, which `health()` does not read. A
-probe whose output was longer than that has not answered, and its
-`error` says so: reading it as empty would report every node
-unregistered and nothing killed. The Kubernetes probe prints about 70
+stores anything longer as a blob. The Kubernetes probe prints about 70
 characters per node and about 80 per OOM-killed container, more with
-long names, so a cluster of about 140 nodes, or one with a hundred or
-so OOM-killed containers, reports the probe unanswered and the cluster
-unhealthy. `api` follows the same rule, and its `kubectl get nodes`
-table crosses the limit at a similar size.
+long names, so it crosses that at about 140 nodes, or a hundred or so
+OOM-killed containers; the `api` probe's `kubectl get nodes` table
+crosses it at a similar cluster size. `health()` reads such a probe's
+output from its blob, for every probe -- `api`, the Kubernetes probe and
+each node's signals -- and whatever the command's exit code, so a large
+cluster reads the same as a small one.
+
+Reading a blob is one more API round trip, which the shared probe budget
+does not bound, so it is made only for a probe whose result names a
+blob; a probe answering inline costs what it always did. The read is
+capped at 1 MiB (`HEALTH_PROBE_OUTPUT_LIMIT_BYTES`), because the output
+comes from a node and a node may be compromised. That holds Kubernetes'
+supported ceiling of 5000 nodes with room for over a thousand OOM-killed
+containers at maximum name lengths, or several thousand typical ones.
+
+A probe whose output could not be read has not answered: `answered` is
+`False`, `stdout` is `None`, `probed` stays `True` because the command
+did run, and `error` names the probe, the blob and the reason, which is
+one of:
+
+* it printed more than the 1 MiB `health()` reads. The output is not
+  truncated and parsed, because a pod list cut short reads as fewer
+  kills and a node list as nodes that never registered;
+* the blob could not be read, with the API's answer, such as a
+  `ResourceNotFoundException`; or
+* the blob is not valid UTF-8, which Shaken Fist does not write.
+
+None of these is read as empty output, which would report every node
+unregistered and nothing killed, and none raises. A probe which also
+exited non-zero says both, as in `... exited 1 and printed more than
+...`. A tenant who can create pods can still push the Kubernetes probe
+past the cap and so make `healthy` false, but that takes thousands of
+OOM-killed containers rather than two dozen, and the report says why.
 
 #### What `healthy` requires
 
