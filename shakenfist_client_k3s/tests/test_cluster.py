@@ -479,16 +479,7 @@ class CreateEnvironmentTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # The release lookups reach the internet, and have their own tests.
-        # A real release rather than a channel name, because create()
-        # refuses one it cannot parse (check_k3s_release()).
-        for target, release in [('get_k3s_release', 'v1.33.4+k3s1'),
-                                ('get_longhorn_release', '1.6.0')]:
-            patcher = mock.patch(
-                'shakenfist_client_k3s.primitives.%s' % target,
-                return_value=release)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        fakes.stub_release_lookups(self)
 
 
 class CreateInstallsWorkersTestCase(CreateEnvironmentTestCase):
@@ -8013,6 +8004,10 @@ class StagedManifestsAreWhatWasValidatedTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # create() looks up the k3s release before it reads the sshkey or
+        # stages a manifest, and the Longhorn release after (#133).
+        fakes.stub_release_lookups(self)
+
         self.client = fakes.FakeClusterClient()
 
     def _writes(self):
@@ -8113,6 +8108,10 @@ class SshKeyIsReadThroughTheHierarchyTestCase(testtools.TestCase):
         patcher = mock.patch('time.sleep', lambda seconds: None)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+        # create() looks up the k3s release before it reads the sshkey or
+        # stages a manifest, and the Longhorn release after (#133).
+        fakes.stub_release_lookups(self)
 
         self.client = fakes.FakeClusterClient()
 

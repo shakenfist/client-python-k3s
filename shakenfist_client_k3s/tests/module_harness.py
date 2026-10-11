@@ -385,6 +385,11 @@ def record_mutating_methods(calls):
 
 
 def main():
+    # This interpreter never imports the test package, so it has to refuse
+    # the network itself; network_guard.py says why it is a bare import.
+    import network_guard
+    network_guard.install()
+
     module_path = sys.argv[1]
     spec = _build_spec(sys.argv[2])
 
