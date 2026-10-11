@@ -196,8 +196,9 @@ Other things to know:
   that still resolve to such a release (`v1.16` to `v1.20`, `testing`)
   are ones Longhorn's chart already refuses. `expand-workers` does not
   check.
-- A bad file, a refused key, or a release that is too old is reported
-  before anything is built or the cluster's name is registered.
+- A bad file, a refused key, a release that is too old, or a failed
+  k3s or Longhorn release lookup is reported before anything is built
+  or the cluster's name is registered.
 - Both mappings are stored in the cluster's metadata, printed by
   `show`, and written to each node as a file whose mode follows the
   node's umask. k3s accepts credentials inline as keys
@@ -661,6 +662,18 @@ the version cache held in namespace metadata; pass
 `--refresh-version-cache` to re-query upstream. This is the same cache
 `create` uses, so these are the commands to check what a create would
 install.
+
+Each Longhorn chart states the Kubernetes versions it supports, and
+`create` installs the newest chart which supports the k3s release it
+resolved, not simply the newest chart: Longhorn 1.13.0 needs Kubernetes
+1.34 or newer, so a cluster on the `v1.33` channel gets 1.12.1. That
+makes the Longhorn answer depend on the channel, so
+`query-longhorn-version` takes `--release-channel` (default `stable`,
+as for `create`) and says which k3s release it answered for. If no
+Longhorn chart supports the release, `create` fails before anything is
+built and says so; pass `--no-longhorn` to build without Longhorn. The
+version `create` chose is recorded in the cluster's metadata as
+`longhorn_version`, which `show` displays.
 
 The k3s version comes from the k3s update API
 (`https://update.k3s.io/v1-release/channels`), and the Longhorn version

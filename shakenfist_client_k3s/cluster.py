@@ -3445,8 +3445,9 @@ class Cluster:
         p = self.get_progress()
         md = self.get_metadata()
 
-        version = primitives.get_longhorn_release(
-            self.client, self.namespace, self.reporter)
+        # Resolved by create() before anything was built (#119), as the
+        # newest chart this cluster's k3s can run (#118).
+        version = md['longhorn_version']
         p.phase(f'Setting up longhorn version {version}')
 
         self.execute_and_await(
@@ -3527,6 +3528,13 @@ class Cluster:
         either way. write_kubeconfig only governs the local file:
         get_kubeconfig() serves what was fetched, and a caller which wants
         the credentials without the side effect asks for them there.
+
+        Both release lookups happen before anything is built or the name
+        is claimed: the k3s release for release_channel, and when
+        install_longhorn is True the newest Longhorn chart that release
+        can run, recorded as ``longhorn_version``. refresh_version_cache
+        refreshes both caches. A ReleaseLookupError from either therefore
+        leaves nothing behind.
 
         install_metallb and install_longhorn default to True, matching the
         behaviour before this parameter existed. Which way they went is
@@ -3680,6 +3688,21 @@ class Cluster:
         # first point at which it is.
         check_k3s_release(target_release, release_channel)
 
+        # Resolved here rather than in setup_longhorn(), which runs once
+        # the instances, the network, k3s and MetalLB all exist: a lookup
+        # failing there leaves a half-built cluster which create cannot
+        # resume (#48), and failing here leaves nothing at all (#119). It
+        # follows the k3s lookup because the chart has to be one that
+        # release can run (#118), and it also means the version installed
+        # is the one resolved now, whatever the cache does mid-create.
+        longhorn_release = None
+        if install_longhorn:
+            self.reporter.debug('Looking up Longhorn versions')
+            longhorn_release = primitives.get_longhorn_release(
+                self.client, self.namespace, self.reporter,
+                force_cache_update=refresh_version_cache,
+                k3s_version=target_release)
+
         # Ensure this name isn't already taken
         namespace_md = self.client.get_namespace_metadata(self.namespace)
         all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
@@ -3784,6 +3807,13 @@ class Cluster:
             # loud here rather than left for somebody to rediscover.
             'metallb_installed': install_metallb,
             'longhorn_installed': install_longhorn,
+
+            # The Longhorn chart version resolved above, or None when
+            # Longhorn is not being installed. Its reader is
+            # setup_longhorn(), which installs exactly this version.
+            # Clusters built before it was recorded have none, and nothing
+            # else reads it.
+            'longhorn_version': longhorn_release,
 
             # The size of each role's nodes, recorded here with the rest
             # of the initial metadata for the same reason as the two flags

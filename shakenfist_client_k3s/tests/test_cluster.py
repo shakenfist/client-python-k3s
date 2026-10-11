@@ -1543,14 +1543,17 @@ class CreateOverInterruptedClusterTestCase(testtools.TestCase):
         # order of create()'s two guards matter.
         self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
 
-        # create() looks up the k3s release before it looks at the name,
-        # and checks it against K3S_RELEASE_FLOOR, so this is a release
-        # rather than a channel name.
-        patcher = mock.patch(
-            'shakenfist_client_k3s.primitives.get_k3s_release',
-            return_value='v1.33.4+k3s1')
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # create() looks up the k3s release and the Longhorn chart before
+        # it looks at the name, and checks the k3s one against
+        # K3S_RELEASE_FLOOR, so that is a release rather than a channel
+        # name.
+        for target, release in [('get_k3s_release', 'v1.33.4+k3s1'),
+                                ('get_longhorn_release', '1.6.0')]:
+            patcher = mock.patch(
+                'shakenfist_client_k3s.primitives.%s' % target,
+                return_value=release)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         self.cluster = _make_cluster(self.client)
 
@@ -3740,20 +3743,19 @@ class ShellQuotingTestCase(testtools.TestCase):
                              'command: %s' % probe)
 
     def test_the_longhorn_version_is_quoted(self):
-        # This one comes from a GitHub release lookup rather than from
-        # anything this module wrote, which is the same trust position as
-        # the k3s channel above.
+        # This one comes from the Longhorn chart index rather than from
+        # anything this module wrote, by way of the metadata create()
+        # recorded it in, which namespace credentials can write. That is
+        # the same trust position as the k3s channel above.
         client = mock.MagicMock()
         client.get_namespace_metadata.return_value = {MD_KEY: {
             'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'longhorn_version': 'v1.9.0; touch /pwned',
             'control_plane_nodes': ['inst-cp1'], 'worker_nodes': []}}
         cluster = Cluster(client, 'banana', 'testns',
                           reporter=progress.CollectingReporter())
 
-        with mock.patch.object(cluster_module.primitives,
-                               'get_longhorn_release',
-                               return_value='v1.9.0; touch /pwned'), \
-                mock.patch.object(Cluster, 'execute_and_await') as ea:
+        with mock.patch.object(Cluster, 'execute_and_await') as ea:
             cluster.setup_longhorn()
 
         installs = [c for c in ea.call_args[0][1] if 'longhorn/longhorn' in c]
