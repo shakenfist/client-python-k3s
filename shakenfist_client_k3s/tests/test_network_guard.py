@@ -183,10 +183,15 @@ class TheModuleHarnessIsGuardedTestCase(testtools.TestCase):
                 'key': 'not-a-real-key',
             }}, f)
 
+        # Without the proxy variables, which tox passes through: with one
+        # set, requests resolves the proxy's name rather than the release
+        # host's, and the refusal names that instead.
+        env = {k: v for k, v in os.environ.items()
+               if not k.lower().endswith('_proxy')}
         process = subprocess.run(
             [sys.executable, HARNESS, MODULE, spec_path],
             stdin=subprocess.DEVNULL, capture_output=True,
-            encoding='utf-8', timeout=60)
+            encoding='utf-8', timeout=60, env=env)
 
         detail = 'stdout: %s\nstderr: %s' % (process.stdout, process.stderr)
         self.assertIn('NetworkAccessRefused', process.stderr, detail)
