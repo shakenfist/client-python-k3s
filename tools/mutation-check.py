@@ -963,10 +963,52 @@ MUTATIONS = [
         PKG + '.tests.test_network_guard.UnixSocketsStillWorkTestCase',
         'stestr',
     ),
-    # Unlike every other entry, this one does reach the network while it
-    # is applied: with the harness unguarded, the real create() makes its
-    # release lookup. The test fails whether that lookup succeeds or not,
-    # because it is asserting on the guard's own exception.
+    (
+        'a unit test cannot resolve a name',
+        PKG + '/tests/network_guard.py',
+        '    if not _is_numeric(host):',
+        '    if False:',
+        PKG + '.tests.test_network_guard.NamesAreNotResolvedTestCase',
+        'stestr',
+    ),
+    (
+        'install() guards getaddrinfo, which is what urllib3 calls',
+        PKG + '/tests/network_guard.py',
+        '    socket.getaddrinfo = _guarded_getaddrinfo\n',
+        '',
+        PKG + '.tests.test_network_guard.NamesAreNotResolvedTestCase',
+        'stestr',
+    ),
+    (
+        'a reverse lookup is refused unless it is told to stay numeric',
+        PKG + '/tests/network_guard.py',
+        '    if not flags & socket.NI_NUMERICHOST:',
+        '    if False:',
+        PKG + '.tests.test_network_guard.NamesAreNotResolvedTestCase',
+        'stestr',
+    ),
+    (
+        'numeric addresses still resolve',
+        PKG + '/tests/network_guard.py',
+        '    try:\n        ipaddress.ip_address(host)\n',
+        '    try:\n        raise ValueError(host)\n',
+        PKG + '.tests.test_network_guard.NumericAddressesStillResolveTestCase',
+        'stestr',
+    ),
+    # Unlike every other entry, the two below reach the network while they
+    # are applied. With the harness unguarded the real create() makes its
+    # release lookup; with only the lookup unguarded it resolves
+    # update.k3s.io and is refused at the connect. The test fails whether
+    # or not either succeeds, because it asserts on the guard's own
+    # exception and on the refusal naming the host.
+    (
+        'the harness is refused at the lookup, before any DNS query',
+        PKG + '/tests/network_guard.py',
+        '    socket.getaddrinfo = _guarded_getaddrinfo\n',
+        '',
+        PKG + '.tests.test_network_guard.TheModuleHarnessIsGuardedTestCase',
+        'tox',
+    ),
     (
         'the Ansible module harness installs the guard in its own interpreter',
         PKG + '/tests/module_harness.py',

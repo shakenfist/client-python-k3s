@@ -6,9 +6,10 @@ like one which passes with it in place, on any machine with a route out,
 and that is how the five tests behind #133 went unnoticed for months.
 
 The addresses are TEST-NET-1 and the IPv6 documentation prefix, which
-route nowhere, so a guard which has stopped refusing gets an error or a
-timeout from the kernel rather than reaching anything. The assertions
-are on the exception type, which only the guard raises.
+route nowhere, and the name is under .invalid, which never resolves. So
+a guard which has stopped refusing gets an error or a timeout rather
+than reaching anything. The assertions are on the exception type, which
+only the guard raises.
 """
 
 import json
@@ -26,6 +27,7 @@ from shakenfist_client_k3s.tests import network_guard
 
 UNROUTABLE_V4 = ('192.0.2.1', 9)
 UNROUTABLE_V6 = ('2001:db8::1', 9)
+UNRESOLVABLE = 'k3s-update.invalid'
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
@@ -66,6 +68,67 @@ class InternetSocketsAreRefusedTestCase(testtools.TestCase):
                           sock.connect, UNROUTABLE_V6)
 
 
+class NamesAreNotResolvedTestCase(testtools.TestCase):
+    """The lookup is refused before it is made, whether or not DNS works."""
+
+    def test_getaddrinfo_is_refused(self):
+        e = self.assertRaises(network_guard.NetworkAccessRefused,
+                              socket.getaddrinfo, UNRESOLVABLE, 443)
+        self.assertIn(UNRESOLVABLE, str(e))
+
+    def test_gethostbyname_is_refused(self):
+        self.assertRaises(network_guard.NetworkAccessRefused,
+                          socket.gethostbyname, UNRESOLVABLE)
+
+    def test_gethostbyname_ex_is_refused(self):
+        self.assertRaises(network_guard.NetworkAccessRefused,
+                          socket.gethostbyname_ex, UNRESOLVABLE)
+
+    def test_gethostbyaddr_is_refused(self):
+        self.assertRaises(network_guard.NetworkAccessRefused,
+                          socket.gethostbyaddr, UNROUTABLE_V4[0])
+
+    def test_getnameinfo_is_refused(self):
+        self.assertRaises(network_guard.NetworkAccessRefused,
+                          socket.getnameinfo, UNROUTABLE_V4, 0)
+
+    def test_localhost_is_refused(self):
+        # Loopback connections are refused too, so letting the name resolve
+        # would only move the failure to the connect.
+        self.assertRaises(network_guard.NetworkAccessRefused,
+                          socket.getaddrinfo, 'localhost', 443)
+
+
+class NumericAddressesStillResolveTestCase(testtools.TestCase):
+    """Resolving a numeric address asks nothing outside the process."""
+
+    def test_an_ipv4_address(self):
+        results = socket.getaddrinfo(UNROUTABLE_V4[0], 443,
+                                     type=socket.SOCK_STREAM)
+        self.assertEqual(UNROUTABLE_V4[0], results[0][4][0])
+
+    def test_an_ipv6_address(self):
+        if not socket.has_ipv6:
+            self.skipTest('this interpreter has no IPv6 support')
+        results = socket.getaddrinfo(UNROUTABLE_V6[0], 443,
+                                     type=socket.SOCK_STREAM)
+        self.assertEqual(UNROUTABLE_V6[0], results[0][4][0])
+
+    def test_the_wildcard_address(self):
+        self.assertNotEqual(
+            [], socket.getaddrinfo(None, 443, flags=socket.AI_PASSIVE))
+
+    def test_gethostbyname(self):
+        self.assertEqual(UNROUTABLE_V4[0],
+                         socket.gethostbyname(UNROUTABLE_V4[0]))
+
+    def test_a_numeric_getnameinfo(self):
+        self.assertEqual(
+            (UNROUTABLE_V4[0], '9'),
+            socket.getnameinfo(UNROUTABLE_V4,
+                               socket.NI_NUMERICHOST | socket.NI_NUMERICSERV))
+
+
 class UnixSocketsStillWorkTestCase(testtools.TestCase):
     """The guard is narrow: a test using a Unix domain socket is unaffected."""
 
@@ -98,7 +161,9 @@ class TheModuleHarnessIsGuardedTestCase(testtools.TestCase):
     because module_harness.main() installs the guard itself. A present
     state for a cluster which does not exist, with the real create() left
     in place, is the shortest path from the module to a release lookup --
-    and so to the network.
+    and so to the network. The refusal has to name update.k3s.io, which
+    only the lookup knows: that is what says it came before any DNS query,
+    so the test gives the same answer on a machine which has none.
 
     Like every test which runs the harness, this one exercises the
     *installed* package and means something only under tox (#106).
@@ -123,6 +188,6 @@ class TheModuleHarnessIsGuardedTestCase(testtools.TestCase):
             stdin=subprocess.DEVNULL, capture_output=True,
             encoding='utf-8', timeout=60)
 
-        self.assertIn('NetworkAccessRefused', process.stderr,
-                      'stdout: %s\nstderr: %s'
-                      % (process.stdout, process.stderr))
+        detail = 'stdout: %s\nstderr: %s' % (process.stdout, process.stderr)
+        self.assertIn('NetworkAccessRefused', process.stderr, detail)
+        self.assertIn("resolve 'update.k3s.io'", process.stderr, detail)

@@ -10,12 +10,15 @@ pre-commit run --all-files
 
 Unit tests live in `shakenfist_client_k3s/tests/` and mock the Shaken
 Fist API, the k3s update API and the Longhorn chart index. The test
-package refuses any internet socket connection (see
-`shakenfist_client_k3s/tests/network_guard.py`), and so does the
-separate interpreter the Ansible module tests run in. A test that
+package refuses every internet socket connection and every lookup of a
+name (see `shakenfist_client_k3s/tests/network_guard.py`), and so does
+the separate interpreter the Ansible module tests run in. A test that
 forgets a stub therefore fails straight away with
-`NetworkAccessRefused`, naming the address it tried to reach. Without
-the guard it would pass until that site went down (#133). A test which
+`NetworkAccessRefused`, naming the host it tried to reach, and it fails
+the same way whether or not the machine has working DNS. Without the
+guard it would pass until that site went down (#133). Loopback is
+refused too, on purpose: a test which needs a server of its own should
+listen on a Unix domain socket. A test which
 calls `create()` must stub both release lookups, which
 `fakes.stub_release_lookups(self)` does.
 
