@@ -202,6 +202,20 @@ class ClusterMetadataErrorTestCase(testtools.TestCase):
         self.assertIn("'10.0.0.1\\nEOF\\ntouch /pwned'", str(e))
         self.assertIn('routed_addresses', str(e))
 
+    def test_not_a_cluster_list(self):
+        e = exceptions.ClusterMetadataError.not_a_cluster_list(
+            'testns', 'orchestrated_k3s_clusters', 'banana')
+
+        self.assertEqual('not_a_cluster_list', e.reason)
+        self.assertIsNone(e.name)
+        self.assertEqual('testns', e.namespace)
+        self.assertEqual('orchestrated_k3s_clusters', e.key)
+        self.assertEqual('banana', e.value)
+        self.assertIn("holds\n'banana'", str(e))
+        self.assertIn(
+            "'sf-client namespace delete-metadata testns orchestrated_k3s_clusters'",
+            str(e))
+
 
 class ReleaseLookupErrorTestCase(testtools.TestCase):
     def test_http_status_k3s(self):

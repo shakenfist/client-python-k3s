@@ -98,16 +98,33 @@ UPSTREAM_UNAVAILABLE_REASONS = frozenset((
 RETRYABLE_CLIENT_STATUSES = frozenset((408, 429))
 
 
+def cluster_list(namespace_md, namespace):
+    """Return the cluster names in a namespace metadata document already read.
+
+    Every reader of CLUSTER_LIST goes through this, for a caller which has
+    the document in hand already and must decide from that one read. An
+    absent key is an empty list. Anything which is not a list of strings
+    raises ClusterMetadataError.not_a_cluster_list(), which has why it is
+    refused rather than searched. The list returned is a copy, so a caller
+    may change it before writing it back.
+    """
+    value = namespace_md.get(CLUSTER_LIST, [])
+    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+        raise exceptions.ClusterMetadataError.not_a_cluster_list(
+            namespace, CLUSTER_LIST, value)
+    return list(value)
+
+
 def list_clusters(client, namespace):
     """Return the names of the managed k3s clusters in a namespace.
 
     Namespace scoped rather than cluster scoped: there is no cluster to
     build here, only the list in namespace metadata which create appends to
     and delete removes from. This takes no reporter because it emits
-    nothing -- the caller decides what to do with the list.
+    nothing -- the caller decides what to do with the list. A list which
+    is not one raises ClusterMetadataError; see cluster_list().
     """
-    namespace_md = client.get_namespace_metadata(namespace)
-    return namespace_md.get(CLUSTER_LIST, [])
+    return cluster_list(client.get_namespace_metadata(namespace), namespace)
 
 
 def _fetch_release_data(product, url, accept, reporter):

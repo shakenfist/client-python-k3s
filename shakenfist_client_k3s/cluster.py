@@ -2081,8 +2081,7 @@ class Cluster:
 
     def _listed(self):
         """Return True if this cluster's name is in the namespace's cluster list."""
-        namespace_md = self.client.get_namespace_metadata(self.namespace)
-        return self.name in namespace_md.get(primitives.CLUSTER_LIST, [])
+        return self.name in primitives.list_clusters(self.client, self.namespace)
 
     def _not_found(self, unlisted):
         """Return the ClusterNotFoundError for a verb which found no metadata for this cluster.
@@ -3928,7 +3927,7 @@ class Cluster:
 
         # Ensure this name isn't already taken
         namespace_md = self.client.get_namespace_metadata(self.namespace)
-        all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
+        all_clusters = primitives.cluster_list(namespace_md, self.namespace)
         existing_md = self.get_metadata()
 
         # The metadata is consulted before the cluster list, because only
@@ -4942,8 +4941,7 @@ class Cluster:
         that the read-modify-write which follows is as narrow as it can be.
         It was never atomic, and this does not make it so.
         """
-        namespace_md = self.client.get_namespace_metadata(self.namespace)
-        all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
+        all_clusters = primitives.list_clusters(self.client, self.namespace)
 
         # Tested for rather than removed unconditionally: list.remove()
         # raises a bare ValueError, which is not a K3sClusterException, so

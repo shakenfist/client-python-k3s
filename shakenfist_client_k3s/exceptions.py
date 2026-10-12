@@ -629,11 +629,19 @@ class ClusterMetadataError(_ReasonedK3sException):
       because that differs between the two sites; the first has spent
       nothing and the second may have routed an address it then refused
       to record.
+    - ``not_a_cluster_list(namespace, key, value)``: the namespace's
+      cluster list holds something which is not a list of names. Raised by
+      ``primitives.cluster_list()``, which every reader of the list goes
+      through, because those reads are membership tests and ``in`` on a
+      string is a substring test: ``'ana'`` would be found in ``'banana'``
+      and a verb would act on a cluster nobody named. ``sf-client namespace
+      set-metadata`` can only write a string, which is how one gets there.
+      It names no cluster, so ``name`` is None.
     """
 
     #: The union of the fields the classmethods below set. See
     #: ``_ReasonedK3sException`` for why this is not left implicit.
-    FIELDS = ('name', 'key', 'value')
+    FIELDS = ('name', 'namespace', 'key', 'value')
 
     @classmethod
     def not_an_address(cls, name, key, value):
@@ -645,6 +653,19 @@ class ClusterMetadataError(_ReasonedK3sException):
             'value in it is checked rather than trusted.'
         ) % (name, key, value)
         return cls('not_an_address', message, name=name, key=key, value=value)
+
+    @classmethod
+    def not_a_cluster_list(cls, namespace, key, value):
+        message = (
+            'The cluster list of namespace %s (metadata key %s) holds\n'
+            '%r, which is not a list of cluster names, so it is refused rather\n'
+            'than searched. Write it back through the API as a JSON list of the\n'
+            "names of this namespace's clusters, or remove it with\n"
+            "'sf-client namespace delete-metadata %s %s', which unlists every\n"
+            "cluster without deleting any: each one's state is kept under its own key."
+        ) % (namespace, key, value, namespace, key)
+        return cls('not_a_cluster_list', message, namespace=namespace, key=key,
+                   value=value)
 
 
 class SshKeyError(K3sClusterException):

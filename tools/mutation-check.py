@@ -340,7 +340,7 @@ MUTATIONS = [
     (
         'every reasoned exception answers all of its fields',
         PKG + '/exceptions.py',
-        "    FIELDS = ('name', 'key', 'value')",
+        "    FIELDS = ('name', 'namespace', 'key', 'value')",
         '    FIELDS = ()',
         PKG + '.tests.test_exceptions.TotalAttributesTestCase',
         'stestr',
@@ -1398,6 +1398,14 @@ MUTATIONS = [
         "            msg=('Cluster %s is in the cluster list",
         PKG + '.tests.test_ansible_module.ListedWithoutStateTestCase',
         'tox',
+    ),
+    (
+        'a cluster list which is a string is refused, not searched',
+        PKG + '/primitives.py',
+        '    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):\n',
+        '    if False:\n',
+        PKG + '.tests.test_cluster.ClusterListWhichIsNotAListTestCase',
+        'stestr',
     ),
 ]
 

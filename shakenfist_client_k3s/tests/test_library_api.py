@@ -1113,6 +1113,27 @@ class ListClustersTestCase(testtools.TestCase):
         client.get_namespace_metadata.return_value = {}
         self.assertEqual([], primitives.list_clusters(client, 'testns'))
 
+    def test_a_list_which_is_not_a_list_of_names_is_refused(self):
+        # What 'sf-client namespace set-metadata' writes is a string, and
+        # 'in' on a string is a substring test. The other two are the same
+        # mistake made through the API.
+        for value in ('banana', {'banana': True}, ['banana', 3], None):
+            client = mock.MagicMock()
+            client.get_namespace_metadata.return_value = {
+                primitives.CLUSTER_LIST: value}
+            e = self.assertRaises(exceptions.ClusterMetadataError,
+                                  primitives.list_clusters, client, 'testns')
+            self.assertEqual('not_a_cluster_list', e.reason, value)
+            self.assertEqual('testns', e.namespace, value)
+            self.assertEqual(primitives.CLUSTER_LIST, e.key, value)
+            self.assertEqual(value, e.value)
+
+    def test_the_list_returned_is_a_copy(self):
+        names = ['banana']
+        namespace_md = {primitives.CLUSTER_LIST: names}
+        primitives.cluster_list(namespace_md, 'testns').append('carrot')
+        self.assertEqual(['banana'], names)
+
 
 # Enough cluster metadata for delete to run straight to the local kubectl
 # cleanup: no nodes to wait for and no node network to unroute addresses

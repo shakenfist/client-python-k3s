@@ -2282,6 +2282,47 @@ class ListedNameWithoutStateTestCase(testtools.TestCase):
                 self.assertEqual(reason, e.reason, (verb, cluster_list))
 
 
+class ClusterListWhichIsNotAListTestCase(testtools.TestCase):
+    """A cluster list which is a string is refused, not searched for substrings.
+
+    'sf-client namespace set-metadata' can only write a string, and 'ana' in
+    'banana' is True. Before every reader went through
+    primitives.cluster_list(), show('ana') answered as though 'ana' were
+    listed, and delete('ana') destroyed k3s-ana-node and then failed on the
+    list's .remove().
+    """
+
+    def setUp(self):
+        super(ClusterListWhichIsNotAListTestCase, self).setUp()
+        self.client = fakes.FakeClusterClient()
+        self.client.metadata[primitives.CLUSTER_LIST] = 'banana'
+        self.client.named_networks['k3s-ana-node'] = [
+            {'uuid': 'net-ana', 'name': 'k3s-ana-node', 'namespace': 'testns',
+             'state': 'created'}]
+        self.before = copy.deepcopy(self.client.metadata)
+        self.cluster = Cluster(self.client, 'ana', 'testns',
+                               reporter=progress.CollectingReporter())
+
+    def _refused(self, verb, *args):
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              getattr(self.cluster, verb), *args)
+        self.assertEqual('not_a_cluster_list', e.reason)
+        self.assertEqual(self.before, self.client.metadata)
+        return e
+
+    def test_show_does_not_find_a_substring(self):
+        self._refused('show')
+
+    def test_delete_does_not_free_a_substring(self):
+        self._refused('delete')
+        self.assertEqual([], self.client.deleted_networks)
+
+    def test_create_refuses_before_writing_anything(self):
+        fakes.stub_release_lookups(self)
+        self._refused('create', 1, 1, 1)
+        self.assertEqual([], self.client.allocated_networks)
+
+
 class ShowReportsStateTestCase(testtools.TestCase):
     """show() reports the cluster state, and says what an unusable one means.
 
