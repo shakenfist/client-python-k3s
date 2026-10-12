@@ -334,6 +334,89 @@ if grep -qxF ciTooOld <<< "${clusters}"; then
     exit 1
 fi
 
+status 'Verify a create naming a missing network is refused'
+# A create given a network which does not exist stops at the network
+# lookup. Before this was handled that escaped as a traceback and left the
+# name listed. Only the real by-name lookup answering "no such network"
+# shows the refusal is raised for what the API really says, which the unit
+# tests' mocked client cannot. The network name is unique per run.
+# --worker-count 0 keeps a create which wrongly succeeds small.
+no_net_output=/tmp/k3s-ci-no-network-refusal
+if sf-client k3s create ciNoNet --network "ciNoSuchNetwork-$$" \
+        --worker-count 0 > "${no_net_output}" 2>&1; then
+    echo 'create on a missing network succeeded; it should have been refused'
+    exit 1
+fi
+if ! grep -qF 'Specified network does not exist' "${no_net_output}"; then
+    echo 'create on a missing network failed, but not with the missing network refusal:'
+    cat "${no_net_output}"
+    exit 1
+fi
+# A here-string rather than a pipe, as above.
+clusters=$(sf-client k3s list)
+if grep -qxF ciNoNet <<< "${clusters}"; then
+    echo 'The refused create left ciNoNet listed'
+    exit 1
+fi
+
+status 'Verify delete frees a name with no state and its orphan network'
+# A create which stopped after allocating its network but before recording
+# it leaves the name listed with no cluster metadata, and a network named
+# k3s-NAME-node behind. delete has to find that network by name, in the
+# namespace, and remove it, and free the name. This is the only real run of
+# the namespaced by-name network lookup, of the get-network-namespace
+# capability the delete checks first, and of the orphan delete. The state
+# is seeded rather than provoked, because a create cannot be stopped at that
+# point on demand. A distinct netblock, so it cannot collide with the
+# minimal cluster's network.
+stuck_name=ciStuck
+stuck_network="k3s-${stuck_name}-node"
+sf-client network create "${stuck_network}" 10.98.0.0/24 > /dev/null
+stuck_network_uuid=$(network_field "${stuck_network}" uuid)
+stuck_network_state=''
+for _ in $(seq 60); do
+    stuck_network_state=$(network_field "${stuck_network_uuid}" state)
+    if [ "${stuck_network_state}" = 'created' ]; then
+        break
+    fi
+    sleep 2
+done
+if [ "${stuck_network_state}" != 'created' ]; then
+    echo "Network ${stuck_network} is in state ${stuck_network_state:-unknown} after two minutes"
+    sf-client network delete "${stuck_network_uuid}" || true
+    exit 1
+fi
+python3 tools/ci_seed_stuck_name.py "${stuck_name}"
+stuck_output=/tmp/k3s-ci-stuck-delete
+if ! sf-client k3s delete "${stuck_name}" > "${stuck_output}" 2>&1; then
+    echo "delete of the stuck name ${stuck_name} failed:"
+    cat "${stuck_output}"
+    sf-client network delete "${stuck_network_uuid}" || true
+    exit 1
+fi
+clusters=$(sf-client k3s list)
+if grep -qxF "${stuck_name}" <<< "${clusters}"; then
+    echo "delete left ${stuck_name} listed"
+    cat "${stuck_output}"
+    sf-client network delete "${stuck_network_uuid}" || true
+    exit 1
+fi
+# Polled, because delete asks for the network to go and does not wait.
+# Shaken Fist keeps a deleted network showable, in state deleted.
+for _ in $(seq 60); do
+    stuck_network_state=$(network_field "${stuck_network_uuid}" state)
+    if [ "${stuck_network_state}" = 'deleting' ] || [ "${stuck_network_state}" = 'deleted' ]; then
+        break
+    fi
+    sleep 2
+done
+if [ "${stuck_network_state}" != 'deleting' ] && [ "${stuck_network_state}" != 'deleted' ]; then
+    echo "delete left the orphan network ${stuck_network} in state ${stuck_network_state:-unknown}"
+    cat "${stuck_output}"
+    sf-client network delete "${stuck_network_uuid}" || true
+    exit 1
+fi
+
 status 'Create the cluster'
 # A manifest staged at create time, which k3s applies itself the first
 # time the server starts. This is the only tier which can answer whether
