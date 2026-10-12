@@ -249,8 +249,9 @@ class FakeClusterClient:
         # What a lookup of a network by name within a namespace finds, as
         # a name mapped to the list of networks carrying it. A list because
         # the server refuses a name which matches several, and a test of
-        # that refusal needs to be able to say so. Empty by default, so a
-        # by-name lookup misses unless a test has put a network there.
+        # that refusal needs to be able to say so. A network allocated
+        # through this client is added, as the server would find it; anything
+        # else is there only if a test has put it there.
         self.named_networks = {}
 
         # The capabilities the fake server advertises, which the real
@@ -279,6 +280,9 @@ class FakeClusterClient:
     def allocate_network(self, netblock, provide_dhcp, provide_nat, name,
                          namespace=None):
         self.allocated_networks.append(name)
+        self.named_networks.setdefault(name, []).append(
+            {'uuid': 'net-1', 'name': name, 'namespace': namespace,
+             'state': 'created'})
         return {'uuid': 'net-1', 'name': name, 'state': 'created'}
 
     def get_network(self, network_ref, namespace=None):

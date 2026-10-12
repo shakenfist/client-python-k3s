@@ -1742,9 +1742,12 @@ class CreateWriteLogClient(ActionLogClient):
             raise CreateInterrupted(repr(action))
 
     def set_namespace_metadata_item(self, namespace, key, value):
+        # Stored as a copy too, as a server stores what it was sent: the
+        # dictionary create() goes on changing is not the namespace's, and
+        # an interruption has to leave what the last write carried.
         self._log(('set_metadata', key, copy.deepcopy(value)))
         return super(CreateWriteLogClient, self).set_namespace_metadata_item(
-            namespace, key, value)
+            namespace, key, copy.deepcopy(value))
 
     def allocate_network(self, netblock, provide_dhcp, provide_nat, name,
                          namespace=None):
@@ -1752,9 +1755,10 @@ class CreateWriteLogClient(ActionLogClient):
         return super(CreateWriteLogClient, self).allocate_network(
             netblock, provide_dhcp, provide_nat, name, namespace=namespace)
 
-    def get_network(self, network_ref):
+    def get_network(self, network_ref, namespace=None):
         self._log(('get_network', network_ref, None))
-        return super(CreateWriteLogClient, self).get_network(network_ref)
+        return super(CreateWriteLogClient, self).get_network(
+            network_ref, namespace=namespace)
 
 
 class CreateWritesItsStateBeforeItsNameTestCase(CreateEnvironmentTestCase):
@@ -1871,6 +1875,23 @@ class CreateWritesItsStateBeforeItsNameTestCase(CreateEnvironmentTestCase):
                          self.client.metadata[primitives.CLUSTER_LIST])
         self.assertEqual('net-1',
                          self.client.metadata[MD_KEY]['node_network'])
+
+        self._cluster().delete()
+        self.assertEqual(['net-1'], self.client.deleted_networks)
+        self.assertEqual({}, self.client.metadata)
+
+    def test_an_interruption_before_the_network_is_recorded_is_recoverable(self):
+        # Killed while the write recording the allocated network's uuid was
+        # in flight: the network exists, and the document says only that
+        # this create allocates its own. delete() finds it by name rather
+        # than leaking it, and a second create of the name would otherwise
+        # have made another network with the same name.
+        self.client.interrupt = (
+            lambda a: a[:2] == ('set_metadata', MD_KEY) and a[2]['node_network'])
+        self.assertRaises(CreateInterrupted, self._cluster().create, 1, 1, 1)
+        self.assertEqual(['k3s-banana-node'], self.client.allocated_networks)
+        self.assertIsNone(self.client.metadata[MD_KEY]['node_network'])
+        self.assertIs(True, self.client.metadata[MD_KEY]['node_network_created'])
 
         self._cluster().delete()
         self.assertEqual(['net-1'], self.client.deleted_networks)

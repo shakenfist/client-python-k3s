@@ -4093,10 +4093,10 @@ class Cluster:
         #
         # The uuid is recorded the moment allocate_network() returns, before
         # the network has finished being created, because the metadata is
-        # the only place delete() looks for it: a create which stopped
-        # during the poll below used to leave a k3s-<name>-node network
-        # that nothing recorded. What is left unrecorded now is a single
-        # API round trip, the allocation itself.
+        # where delete() looks for it. That leaves the allocation itself, a
+        # single API round trip, in which a network exists that no document
+        # records; delete() finds one lost there by its name, because the
+        # first write already said node_network_created.
         if not network:
             p.phase('Creating node network')
             node_network = self.client.allocate_network(
@@ -4934,6 +4934,14 @@ class Cluster:
             # None, not []: everywhere else this key holds a network uuid
             # string, and create_instance() reads it as one.
             md['node_network'] = None
+        elif md.get('node_network_created'):
+            # create() records the uuid of the network it allocates with the
+            # write straight after allocate_network() returns, so one which
+            # stopped in that round trip left a network of its own that only
+            # its name records. A delete which has already destroyed the
+            # network reaches here too, and the lookup misses.
+            self._delete_unrecorded_node_network(
+                self.client.get_namespace_metadata(self.namespace))
 
         md['state'] = 'deleted'
         self.set_metadata(md)
@@ -4990,44 +4998,30 @@ class Cluster:
             self.client.set_namespace_metadata_item(
                 self.namespace, primitives.CLUSTER_LIST, all_clusters)
 
-    def _free_unrecorded_name(self, namespace_md, update_kubeconfig):
-        """Free a name in the namespace's cluster list which has no metadata behind it.
+    def _delete_unrecorded_node_network(self, namespace_md):
+        """Find the k3s-<name>-node network create() may have allocated without recording it, and destroy it.
 
-        delete()'s path for a name stuck by an earlier version of this
-        package (#72); delete()'s docstring says how one gets stuck. There
-        is no document, so there are no instances, addresses or tokens on
-        record to tear down, and delete_metadata() is not called: there is
-        nothing for it to remove, and on a cache which holds a miss it would
-        be deleting a document the API never had.
+        Used by delete() wherever create() can have allocated a network
+        whose uuid no document holds: a name stuck with no document at all
+        (_free_unrecorded_name()), and a document whose create stopped
+        between allocate_network() and the write recording the uuid. It is
+        found by that name, within this namespace.
 
-        What there may be is a node network. create() used to allocate
-        k3s-<name>-node after listing the name and record its uuid only in
-        the document it wrote afterwards, so a create which stopped in
-        between left a network nothing records. It is found by that name,
-        within this namespace, and destroyed. The name is proof enough that
-        create() allocated it, which is the argument _owns_node_network()
-        already makes for clusters built before node_network_created was
-        recorded: a borrowed network carrying it would have to have been
-        named after this cluster by somebody else. And it cannot belong to
-        a later cluster of the same name, because this stuck name is what
-        has stopped any later cluster being created. A delete which stopped
-        after removing the document leaves no network to find -- delete()
-        has always destroyed the network before the document -- so the
-        lookup simply misses.
+        The name is proof enough that create() allocated it, which is the
+        argument _owns_node_network() already makes for clusters built
+        before node_network_created was recorded: a borrowed network
+        carrying it would have to have been named after this cluster by
+        somebody else. It cannot be a later cluster's of the same name,
+        because this name is still held, listed or recorded, and create()
+        refuses a held name. What the name does not prove is that nobody
+        borrowed the network since, so one which a cluster document in
+        namespace_md records is left in place; see _network_recorded_by().
 
-        namespace_md is the read delete() decided to come here from. A
-        network some other cluster's document records is left in place,
-        whatever its name: see _network_recorded_by().
+        A server which cannot look a network up by name in a namespace, or
+        which finds the name ambiguous, gets a report of what may be left
+        behind rather than a failure, so that the network cannot stop the
+        rest of the delete.
         """
-        # Not a debug line, for the same reason as delete()'s note about an
-        # interrupted cluster: this is the recovery the error messages point
-        # at, and the operator should be told what it is about to do.
-        self.reporter.write(
-            'Cluster %s is in the cluster list of namespace %s but has no '
-            'recorded state:\nan earlier create stopped before it wrote any, '
-            'or an earlier delete after removing it.\nFreeing the name.\n'
-            % (self.name, self.namespace))
-
         network_name = 'k3s-%s-node' % self.name
         network = None
         try:
@@ -5037,9 +5031,7 @@ class Cluster:
         except apiclient.IncapableException:
             # The server cannot look a name up within a namespace, and a
             # lookup across every namespace could find somebody else's
-            # network. Freeing the name is the point of this path, so a
-            # network which might be left over is reported rather than
-            # allowed to fail it.
+            # network.
             self.reporter.write(
                 'This Shaken Fist cannot look a network up by name within a '
                 'namespace, so a network named %s\nmay have been left behind. '
@@ -5078,6 +5070,38 @@ class Cluster:
                     'Leaving network %s in place: the API answered a lookup of '
                     '%s in namespace %s with it' % (network.get('uuid'), network_name,
                                                     self.namespace))
+
+    def _free_unrecorded_name(self, namespace_md, update_kubeconfig):
+        """Free a name in the namespace's cluster list which has no metadata behind it.
+
+        delete()'s path for a name stuck by an earlier version of this
+        package (#72); delete()'s docstring says how one gets stuck. There
+        is no document, so there are no instances, addresses or tokens on
+        record to tear down, and delete_metadata() is not called: there is
+        nothing for it to remove, and on a cache which holds a miss it would
+        be deleting a document the API never had.
+
+        What there may be is a node network. create() used to allocate
+        k3s-<name>-node after listing the name and record its uuid only in
+        the document it wrote afterwards, so a create which stopped in
+        between left a network nothing records, which
+        _delete_unrecorded_node_network() finds by name. A delete which
+        stopped after removing the document leaves no network to find --
+        delete() has always destroyed the network before the document -- so
+        the lookup simply misses.
+
+        namespace_md is the read delete() decided to come here from.
+        """
+        # Not a debug line, for the same reason as delete()'s note about an
+        # interrupted cluster: this is the recovery the error messages point
+        # at, and the operator should be told what it is about to do.
+        self.reporter.write(
+            'Cluster %s is in the cluster list of namespace %s but has no '
+            'recorded state:\nan earlier create stopped before it wrote any, '
+            'or an earlier delete after removing it.\nFreeing the name.\n'
+            % (self.name, self.namespace))
+
+        self._delete_unrecorded_node_network(namespace_md)
 
         # Last, so that a failure above leaves the name listed and the
         # delete can be run again, which is the order delete() itself uses:

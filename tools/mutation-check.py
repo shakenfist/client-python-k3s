@@ -1435,6 +1435,16 @@ MUTATIONS = [
         '.test_other_clusters_and_the_version_caches_do_not_keep_the_orphan',
         'stestr',
     ),
+    (
+        'delete() recovers a network create allocated and never recorded',
+        PKG + '/cluster.py',
+        '            self._delete_unrecorded_node_network(\n'
+        '                self.client.get_namespace_metadata(self.namespace))\n',
+        '            pass\n',
+        PKG + '.tests.test_cluster.CreateWritesItsStateBeforeItsNameTestCase'
+        '.test_an_interruption_before_the_network_is_recorded_is_recoverable',
+        'stestr',
+    ),
 ]
 
 
