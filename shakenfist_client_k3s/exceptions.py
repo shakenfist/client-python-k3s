@@ -307,16 +307,24 @@ class ClusterInterruptedError(_ReasonedK3sException):
         # 'unknown' is not a state anything wrote, so it is not quoted as
         # one: "its state is 'unknown'" reads as though some run had
         # recorded that word, when what happened is that none recorded
-        # anything. Every other state keeps the text it always had.
+        # anything. Nor is it said to have been interrupted mid-build: a
+        # delete which stopped after removing the document leaves the same.
+        # The wording follows ClusterNotFoundError.listed_without_state(),
+        # which the other verbs raise for the same name.
         if state == 'unknown':
-            found = 'no state was\nrecorded for it at all'
+            message = (
+                'Cluster %s has no recorded state, which is what an earlier create\n'
+                'leaves if it stopped before writing any, or an earlier delete if it\n'
+                'stopped after removing it. Free the name with\n'
+                "'sf-client k3s delete %s' and then create it again."
+            ) % (name, name)
         else:
-            found = "its state is\n'%s' rather than 'created'" % state
-        message = (
-            'Cluster %s was interrupted while it was being built: %s. Resuming a half built cluster is not\n'
-            'supported, so remove what is left of it with\n'
-            "'sf-client k3s delete %s' and then create it again."
-        ) % (name, found, name)
+            message = (
+                'Cluster %s was interrupted while it was being built: its state is\n'
+                "'%s' rather than 'created'. Resuming a half built cluster is not\n"
+                'supported, so remove what is left of it with\n'
+                "'sf-client k3s delete %s' and then create it again."
+            ) % (name, state, name)
         return cls('mid_create', message, name=name, state=state)
 
     @classmethod

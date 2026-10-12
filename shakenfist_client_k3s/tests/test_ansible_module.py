@@ -599,6 +599,9 @@ class ListedWithoutStateTestCase(ModuleTestCase):
         self.assertFalse(run.changed)
         self.assertIn('state: absent', run.msg)
         self.assertNotIn('partly built', run.msg)
+        # Both ways an older version left such a name, not only the create.
+        self.assertIn('an earlier create stopped before writing any', run.msg)
+        self.assertIn('or an earlier delete after removing it', run.msg)
         self.assertNothingMutated(run)
         self.assertEqual([module_harness.CLUSTER_NAME], run.cluster_list)
 

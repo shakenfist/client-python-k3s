@@ -670,10 +670,11 @@ def _present(module, cluster, reporter, mutation):
         module.fail_json(
             changed=False,
             msg=('Cluster %s is in the cluster list of namespace %s but has '
-                 'no recorded state: an earlier run stopped before writing '
-                 'any, so there is nothing to describe and a new cluster '
-                 'cannot take the name. Remove it with state: absent and '
-                 'then run this task again.'
+                 'no recorded state: an earlier create stopped before '
+                 'writing any, or an earlier delete after removing it, so '
+                 'there is nothing to describe and a new cluster cannot take '
+                 'the name. Remove it with state: absent and then run this '
+                 'task again.'
                  % (cluster.name, module.params['namespace'])),
             health=None, log=reporter.lines)
 

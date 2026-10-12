@@ -1700,7 +1700,7 @@ class CreateOverInterruptedClusterTestCase(testtools.TestCase):
         self.assertEqual('unknown', e.state)
         message = str(e)
         self.assertIn("'sf-client k3s delete banana'", message)
-        self.assertIn('no state was\nrecorded', message)
+        self.assertIn('has no recorded state', message)
         self.assertNotIn("'unknown'", message)
 
         # And it is refused before anything is written or built.
