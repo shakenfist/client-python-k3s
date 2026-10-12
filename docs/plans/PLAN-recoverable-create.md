@@ -231,12 +231,72 @@ itself out in that pull request and records no `Merged` cell.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Recoverable create | This file, steps below | In progress | |
-| 2. Push audit | `PUSH-AUDIT.md` over phase 1's diff against `develop`, before push | Not started | |
+| 1. Recoverable create | This file, steps below | Complete | |
+| 2. Push audit | `PUSH-AUDIT.md` over phase 1's diff against `develop`, before push | Complete | |
 
 Plan phase 1 at high effort. It changes the order of create's writes to
 namespace metadata, which this project's guidance names as a
 high-effort area.
+
+### Push audit result
+
+Run on 2026-10-12 over `1326a3b..e5acb4a`, the whole of phase 1, by
+three reviewers: code quality and correctness, tests and security, and
+documentation. They raised twelve findings that were fixed on this
+branch before the push, in `0cefa5d..be09ee5`. One was declined.
+
+* **Security.** Freeing a stuck name deleted any `k3s-<name>-node`
+  network found in the namespace, even one another cluster recorded as
+  its borrowed network. An operator who found the orphan and passed it
+  to a new cluster with `--network` would have lost it, and the server
+  deletes a network that still has interfaces. The network is now left
+  in place, and the cluster that records it is named. The orphan delete
+  also passes the namespace, so the server refuses a uuid outside it.
+* **A leak the plan said was recovered was not.** A create stopped
+  between allocating its network and recording the uuid left a document
+  whose `node_network` was empty. `delete()`'s main path skipped the
+  network, so it leaked for good, and the next create of that name made
+  a second network with the same name. `delete()` now looks the network
+  up by name in that case, through the same checked helper the
+  stuck-name path uses.
+* **A race.** "No metadata" came from a possibly cached read and
+  "listed" from a later one. A delete racing a new create could have
+  destroyed the new cluster's network. Both are now decided from one
+  fresh read, and a document that has appeared since takes the normal
+  delete path.
+* **A cluster list that is not a list.** `sf-client namespace
+  set-metadata` stores a string, and a string was matched by substring:
+  `show ana` matched `banana`, and `delete ana` deleted `k3s-ana-node`
+  before crashing. `primitives.cluster_list()` now validates the value,
+  and every reader goes through it.
+* **Error types.** A borrowed network name that matches several
+  networks now raises `NetworkNotFoundError.ambiguous()` instead of an
+  apiclient exception.
+* **Tests.** The orphan network's name guard could not fail, because
+  the fake was keyed by name. A test and a mutation-check entry now
+  cover it. The mutation check has nine new entries and catches all
+  139.
+* **Functional coverage.** No live test would have failed before this
+  change. `tools/ci_deploy_test.sh` now checks that a create naming a
+  missing network is refused and leaves no name listed. It also sets up
+  a stuck name with `tools/ci_seed_stuck_name.py` and checks that
+  `delete` frees it and removes its orphan network. That is the only
+  real run of the network lookup by name within a namespace. Neither
+  block has run yet; the merge queue will be their first run.
+* **Code and docs quality.** Small fixes:
+  * `_listed()` now reuses `primitives.list_clusters()`.
+  * The message for a stateless name now names both causes.
+  * A double-quoted string is now single-quoted.
+  * The module uses `cluster.namespace`.
+  * A plan reference was removed from a test docstring.
+  * The history of how a name gets stuck, retold about ten times, is
+    now told once, in `delete()`'s docstring.
+  * The docs now describe the ownership check, the network recovery and
+    the two new exception reasons.
+
+**Declined:** splitting `cluster.py`. It was already far past the
+size threshold, this branch adds about 4%, and a split belongs in its
+own change. The seam is recorded under Future work.
 
 ### Phase 1 steps
 
@@ -690,14 +750,36 @@ We should list obvious extensions, known issues, unrelated bugs we
 encountered, and anything else we should one day do but have
 chosen to defer to here, so that we do not forget them.
 
-* `create()`'s network poll (`cluster.py:2830-2836`) loops until the
-  network reports `created` and has no deadline and no `error` exit. A
-  network the API fails to create hangs `create` indefinitely. This is
-  a separate bug, worth its own issue.
+* The node network poll in `create()` loops until the network reports
+  `created`, and has no deadline and no exit on `error`. A network the
+  API fails to create hangs `create` indefinitely. This is a separate
+  bug, worth its own issue.
 * Concurrent creates of one name both pass the list check. The
   read-modify-write on `CLUSTER_LIST` is not atomic, and this plan does
   not change that.
 * Resuming an interrupted create rather than tearing it down is #48.
+* `delete()`'s main path calls `delete_network()` without
+  `namespace=`. The new orphan path passes it, so the server refuses a
+  uuid outside the namespace. Passing it on the main path too would
+  harden against a tampered `node_network`, but first check that every
+  older cluster's network was allocated in the cluster's own namespace.
+* With a malformed cluster list, `delete()`'s main path tears down the
+  instances and network before `_unlist()` refuses the list. The
+  document is left in state `deleted` and recovers once the list is
+  repaired, but checking the list before the teardown would be cleaner.
+* The ssh key being read before the first write has no mutation-check
+  entry. Breaking it means moving code across several statements rather
+  than making a minimal edit, so only the step 1a tests guard it. They
+  were shown to fail against the old `create()`.
+* `cluster.py` grew by about 4% and was already far past the size
+  threshold. The teardown path (`_owns_node_network()`, `delete()`,
+  `_unlist()`, `_free_unrecorded_name()`, the orphan network helper and
+  the kubeconfig cleanup) is an existing seam for a split, in its own
+  change.
+* `collection/requirements.txt` asks for `shakenfist_client_k3s>=0.3.0`,
+  and 0.3.0 is unreleased (the latest tag is v0.2.0), so it already
+  covers the library behaviour the module now relies on. If 0.3.0 is
+  released before this merges, raise the floor.
 
 ### Bugs fixed during this work
 
@@ -711,6 +793,23 @@ while planning it.
   missing `network=` and an unreadable `sshkey` both claimed the name
   before failing.
 * The Ansible module's `state: absent` reported a stuck name as absent.
+* `NetworkNotFoundError` could never fire against a real server.
+  `apiclient.get_network()` raises `ResourceNotFoundException` on a 404,
+  so a typo in `network=` escaped as an apiclient exception past the
+  command line's group handler. The unit fakes returned None, which is
+  why no test noticed. A name matching several networks (a 400) now
+  raises `NetworkNotFoundError.ambiguous()` as well.
+* Stuck names had a second cause. Before 46485f9, `delete()` removed
+  the metadata document before it unlisted the name. Every release
+  contains that fix, so only pre-release installs are affected.
+  `delete()` frees those names too, and removes their kubeconfig
+  entries when asked.
+* The Ansible module's `state: present` reported `changed=True` and
+  "may be partly built" for a create refused before it wrote anything.
+* A cluster list stored as a string, which is what
+  `sf-client namespace set-metadata` writes, was matched by substring:
+  `show ana` matched `banana`. It is now refused with
+  `ClusterMetadataError.not_a_cluster_list`.
 
 Related issues to be aware of: #48 (resumable create) builds on the
 recovery this plan makes complete. PR #120 edits the same part of
