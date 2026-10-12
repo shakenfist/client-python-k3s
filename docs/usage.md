@@ -344,9 +344,14 @@ cluster list with no metadata document behind it, either because a
 because a `delete` removed the document before it released the name.
 `delete NAME` now frees such a name. Nothing records what that cluster
 had, so it deletes an orphaned `k3s-NAME-node` network if it finds one
-in the namespace by name, and if the server cannot look networks up by
-name in a namespace it says so and tells you to find the network with
-`sf-client network list` and remove it yourself. `create` refuses such
+in the namespace by name -- unless another cluster's metadata records
+that network as its own, in which case the network is left alone and the
+message names the cluster that records it. If the server cannot look
+networks up by name in a namespace it says so and tells you to find the
+network with `sf-client network list` and remove it yourself.
+`delete NAME` on a cluster which does have recorded state also finds and
+removes a network a `create` allocated but stopped before recording, so
+a `create` stopped at any point is cleaned up by one `delete`. `create` refuses such
 a name as an interrupted cluster of unknown state, and `show`, `health`,
 `get-kubeconfig`, `expand-workers`, `remove-worker`, `expand-addresses`
 and `update-os` report that the name is listed without any recorded
@@ -506,6 +511,15 @@ none, which is a truthful answer rather than a refusal.
 ### `list`
 
 Prints the names of the clusters recorded in the namespace.
+
+If the namespace's `orchestrated_k3s_clusters` value is not a list of
+names, `list` and every command that reads the list refuse with an
+error rather than guess. `sf-client namespace set-metadata` can only
+store a string, which is how this happens. Write the key back through
+the API as a JSON list of the namespace's cluster names, or remove it
+with `sf-client namespace delete-metadata NAMESPACE
+orchestrated_k3s_clusters`, which unlists every cluster without deleting
+any of them.
 
 ### `show NAME`
 
