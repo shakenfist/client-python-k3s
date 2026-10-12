@@ -695,6 +695,36 @@ installer is given the exact release the lookup resolved to
 assets, so a node needs to reach `https://get.k3s.io` and GitHub but
 not `update.k3s.io`.
 
+An answer is cached for 24 hours. From 0.3.0, when the cache has
+expired and the upstream cannot answer, the expired copy is used
+instead and a warning says so, naming the upstream, what went wrong and
+when the copy was fetched:
+
+```
+The k3s release cache could not be refreshed from https://update.k3s.io/v1-release/channels, so the copy fetched at 2026-10-10 06:12 UTC (31h48m ago) is being used instead. The next lookup will try again. The refresh failed with:
+Unable to determine latest k3s release version
+    GET https://update.k3s.io/v1-release/channels
+    failed: ...
+```
+
+"Cannot answer" means a connection failure, a timeout, a certificate
+which does not verify, a 5xx, a 408 or 429, or a 200 whose body is not
+a usable channel list or chart index -- a captive portal or a proxy's
+error page. Any other 4xx is not: a URL which has gone, or a proxy
+which refuses or wants credentials, is something to fix rather than
+wait out, so it fails as before. The copy is used as it is, so the
+next lookup asks upstream again, and the first one to get an answer
+replaces it. There is no limit on its age: an old channel map still
+names a release that installs, just not the newest, and `create`
+still refuses one older than the plugin supports (v1.21.1). A k3s copy
+which does not name the requested channel cannot stand in for it, and
+nor can a Longhorn copy with no chart the cluster's k3s release can
+run, so those lookups fail with the upstream's error.
+
+`--refresh-version-cache` never falls back. It asks for upstream's
+answer, so when upstream cannot give one the command fails with the
+error; run it again without the flag to use the cached copy.
+
 ## Where cluster state lives
 
 There is no local state file. A cluster is described entirely by

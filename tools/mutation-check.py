@@ -138,8 +138,8 @@ MUTATIONS = [
     (
         'a release lookup body which does not parse is quoted bounded',
         PKG + '/primitives.py',
-        "                'k3s', url, r.text[:RESPONSE_SNIPPET_BYTES])",
-        "                'k3s', url, r.text)",
+        "            'k3s', url, r.text[:RESPONSE_SNIPPET_BYTES])",
+        "            'k3s', url, r.text)",
         PKG + '.tests.test_primitives.GetK3sReleaseTestCase',
         'stestr',
     ),
@@ -154,8 +154,8 @@ MUTATIONS = [
     (
         'the Longhorn chart index cannot construct Python objects',
         PKG + '/primitives.py',
-        '            index = yaml.safe_load(r.text)',
-        '            index = yaml.load(r.text, Loader=yaml.UnsafeLoader)',
+        '        index = yaml.safe_load(r.text)',
+        '        index = yaml.load(r.text, Loader=yaml.UnsafeLoader)',
         PKG + '.tests.test_primitives.GetLonghornReleaseTestCase',
         'stestr',
     ),
@@ -165,6 +165,176 @@ MUTATIONS = [
         '            if fits:\n',
         '            if fits is not False:\n',
         PKG + '.tests.test_primitives.LonghornCompatibilityTestCase',
+        'stestr',
+    ),
+    (
+        'a release cache time which cannot be believed is not used',
+        PKG + '/primitives.py',
+        '            and 0 < updated <= time.time() + RELEASE_CACHE_LIFETIME)',
+        '            and True) or True',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a Longhorn cache time which cannot be believed is not used',
+        PKG + '/primitives.py',
+        "                or not isinstance(version_cache.get('charts'), dict)\n"
+        "                or not _cache_time_is_usable(version_cache.get('updated'))):",
+        "                or not isinstance(version_cache.get('charts'), dict)):",
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a release cache with no time, or time zero, is not used',
+        PKG + '/primitives.py',
+        '            and 0 < updated <= time.time() + RELEASE_CACHE_LIFETIME)',
+        '            and 0 <= updated <= time.time() + RELEASE_CACHE_LIFETIME)',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'the Longhorn fallback keeps the fetch error\'s context',
+        PKG + '/primitives.py',
+        '            if selected is None:\n                raise\n',
+        '            if selected is None:\n                raise e from None\n',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a cached k3s release which is not a release name is not used',
+        PKG + '/primitives.py',
+        '                or not all(isinstance(r, str) and r for r in releases.values())\n',
+        '',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a release lookup never turns TLS verification off',
+        PKG + '/primitives.py',
+        '            timeout=RELEASE_LOOKUP_TIMEOUT)',
+        '            timeout=RELEASE_LOOKUP_TIMEOUT, verify=False)',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'an expired k3s cache stands in for an unreachable upstream',
+        PKG + '/primitives.py',
+        "    'request_failed', 'unreadable_response', 'no_usable_k3s_channels',",
+        "    'unreadable_response', 'no_usable_k3s_channels',",
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'an expired Longhorn cache stands in for an index with nothing usable',
+        PKG + '/primitives.py',
+        "    'no_parsable_longhorn_release'))",
+        '    ))',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'an expired release cache stands in for a 5xx',
+        PKG + '/primitives.py',
+        '        return (error.status_code >= 500',
+        '        return (error.status_code >= 600',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'an expired release cache does not stand in for a 4xx which is an answer',
+        PKG + '/primitives.py',
+        '                or error.status_code in RETRYABLE_CLIENT_STATUSES)',
+        '                or error.status_code >= 400)',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'an expired k3s cache answers only for a channel it names',
+        PKG + '/primitives.py',
+        "                    and version_cache.get('releases', {}).get(release_channel)):",
+        "                    and version_cache.get('releases', {})):",
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'an expired Longhorn cache answers only if it has charts',
+        PKG + '/primitives.py',
+        "            if not (_upstream_unavailable(e) and version_cache.get('charts')):",
+        '            if not _upstream_unavailable(e):',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'an expired Longhorn cache answers only if it has a chart for the release',
+        PKG + '/primitives.py',
+        '            if selected is None:\n                raise\n',
+        '',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a stale k3s copy is not written back, so upstream is asked again',
+        PKG + '/primitives.py',
+        "            _warn_stale_copy('k3s', K3S_CHANNELS_URL, updated, e, reporter)\n",
+        "            _warn_stale_copy('k3s', K3S_CHANNELS_URL, updated, e, reporter)\n"
+        "            version_cache['updated'] = time.time()\n",
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a forced k3s refresh never falls back to the cache it skipped',
+        PKG + '/primitives.py',
+        "    if force_cache_update:\n"
+        "        version_cache = {'updated': 0}\n"
+        "        reporter.debug('Forcing cache update')\n"
+        "    else:\n"
+        "        namespace_md = client.get_namespace_metadata(namespace)\n"
+        "        version_cache = namespace_md.get(\n"
+        "            K3S_VERSION_CACHE_KEY,",
+        "    if False:\n"
+        "        version_cache = {'updated': 0}\n"
+        "        reporter.debug('Forcing cache update')\n"
+        "    else:\n"
+        "        namespace_md = client.get_namespace_metadata(namespace)\n"
+        "        version_cache = namespace_md.get(\n"
+        "            K3S_VERSION_CACHE_KEY,",
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a forced Longhorn refresh never falls back to the cache it skipped',
+        PKG + '/primitives.py',
+        "    if force_cache_update:\n"
+        "        version_cache = {'updated': 0}\n"
+        "        reporter.debug('Forcing cache update')\n"
+        "    else:\n"
+        "        namespace_md = client.get_namespace_metadata(namespace)\n"
+        "        version_cache = namespace_md.get(\n"
+        "            LONGHORN_VERSION_CACHE_KEY,",
+        "    if False:\n"
+        "        version_cache = {'updated': 0}\n"
+        "        reporter.debug('Forcing cache update')\n"
+        "    else:\n"
+        "        namespace_md = client.get_namespace_metadata(namespace)\n"
+        "        version_cache = namespace_md.get(\n"
+        "            LONGHORN_VERSION_CACHE_KEY,",
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a k3s cache whose releases is not a dict is fetched past',
+        PKG + '/primitives.py',
+        '        if (not isinstance(releases, dict)\n',
+        "        if ('releases' not in version_cache\n",
+        PKG + '.tests.test_primitives.GetK3sReleaseTestCase',
+        'stestr',
+    ),
+    (
+        'a stale k3s release is still held to the release floor',
+        PKG + '/cluster.py',
+        '    if version < K3S_RELEASE_FLOOR:',
+        '    if False:',
+        PKG + '.tests.test_library_api.K3sConfigTestCase.test_a_stale_release_below_the_floor_registers_nothing',
         'stestr',
     ),
     (

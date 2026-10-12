@@ -18,7 +18,9 @@ import tempfile
 # The PyPI mock backport is used for consistency with the other tests in
 # this package, which support Python >= 3.7.
 import mock
+import requests
 import testtools
+import time
 import yaml
 
 from shakenfist_client_k3s import cluster as cluster_module
@@ -30,6 +32,10 @@ from shakenfist_client_k3s.tests import fakes
 
 
 MD_KEY = cluster_module.METADATA_KEY % 'banana'
+
+# The real lookup, kept before LibraryTestCase patches it out, for the test
+# which has to see what create() does with an answer the lookup really gave.
+REAL_GET_K3S_RELEASE = primitives.get_k3s_release
 
 
 class RecordingClient(fakes.FakeClusterClient):
@@ -687,6 +693,33 @@ class K3sConfigTestCase(LibraryTestCase):
 
         self.assertEqual('created', self._stored()['state'])
         self.assertIsNone(self._stored()['longhorn_version'])
+
+    def test_a_stale_release_below_the_floor_registers_nothing(self):
+        # An expired copy standing in for an unreachable upstream is still
+        # a release create() has to check: the floor is applied to what the
+        # lookup returned, wherever that came from. The real lookup, so
+        # that the answer really is the stale copy's.
+        cache = {'updated': time.time() - 3 * 24 * 3600,
+                 'releases': {'v1.20': 'v1.20.15+k3s1'}}
+        self.client.metadata[primitives.K3S_VERSION_CACHE_KEY] = cache
+
+        with mock.patch('shakenfist_client_k3s.primitives.get_k3s_release',
+                        REAL_GET_K3S_RELEASE):
+            with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                            side_effect=requests.ConnectionError('down')):
+                e = self.assertRaises(
+                    exceptions.UnsupportedReleaseError, self._cluster().create,
+                    1, 1, 1, release_channel='v1.20')
+
+        self.assertEqual('too_old', e.reason)
+        self.assertEqual('v1.20.15+k3s1', e.release)
+        self.assertIn('The k3s release cache could not be refreshed',
+                      self.reporter.getvalue())
+        self.assertEqual([], self.client.calls)
+        self.assertEqual({primitives.K3S_VERSION_CACHE_KEY: cache},
+                         self.client.metadata)
+        self.assertEqual([], self.client.allocated_networks)
+        self.assertEqual({}, self.client.instances)
 
     def test_both_configs_are_recorded(self):
         self._cluster().create(1, 1, 1, server_config=self.SERVER,

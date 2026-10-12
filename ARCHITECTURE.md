@@ -121,6 +121,8 @@ upstream has an API rate limit; the GitHub releases API, which the
 Longhorn lookup once used, allows 60 anonymous requests an hour per
 source address and failed creates from behind shared NAT (#97).
 Results are cached in namespace metadata and refreshed when stale.
+When the upstream cannot answer, an expired copy stands in, with a
+warning (`docs/usage.md` has which failures count).
 Both parsers are defensive about upstream data: a fetch failure, an
 unparsable body or a document of the wrong shape is a
 `ReleaseLookupError` rather than a traceback, k3s channels without a

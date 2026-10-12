@@ -13,6 +13,7 @@ way, so that a Cluster can call these lookups.
 """
 
 import json
+import math
 from packaging.version import InvalidVersion, Version
 import re
 import requests
@@ -21,6 +22,7 @@ import time
 import yaml
 
 from shakenfist_client_k3s import exceptions
+from shakenfist_client_k3s import progress
 
 
 # The namespace metadata key the list of managed clusters is stored under.
@@ -65,6 +67,36 @@ LONGHORN_CHART_INDEX_URL = 'https://charts.longhorn.io/index.yaml'
 # accepts the connection and never answers hangs the command, silently.
 RELEASE_LOOKUP_TIMEOUT = 30
 
+# How long a release lookup's cached answer is used before its upstream is
+# asked again, in seconds.
+RELEASE_CACHE_LIFETIME = 24 * 3600
+
+
+# The ReleaseLookupError reasons which mean the upstream could not give an
+# answer, as against having answered no. For these an expired cached copy
+# stands in rather than the lookup failing; docs/usage.md has the policy
+# (no age limit, no fallback on a forced refresh) and why.
+#
+# request_failed includes a certificate which does not verify (#132). That
+# is safe to fall back from because requests raises before there is a
+# response, so nothing the unverified connection said is read, let alone
+# stored. Nothing here turns verification off.
+#
+# The two empty parses are here although the document parsed, because an
+# error page which happens to be valid JSON or YAML produces them: most
+# HTML parses as a YAML string, so a captive portal in front of the
+# Longhorn index lands here rather than at unreadable_response. An empty
+# parse is still never stored; the fetch functions raise first.
+UPSTREAM_UNAVAILABLE_REASONS = frozenset((
+    'request_failed', 'unreadable_response', 'no_usable_k3s_channels',
+    'no_parsable_longhorn_release'))
+
+# The 4xx statuses which also mean "not now"; every 5xx does too. The rest
+# of 4xx -- a URL which has gone, a proxy which refuses or wants
+# credentials -- will not change by waiting, so a copy would only postpone
+# finding out.
+RETRYABLE_CLIENT_STATUSES = frozenset((408, 429))
+
 
 def list_clusters(client, namespace):
     """Return the names of the managed k3s clusters in a namespace.
@@ -107,8 +139,99 @@ def _fetch_release_data(product, url, accept, reporter):
     return r
 
 
+def _cache_time_is_usable(updated):
+    """Say whether a release cache's 'updated' time can be believed.
+
+    Namespace metadata is writable by any client with access to the
+    namespace, so the time is checked before anything relies on it. A
+    value which is not a finite number, or is negative, would raise from
+    time.gmtime() in the stale copy's warning -- the path which exists to
+    avoid a failure. One far in the future would never expire, pinning the
+    cache to whatever it holds. A lifetime of slack allows for the clock of
+    whichever client wrote it. Zero, or no time at all (None), is not a
+    fetch this package recorded: as a stale copy it would be dated 1970.
+    """
+    return (isinstance(updated, (int, float)) and not isinstance(updated, bool)
+            and math.isfinite(updated)
+            and 0 < updated <= time.time() + RELEASE_CACHE_LIFETIME)
+
+
+def _upstream_unavailable(error):
+    """Say whether a ReleaseLookupError means the upstream could not answer.
+
+    The reasons and statuses this accepts, and why, are on
+    UPSTREAM_UNAVAILABLE_REASONS and RETRYABLE_CLIENT_STATUSES.
+    """
+    if error.reason == 'http_status':
+        return (error.status_code >= 500
+                or error.status_code in RETRYABLE_CLIENT_STATUSES)
+    return error.reason in UPSTREAM_UNAVAILABLE_REASONS
+
+
+def _warn_stale_copy(product, url, updated, error, reporter):
+    """Tell the caller that an expired cached copy is standing in for upstream.
+
+    Written rather than debug: the answer is older than the cache would
+    normally allow, and somebody choosing a release ought to know that.
+    The copy is dated as well as aged, because an age alone has to be
+    read against when the output was written, and an Ansible log is read
+    later. The error is quoted whole, as it would have been raised, so the
+    warning says what failed in the same words a failure would have used.
+    """
+    reporter.write(
+        'The %s release cache could not be refreshed from %s, so the copy '
+        'fetched at %s UTC (%s ago) is being used instead. The next lookup '
+        'will try again. The refresh failed with:\n%s\n'
+        % (product, url, time.strftime('%Y-%m-%d %H:%M', time.gmtime(updated)),
+           progress.format_elapsed(time.time() - updated), error))
+
+
+def _fetch_k3s_releases(reporter):
+    """Fetch and parse the k3s channel list, returning a channel to release map."""
+    url = K3S_CHANNELS_URL
+    r = _fetch_release_data('k3s', url, 'application/json', reporter)
+    try:
+        d = r.json()
+    except ValueError:
+        # A 200 carrying HTML -- a captive portal, a proxy error page.
+        raise exceptions.ReleaseLookupError.unreadable_response(
+            'k3s', url, r.text[:RESPONSE_SNIPPET_BYTES])
+
+    releases = {}
+    reporter.debug('Fetched release data:')
+    reporter.debug(json.dumps(d, indent=4, sort_keys=True))
+    # A document of the wrong shape yields no channels, and so the
+    # no_usable_k3s_channels error below rather than a traceback.
+    channels = d.get('data', []) if isinstance(d, dict) else []
+    for reldata in channels if isinstance(channels, list) else []:
+        if not isinstance(reldata, dict):
+            continue
+        # Some channels (for example v1.16-testing) have no released
+        # version and therefore no 'latest' key.
+        if 'name' not in reldata or 'latest' not in reldata:
+            reporter.debug(f'Channel {reldata.get("name")} has no latest release, '
+                           'skipping')
+            continue
+        releases[reldata['name']] = reldata['latest']
+
+    # Don't return an empty parse result: get_k3s_release() would persist
+    # it, and a transient upstream error would then poison the shared
+    # namespace cache until it next expires. This mirrors the 'not charts'
+    # guard in _fetch_longhorn_charts().
+    if not releases:
+        raise exceptions.ReleaseLookupError.no_usable_k3s_channels(
+            url, json.dumps(d)[:RESPONSE_SNIPPET_BYTES])
+    return releases
+
+
 def get_k3s_release(client, namespace, reporter, force_cache_update=False,
                     release_channel=None):
+    """Return the k3s release a channel resolves to, from cache or upstream.
+
+    When the cache has expired and upstream cannot answer, an expired copy
+    which names the channel is returned instead, with a warning; see
+    UPSTREAM_UNAVAILABLE_REASONS. A forced refresh never falls back.
+    """
     if force_cache_update:
         version_cache = {'updated': 0}
         reporter.debug('Forcing cache update')
@@ -116,7 +239,14 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
         namespace_md = client.get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             K3S_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
-        if not isinstance(version_cache, dict) or 'releases' not in version_cache:
+        # A dict of release names, not just present: the stale copy below
+        # and the channel lookup at the end both read it as one, and
+        # return a value from it as the release to install, and namespace
+        # metadata is writable by any client with access to the namespace.
+        releases = version_cache.get('releases') if isinstance(version_cache, dict) else None
+        if (not isinstance(releases, dict)
+                or not all(isinstance(r, str) and r for r in releases.values())
+                or not _cache_time_is_usable(version_cache.get('updated'))):
             reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
@@ -125,47 +255,26 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
     reporter.debug(f'Cached version information from {updated}: '
                    f'{version_cache.get("releases", {})}')
 
-    if time.time() - updated > 24 * 3600:
+    if time.time() - updated > RELEASE_CACHE_LIFETIME:
         reporter.debug('Updating release version cache')
-
-        url = K3S_CHANNELS_URL
-        r = _fetch_release_data('k3s', url, 'application/json', reporter)
         try:
-            d = r.json()
-        except ValueError:
-            # A 200 carrying HTML -- a captive portal, a proxy error page.
-            raise exceptions.ReleaseLookupError.unreadable_response(
-                'k3s', url, r.text[:RESPONSE_SNIPPET_BYTES])
-
-        releases = {}
-        reporter.debug('Fetched release data:')
-        reporter.debug(json.dumps(d, indent=4, sort_keys=True))
-        # A document of the wrong shape yields no channels, and so the
-        # no_usable_k3s_channels error below rather than a traceback.
-        channels = d.get('data', []) if isinstance(d, dict) else []
-        for reldata in channels if isinstance(channels, list) else []:
-            if not isinstance(reldata, dict):
-                continue
-            # Some channels (for example v1.16-testing) have no released
-            # version and therefore no 'latest' key.
-            if 'name' not in reldata or 'latest' not in reldata:
-                reporter.debug(f'Channel {reldata.get("name")} has no latest release, '
-                               'skipping')
-                continue
-            releases[reldata['name']] = reldata['latest']
-
-        # Don't persist an empty parse result: a transient upstream error
-        # would otherwise poison the shared namespace cache until it next
-        # expires. This mirrors the 'latest is None' guard in
-        # get_longhorn_release().
-        if not releases:
-            raise exceptions.ReleaseLookupError.no_usable_k3s_channels(
-                url, json.dumps(d)[:RESPONSE_SNIPPET_BYTES])
-
-        version_cache['releases'] = releases
-        version_cache['updated'] = time.time()
-        client.set_namespace_metadata_item(
-            namespace, K3S_VERSION_CACHE_KEY, version_cache)
+            releases = _fetch_k3s_releases(reporter)
+        except exceptions.ReleaseLookupError as e:
+            # The expired copy answers only if it names this channel: one
+            # which does not would turn "upstream is down" into "no such
+            # channel" and send the operator to the wrong option. A forced
+            # refresh never read a copy, so has none to offer. The copy is
+            # used as it is, 'updated' untouched, so the next lookup asks
+            # upstream again.
+            if not (_upstream_unavailable(e)
+                    and version_cache.get('releases', {}).get(release_channel)):
+                raise
+            _warn_stale_copy('k3s', K3S_CHANNELS_URL, updated, e, reporter)
+        else:
+            version_cache['releases'] = releases
+            version_cache['updated'] = time.time()
+            client.set_namespace_metadata_item(
+                namespace, K3S_VERSION_CACHE_KEY, version_cache)
 
     most_recent = version_cache['releases'].get(release_channel, None)
     if not most_recent:
@@ -304,6 +413,75 @@ def _select_longhorn_chart(charts, k3s_version, reporter):
         k3s_version)
 
 
+def _fetch_longhorn_charts(reporter):
+    """Fetch and parse the Longhorn chart index.
+
+    Returns a map of each final chart version it lists to that chart's
+    kubeVersion constraint, the shape the cache stores. An index with none
+    raises rather than returning nothing, for the reason the matching guard
+    in _fetch_k3s_releases() gives.
+    """
+    r = _fetch_release_data(
+        'Longhorn', LONGHORN_CHART_INDEX_URL, 'application/yaml, */*',
+        reporter)
+    try:
+        # safe_load, because this is third-party data. It is no less
+        # trusted than the chart the install then runs from the same
+        # host, but it should not be able to construct objects here.
+        index = yaml.safe_load(r.text)
+    except yaml.YAMLError:
+        raise exceptions.ReleaseLookupError.unreadable_response(
+            'Longhorn', LONGHORN_CHART_INDEX_URL,
+            r.text[:RESPONSE_SNIPPET_BYTES])
+
+    # A Helm repository index maps each chart name under 'entries' to
+    # a list of that chart's versions. A document of any other shape
+    # -- an error page which happens to parse as YAML, a reshaped
+    # index -- yields no releases, and so the no_parsable_longhorn_release
+    # error below rather than a traceback.
+    entries = index.get('entries') if isinstance(index, dict) else None
+    listed = entries.get('longhorn') if isinstance(entries, dict) else None
+
+    charts = {}
+    for chart in listed if isinstance(listed, list) else []:
+        if not isinstance(chart, dict) or chart.get('deprecated'):
+            continue
+
+        # The chart version, not appVersion, because it is what helm
+        # install --version takes. Longhorn has kept the two equal so
+        # far, apart from appVersion's leading 'v'. A version YAML
+        # read as something other than a string (1.10 is the float
+        # 1.1) is not one to trust, so it is skipped.
+        chart_version = chart.get('version')
+        if not isinstance(chart_version, str):
+            continue
+
+        # Helm chart versions are SemVer, which PEP 440 mostly
+        # accepts: 1.7.0-rc1 parses as a prerelease and is skipped as
+        # one. Longhorn has published versions which are not valid at
+        # all (v1.4.0-hotfix1 was a release tag), so skip those too.
+        try:
+            parsed_version = Version(chart_version)
+        except InvalidVersion:
+            reporter.debug(f'Skipping unparsable chart version {chart_version}')
+            continue
+        if parsed_version.is_prerelease:
+            continue
+
+        # '' for a chart which states no kubeVersion, which Helm will
+        # install on anything; None for one which states something
+        # other than a string, which is not a constraint to guess at.
+        kube_version = chart.get('kubeVersion', '')
+        charts[chart_version] = (
+            kube_version if isinstance(kube_version, str) else None)
+
+    # Don't return an empty parse result, for the reason
+    # _fetch_k3s_releases() gives.
+    if not charts:
+        raise exceptions.ReleaseLookupError.no_parsable_longhorn_release()
+    return charts
+
+
 def get_longhorn_release(client, namespace, reporter, force_cache_update=False,
                          k3s_version=None):
     """Return the newest Longhorn chart version a cluster can install.
@@ -314,6 +492,10 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False,
     the newest chart whose kubeVersion admits this release is returned.
     Left as None, compatibility is not considered and the newest chart is
     returned; create() always passes one (#118).
+
+    When the cache has expired and upstream cannot answer, an expired copy
+    is used instead, with a warning, on the same terms as get_k3s_release():
+    only if it has a chart this release can run.
     """
     if force_cache_update:
         version_cache = {'updated': 0}
@@ -324,9 +506,12 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False,
             LONGHORN_VERSION_CACHE_KEY, {'updated': 0})
         # A cache without 'charts' -- one written before the lookup
         # recorded each chart's kubeVersion, or anything else -- cannot
-        # answer a compatibility question, so it is refetched.
+        # answer a compatibility question, so it is refetched. What is in
+        # 'charts' is re-validated by _select_longhorn_chart(); its time
+        # is checked here, for the reason get_k3s_release() gives.
         if (not isinstance(version_cache, dict)
-                or not isinstance(version_cache.get('charts'), dict)):
+                or not isinstance(version_cache.get('charts'), dict)
+                or not _cache_time_is_usable(version_cache.get('updated'))):
             reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
@@ -335,67 +520,33 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False,
     reporter.debug(f'Cached version information from {updated}: '
                    f'{version_cache.get("charts", {})}')
 
-    if time.time() - updated > 24 * 3600:
+    if time.time() - updated > RELEASE_CACHE_LIFETIME:
         reporter.debug('Updating release version cache')
-
-        r = _fetch_release_data(
-            'Longhorn', LONGHORN_CHART_INDEX_URL, 'application/yaml, */*',
-            reporter)
         try:
-            # safe_load, because this is third-party data. It is no less
-            # trusted than the chart the install then runs from the same
-            # host, but it should not be able to construct objects here.
-            index = yaml.safe_load(r.text)
-        except yaml.YAMLError:
-            raise exceptions.ReleaseLookupError.unreadable_response(
-                'Longhorn', LONGHORN_CHART_INDEX_URL,
-                r.text[:RESPONSE_SNIPPET_BYTES])
-
-        # A Helm repository index maps each chart name under 'entries' to
-        # a list of that chart's versions. A document of any other shape
-        # -- an error page which happens to parse as YAML, a reshaped
-        # index -- yields no releases, and so the no_parsable_longhorn_release
-        # error below rather than a traceback.
-        entries = index.get('entries') if isinstance(index, dict) else None
-        listed = entries.get('longhorn') if isinstance(entries, dict) else None
-
-        charts = {}
-        for chart in listed if isinstance(listed, list) else []:
-            if not isinstance(chart, dict) or chart.get('deprecated'):
-                continue
-
-            # The chart version, not appVersion, because it is what helm
-            # install --version takes. Longhorn has kept the two equal so
-            # far, apart from appVersion's leading 'v'. A version YAML
-            # read as something other than a string (1.10 is the float
-            # 1.1) is not one to trust, so it is skipped.
-            chart_version = chart.get('version')
-            if not isinstance(chart_version, str):
-                continue
-
-            # Helm chart versions are SemVer, which PEP 440 mostly
-            # accepts: 1.7.0-rc1 parses as a prerelease and is skipped as
-            # one. Longhorn has published versions which are not valid at
-            # all (v1.4.0-hotfix1 was a release tag), so skip those too.
+            charts = _fetch_longhorn_charts(reporter)
+        except exceptions.ReleaseLookupError as e:
+            # As in get_k3s_release(), which has the reasons. The copy
+            # answers only if it has a chart this release can run: one
+            # which has none would turn "upstream is down" into "no
+            # compatible chart" and send the operator to the wrong option.
+            # A forced refresh never read a copy, so has none to offer.
+            # The fetch error is raised outside the selection's handler, so
+            # that it keeps its own context (the requests exception behind
+            # request_failed) as the k3s path's bare raise does.
+            if not (_upstream_unavailable(e) and version_cache.get('charts')):
+                raise
+            selected = None
             try:
-                parsed_version = Version(chart_version)
-            except InvalidVersion:
-                reporter.debug(f'Skipping unparsable chart version {chart_version}')
-                continue
-            if parsed_version.is_prerelease:
-                continue
-
-            # '' for a chart which states no kubeVersion, which Helm will
-            # install on anything; None for one which states something
-            # other than a string, which is not a constraint to guess at.
-            kube_version = chart.get('kubeVersion', '')
-            charts[chart_version] = (
-                kube_version if isinstance(kube_version, str) else None)
-
-        # Don't persist an empty parse result, for the reason
-        # get_k3s_release() gives.
-        if not charts:
-            raise exceptions.ReleaseLookupError.no_parsable_longhorn_release()
+                selected = _select_longhorn_chart(
+                    version_cache['charts'], k3s_version, reporter)
+            except exceptions.ReleaseLookupError:
+                pass
+            if selected is None:
+                raise
+            _warn_stale_copy('Longhorn', LONGHORN_CHART_INDEX_URL, updated, e,
+                             reporter)
+            reporter.debug(f'Selected Longhorn version: {selected}')
+            return selected
 
         version_cache = {'charts': charts, 'updated': time.time()}
         client.set_namespace_metadata_item(

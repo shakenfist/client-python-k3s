@@ -1065,6 +1065,13 @@ class ReleaseLookupError(_ReasonedK3sException):
     does not decide which attributes exist: every field any of them sets
     is declared below, so ``getattr`` is total and an unset field answers
     None rather than raising ``AttributeError``.
+
+    The fetch failures are not always raised: when the cache has expired
+    and holds a copy which can answer, a reason which says the upstream
+    could not answer is written to the reporter as a warning and the
+    copy is returned instead. ``primitives.UPSTREAM_UNAVAILABLE_REASONS``
+    and ``primitives._upstream_unavailable()`` say which, and why.
+    ``unknown_channel`` is never one of them.
     """
 
     #: The union of the fields the classmethods below set. See
