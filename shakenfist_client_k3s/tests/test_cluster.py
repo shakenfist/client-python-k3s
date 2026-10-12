@@ -2355,10 +2355,9 @@ class DeleteFreesAListedNameWithoutStateTestCase(testtools.TestCase):
 class ListedNameWithoutStateTestCase(testtools.TestCase):
     """The other verbs say how to free a listed name with no metadata, rather than only that it does not exist.
 
-    Open question 3 of docs/plans/PLAN-recoverable-create.md. `k3s list`
-    prints such a name, and every other verb used to say there was no such
-    cluster, so the operator was told two contradictory things and how to
-    reconcile them neither. Each verb now raises
+    `k3s list` prints such a name, and every other verb used to say there was
+    no such cluster, so the operator was told two contradictory things and
+    how to reconcile them neither. Each verb now raises
     ClusterNotFoundError.listed_without_state() for that case, which names
     the delete that frees it, and keeps its own historical reason for a name
     nobody has heard of. The class is unchanged, so a caller which catches

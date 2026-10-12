@@ -638,7 +638,7 @@ def _probe(module, cluster, reporter, mutation):
             health=None, log=reporter.lines)
 
 
-def _listed_without_state(module, cluster):
+def _listed_without_state(cluster):
     """Whether the name is in the namespace's cluster list with no metadata behind it.
 
     That is what versions before the fix for #72 left when a create or a
@@ -651,7 +651,7 @@ def _listed_without_state(module, cluster):
     if cluster.get_metadata() is not None:
         return False
     return cluster.name in sf_primitives.list_clusters(
-        cluster.client, module.params['namespace'])
+        cluster.client, cluster.namespace)
 
 
 def _present(module, cluster, reporter, mutation):
@@ -666,7 +666,7 @@ def _present(module, cluster, reporter, mutation):
     # only after mutation.creating() had made this run claim a change and
     # advise that a cluster may be partly built, and a check mode run must
     # not say it would create over a name which is stuck.
-    if _listed_without_state(module, cluster):
+    if _listed_without_state(cluster):
         module.fail_json(
             changed=False,
             msg=('Cluster %s is in the cluster list of namespace %s but has '
@@ -675,7 +675,7 @@ def _present(module, cluster, reporter, mutation):
                  'there is nothing to describe and a new cluster cannot take '
                  'the name. Remove it with state: absent and then run this '
                  'task again.'
-                 % (cluster.name, module.params['namespace'])),
+                 % (cluster.name, cluster.namespace)),
             health=None, log=reporter.lines)
 
     if cluster.get_metadata() is None:
@@ -776,7 +776,7 @@ def _absent(module, cluster, reporter, mutation):
     # A name which is listed but has no metadata counts as present: delete()
     # frees it, and that is the only way to.
     if (cluster.get_metadata() is None
-            and not _listed_without_state(module, cluster)):
+            and not _listed_without_state(cluster)):
         module.exit_json(changed=False, health=None, log=reporter.lines)
 
     if module.check_mode:

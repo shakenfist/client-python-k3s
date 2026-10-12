@@ -218,7 +218,7 @@ class ClusterNotFoundError(K3sClusterException):
         message = (
             "Cluster %s is in this namespace's cluster list but has no recorded\n"
             'state: an earlier create stopped before it wrote any, or an earlier\n'
-            "delete stopped after removing it. Free the name with\n"
+            'delete stopped after removing it. Free the name with\n'
             "'sf-client k3s delete %s'."
         ) % (name, name)
         return cls(name, 'listed_without_state', message)

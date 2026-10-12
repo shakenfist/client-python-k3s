@@ -1380,7 +1380,7 @@ MUTATIONS = [
         'the Ansible module frees a listed name without state on state: absent',
         'collection/plugins/modules/sf_k3s_cluster.py',
         '    if (cluster.get_metadata() is None\n'
-        '            and not _listed_without_state(module, cluster)):\n',
+        '            and not _listed_without_state(cluster)):\n',
         '    if cluster.get_metadata() is None:\n',
         PKG + '.tests.test_ansible_module.ListedWithoutStateTestCase',
         'tox',
@@ -1388,7 +1388,7 @@ MUTATIONS = [
     (
         'the Ansible module refuses a listed name without state on state: present',
         'collection/plugins/modules/sf_k3s_cluster.py',
-        '    if _listed_without_state(module, cluster):\n'
+        '    if _listed_without_state(cluster):\n'
         '        module.fail_json(\n'
         '            changed=False,\n'
         "            msg=('Cluster %s is in the cluster list",
