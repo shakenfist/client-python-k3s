@@ -160,6 +160,11 @@ def _build_spec(path):
                        have passed.
     cluster_exists     whether the fake client serves metadata for the
                        cluster the module asks about.
+    cluster_listed     whether the cluster's name is in the namespace's
+                       cluster list. With cluster_exists false this is a
+                       name left listed with no metadata by an older
+                       version. Writes to the list are applied to the fake
+                       namespace metadata, so the final list is reported.
     cluster_state      the metadata's own state field, 'created' for a
                        cluster which finished building.
     worker_nodes       how many worker instance uuids the metadata lists,
@@ -210,6 +215,7 @@ def _build_spec(path):
     with io.open(path, encoding='utf-8') as f:
         spec = json.load(f)
     spec.setdefault('cluster_exists', False)
+    spec.setdefault('cluster_listed', False)
     spec.setdefault('cluster_state', 'created')
     spec.setdefault('worker_nodes', 1)
     spec.setdefault('instance_state', 'created')
@@ -228,6 +234,7 @@ def build_fake_client(spec):
     """A MagicMock which answers what health() and delete() ask it."""
     from shakenfist_client import apiclient
     from shakenfist_client_k3s import cluster as cluster_module
+    from shakenfist_client_k3s import primitives
 
     namespace_md = {}
     if spec['cluster_exists']:
@@ -241,8 +248,31 @@ def build_fake_client(spec):
         md['name'] = name
         namespace_md[cluster_module.METADATA_KEY % name] = md
 
+    if spec['cluster_listed']:
+        namespace_md[primitives.CLUSTER_LIST] = [
+            spec['params'].get('name', CLUSTER_NAME)]
+
     client = mock.MagicMock()
     client.get_namespace_metadata.return_value = namespace_md
+    # Kept where the diagnostics can read it without going through a mock
+    # which a scenario may have told to raise.
+    client.namespace_md = namespace_md
+
+    # Writes to the namespace metadata land in the document the fake serves,
+    # so that a test can see the list as the module left it.
+    def set_item(namespace, key, value):
+        namespace_md[key] = value
+
+    def delete_item(namespace, key):
+        namespace_md.pop(key, None)
+
+    client.set_namespace_metadata_item.side_effect = set_item
+    client.delete_namespace_metadata_item.side_effect = delete_item
+
+    # No network of any name exists, which is what freeing a stuck name looks
+    # up before it unlists the name.
+    client.get_network.side_effect = apiclient.ResourceNotFoundException(
+        'network not found', 'GET', 'http://sf-1:13000/networks', 404, 'none')
 
     # The first thing the module asks the client for is this cluster's
     # metadata, so it is the cheapest place to stand in for "the API said
@@ -409,6 +439,7 @@ def main():
     client = build_fake_client(spec)
 
     from shakenfist_client import apiclient
+    from shakenfist_client_k3s import primitives
 
     def client_factory(**kwargs):
         if spec['unconfigured']:
@@ -450,6 +481,8 @@ def main():
             'exit_code': code,
             'cluster_calls': sorted(set(cluster_calls)),
             'client_calls': client_calls,
+            'cluster_list': client.namespace_md.get(
+                primitives.CLUSTER_LIST, []),
             'create_kwargs': {k: repr(v) for k, v in created_kwargs.items()},
         })))
 

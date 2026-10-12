@@ -52,6 +52,7 @@ try:
     from shakenfist_client_k3s import client as sf_client
     from shakenfist_client_k3s import cluster as sf_cluster
     from shakenfist_client_k3s import exceptions as sf_exceptions
+    from shakenfist_client_k3s import primitives as sf_primitives
     from shakenfist_client_k3s import progress as sf_progress
 except ImportError:
     HAS_SF_K3S = False
@@ -121,7 +122,9 @@ options:
         which does alone. V(absent) destroys the cluster, its instances and
         the node network if this module created it, and works on a cluster
         an earlier run interrupted half way through building - which is the
-        only way to clear one.
+        only way to clear one. It also frees a name an older version left in
+        the namespace's cluster list with no recorded state, which
+        V(present) refuses to build over.
     required: false
     default: present
     choices: [present, absent]
@@ -635,12 +638,45 @@ def _probe(module, cluster, reporter, mutation):
             health=None, log=reporter.lines)
 
 
+def _listed_without_state(module, cluster):
+    """Whether the name is in the namespace's cluster list with no metadata behind it.
+
+    That is what versions before the fix for #72 left when a create or a
+    delete stopped between listing the name and writing, or removing, its
+    state. It is neither a cluster this module can describe nor a name that
+    is free: create() refuses it, and delete() is the one verb which frees
+    it. Asked of the public list_clusters() rather than of the Cluster, so
+    that this module does not reach into the library's private helpers.
+    """
+    if cluster.get_metadata() is not None:
+        return False
+    return cluster.name in sf_primitives.list_clusters(
+        cluster.client, module.params['namespace'])
+
+
 def _present(module, cluster, reporter, mutation):
     """Ensure the cluster exists, and report whether that took a change."""
     # get_metadata() rather than health() for the existence decision: this
     # is a single namespace metadata read, which is the cheap check decision
     # 6 of the phase 5 plan promised, and it caches its answer -- including
     # a miss -- so the health() calls below cost no second read.
+    #
+    # A name which is listed but has no metadata is checked first, and in
+    # check mode too: create() would refuse it before writing anything, but
+    # only after mutation.creating() had made this run claim a change and
+    # advise that a cluster may be partly built, and a check mode run must
+    # not say it would create over a name which is stuck.
+    if _listed_without_state(module, cluster):
+        module.fail_json(
+            changed=False,
+            msg=('Cluster %s is in the cluster list of namespace %s but has '
+                 'no recorded state: an earlier run stopped before writing '
+                 'any, so there is nothing to describe and a new cluster '
+                 'cannot take the name. Remove it with state: absent and '
+                 'then run this task again.'
+                 % (cluster.name, module.params['namespace'])),
+            health=None, log=reporter.lines)
+
     if cluster.get_metadata() is None:
         # The second entry of shape below is, beyond run_module()'s floor
         # check, the whole of this module's involvement with worker counts:
@@ -736,7 +772,10 @@ def _present(module, cluster, reporter, mutation):
 
 def _absent(module, cluster, reporter, mutation):
     """Ensure the cluster does not exist, and report whether that took a change."""
-    if cluster.get_metadata() is None:
+    # A name which is listed but has no metadata counts as present: delete()
+    # frees it, and that is the only way to.
+    if (cluster.get_metadata() is None
+            and not _listed_without_state(module, cluster)):
         module.exit_json(changed=False, health=None, log=reporter.lines)
 
     if module.check_mode:
@@ -952,11 +991,12 @@ def run_module():
     except sf_exceptions.K3sClusterException as e:
         # The advice is appended here too, not only to the two API
         # handlers. The library's own sentence explains what went wrong and
-        # says nothing about what the run had already built: an ssh key
-        # which cannot be read is reported from inside create(), by which
-        # point the network exists. Whether debris is left behind is a
-        # property of how far the run got, not of which exception ended it,
-        # which is the whole reason that question has one answer.
+        # says nothing about what the run had already built: an agent
+        # operation which fails while k3s is being installed is reported from
+        # inside create(), by which point the instances exist. Whether
+        # debris is left behind is a property of how far the run got, not of
+        # which exception ended it, which is the whole reason that question
+        # has one answer.
         module.fail_json(
             changed=mutation.changed,
             msg='%s %s' % (e, mutation.advice()),

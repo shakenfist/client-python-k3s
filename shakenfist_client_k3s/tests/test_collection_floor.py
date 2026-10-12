@@ -52,6 +52,7 @@ FIRST_SHIPPED = {
     'exceptions.ClusterNameError': (0, 3, 0),
     'exceptions.K3sClusterException': (0, 1, 0),
     'exceptions.ShapeError': (0, 3, 0),
+    'primitives.list_clusters': (0, 1, 0),
     'progress.CollectingReporter': (0, 1, 0),
 }
 

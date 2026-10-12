@@ -134,6 +134,10 @@ class ModuleResult:
         return self.diagnostics['client_calls']
 
     @property
+    def cluster_list(self):
+        return self.diagnostics['cluster_list']
+
+    @property
     def create_kwargs(self):
         return self.diagnostics['create_kwargs']
 
@@ -553,6 +557,60 @@ class InterruptedClusterTestCase(ModuleTestCase):
 
         self.assertTrue(run.changed)
         self.assertIn('delete', run.cluster_calls)
+
+
+class ListedWithoutStateTestCase(ModuleTestCase):
+    """A name in the namespace's cluster list with no metadata behind it.
+
+    What versions before the fix for #72 left when a create or a delete
+    stopped between listing the name and writing, or removing, its state.
+    state: absent frees it; state: present must not claim to build over it.
+    """
+
+    def test_absent_frees_the_name(self):
+        run = self.run_module(base_params(state='absent'),
+                              cluster_exists=False, cluster_listed=True)
+
+        self.assertTrue(run.changed)
+        self.assertIn('delete', run.cluster_calls)
+        self.assertEqual([], run.cluster_list)
+
+    def test_absent_in_check_mode_changes_nothing(self):
+        run = self.run_module(
+            base_params(state='absent', **{'_ansible_check_mode': True}),
+            cluster_exists=False, cluster_listed=True)
+
+        self.assertTrue(run.changed)
+        self.assertNothingMutated(run)
+        self.assertEqual([module_harness.CLUSTER_NAME], run.cluster_list)
+
+    def test_absent_when_neither_listed_nor_recorded_is_not_a_change(self):
+        run = self.run_module(base_params(state='absent'),
+                              cluster_exists=False, cluster_listed=False)
+
+        self.assertFalse(run.changed)
+        self.assertNothingMutated(run)
+
+    def test_present_fails_without_creating(self):
+        run = self.run_module(base_params(), cluster_exists=False,
+                              cluster_listed=True, expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertFalse(run.changed)
+        self.assertIn('state: absent', run.msg)
+        self.assertNotIn('partly built', run.msg)
+        self.assertNothingMutated(run)
+        self.assertEqual([module_harness.CLUSTER_NAME], run.cluster_list)
+
+    def test_present_in_check_mode_fails_the_same_way(self):
+        run = self.run_module(
+            base_params(**{'_ansible_check_mode': True}),
+            cluster_exists=False, cluster_listed=True, expect_failure=True)
+
+        self.assertTrue(run.failed)
+        self.assertFalse(run.changed)
+        self.assertIn('state: absent', run.msg)
+        self.assertNothingMutated(run)
 
 
 class CreateTestCase(ModuleTestCase):
