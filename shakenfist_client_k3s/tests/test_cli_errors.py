@@ -159,7 +159,7 @@ class CommandExceptionTestCase(ClientTestCase):
         self.assertEqual('banana', e.name)
 
     def test_create_network_missing(self):
-        self.client.get_network.return_value = None
+        self.client.get_network.side_effect = fakes.network_not_found('nosuch')
         e = self._assert_raises(
             shakenfist_client_k3s.k3s_create, ['banana', '--network', 'nosuch'],
             exceptions.NetworkNotFoundError, dict(_version_cache()))
@@ -330,7 +330,7 @@ class GroupHandlerTestCase(ClientTestCase):
             'Sorry, that cluster name is already taken\n', md)
 
     def test_create_network_missing(self):
-        self.client.get_network.return_value = None
+        self.client.get_network.side_effect = fakes.network_not_found('nosuch')
         self._assert_cli_failure(
             ['create', 'banana', '--network', 'nosuch'],
             'Specified network does not exist\n', dict(_version_cache()))

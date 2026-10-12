@@ -156,11 +156,20 @@ has two halves:
    alongside `test_an_invalid_size_registers_nothing` (line 511).
 3. **Record the allocated network's uuid immediately.** Write
    `md['node_network']` with `set_metadata()` straight after
-   `allocate_network()` returns, before the poll loop. The metadata
-   document then exists before the network is allocated, with
-   `node_network: None` and `node_network_created` already set. The
-   only window that still leaks is one API round trip. That leaks a
-   network, not a name, and step 1b's by-name lookup recovers it.
+   `allocate_network()` returns, before the poll loop. When create
+   allocates the network, the metadata document exists before the
+   allocation, with `node_network: None` and `node_network_created`
+   already set. A borrowed network is known before the first write, so
+   that write already carries its uuid. The only window that still
+   leaks is one API round trip. That leaks a network, not a name, and
+   step 1b's by-name lookup recovers it.
+
+   Step 1a found that the borrowed-network check never worked against
+   a real server. `apiclient.get_network()` raises
+   `ResourceNotFoundException` on a 404 rather than returning a falsy
+   value, so `NetworkNotFoundError` was unreachable and callers got an
+   exception that is not a `K3sClusterException`. Step 1a catches it
+   and raises `NetworkNotFoundError`.
 4. **`delete()` treats "listed, no metadata" as something it can clean
    up.** It removes the list entry and says plainly that it is freeing
    a name whose create never wrote any state. "Neither listed nor
@@ -222,7 +231,7 @@ itself out in that pull request and records no `Merged` cell.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Recoverable create | This file, steps below | Not started | |
+| 1. Recoverable create | This file, steps below | In progress | |
 | 2. Push audit | `PUSH-AUDIT.md` over phase 1's diff against `develop`, before push | Not started | |
 
 Plan phase 1 at high effort. It changes the order of create's writes to

@@ -3670,7 +3670,17 @@ class Cluster:
         install_longhorn is True the newest Longhorn chart that release
         can run, recorded as ``longhorn_version``. refresh_version_cache
         refreshes both caches. A ReleaseLookupError from either therefore
-        leaves nothing behind.
+        leaves nothing behind. So does a network argument naming a network
+        that does not exist, which is looked up at the same point and
+        raises NetworkNotFoundError, and an sshkey which cannot be read,
+        which raises SshKeyError before any of the lookups.
+
+        Of create()'s own writes, the cluster's metadata document comes
+        first, in state 'initial', and its name joins the namespace's
+        cluster list after that. A create which stops anywhere after the
+        first write -- interrupted, or failing -- therefore leaves a
+        document create() refuses with ClusterInterruptedError and delete()
+        removes, together with everything it records as built.
 
         install_metallb and install_longhorn default to True, matching the
         behaviour before this parameter existed. Which way they went is
@@ -3759,20 +3769,24 @@ class Cluster:
         and deleted. validate_counts() states the counts' floors.
         """
         # Every argument which can be refused without the API is refused
-        # here, before anything else happens -- sshkey, by contrast, is read
-        # after the name and the network have been settled. The placement
-        # matters more than it looks. The name is registered in the cluster
-        # list a few lines below, and the metadata document written in state
-        # 'initial' shortly after; a value which can never be valid (a name
-        # with a dot in it, a zero size, a key the plugin owns) discovered
-        # once those exist leaves a claimed name and a document stuck in
-        # 'initial' that only a delete clears. Discovered later still, once
-        # a network has been allocated and instances booted, it is a cluster
-        # the caller has to delete before the name can be used again.
-        # test_an_invalid_size_registers_nothing and its siblings pin this.
-        # None of it is a check of what Shaken Fist will accept: a valid
-        # size the API still refuses, for quota or because no hypervisor has
-        # the room, fails mid-create, as any other API refusal there does.
+        # here, before anything else happens, and that includes reading the
+        # two local paths a caller hands in: the manifests, and sshkey just
+        # below. The placement matters more than it looks. The first thing
+        # create() writes is this cluster's metadata document, in state
+        # 'initial', and the name joins the cluster list straight after; a
+        # value which can never be valid (a name with a dot in it, a zero
+        # size, a key the plugin owns, a key file nobody can read)
+        # discovered once those exist leaves a claimed name and a document
+        # stuck in 'initial' that only a delete clears. Discovered later
+        # still, once a network has been allocated and instances booted, it
+        # is a cluster the caller has to delete before the name can be used
+        # again. test_an_invalid_size_registers_nothing and its siblings pin
+        # this. None of it is a check of what Shaken Fist will accept: a
+        # valid size the API still refuses, for quota or because no
+        # hypervisor has the room, fails mid-create, as any other API
+        # refusal there does. The checks which do need the API -- the
+        # release floor, and a borrowed network existing -- come next,
+        # still before the first write, for the same reason.
         #
         # The manifests read here are kept and handed to
         # install_control_plane() below, rather than letting it read the
@@ -3787,6 +3801,25 @@ class Cluster:
             control_plane_disk=control_plane_disk, worker_cpus=worker_cpus,
             worker_memory=worker_memory, worker_disk=worker_disk,
             server_config=server_config, agent_config=agent_config)
+
+        # Read the ssh key if any, beside the manifest read above and for
+        # the same reason: it is a local file, nothing it needs is created
+        # by this method, and reading it after the name was claimed made an
+        # unreadable key a claimed name with nothing recorded behind it
+        # (shakenfist/client-python-k3s#72). Guarded and with the encoding
+        # stated for the same two reasons read_manifests() is: an OpenSSH
+        # public key's comment field can hold any bytes the user put in it,
+        # and a library caller which catches K3sClusterException should not
+        # have to catch OSError as well to survive a path which does not
+        # exist. The CLI's own click.Path(exists=True) covers only the CLI,
+        # and only a missing file rather than an unreadable one.
+        ssh_key_content = None
+        if sshkey:
+            try:
+                with open(sshkey, encoding='utf-8') as f:
+                    ssh_key_content = f.read()
+            except (OSError, UnicodeDecodeError) as e:
+                raise exceptions.SshKeyError.unreadable(sshkey, str(e))
 
         # Phases: create control plane nodes, create workers, install control
         # plane, install workers, fetch credentials, wait for the nodes to be
@@ -3839,66 +3872,78 @@ class Cluster:
                 force_cache_update=refresh_version_cache,
                 k3s_version=target_release)
 
+        # A network handed in with network= is looked up here, before the
+        # name is claimed, for the same reason as the release floor above:
+        # it reads from the API, so it cannot join the checks at the top of
+        # this method, and a typo in it found after the claim used to leave
+        # a listed name with no metadata behind it (#72). Only the lookup
+        # happens here. A network this create allocates for itself is
+        # allocated after the claim, because it is the first thing built
+        # and has to be recorded somewhere the moment it exists.
+        #
+        # The API reports a network it does not have by raising, with a 404
+        # as ResourceNotFoundException, rather than by answering with
+        # nothing -- the same call _owns_node_network() catches it from.
+        # This used to test the answer for falsiness instead, which nothing
+        # the client returns ever is, so a typo in network= escaped as an
+        # apiclient exception rather than as a K3sClusterException, past
+        # this package's command line group handler, and reported by the
+        # Ansible module only as a generic "the API refused a request".
+        node_network = None
+        if network:
+            try:
+                node_network = self.client.get_network(network)
+            except apiclient.ResourceNotFoundException as e:
+                raise exceptions.NetworkNotFoundError(network) from e
+
         # Ensure this name isn't already taken
         namespace_md = self.client.get_namespace_metadata(self.namespace)
         all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
-        md = self.get_metadata()
+        existing_md = self.get_metadata()
 
         # The metadata is consulted before the cluster list, which is a
         # change of order rather than of behaviour: both checks raised the
         # same ClusterExistsError, so which fired first did not matter
         # until now. It matters now because only the metadata knows whether
         # the cluster holding this name ever finished being built, and an
-        # interrupted create leaves the name in the cluster list too. Asking
-        # the list first would answer "that name is taken" for the one case
-        # which has a more useful answer than that.
-        if md:
-            interrupted = self._interrupted_state(md)
+        # interrupted create may have listed the name too. Asking the list
+        # first would answer "that name is taken" for the one case which
+        # has a more useful answer than that.
+        #
+        # existing_md rather than md: this is what some earlier create left
+        # behind, and md below is the document this one is about to write.
+        # get_metadata() has cached the miss as None, and the set_metadata()
+        # below replaces that entry, so every later get_metadata() in this
+        # method answers with the document written here and no extra read.
+        if existing_md:
+            interrupted = self._interrupted_state(existing_md)
             if interrupted:
                 raise exceptions.ClusterInterruptedError.mid_create(
                     self.name, interrupted)
             raise exceptions.ClusterExistsError(self.name)
         if self.name in all_clusters:
             raise exceptions.ClusterExistsError(self.name)
-        all_clusters.append(self.name)
-        self.client.set_namespace_metadata_item(
-            self.namespace, primitives.CLUSTER_LIST, all_clusters)
 
-        # Create a network for nodes
-        if network:
-            node_network = self.client.get_network(network)
-            if not node_network:
-                raise exceptions.NetworkNotFoundError(network)
-        else:
-            p.phase('Creating node network')
-            node_network = self.client.allocate_network(
-                '10.0.0.0/16', True, True, 'k3s-%s-node' % self.name,
-                namespace=self.namespace)
-            p.note('created %s (uuid %s)' % (node_network['name'], node_network['uuid']))
-            while True:
-                node_network = self.client.get_network(node_network['uuid'])
-                p.update(node_network['name'], 'state %s' % node_network['state'])
-                if node_network['state'] == 'created':
-                    break
-                time.sleep(1)
-            p.wait_done()
-
-        # Read the ssh key if any. Guarded and with the encoding stated for
-        # the same two reasons read_manifests() is: this is the other local
-        # path a caller hands in, an OpenSSH public key's comment field can
-        # hold any bytes the user put in it, and a library caller which
-        # catches K3sClusterException should not have to catch OSError as
-        # well to survive a path which does not exist. The CLI's own
-        # click.Path(exists=True) covers only the CLI.
-        ssh_key_content = None
-        if sshkey:
-            try:
-                with open(sshkey, encoding='utf-8') as f:
-                    ssh_key_content = f.read()
-            except (OSError, UnicodeDecodeError) as e:
-                raise exceptions.SshKeyError.unreadable(sshkey, str(e))
-
-        # Initialise the metadata
+        # Initialise the metadata, and only then claim the name. These two
+        # writes are not atomic, and this is the order which makes an
+        # interruption between them recoverable: it is delete()'s order
+        # ("release the name, and only then remove the metadata document")
+        # run backwards, for the same reason. Stopping after the first
+        # leaves a metadata document in state 'initial' whose name is not
+        # listed, which create() reports as ClusterInterruptedError naming
+        # 'sf-client k3s delete', and which delete() runs to completion
+        # over -- its node lists are empty, its network is either None or
+        # recorded, and delete() tests for the list entry rather than
+        # assuming it. The other order, which this used to write, left a
+        # listed name with no metadata: create() said the name was taken,
+        # delete() said there was no such cluster, and only an edit of the
+        # namespace metadata by hand got it back (#72).
+        #
+        # node_network is the borrowed network's uuid, or None until the
+        # network this create allocates exists, which is the shape delete()
+        # already tolerates. node_network_created is final from the first
+        # write either way, because whether the network is borrowed is known
+        # before it exists.
         self.reporter.debug('Initialize cluster metadata')
         md = {
             'name': self.name,
@@ -3909,8 +3954,8 @@ class Cluster:
             'plugin_version': distribution_version('shakenfist_client_k3s'),
             'state': 'initial',
             'node_serial': 1,
-            'node_network': node_network['uuid'],
-            # Whether the network above is this cluster's to destroy. A
+            'node_network': node_network['uuid'] if node_network else None,
+            # Whether the node network is this cluster's to destroy. A
             # network handed in with network= belongs to whoever made it,
             # and may be carrying other clusters or instances, so delete()
             # removes only one this create allocated. Its reader is
@@ -3979,6 +4024,34 @@ class Cluster:
             'agent_config': agent_config or {},
         }
         self.set_metadata(md)
+
+        all_clusters.append(self.name)
+        self.client.set_namespace_metadata_item(
+            self.namespace, primitives.CLUSTER_LIST, all_clusters)
+
+        # Create a network for nodes, unless one was handed in above.
+        #
+        # The uuid is recorded the moment allocate_network() returns, before
+        # the network has finished being created, because the metadata is
+        # the only place delete() looks for it: a create which stopped
+        # during the poll below used to leave a k3s-<name>-node network
+        # that nothing recorded. What is left unrecorded now is a single
+        # API round trip, the allocation itself.
+        if not network:
+            p.phase('Creating node network')
+            node_network = self.client.allocate_network(
+                '10.0.0.0/16', True, True, 'k3s-%s-node' % self.name,
+                namespace=self.namespace)
+            md['node_network'] = node_network['uuid']
+            self.set_metadata(md)
+            p.note('created %s (uuid %s)' % (node_network['name'], node_network['uuid']))
+            while True:
+                node_network = self.client.get_network(node_network['uuid'])
+                p.update(node_network['name'], 'state %s' % node_network['state'])
+                if node_network['state'] == 'created':
+                    break
+                time.sleep(1)
+            p.wait_done()
 
         # We really should do a pre-fetch on the disk image and wait for it to
         # download before starting instances. That way the point of slowness is

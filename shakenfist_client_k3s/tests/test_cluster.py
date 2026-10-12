@@ -1626,10 +1626,12 @@ class CreateOverInterruptedClusterTestCase(testtools.TestCase):
     def setUp(self):
         super(CreateOverInterruptedClusterTestCase, self).setUp()
         self.client = fakes.FakeClusterClient()
-        # An interrupted create leaves the name in the namespace cluster
-        # list as well as in its own metadata document: create() registers
-        # the name before it writes anything else, which is what makes the
-        # order of create()'s two guards matter.
+        # An interrupted create usually leaves the name in the namespace
+        # cluster list as well as in its own metadata document: create()
+        # writes the document and lists the name before it builds
+        # anything, so only an interruption between those two writes leaves
+        # the document alone. Both being there is what makes the order of
+        # create()'s two guards matter.
         self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
 
         # create() looks up the k3s release and the Longhorn chart before
@@ -1688,6 +1690,174 @@ class CreateOverInterruptedClusterTestCase(testtools.TestCase):
         # to say than that the name is taken.
         self.assertRaises(exceptions.ClusterExistsError, self.cluster.create,
                           1, 1, 1)
+
+
+class CreateInterrupted(Exception):
+    """What CreateWriteLogClient raises to stand in for a create being killed.
+
+    Not KeyboardInterrupt, which the test runner treats as the operator
+    stopping the run, and not anything in the K3sClusterException hierarchy,
+    which create() could conceivably catch: a killed process is caught by
+    nothing.
+    """
+
+
+class CreateWriteLogClient(ActionLogClient):
+    """An ActionLogClient which also logs create()'s writes and network calls.
+
+    Metadata writes are logged with a deep copy of the value written, so a
+    test can see what each write carried at the time rather than the
+    dictionary create() went on to change. interrupt, when set, is a
+    predicate over each logged action; the first action it accepts raises
+    CreateInterrupted before the call has any effect, which is what a
+    process killed while that request was in flight looks like from the
+    namespace's side.
+    """
+
+    def __init__(self):
+        super(CreateWriteLogClient, self).__init__()
+        self.interrupt = None
+
+    def _log(self, action):
+        self.actions.append(action)
+        if self.interrupt is not None and self.interrupt(action):
+            self.interrupt = None
+            raise CreateInterrupted(repr(action))
+
+    def set_namespace_metadata_item(self, namespace, key, value):
+        self._log(('set_metadata', key, copy.deepcopy(value)))
+        return super(CreateWriteLogClient, self).set_namespace_metadata_item(
+            namespace, key, value)
+
+    def allocate_network(self, netblock, provide_dhcp, provide_nat, name,
+                         namespace=None):
+        self._log(('allocate_network', name, None))
+        return super(CreateWriteLogClient, self).allocate_network(
+            netblock, provide_dhcp, provide_nat, name, namespace=namespace)
+
+    def get_network(self, network_ref):
+        self._log(('get_network', network_ref, None))
+        return super(CreateWriteLogClient, self).get_network(network_ref)
+
+
+class CreateWritesItsStateBeforeItsNameTestCase(CreateEnvironmentTestCase):
+    """create() writes its metadata document before it lists the name, and records its network at once.
+
+    shakenfist/client-python-k3s#72. create() used to append the name to
+    the namespace's cluster list first and write the cluster's metadata
+    document second, with the node network's allocation and poll in
+    between. Anything which stopped it there -- an interruption, a borrowed
+    network that did not exist, an sshkey it could not read -- left a
+    listed name with no document: create() said the name was taken,
+    delete() said there was no such cluster, and an allocated network was
+    recorded nowhere.
+
+    The order is now delete()'s reversed (see
+    DeleteReleasesTheNameBeforeTheMetadataTestCase): the document first,
+    in state 'initial', then the list entry, and the uuid of a network
+    create allocates is written into the document as soon as the API
+    returns it, before the poll waits for it to be created. The last two
+    tests here are the reason, run through: an interruption at either
+    point leaves something delete() clears.
+    """
+
+    def setUp(self):
+        super(CreateWritesItsStateBeforeItsNameTestCase, self).setUp()
+        self.client = CreateWriteLogClient()
+
+    def _cluster(self):
+        return _make_cluster(self.client)
+
+    def _index(self, predicate):
+        for i, action in enumerate(self.client.actions):
+            if predicate(action):
+                return i
+        self.fail('no such action in %r' % (self.client.actions,))
+
+    def _metadata_writes(self):
+        return [(i, value) for i, (kind, key, value)
+                in enumerate(self.client.actions)
+                if kind == 'set_metadata' and key == MD_KEY]
+
+    def test_the_metadata_is_written_before_the_name_is_listed(self):
+        self._cluster().create(1, 1, 1)
+
+        listed = self._index(
+            lambda a: a[:2] == ('set_metadata', primitives.CLUSTER_LIST))
+        first_md, first_value = self._metadata_writes()[0]
+        self.assertLess(first_md, listed)
+        self.assertEqual('initial', first_value['state'])
+
+    def test_an_allocated_network_is_recorded_before_it_is_polled(self):
+        self._cluster().create(1, 1, 1)
+
+        allocated = self._index(lambda a: a[0] == 'allocate_network')
+        polled = self._index(lambda a: a[0] == 'get_network')
+        self.assertLess(allocated, polled)
+
+        # The first write predates the network, and already says it will
+        # be this cluster's own.
+        first_md, first_value = self._metadata_writes()[0]
+        self.assertLess(first_md, allocated)
+        self.assertIsNone(first_value['node_network'])
+        self.assertIs(True, first_value['node_network_created'])
+
+        # And the uuid is written between the allocation and the poll.
+        between = [value for i, value in self._metadata_writes()
+                   if allocated < i < polled]
+        self.assertEqual(['net-1'],
+                         [value['node_network'] for value in between])
+
+    def test_a_borrowed_network_is_in_the_first_metadata_write(self):
+        self._cluster().create(1, 1, 1, network='borrowed')
+
+        # Looked up before either write, so a borrowed network which does
+        # not exist registers nothing (test_library_api has that refusal).
+        looked_up = self._index(lambda a: a[:2] == ('get_network', 'borrowed'))
+        listed = self._index(
+            lambda a: a[:2] == ('set_metadata', primitives.CLUSTER_LIST))
+        first_md, first_value = self._metadata_writes()[0]
+        self.assertLess(looked_up, first_md)
+        self.assertLess(looked_up, listed)
+        self.assertEqual('net-1', first_value['node_network'])
+        self.assertIs(False, first_value['node_network_created'])
+        self.assertEqual([], self.client.allocated_networks)
+
+    def test_an_interruption_before_the_name_is_listed_is_recoverable(self):
+        # Killed while the list write was in flight: the document exists,
+        # in state 'initial', and the name is not listed.
+        self.client.interrupt = (
+            lambda a: a[:2] == ('set_metadata', primitives.CLUSTER_LIST))
+        self.assertRaises(CreateInterrupted, self._cluster().create, 1, 1, 1)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+        self.assertEqual('initial', self.client.metadata[MD_KEY]['state'])
+
+        # A fresh create, as the operator's next attempt would be, is told
+        # the cluster was interrupted and where the way out is...
+        e = self.assertRaises(exceptions.ClusterInterruptedError,
+                              self._cluster().create, 1, 1, 1)
+        self.assertEqual('initial', e.state)
+
+        # ...and that way out works, and frees the name.
+        self._cluster().delete()
+        self.assertEqual({}, self.client.metadata)
+        self._cluster().create(1, 1, 1)
+        self.assertEqual('created', self.client.metadata[MD_KEY]['state'])
+
+    def test_an_interruption_during_the_network_poll_is_recoverable(self):
+        # Killed while waiting for the allocated network: the name is
+        # listed, and the document records the network, so delete()
+        # destroys it rather than leaking it.
+        self.client.interrupt = lambda a: a[0] == 'get_network'
+        self.assertRaises(CreateInterrupted, self._cluster().create, 1, 1, 1)
+        self.assertEqual(['banana'],
+                         self.client.metadata[primitives.CLUSTER_LIST])
+        self.assertEqual('net-1',
+                         self.client.metadata[MD_KEY]['node_network'])
+
+        self._cluster().delete()
+        self.assertEqual(['net-1'], self.client.deleted_networks)
+        self.assertEqual({}, self.client.metadata)
 
 
 class DeleteInterruptedClusterTestCase(testtools.TestCase):
@@ -8283,8 +8453,9 @@ class StagedManifestsAreWhatWasValidatedTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # create() looks up the k3s release before it reads the sshkey or
-        # stages a manifest, and the Longhorn release after (#133).
+        # create() reads the sshkey and the manifests before it looks up
+        # either release, but a create which gets past those still looks up
+        # both (#133).
         fakes.stub_release_lookups(self)
 
         self.client = fakes.FakeClusterClient()
@@ -8388,8 +8559,9 @@ class SshKeyIsReadThroughTheHierarchyTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # create() looks up the k3s release before it reads the sshkey or
-        # stages a manifest, and the Longhorn release after (#133).
+        # create() reads the sshkey and the manifests before it looks up
+        # either release, but a create which gets past those still looks up
+        # both (#133).
         fakes.stub_release_lookups(self)
 
         self.client = fakes.FakeClusterClient()

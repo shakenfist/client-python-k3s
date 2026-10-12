@@ -19,6 +19,7 @@ import tempfile
 # this package, which support Python >= 3.7.
 import mock
 import requests
+from shakenfist_client import apiclient
 import testtools
 import time
 import yaml
@@ -195,16 +196,22 @@ class ClusterLifecycleTestCase(LibraryTestCase):
         self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
 
     def test_create_registers_the_name_before_building_anything(self):
-        # The name goes into the namespace cluster list, and then the
-        # cluster's own metadata document, before the first instance
-        # exists. Reversing that would leave a create which died early with
-        # instances nothing knows how to find.
+        # The cluster's own metadata document, then the name in the
+        # namespace cluster list, then the document again carrying the
+        # network create allocated, all before the first instance exists.
+        # Building first would leave a create which died early with
+        # instances nothing knows how to find. The two leading writes were
+        # the other way round until #72: a list entry with no document
+        # behind it is a name neither create() nor delete() can do anything
+        # with, and CreateWritesItsStateBeforeItsNameTestCase in
+        # test_cluster.py has the reasoning and the recovery.
         c = self._cluster()
         c.create(1, 1, 1)
 
         first_instance = self.client.calls.index('create_instance')
         self.assertEqual(
-            ['set_namespace_metadata_item:%s' % primitives.CLUSTER_LIST,
+            ['set_namespace_metadata_item:%s' % MD_KEY,
+             'set_namespace_metadata_item:%s' % primitives.CLUSTER_LIST,
              'set_namespace_metadata_item:%s' % MD_KEY],
             self.client.calls[:first_instance])
 
@@ -589,6 +596,125 @@ class NodeSizingTestCase(LibraryTestCase):
         self.assertEqual(
             ('k3s-banana-node-003', w['cpus'], w['memory'], w['disk']),
             self.client.instance_sizes[-1])
+
+
+class MissingNetworkClient(RecordingClient):
+    """A client on which one network, 'typo', does not exist.
+
+    The stock fake answers every get_network() with the same network, so
+    without this a typo in network= cannot be expressed at all. 'typo' is
+    answered by raising ResourceNotFoundException, which is what the real
+    client does with the API's 404 -- it never answers None -- and every
+    other network as the stock fake answers it, so that the same client
+    can then be given a create which names a real one. The lookups it was
+    asked for are kept so a test can see the check was actually reached.
+    """
+
+    MISSING = 'typo'
+
+    def __init__(self):
+        super(MissingNetworkClient, self).__init__()
+        self.network_lookups = []
+
+    def get_network(self, network_ref):
+        self.network_lookups.append(network_ref)
+        if network_ref == self.MISSING:
+            raise fakes.network_not_found(network_ref)
+        return super(MissingNetworkClient, self).get_network(network_ref)
+
+
+class NetworkAndSshKeyRefusalTestCase(LibraryTestCase):
+    """create() refuses a missing borrowed network or an unreadable sshkey before registering anything.
+
+    NodeSizingTestCase's claim for the two checks #72 found on the wrong
+    side of the name claim. Both used to run after the name was in the
+    namespace cluster list and before the metadata document existed, so
+    either one -- a typo in network=, a key file which is not readable or
+    not UTF-8 -- left a listed name that create() called taken and delete()
+    called nonexistent. The sshkey one also ran after the node network had
+    been allocated, so it leaked that too.
+
+    The sshkey is a local read and is refused before the API is asked
+    anything, so the client is wrapped and asserted not to have been
+    called, as NameAndCountRefusalTestCase does. The network has to be
+    looked up, so that refusal asserts only that nothing was written,
+    allocated or built.
+    """
+
+    def setUp(self):
+        super(NetworkAndSshKeyRefusalTestCase, self).setUp()
+        self.client = MissingNetworkClient()
+
+    def _assert_nothing_registered(self):
+        self.assertEqual(
+            [], self.client.calls,
+            'the cluster was registered or an instance created before the '
+            'refusal')
+        # Neither the cluster list nor this cluster's own document.
+        self.assertEqual({}, self.client.metadata)
+        self.assertEqual([], self.client.allocated_networks)
+        self.assertEqual({}, self.client.instances)
+        self.assertEqual([], self.client.executed)
+
+    def _refused_sshkey(self, path):
+        wrapped = mock.MagicMock(wraps=self.client)
+        c = Cluster(wrapped, 'banana', 'testns', reporter=self.reporter)
+        e = self.assertRaises(exceptions.SshKeyError, c.create, 1, 1, 1,
+                              sshkey=path)
+        self.assertEqual([], wrapped.mock_calls)
+        self.assertFalse(primitives.get_k3s_release.called)
+        self._assert_nothing_registered()
+        self.assertEqual(path, e.path)
+        return e
+
+    def test_a_missing_network_registers_nothing(self):
+        e = self.assertRaises(exceptions.NetworkNotFoundError,
+                              self._cluster().create, 1, 1, 1,
+                              network='typo')
+        self.assertEqual('typo', e.network)
+        self.assertEqual(['typo'], self.client.network_lookups)
+        self._assert_nothing_registered()
+
+    def test_a_missing_network_is_a_k3s_cluster_exception(self):
+        # What a library caller, the command line's group handler and the
+        # Ansible module all catch. The client's own exception is kept as
+        # the cause, so the API's answer is not lost, but it is not what
+        # comes out.
+        e = self.assertRaises(exceptions.K3sClusterException,
+                              self._cluster().create, 1, 1, 1,
+                              network='typo')
+        self.assertIsInstance(e, exceptions.NetworkNotFoundError)
+        self.assertNotIsInstance(e, apiclient.APIException)
+        self.assertIsInstance(e.__cause__,
+                              apiclient.ResourceNotFoundException)
+
+    def test_an_unreadable_sshkey_registers_nothing(self):
+        # A path which exists but cannot be read as a file, which is the
+        # case the command line's click.Path(exists=True) lets through. A
+        # directory rather than a file with its mode cleared, because the
+        # tests may run as root, who can read the latter.
+        self._refused_sshkey(self.home)
+
+    def test_a_missing_sshkey_registers_nothing(self):
+        self._refused_sshkey(os.path.join(self.home, 'no-such-key.pub'))
+
+    def test_an_sshkey_which_is_not_utf8_registers_nothing(self):
+        path = os.path.join(self.home, 'binary.pub')
+        with open(path, 'wb') as f:
+            f.write(b'ssh-rsa AAAA\xff\xfe comment\n')
+        self._refused_sshkey(path)
+
+    def test_the_name_is_free_after_a_missing_network(self):
+        # The consequence the ordering exists for, as
+        # NodeSizingTestCase.test_the_name_is_free_after_a_refusal has it:
+        # the caller fixes the typo and runs the same create again, and is
+        # told neither that the name is taken nor that it was interrupted.
+        self.assertRaises(exceptions.NetworkNotFoundError,
+                          self._cluster().create, 1, 1, 1, network='typo')
+        self._cluster().create(1, 1, 1, network='net-1')
+        self.assertEqual('created', self.client.metadata[MD_KEY]['state'])
+        self.assertEqual(['banana'],
+                         self.client.metadata[primitives.CLUSTER_LIST])
 
 
 class K3sConfigTestCase(LibraryTestCase):

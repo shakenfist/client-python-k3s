@@ -43,6 +43,20 @@ def not_found(instance_uuid):
         'instance not found')
 
 
+def network_not_found(network_ref):
+    """Build the exception the API client raises for a network it does not have.
+
+    The client never answers a missing network with None: get_network()
+    returns the response body of a successful request, and the API's 404
+    is raised as this. A fake which returns None instead models a client
+    that does not exist, and a check written against it passes for the
+    wrong reason, which is how create() came to test for a falsy answer.
+    """
+    return apiclient.ResourceNotFoundException(
+        'network not found', 'GET', '/networks/%s' % network_ref, 404,
+        'network not found')
+
+
 # A minimal kubeconfig in the shape k3s writes, pointing at the loopback
 # address the way the real file does before create rewrites it.
 KUBECONFIG = """apiVersion: v1

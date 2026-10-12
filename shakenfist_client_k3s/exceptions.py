@@ -120,7 +120,10 @@ class NetworkNotFoundError(K3sClusterException):
     """Raised when ``--network`` names a network that does not exist.
 
     Raised by ``Cluster.create()`` when it looks up the network named by
-    its ``network`` argument and finds nothing.
+    its ``network`` argument and the API answers that there is no such
+    network, which the client reports as ``ResourceNotFoundException``.
+    That exception is chained as ``__cause__`` rather than let out, so
+    that a caller which catches ``K3sClusterException`` catches this.
     """
 
     def __init__(self, network):
