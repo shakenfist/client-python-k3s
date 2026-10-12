@@ -116,21 +116,40 @@ class ClusterExistsError(K3sClusterException):
 
 
 class NetworkNotFoundError(K3sClusterException):
-    """Raised when ``--network`` names a network that does not exist.
+    """Raised when ``--network`` does not name exactly one network.
 
     Raised by ``Cluster.create()`` when it looks up the network named by
-    its ``network`` argument and the API answers that there is no such
-    network, which the client reports as ``ResourceNotFoundException``.
-    That exception is chained as ``__cause__`` rather than let out, so
+    its ``network`` argument and the API cannot answer with one. The
+    client's exception is chained as ``__cause__`` rather than let out, so
     that a caller which catches ``K3sClusterException`` catches this.
+    ``reason`` says which it was:
+
+    - ``does_not_exist``, the default: there is no such network, which the
+      client reports as ``ResourceNotFoundException``.
+    - ``ambiguous()``: the argument is a name more than one network
+      carries, which the server answers with a 400 and the client reports
+      as ``RequestMalformedException``. Its message says to pass the uuid.
+
+    A reason of this class rather than a class of its own, so that a
+    caller catching ``NetworkNotFoundError`` for "network= did not identify
+    a network" catches both.
     """
 
-    def __init__(self, network):
+    def __init__(self, network, reason='does_not_exist',
+                 message='Specified network does not exist'):
         self.network = network
+        self.reason = reason
+        self.message = message
         super(NetworkNotFoundError, self).__init__(network)
 
     def __str__(self):
-        return 'Specified network does not exist'
+        return self.message
+
+    @classmethod
+    def ambiguous(cls, network):
+        return cls(network, 'ambiguous',
+                   'Specified network %s matches more than one network; pass '
+                   "the network's uuid instead" % network)
 
 
 class ClusterNotFoundError(K3sClusterException):

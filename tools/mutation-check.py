@@ -1472,6 +1472,15 @@ MUTATIONS = [
         '.test_a_network_the_api_answered_for_another_namespace_is_kept',
         'stestr',
     ),
+    (
+        'an ambiguous borrowed network is refused as a K3sClusterException',
+        PKG + '/cluster.py',
+        '                raise exceptions.NetworkNotFoundError.ambiguous(network) from e\n',
+        '                raise\n',
+        PKG + '.tests.test_library_api.NetworkAndSshKeyRefusalTestCase'
+        '.test_an_ambiguous_network_registers_nothing',
+        'stestr',
+    ),
 ]
 
 

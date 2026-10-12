@@ -599,18 +599,22 @@ class NodeSizingTestCase(LibraryTestCase):
 
 
 class MissingNetworkClient(RecordingClient):
-    """A client on which one network, 'typo', does not exist.
+    """A client on which one network, 'typo', does not exist, and one name, 'shared', is ambiguous.
 
     The stock fake answers every get_network() with the same network, so
     without this a typo in network= cannot be expressed at all. 'typo' is
     answered by raising ResourceNotFoundException, which is what the real
-    client does with the API's 404 -- it never answers None -- and every
-    other network as the stock fake answers it, so that the same client
-    can then be given a create which names a real one. The lookups it was
-    asked for are kept so a test can see the check was actually reached.
+    client does with the API's 404 -- it never answers None -- and
+    'shared' by raising RequestMalformedException, which is what it does
+    with the 400 the server answers a name several networks carry. Every
+    other network is answered as the stock fake answers it, so that the
+    same client can then be given a create which names a real one. The
+    lookups it was asked for are kept so a test can see the check was
+    actually reached.
     """
 
     MISSING = 'typo'
+    AMBIGUOUS = 'shared'
 
     def __init__(self):
         super(MissingNetworkClient, self).__init__()
@@ -620,6 +624,10 @@ class MissingNetworkClient(RecordingClient):
         self.network_lookups.append(network_ref)
         if network_ref == self.MISSING:
             raise fakes.network_not_found(network_ref)
+        if network_ref == self.AMBIGUOUS:
+            raise apiclient.RequestMalformedException(
+                'API request failed', 'GET', '/networks/%s' % network_ref, 400,
+                'multiple networks have the name "%s"' % network_ref)
         return super(MissingNetworkClient, self).get_network(network_ref)
 
 
@@ -687,6 +695,21 @@ class NetworkAndSshKeyRefusalTestCase(LibraryTestCase):
         self.assertNotIsInstance(e, apiclient.APIException)
         self.assertIsInstance(e.__cause__,
                               apiclient.ResourceNotFoundException)
+
+    def test_an_ambiguous_network_registers_nothing(self):
+        # A name several networks carry, which the server will not choose
+        # between. It is a K3sClusterException saying to pass the uuid,
+        # not the client's 400.
+        e = self.assertRaises(exceptions.NetworkNotFoundError,
+                              self._cluster().create, 1, 1, 1,
+                              network='shared')
+        self.assertEqual('ambiguous', e.reason)
+        self.assertEqual('shared', e.network)
+        self.assertIn('uuid', str(e))
+        self.assertIsInstance(e.__cause__,
+                              apiclient.RequestMalformedException)
+        self.assertEqual(['shared'], self.client.network_lookups)
+        self._assert_nothing_registered()
 
     def test_an_unreadable_sshkey_registers_nothing(self):
         # A path which exists but cannot be read as a file, which is the

@@ -14,7 +14,16 @@ class NetworkNotFoundErrorTestCase(testtools.TestCase):
     def test_str(self):
         e = exceptions.NetworkNotFoundError('mynet')
         self.assertEqual('mynet', e.network)
+        self.assertEqual('does_not_exist', e.reason)
         self.assertEqual('Specified network does not exist', str(e))
+
+    def test_ambiguous(self):
+        e = exceptions.NetworkNotFoundError.ambiguous('mynet')
+        self.assertIsInstance(e, exceptions.NetworkNotFoundError)
+        self.assertEqual('mynet', e.network)
+        self.assertEqual('ambiguous', e.reason)
+        self.assertIn('mynet matches more than one network', str(e))
+        self.assertIn("pass the network's uuid instead", str(e))
 
 
 class ClusterNotFoundErrorTestCase(testtools.TestCase):

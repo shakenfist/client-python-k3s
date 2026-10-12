@@ -3944,6 +3944,10 @@ class Cluster:
                 node_network = self.client.get_network(network)
             except apiclient.ResourceNotFoundException as e:
                 raise exceptions.NetworkNotFoundError(network) from e
+            except apiclient.RequestMalformedException as e:
+                # A name several networks carry: the server answers with a 400
+                # rather than choosing, and so does this.
+                raise exceptions.NetworkNotFoundError.ambiguous(network) from e
 
         # Ensure this name isn't already taken
         namespace_md = self.client.get_namespace_metadata(self.namespace)
