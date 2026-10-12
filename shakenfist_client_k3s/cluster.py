@@ -30,6 +30,7 @@ import ipaddress
 import json
 import os
 import re
+import requests
 from shakenfist_client import apiclient
 import shlex
 import shutil
@@ -170,7 +171,8 @@ HEALTH_PROBE_TIMEOUT_SECONDS = 30
 # reading it as empty is the claim _collect_probe() exists to refuse. A
 # tenant who can create pods can still make the Kubernetes probe this
 # long, but it takes thousands of OOM-killed containers rather than two
-# dozen, and the report then says why the probe could not be read.
+# dozen, and the report then says why the probe could not be read. The
+# error states the limit in whole MiB, so keep it a multiple of one.
 HEALTH_PROBE_OUTPUT_LIMIT_BYTES = 1024 * 1024
 
 # The command health() runs on the first control plane node to ask whether
@@ -2633,7 +2635,10 @@ class Cluster:
         None, or None and why it was not read. Nothing here raises for an
         output which cannot be read. An apiclient error -- the blob is gone,
         or the API refuses the read -- is the probe not answering, an honest
-        unknown, the same as the API refusing to run the command; an output
+        unknown, the same as the API refusing to run the command. So is a
+        requests error: get_blob_data() streams, so a connection which drops
+        part way through a read of up to the cap surfaces as one (a
+        ChunkedEncodingError, say) rather than as an apiclient error. An output
         which is not UTF-8 is not something Shaken Fist's sidechannel
         writes, which encodes the command's output as UTF-8 to store it, so
         it is not believed either.
@@ -2644,7 +2649,7 @@ class Cluster:
                 data.extend(chunk)
                 if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:
                     break
-        except apiclient.APIException as e:
+        except (apiclient.APIException, requests.exceptions.RequestException) as e:
             return None, (
                 'printed more than the 10 KiB Shaken Fist returns inline, and '
                 'its output could not be read from blob %s, where it was '
@@ -2652,9 +2657,9 @@ class Cluster:
 
         if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:
             return None, (
-                'printed more than the %d KiB this version of the k3s plugin '
+                'printed more than the %d MiB this version of the k3s plugin '
                 'reads, so its output, which Shaken Fist stored as blob %s, '
-                'was not read' % (HEALTH_PROBE_OUTPUT_LIMIT_BYTES // 1024, blob_uuid))
+                'was not read' % (HEALTH_PROBE_OUTPUT_LIMIT_BYTES // (1024 * 1024), blob_uuid))
 
         try:
             return data.decode('utf-8'), None

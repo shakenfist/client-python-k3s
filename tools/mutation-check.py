@@ -552,12 +552,20 @@ MUTATIONS = [
     (
         'a blob which cannot be read is a probe which did not answer, not a traceback',
         PKG + '/cluster.py',
-        '        except apiclient.APIException as e:\n'
+        '        except (apiclient.APIException, requests.exceptions.RequestException) as e:\n'
         '            return None, (\n'
         "                'printed more than the 10 KiB Shaken Fist returns inline, and '\n",
         '        except ZeroDivisionError as e:\n'
         '            return None, (\n'
         "                'printed more than the 10 KiB Shaken Fist returns inline, and '\n",
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'a connection lost part way through a blob read is a probe which did not answer',
+        PKG + '/cluster.py',
+        '        except (apiclient.APIException, requests.exceptions.RequestException) as e:\n',
+        '        except apiclient.APIException as e:\n',
         PKG + '.tests.test_cluster.HealthKubernetesTestCase',
         'stestr',
     ),

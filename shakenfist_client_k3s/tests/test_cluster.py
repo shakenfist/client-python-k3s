@@ -15,6 +15,7 @@ import time
 # The PyPI mock backport is used for consistency with the other tests in
 # this package, which support Python >= 3.7.
 import mock
+import requests
 from shakenfist_client import apiclient
 import testtools
 import yaml
@@ -2221,7 +2222,7 @@ class HealthTestCase(testtools.TestCase):
         self.assertEqual(0, report['api']['return_code'])
         self.assertIsNone(report['api']['stdout'])
         self.assertEqual(
-            "'%s' printed more than the 1024 KiB this version of the k3s "
+            "'%s' printed more than the 1 MiB this version of the k3s "
             'plugin reads, so its output, which Shaken Fist stored as blob '
             'blob-001, was not read' % cluster_module.K3S_API_PROBE_COMMAND,
             report['api']['error'])
@@ -7501,7 +7502,7 @@ class HealthKubernetesTestCase(testtools.TestCase):
         self._assert_nothing_read(report)
         self.assertEqual(
             {'probed': True, 'answered': False,
-             'error': 'the Kubernetes probe printed more than the 1024 KiB '
+             'error': 'the Kubernetes probe printed more than the 1 MiB '
                       'this version of the k3s plugin reads, so its output, '
                       'which Shaken Fist stored as blob blob-001, was not read',
              'unmatched_nodes': None},
@@ -7529,6 +7530,29 @@ class HealthKubernetesTestCase(testtools.TestCase):
                       'Shaken Fist returns inline, and its output could not '
                       'be read from blob blob-001, where it was stored: '
                       'ResourceNotFoundException: blob not found',
+             'unmatched_nodes': None},
+            report['kubernetes'])
+        self.assertTrue(report['api']['answered'])
+
+    def test_a_connection_lost_part_way_through_a_blob_reads_nothing(self):
+        # get_blob_data() streams, so a dropped connection arrives as a
+        # requests error after some chunks rather than as an apiclient one.
+        # It is the probe not answering too, not a traceback.
+        self.client.kubernetes_stdout = (
+            fakes.KUBERNETES_PROBE_OUTPUT + self._oom_lines(200))
+        self.client.blob_stream_raises = requests.exceptions.ChunkedEncodingError(
+            'Connection broken: IncompleteRead')
+
+        report = self.cluster.health()
+
+        self._assert_nothing_read(report)
+        self.assertGreater(self.client.blob_bytes_served, 0)
+        self.assertEqual(
+            {'probed': True, 'answered': False,
+             'error': 'the Kubernetes probe printed more than the 10 KiB '
+                      'Shaken Fist returns inline, and its output could not '
+                      'be read from blob blob-001, where it was stored: '
+                      'ChunkedEncodingError: Connection broken: IncompleteRead',
              'unmatched_nodes': None},
             report['kubernetes'])
         self.assertTrue(report['api']['answered'])

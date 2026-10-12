@@ -611,7 +611,9 @@ one of:
   truncated and parsed, because a pod list cut short reads as fewer
   kills and a node list as nodes that never registered;
 * the blob could not be read, with the API's answer, such as a
-  `ResourceNotFoundException`; or
+  `ResourceNotFoundException`, or with the transport error when the
+  connection dropped part way through the read, such as a
+  `ChunkedEncodingError`; or
 * the blob is not valid UTF-8, which Shaken Fist does not write.
 
 None of these is read as empty output, which would report every node

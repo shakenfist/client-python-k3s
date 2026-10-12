@@ -526,13 +526,16 @@ class HealthClient(FakeClusterClient):
 
         # The blobs a stream too long to return inline was stored as, by
         # uuid, as the bytes the server would serve; blob_raises, when set,
-        # is what reading any blob raises instead; and blob_bytes_served
+        # is what reading any blob raises instead; blob_stream_raises, when
+        # set, is raised after the first chunk, as a connection which drops
+        # part way through a streamed read would be; and blob_bytes_served
         # counts what get_blob_data() handed out, so a test can see that a
         # capped read stopped early rather than reading the whole blob and
         # then refusing it. Reads are recorded in calls as ('blob', uuid).
         self.blob_serial = 0
         self.blobs = {}
         self.blob_raises = None
+        self.blob_stream_raises = None
         self.blob_bytes_served = 0
 
     def set_namespace_metadata_item(self, namespace, key, value):
@@ -620,6 +623,8 @@ class HealthClient(FakeClusterClient):
             chunk = data[offset:offset + 8192]
             self.blob_bytes_served += len(chunk)
             yield chunk
+            if self.blob_stream_raises:
+                raise self.blob_stream_raises
 
     def get_agent_operation(self, operation_uuid):
         # A probe which is still pending stays pending: this is the node
