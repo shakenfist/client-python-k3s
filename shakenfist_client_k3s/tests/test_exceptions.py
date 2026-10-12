@@ -35,6 +35,33 @@ class ClusterNotFoundErrorTestCase(testtools.TestCase):
         self.assertEqual('not_found', e.reason)
         self.assertEqual('Cluster not found!', str(e))
 
+    def test_listed_without_state(self):
+        e = exceptions.ClusterNotFoundError.listed_without_state('banana')
+        self.assertEqual('listed_without_state', e.reason)
+        self.assertEqual('banana', e.name)
+        self.assertIn('banana', str(e).split('\n')[0])
+        self.assertIn("'sf-client k3s delete banana'", str(e))
+
+
+class ClusterInterruptedErrorTestCase(testtools.TestCase):
+    def test_mid_create_quotes_a_recorded_state(self):
+        e = exceptions.ClusterInterruptedError.mid_create('banana', 'initial')
+        self.assertEqual('initial', e.state)
+        self.assertEqual(
+            'Cluster banana was interrupted while it was being built: its state is\n'
+            "'initial' rather than 'created'. Resuming a half built cluster is not\n"
+            'supported, so remove what is left of it with\n'
+            "'sf-client k3s delete banana' and then create it again.", str(e))
+
+    def test_mid_create_does_not_quote_unknown_as_a_state(self):
+        # 'unknown' is what _interrupted_state() answers when nothing
+        # recorded a state, so it is not quoted as though something had.
+        e = exceptions.ClusterInterruptedError.mid_create('banana', 'unknown')
+        self.assertEqual('unknown', e.state)
+        self.assertNotIn("'unknown'", str(e))
+        self.assertIn('no state was\nrecorded for it at all', str(e))
+        self.assertIn("'sf-client k3s delete banana'", str(e))
+
 
 class ClusterIncompleteErrorTestCase(testtools.TestCase):
     def test_str(self):

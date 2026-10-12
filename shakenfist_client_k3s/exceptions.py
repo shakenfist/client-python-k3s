@@ -96,16 +96,15 @@ class _ReasonedK3sException(K3sClusterException):
 class ClusterExistsError(K3sClusterException):
     """Raised when a cluster create is attempted with a name already in use.
 
-    Raised by ``Cluster.create()``, from either of two checks: the name is
-    already present in the namespace's cluster list, or namespace metadata
-    already exists for it and records a cluster which finished being built.
-    The second check no longer always reaches here -- metadata whose
-    ``state`` is anything but ``created`` raises
-    ``ClusterInterruptedError.mid_create()`` instead, because a cluster
-    which never finished is a different problem with a different answer
-    (tear it down) from a name which is genuinely in use. Both paths which
-    do reach here render the same text, so this class does not need to
-    distinguish which check failed.
+    Raised by ``Cluster.create()`` from one check: namespace metadata
+    already exists for the name and records a cluster which finished being
+    built. It used to be raised from two. The other was a name present in
+    the namespace's cluster list with no metadata behind it, which now
+    raises ``ClusterInterruptedError.mid_create()`` with state
+    ``'unknown'``, as metadata whose ``state`` is anything but ``created``
+    does: in both a create stopped part way, and the answer is to tear it
+    down rather than to pick another name. Only a name which is genuinely
+    in use reaches here.
     """
 
     def __init__(self, name):
@@ -137,11 +136,11 @@ class NetworkNotFoundError(K3sClusterException):
 class ClusterNotFoundError(K3sClusterException):
     """Raised when a named cluster (or a required part of its state) is missing.
 
-    This covers one site in each of eight commands, which use three
-    distinct message strings. None of the three interpolate the cluster
-    name, so ``name`` is carried only as a structured attribute, not
-    rendered. Construct via the classmethods below, one per distinct
-    message:
+    This covers one site in each of eight commands, which use four
+    distinct message strings. The first three do not interpolate the
+    cluster name, so for them ``name`` is carried only as a structured
+    attribute, not rendered. Construct via the classmethods below, one per
+    distinct message:
 
     - ``unknown_cluster()``: raised by ``Cluster.get_kubeconfig()`` when
       there is no cluster metadata at all.
@@ -150,11 +149,23 @@ class ClusterNotFoundError(K3sClusterException):
     - ``not_found()``: raised by ``Cluster.expand_workers()``,
       ``Cluster.remove_worker()``, ``Cluster.expand_addresses()`` and
       ``Cluster.update_os()``.
+    - ``listed_without_state()``: raised by every one of those verbs
+      except ``Cluster.delete()``, in place of its own message, when there
+      is no metadata but the name is in the namespace's cluster list.
+      Earlier versions of this package could leave a name that way: a
+      create which stopped before it wrote any state, or a delete which
+      stopped after removing it (shakenfist/client-python-k3s#72). The
+      name is rendered, because the message gives the command which frees
+      it, and that command is ``delete()``, which is why ``delete()``
+      cleans such a name up rather than raising this.
 
-    Which of the two "there is no such cluster" messages a verb uses is
-    historical rather than meaningful, and new verbs join the group they
-    read like: ``health()`` reports on a cluster the way ``show()`` does,
-    so it says what ``show()`` says.
+    Which of the first three, "there is no such cluster", messages a verb
+    uses is historical rather than meaningful, and new verbs join the group
+    they read like: ``health()`` reports on a cluster the way ``show()``
+    does, so it says what ``show()`` says. ``listed_without_state()`` is a
+    reason of this class rather than a class of its own so that a caller
+    which catches ``ClusterNotFoundError`` is unaffected: there is still
+    no cluster to act on, only a name to free.
 
     One further original site, ``Cluster.get_kubeconfig()``'s second check
     -- metadata present but no kubeconfig recorded -- is not here: that
@@ -182,6 +193,16 @@ class ClusterNotFoundError(K3sClusterException):
     @classmethod
     def not_found(cls, name):
         return cls(name, 'not_found', 'Cluster not found!')
+
+    @classmethod
+    def listed_without_state(cls, name):
+        message = (
+            "Cluster %s is in this namespace's cluster list but has no recorded\n"
+            'state: an earlier create stopped before it wrote any, or an earlier\n'
+            "delete stopped after removing it. Free the name with\n"
+            "'sf-client k3s delete %s'."
+        ) % (name, name)
+        return cls(name, 'listed_without_state', message)
 
 
 class ClusterIncompleteError(K3sClusterException):
@@ -213,7 +234,7 @@ class ClusterIncompleteError(K3sClusterException):
 
 
 class ClusterInterruptedError(_ReasonedK3sException):
-    """Raised when a cluster's own metadata says it never finished being built.
+    """Raised when a cluster's own metadata says it never finished being built, or it has none.
 
     ``md['state']`` is written by ``Cluster.create()`` and
     ``Cluster.delete()`` and, until phase 3, was read nowhere at all (survey
@@ -230,11 +251,17 @@ class ClusterInterruptedError(_ReasonedK3sException):
 
     - ``mid_create(name, state)``: raised by ``Cluster.create()`` when the
       name it was asked for already holds the metadata of an unfinished
-      cluster. This is deliberately distinguished from
-      ``ClusterExistsError``, which says only that the name is taken: a
-      name held by a finished cluster belongs to a working cluster, and a
-      name held by an unfinished one belongs to rubbish the caller can
-      remove.
+      cluster, or is in the namespace's cluster list with no metadata
+      behind it at all. The second is what earlier versions of this
+      package left when a create stopped before writing any state
+      (shakenfist/client-python-k3s#72); there is no state to report, so
+      ``state`` is ``'unknown'``, the answer ``_interrupted_state()``
+      already gives for metadata which carries none, and the message says
+      that no state was recorded rather than quoting the word. This is
+      deliberately distinguished from ``ClusterExistsError``, which says
+      only that the name is taken: a name held by a finished cluster
+      belongs to a working cluster, and a name held by an unfinished one
+      belongs to rubbish the caller can remove.
     - ``not_usable(name, state, verb)``: raised by the verbs which need a
       built cluster to work on -- ``Cluster.expand_workers()``,
       ``Cluster.remove_worker()`` and ``Cluster.expand_addresses()``. All
@@ -258,12 +285,19 @@ class ClusterInterruptedError(_ReasonedK3sException):
 
     @classmethod
     def mid_create(cls, name, state):
+        # 'unknown' is not a state anything wrote, so it is not quoted as
+        # one: "its state is 'unknown'" reads as though some run had
+        # recorded that word, when what happened is that none recorded
+        # anything. Every other state keeps the text it always had.
+        if state == 'unknown':
+            found = 'no state was\nrecorded for it at all'
+        else:
+            found = "its state is\n'%s' rather than 'created'" % state
         message = (
-            'Cluster %s was interrupted while it was being built: its state is\n'
-            "'%s' rather than 'created'. Resuming a half built cluster is not\n"
+            'Cluster %s was interrupted while it was being built: %s. Resuming a half built cluster is not\n'
             'supported, so remove what is left of it with\n'
             "'sf-client k3s delete %s' and then create it again."
-        ) % (name, state, name)
+        ) % (name, found, name)
         return cls('mid_create', message, name=name, state=state)
 
     @classmethod

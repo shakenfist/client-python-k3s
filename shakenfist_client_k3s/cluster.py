@@ -2079,6 +2079,33 @@ class Cluster:
             raise exceptions.ClusterInterruptedError.not_usable(
                 self.name, state, verb)
 
+    def _listed(self):
+        """Return True if this cluster's name is in the namespace's cluster list."""
+        namespace_md = self.client.get_namespace_metadata(self.namespace)
+        return self.name in namespace_md.get(primitives.CLUSTER_LIST, [])
+
+    def _not_found(self, unlisted):
+        """Return the ClusterNotFoundError for a verb which found no metadata for this cluster.
+
+        unlisted is the verb's own ``ClusterNotFoundError`` classmethod --
+        ``does_not_exist``, ``not_found`` or ``unknown_cluster``, which are
+        historical rather than meaningful -- and is what a name nobody has
+        heard of gets, exactly as before. A name which is in the namespace's
+        cluster list gets ``listed_without_state()`` instead, which names
+        ``sf-client k3s delete`` as the way to free it. Earlier versions of
+        this package left names that way (#72), and ``k3s list`` prints
+        them, so "does not exist" alone told the operator two contradictory
+        things and how to reconcile them neither.
+
+        The list is read here, on the error path, rather than alongside the
+        metadata in get_metadata(): a verb which finds its cluster pays for
+        no extra read. It is returned rather than raised so that each caller
+        reads as the raise it is.
+        """
+        if self._listed():
+            return exceptions.ClusterNotFoundError.listed_without_state(self.name)
+        return unlisted(self.name)
+
     def _require_addresses(self, md, key):
         """Refuse to run on metadata whose key does not hold IP addresses.
 
@@ -3680,7 +3707,10 @@ class Cluster:
         cluster list after that. A create which stops anywhere after the
         first write -- interrupted, or failing -- therefore leaves a
         document create() refuses with ClusterInterruptedError and delete()
-        removes, together with everything it records as built.
+        removes, together with everything it records as built. A name an
+        earlier version of this package left in the cluster list with no
+        document behind it is refused the same way, with state 'unknown',
+        and delete() frees that too.
 
         install_metallb and install_longhorn default to True, matching the
         behaviour before this parameter existed. Which way they went is
@@ -3901,14 +3931,24 @@ class Cluster:
         all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
         existing_md = self.get_metadata()
 
-        # The metadata is consulted before the cluster list, which is a
-        # change of order rather than of behaviour: both checks raised the
-        # same ClusterExistsError, so which fired first did not matter
-        # until now. It matters now because only the metadata knows whether
-        # the cluster holding this name ever finished being built, and an
-        # interrupted create may have listed the name too. Asking the list
-        # first would answer "that name is taken" for the one case which
-        # has a more useful answer than that.
+        # The metadata is consulted before the cluster list, because only
+        # the metadata knows whether the cluster holding this name ever
+        # finished being built, and an interrupted create may have listed
+        # the name too. Asking the list first would answer with less than
+        # the metadata knows: "that name is taken" for a working cluster
+        # whose name is listed, or "no state was recorded" for an
+        # interrupted one whose state was.
+        #
+        # A listed name with no metadata at all is an interrupted create
+        # too, not a name in use. Earlier versions of create() listed the
+        # name before writing any state, and earlier versions of delete()
+        # removed the state before unlisting the name, so either stopping
+        # in between left exactly this (#72). This used to raise
+        # ClusterExistsError, which told the operator to pick another name
+        # when the right answer is that delete() frees this one; it now
+        # raises ClusterInterruptedError like any other unfinished cluster,
+        # with state 'unknown' -- what _interrupted_state() answers for a
+        # document with no state -- since there is none to report.
         #
         # existing_md rather than md: this is what some earlier create left
         # behind, and md below is the document this one is about to write.
@@ -3922,7 +3962,8 @@ class Cluster:
                     self.name, interrupted)
             raise exceptions.ClusterExistsError(self.name)
         if self.name in all_clusters:
-            raise exceptions.ClusterExistsError(self.name)
+            raise exceptions.ClusterInterruptedError.mid_create(
+                self.name, 'unknown')
 
         # Initialise the metadata, and only then claim the name. These two
         # writes are not atomic, and this is the order which makes an
@@ -4251,7 +4292,7 @@ class Cluster:
         """
         md = self.get_metadata()
         if not md:
-            raise exceptions.ClusterNotFoundError.unknown_cluster(self.name)
+            raise self._not_found(exceptions.ClusterNotFoundError.unknown_cluster)
 
         kubeconfig = md.get('kubeconfig')
         if not kubeconfig:
@@ -4309,7 +4350,7 @@ class Cluster:
         """
         md = self.get_metadata()
         if not md:
-            raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+            raise self._not_found(exceptions.ClusterNotFoundError.does_not_exist)
 
         interrupted = self._interrupted_state(md)
         if interrupted:
@@ -4539,7 +4580,7 @@ class Cluster:
         """
         md = self.get_metadata()
         if not md:
-            raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+            raise self._not_found(exceptions.ClusterNotFoundError.does_not_exist)
 
         nodes = []
         for role, md_key in (('control_plane', 'control_plane_nodes'),
@@ -4742,11 +4783,28 @@ class Cluster:
         rather than absent, the network teardown is already guarded, and
         the local kubectl cleanup is idempotent -- so the only change this
         needed was to say what it is doing.
+
+        It also frees a name which is in the namespace's cluster list but
+        has no metadata document at all. create() cannot leave that any
+        more, but earlier versions could: create() used to list the name
+        before writing any state, and delete() used to remove the state
+        before unlisting the name, so either stopping in between left a
+        name create() refused and every other verb called nonexistent
+        (shakenfist/client-python-k3s#72). There is no record of what such
+        a name built, so _free_unrecorded_name() removes the one thing it
+        can find by name -- the node network create() would have allocated
+        -- and then the list entry. A name which is neither listed nor
+        recorded still raises ``ClusterNotFoundError.does_not_exist``.
         """
-        # Ensure this name exists
+        # Ensure this name exists. A listed name with no metadata is not
+        # one, but it is something only this verb can clean up, so it is
+        # cleaned up rather than refused; see _free_unrecorded_name().
         md = self.get_metadata()
         if not md:
-            raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+            if not self._listed():
+                raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+            self._free_unrecorded_name(update_kubeconfig)
+            return
 
         # Not a debug line: a delete which follows a failed create is the
         # supported recovery, and an operator running it wants to be told
@@ -4854,17 +4912,34 @@ class Cluster:
         # which makes an interruption between them recoverable.
         #
         # The other order -- which this did until now -- leaves the name
-        # in the cluster list with no metadata document behind it, and
-        # that combination is unusable forever: delete() raises
-        # ClusterNotFoundError because there is no metadata, and create()
-        # raises ClusterExistsError because the name is in the list. This
-        # order leaves a metadata document in state 'deleted' whose name
+        # in the cluster list with no metadata document behind it. That
+        # combination was unusable forever, because delete() raised
+        # ClusterNotFoundError for the missing metadata and create() raised
+        # ClusterExistsError for the listed name; delete() can now free it
+        # (_free_unrecorded_name()), but blindly, since nothing records
+        # what the cluster had. This order leaves a metadata document in state 'deleted' whose name
         # is no longer listed, which delete() runs to completion over --
         # the instances and the network are already gone, and the steps
         # above tolerate that -- so the recovery is to run the delete
         # again. That is the same recovery an interrupted create has, and
         # the same one docs/usage.md documents for
         # shakenfist/client-python-k3s#72.
+        self._unlist()
+        self.delete_metadata()
+
+        # And remove the local config, if the caller wants the local side
+        # effect. Everything above this point is the cluster; this is the
+        # calling machine's kubectl configuration.
+        if update_kubeconfig:
+            self._delete_kubeconfig_entries()
+
+    def _unlist(self):
+        """Remove this cluster's name from the namespace's cluster list, if it is there.
+
+        The list is read afresh rather than taken from an earlier read, so
+        that the read-modify-write which follows is as narrow as it can be.
+        It was never atomic, and this does not make it so.
+        """
         namespace_md = self.client.get_namespace_metadata(self.namespace)
         all_clusters = namespace_md.get(primitives.CLUSTER_LIST, [])
 
@@ -4872,7 +4947,7 @@ class Cluster:
         # raises a bare ValueError, which is not a K3sClusterException, so
         # the group handler does not catch it and the user sees a
         # traceback. A second delete of a cluster this one has already
-        # unlisted is exactly the recovery described above, and two
+        # unlisted is exactly the recovery delete() describes, and two
         # concurrent deletes reach it as well.
         if self.name in all_clusters:
             all_clusters.remove(self.name)
@@ -4883,11 +4958,101 @@ class Cluster:
             self.client.set_namespace_metadata_item(
                 self.namespace, primitives.CLUSTER_LIST, all_clusters)
 
-        self.delete_metadata()
+    def _free_unrecorded_name(self, update_kubeconfig):
+        """Free a name in the namespace's cluster list which has no metadata behind it.
 
-        # And remove the local config, if the caller wants the local side
-        # effect. Everything above this point is the cluster; this is the
-        # calling machine's kubectl configuration.
+        delete()'s path for a name stuck by an earlier version of this
+        package (#72); delete()'s docstring says how one gets stuck. There
+        is no document, so there are no instances, addresses or tokens on
+        record to tear down, and delete_metadata() is not called: there is
+        nothing for it to remove, and on a cache which holds a miss it would
+        be deleting a document the API never had.
+
+        What there may be is a node network. create() used to allocate
+        k3s-<name>-node after listing the name and record its uuid only in
+        the document it wrote afterwards, so a create which stopped in
+        between left a network nothing records. It is found by that name,
+        within this namespace, and destroyed. The name is proof enough that
+        create() allocated it, which is the argument _owns_node_network()
+        already makes for clusters built before node_network_created was
+        recorded: a borrowed network carrying it would have to have been
+        named after this cluster by somebody else. And it cannot belong to
+        a later cluster of the same name, because this stuck name is what
+        has stopped any later cluster being created. A delete which stopped
+        after removing the document leaves no network to find -- delete()
+        has always destroyed the network before the document -- so the
+        lookup simply misses.
+        """
+        # Not a debug line, for the same reason as delete()'s note about an
+        # interrupted cluster: this is the recovery the error messages point
+        # at, and the operator should be told what it is about to do.
+        self.reporter.write(
+            'Cluster %s is in the cluster list of namespace %s but has no '
+            'recorded state:\nan earlier create stopped before it wrote any, '
+            'or an earlier delete after removing it.\nFreeing the name.\n'
+            % (self.name, self.namespace))
+
+        network_name = 'k3s-%s-node' % self.name
+        network = None
+        try:
+            network = self.client.get_network(network_name, namespace=self.namespace)
+        except apiclient.ResourceNotFoundException:
+            self.reporter.debug('There is no network named %s to delete' % network_name)
+        except apiclient.IncapableException:
+            # The server cannot look a name up within a namespace, and a
+            # lookup across every namespace could find somebody else's
+            # network. Freeing the name is the point of this path, so a
+            # network which might be left over is reported rather than
+            # allowed to fail it.
+            self.reporter.write(
+                'This Shaken Fist cannot look a network up by name within a '
+                'namespace, so a network named %s\nmay have been left behind. '
+                "Find it with 'sf-client network list' and remove it with\n"
+                "'sf-client network delete <uuid>'.\n" % network_name)
+        except apiclient.RequestMalformedException as e:
+            # The server answers a name which matches more than one network
+            # with a 400 rather than with a list (MultipleObjects, in
+            # network.Network.from_db_by_ref()), and which of several is
+            # this cluster's cannot be told from a name. None is deleted.
+            self.reporter.write(
+                'Could not look up a single network named %s (%s), so none was '
+                "deleted.\nFind any left behind with 'sf-client network list' "
+                "and remove them with\n'sf-client network delete <uuid>'.\n"
+                % (network_name, e.text))
+
+        if network:
+            # Checked rather than trusted. The server already refuses a
+            # network outside the namespace it was asked about, but this is
+            # a delete made on the strength of a name alone, and an answer
+            # which is not the network asked for -- from a server which
+            # ignored the namespace, say -- must not be destroyed.
+            if (network.get('name') == network_name
+                    and network.get('namespace', self.namespace) == self.namespace):
+                self.reporter.write('Deleting network %s (uuid %s), which create '
+                                    'allocated and never recorded.\n'
+                                    % (network_name, network['uuid']))
+                self.client.delete_network(network['uuid'])
+            else:
+                self.reporter.debug(
+                    'Leaving network %s in place: the API answered a lookup of '
+                    '%s in namespace %s with it' % (network.get('uuid'), network_name,
+                                                    self.namespace))
+
+        # Last, so that a failure above leaves the name listed and the
+        # delete can be run again, which is the order delete() itself uses:
+        # what the name stands for goes first, and the name after it.
+        self._unlist()
+
+        # The kubeconfig entries are removed on the same terms as on
+        # delete()'s main path, rather than skipped. A create which stopped
+        # before writing any state never wrote them either, and for that
+        # case this finds nothing and changes nothing. But a delete by an
+        # earlier version which stopped after removing the document had not
+        # yet removed them -- that delete removed them last -- so this is
+        # the only cleanup they will get. Only entries named for this
+        # cluster are touched, and only those kubectl reports as present.
+        # After the name is freed, as on the main path, so that a kubeconfig
+        # failure cannot leave the name stuck.
         if update_kubeconfig:
             self._delete_kubeconfig_entries()
 
@@ -5035,7 +5200,7 @@ class Cluster:
         validate_counts(1, worker_count=worker_count)
         md = self.get_metadata()
         if not md:
-            raise exceptions.ClusterNotFoundError.not_found(self.name)
+            raise self._not_found(exceptions.ClusterNotFoundError.not_found)
         self._require_usable(md, 'expand-workers')
 
         # Three phases: create the workers, install k3s on them, and wait for
@@ -5125,7 +5290,7 @@ class Cluster:
         """
         md = self.get_metadata()
         if not md:
-            raise exceptions.ClusterNotFoundError.not_found(self.name)
+            raise self._not_found(exceptions.ClusterNotFoundError.not_found)
         self._require_usable(md, 'remove-worker')
 
         # Repeating --worker with the same uuid would otherwise drain a node
@@ -5361,7 +5526,7 @@ class Cluster:
         validate_counts(1, address_count=address_count)
         md = self.get_metadata()
         if not md:
-            raise exceptions.ClusterNotFoundError.not_found(self.name)
+            raise self._not_found(exceptions.ClusterNotFoundError.not_found)
         self._require_usable(md, 'expand-addresses')
 
         # Absent means True: clusters built before create() recorded this
@@ -5392,7 +5557,7 @@ class Cluster:
         """
         md = self.get_metadata()
         if not md:
-            raise exceptions.ClusterNotFoundError.not_found(self.name)
+            raise self._not_found(exceptions.ClusterNotFoundError.not_found)
 
         p = self.start_progress(1)
         p.phase('Updating the OS on all cluster nodes')
