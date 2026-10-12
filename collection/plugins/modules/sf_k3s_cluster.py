@@ -641,9 +641,8 @@ def _probe(module, cluster, reporter, mutation):
 def _listed_without_state(cluster):
     """Whether the name is in the namespace's cluster list with no metadata behind it.
 
-    That is what versions before the fix for #72 left when a create or a
-    delete stopped between listing the name and writing, or removing, its
-    state. It is neither a cluster this module can describe nor a name that
+    Earlier versions of the library could leave one; Cluster.delete() has
+    how. It is neither a cluster this module can describe nor a name that
     is free: create() refuses it, and delete() is the one verb which frees
     it. Asked of the public list_clusters() rather than of the Cluster, so
     that this module does not reach into the library's private helpers.

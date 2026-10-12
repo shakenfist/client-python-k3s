@@ -96,15 +96,11 @@ class _ReasonedK3sException(K3sClusterException):
 class ClusterExistsError(K3sClusterException):
     """Raised when a cluster create is attempted with a name already in use.
 
-    Raised by ``Cluster.create()`` from one check: namespace metadata
-    already exists for the name and records a cluster which finished being
-    built. It used to be raised from two. The other was a name present in
-    the namespace's cluster list with no metadata behind it, which now
-    raises ``ClusterInterruptedError.mid_create()`` with state
-    ``'unknown'``, as metadata whose ``state`` is anything but ``created``
-    does: in both a create stopped part way, and the answer is to tear it
-    down rather than to pick another name. Only a name which is genuinely
-    in use reaches here.
+    Raised by ``Cluster.create()`` when namespace metadata already exists
+    for the name and records a cluster which finished being built. A name
+    held by an unfinished cluster, or listed with no metadata behind it,
+    raises ``ClusterInterruptedError.mid_create()`` instead, because the
+    answer there is to tear it down rather than to pick another name.
     """
 
     def __init__(self, name):
@@ -170,13 +166,11 @@ class ClusterNotFoundError(K3sClusterException):
       ``Cluster.update_os()``.
     - ``listed_without_state()``: raised by every one of those verbs
       except ``Cluster.delete()``, in place of its own message, when there
-      is no metadata but the name is in the namespace's cluster list.
-      Earlier versions of this package could leave a name that way: a
-      create which stopped before it wrote any state, or a delete which
-      stopped after removing it (shakenfist/client-python-k3s#72). The
-      name is rendered, because the message gives the command which frees
-      it, and that command is ``delete()``, which is why ``delete()``
-      cleans such a name up rather than raising this.
+      is no metadata but the name is in the namespace's cluster list, which
+      earlier versions of this package could leave (``Cluster.delete()``
+      has how). The name is rendered, because the message gives the
+      command which frees it, and that command is ``delete()``, which is
+      why ``delete()`` frees such a name rather than raising this.
 
     Which of the first three, "there is no such cluster", messages a verb
     uses is historical rather than meaningful, and new verbs join the group
@@ -271,16 +265,15 @@ class ClusterInterruptedError(_ReasonedK3sException):
     - ``mid_create(name, state)``: raised by ``Cluster.create()`` when the
       name it was asked for already holds the metadata of an unfinished
       cluster, or is in the namespace's cluster list with no metadata
-      behind it at all. The second is what earlier versions of this
-      package left when a create stopped before writing any state
-      (shakenfist/client-python-k3s#72); there is no state to report, so
-      ``state`` is ``'unknown'``, the answer ``_interrupted_state()``
-      already gives for metadata which carries none, and the message says
-      that no state was recorded rather than quoting the word. This is
-      deliberately distinguished from ``ClusterExistsError``, which says
-      only that the name is taken: a name held by a finished cluster
-      belongs to a working cluster, and a name held by an unfinished one
-      belongs to rubbish the caller can remove.
+      behind it at all (``Cluster.delete()`` has how). The second has no
+      state to report, so ``state`` is ``'unknown'``, the answer
+      ``_interrupted_state()`` already gives for metadata which carries
+      none, and the message says that no state was recorded rather than
+      quoting the word. This is deliberately distinguished from
+      ``ClusterExistsError``, which says only that the name is taken: a
+      name held by a finished cluster belongs to a working cluster, and a
+      name held by an unfinished one belongs to rubbish the caller can
+      remove.
     - ``not_usable(name, state, verb)``: raised by the verbs which need a
       built cluster to work on -- ``Cluster.expand_workers()``,
       ``Cluster.remove_worker()`` and ``Cluster.expand_addresses()``. All
