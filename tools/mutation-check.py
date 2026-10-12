@@ -168,6 +168,31 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'a release cache time which cannot be believed is not used',
+        PKG + '/primitives.py',
+        '            and 0 <= updated <= time.time() + RELEASE_CACHE_LIFETIME)',
+        '            and True) or True',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a Longhorn cache time which cannot be believed is not used',
+        PKG + '/primitives.py',
+        "                or not isinstance(version_cache.get('charts'), dict)\n"
+        "                or not _cache_time_is_usable(version_cache.get('updated', 0))):",
+        "                or not isinstance(version_cache.get('charts'), dict)):",
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
+        'a cached k3s release which is not a release name is not used',
+        PKG + '/primitives.py',
+        '                or not all(isinstance(r, str) and r for r in releases.values())\n',
+        '',
+        PKG + '.tests.test_primitives.StaleCopyTestCase',
+        'stestr',
+    ),
+    (
         'a release lookup never turns TLS verification off',
         PKG + '/primitives.py',
         '            timeout=RELEASE_LOOKUP_TIMEOUT)',
@@ -283,8 +308,8 @@ MUTATIONS = [
     (
         'a k3s cache whose releases is not a dict is fetched past',
         PKG + '/primitives.py',
-        "not isinstance(version_cache.get('releases'), dict):",
-        "'releases' not in version_cache:",
+        '        if (not isinstance(releases, dict)\n',
+        "        if ('releases' not in version_cache\n",
         PKG + '.tests.test_primitives.GetK3sReleaseTestCase',
         'stestr',
     ),

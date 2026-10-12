@@ -13,6 +13,7 @@ way, so that a Cluster can call these lookups.
 """
 
 import json
+import math
 from packaging.version import InvalidVersion, Version
 import re
 import requests
@@ -69,6 +70,7 @@ RELEASE_LOOKUP_TIMEOUT = 30
 # How long a release lookup's cached answer is used before its upstream is
 # asked again, in seconds.
 RELEASE_CACHE_LIFETIME = 24 * 3600
+
 
 # The ReleaseLookupError reasons which mean the upstream could not give an
 # answer, as against having answered no. For these an expired cached copy
@@ -135,6 +137,22 @@ def _fetch_release_data(product, url, accept, reporter):
         raise exceptions.ReleaseLookupError.http_status(
             product, url, r.status_code, r.text[:RESPONSE_SNIPPET_BYTES])
     return r
+
+
+def _cache_time_is_usable(updated):
+    """Say whether a release cache's 'updated' time can be believed.
+
+    Namespace metadata is writable by any client with access to the
+    namespace, so the time is checked before anything relies on it. A
+    value which is not a finite number, or is negative, would raise from
+    time.gmtime() in the stale copy's warning -- the path which exists to
+    avoid a failure. One far in the future would never expire, pinning the
+    cache to whatever it holds. A lifetime of slack allows for the clock of
+    whichever client wrote it.
+    """
+    return (isinstance(updated, (int, float)) and not isinstance(updated, bool)
+            and math.isfinite(updated)
+            and 0 <= updated <= time.time() + RELEASE_CACHE_LIFETIME)
 
 
 def _upstream_unavailable(error):
@@ -220,10 +238,14 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
         namespace_md = client.get_namespace_metadata(namespace)
         version_cache = namespace_md.get(
             K3S_VERSION_CACHE_KEY, {'updated': 0, 'releases': {}})
-        # A dict, not just present: the stale copy below and the channel
-        # lookup at the end both read it as one, and namespace metadata is
-        # writable by any client with access to the namespace.
-        if not isinstance(version_cache, dict) or not isinstance(version_cache.get('releases'), dict):
+        # A dict of release names, not just present: the stale copy below
+        # and the channel lookup at the end both read it as one, and
+        # return a value from it as the release to install, and namespace
+        # metadata is writable by any client with access to the namespace.
+        releases = version_cache.get('releases') if isinstance(version_cache, dict) else None
+        if (not isinstance(releases, dict)
+                or not all(isinstance(r, str) and r for r in releases.values())
+                or not _cache_time_is_usable(version_cache.get('updated', 0))):
             reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
@@ -483,9 +505,12 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False,
             LONGHORN_VERSION_CACHE_KEY, {'updated': 0})
         # A cache without 'charts' -- one written before the lookup
         # recorded each chart's kubeVersion, or anything else -- cannot
-        # answer a compatibility question, so it is refetched.
+        # answer a compatibility question, so it is refetched. What is in
+        # 'charts' is re-validated by _select_longhorn_chart(); its time
+        # is checked here, for the reason get_k3s_release() gives.
         if (not isinstance(version_cache, dict)
-                or not isinstance(version_cache.get('charts'), dict)):
+                or not isinstance(version_cache.get('charts'), dict)
+                or not _cache_time_is_usable(version_cache.get('updated', 0))):
             reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 

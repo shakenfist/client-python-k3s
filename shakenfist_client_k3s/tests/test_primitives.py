@@ -850,6 +850,68 @@ class StaleCopyTestCase(testtools.TestCase):
                 self.assertEqual(product, e.product)
         self.assertEqual('', self.reporter.getvalue())
 
+    def test_a_tampered_copy_raises_the_fetch_failure(self):
+        # Namespace metadata is writable by any client with access to the
+        # namespace. A copy whose time time.gmtime() cannot format, or
+        # whose stored answer is not a release name, is no copy at all: the
+        # lookup raises the failure it would have raised with none, rather
+        # than an OverflowError from the warning or a non-string release.
+        # The Longhorn values are the ones _select_longhorn_chart() rejects:
+        # no final version, or no constraint it can read.
+        tampered = []
+        for updated in [-1e20, -1, float('nan'), float('inf'), 'yesterday',
+                        True, None]:
+            tampered.append(('updated %r' % (updated,),
+                             dict(STALE_K3S, updated=updated),
+                             dict(STALE_LONGHORN, updated=updated)))
+        for value, charts in [(7, {'banana': ''}), ('', {'1.5.1-rc1': ''}),
+                              (None, {'1.5.1': 7}), (['v1.32.1+k3s1'], {'1.5.1': None})]:
+            tampered.append(('release %r, charts %r' % (value, charts),
+                             dict(STALE_K3S, releases={'stable': value}),
+                             dict(STALE_LONGHORN, charts=charts)))
+
+        def longhorn():
+            return self._longhorn(k3s_version='v1.33.4+k3s1')
+
+        for what, k3s_cache, longhorn_cache in tampered:
+            self.client.metadata = {
+                primitives.K3S_VERSION_CACHE_KEY: k3s_cache,
+                primitives.LONGHORN_VERSION_CACHE_KEY: longhorn_cache}
+            for product, lookup in [('k3s', self._k3s),
+                                    ('Longhorn', longhorn)]:
+                with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                                side_effect=requests.ConnectionError('down')):
+                    e = self.assertRaises(exceptions.ReleaseLookupError, lookup)
+
+                self.assertEqual('request_failed', e.reason, (product, what))
+                self.assertEqual(product, e.product)
+        self.assertEqual('', self.reporter.getvalue())
+
+    def test_a_copy_dated_in_the_future_is_refreshed(self):
+        # One which never expired would pin the cache to whatever it held.
+        # A lifetime of slack allows for the writer's clock; beyond that the
+        # copy is not believed, and upstream is asked.
+        future = NOW + 2 * primitives.RELEASE_CACHE_LIFETIME
+        self.client.metadata = {
+            primitives.K3S_VERSION_CACHE_KEY: dict(STALE_K3S, updated=future),
+            primitives.LONGHORN_VERSION_CACHE_KEY: dict(STALE_LONGHORN, updated=future)}
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_fake_response(K3S_CHANNELS)):
+            self.assertEqual('v1.33.4+k3s1', self._k3s())
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request',
+                        return_value=_index_response()):
+            self.assertEqual('1.6.0', self._longhorn())
+
+        # Within the slack it is still a fresh copy, and nothing is asked.
+        nearly = NOW + primitives.RELEASE_CACHE_LIFETIME / 2
+        self.client.metadata = {
+            primitives.K3S_VERSION_CACHE_KEY: dict(STALE_K3S, updated=nearly),
+            primitives.LONGHORN_VERSION_CACHE_KEY: dict(STALE_LONGHORN, updated=nearly)}
+        with mock.patch('shakenfist_client_k3s.primitives.requests.request') as mock_request:
+            self.assertEqual('v1.32.1+k3s1', self._k3s())
+            self.assertEqual('1.5.1', self._longhorn())
+        mock_request.assert_not_called()
+
     def test_a_copy_without_the_channel_raises_the_fetch_failure(self):
         # Not unknown_channel: the channel may well exist upstream, and
         # "no such channel" would send the operator to the wrong option.
