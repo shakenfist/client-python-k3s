@@ -1328,6 +1328,77 @@ MUTATIONS = [
         PKG + '.tests.test_network_guard.TheModuleHarnessIsGuardedTestCase',
         'tox',
     ),
+    (
+        'create() writes the cluster state before it lists the name',
+        PKG + '/cluster.py',
+        '        self.set_metadata(md)\n'
+        '\n'
+        '        all_clusters.append(self.name)\n'
+        '        self.client.set_namespace_metadata_item(\n'
+        '            self.namespace, primitives.CLUSTER_LIST, all_clusters)\n',
+        '        all_clusters.append(self.name)\n'
+        '        self.client.set_namespace_metadata_item(\n'
+        '            self.namespace, primitives.CLUSTER_LIST, all_clusters)\n'
+        '\n'
+        '        self.set_metadata(md)\n',
+        PKG + '.tests.test_cluster.CreateWritesItsStateBeforeItsNameTestCase'
+        '.test_the_metadata_is_written_before_the_name_is_listed',
+        'stestr',
+    ),
+    (
+        'a missing borrowed network is refused as a K3sClusterException',
+        PKG + '/cluster.py',
+        '                raise exceptions.NetworkNotFoundError(network) from e\n',
+        '                raise\n',
+        PKG + '.tests.test_library_api.NetworkAndSshKeyRefusalTestCase'
+        '.test_a_missing_network_is_a_k3s_cluster_exception',
+        'stestr',
+    ),
+    (
+        'delete() frees a listed name which has no metadata',
+        PKG + '/cluster.py',
+        '            if not self._listed():\n'
+        '                raise exceptions.ClusterNotFoundError.does_not_exist(self.name)\n',
+        '            if True:\n'
+        '                raise exceptions.ClusterNotFoundError.does_not_exist(self.name)\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase',
+        'stestr',
+    ),
+    (
+        'a failed orphan network delete leaves the name listed',
+        PKG + '/cluster.py',
+        "        network_name = 'k3s-%s-node' % self.name\n"
+        '        network = None\n',
+        '        self._unlist()\n'
+        "        network_name = 'k3s-%s-node' % self.name\n"
+        '        network = None\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_failed_network_delete_leaves_the_name_listed',
+        'stestr',
+    ),
+    (
+        'the Ansible module frees a listed name without state on state: absent',
+        'collection/plugins/modules/sf_k3s_cluster.py',
+        '    if (cluster.get_metadata() is None\n'
+        '            and not _listed_without_state(module, cluster)):\n',
+        '    if cluster.get_metadata() is None:\n',
+        PKG + '.tests.test_ansible_module.ListedWithoutStateTestCase',
+        'tox',
+    ),
+    (
+        'the Ansible module refuses a listed name without state on state: present',
+        'collection/plugins/modules/sf_k3s_cluster.py',
+        '    if _listed_without_state(module, cluster):\n'
+        '        module.fail_json(\n'
+        '            changed=False,\n'
+        "            msg=('Cluster %s is in the cluster list",
+        '    if False:\n'
+        '        module.fail_json(\n'
+        '            changed=False,\n'
+        "            msg=('Cluster %s is in the cluster list",
+        PKG + '.tests.test_ansible_module.ListedWithoutStateTestCase',
+        'tox',
+    ),
 ]
 
 
