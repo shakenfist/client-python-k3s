@@ -3286,9 +3286,18 @@ class Cluster:
                     '%s/%s' % (K3S_MANIFEST_DIR, basename), content,
                     delimiter=K3S_MANIFEST_DELIMITER))
 
-        # Instruct the first control plane node to install k3s and helm
+        # Instruct the first control plane node to install k3s and helm.
+        #
+        # md['k3s_version'] is the exact release create() resolved from
+        # the release channel, such as v1.36.5+k3s1, so it is passed as
+        # INSTALL_K3S_VERSION, which the installer uses as given. Passed
+        # as INSTALL_K3S_CHANNEL instead, the installer would ask
+        # update.k3s.io for a channel named after the release -- one
+        # which does not exist -- making every node's install depend on
+        # that host for no gain. install_k3s_component() does the same
+        # for every other node.
         cmds.append('curl -sfL https://get.k3s.io | '
-                    'INSTALL_K3S_CHANNEL=%s sh -s - server'
+                    'INSTALL_K3S_VERSION=%s sh -s - server'
                     % shlex.quote(md['k3s_version']))
         cmds.append('sudo apt-get install -y extrepo')
         cmds.append('sudo extrepo enable helm')
@@ -3329,14 +3338,16 @@ class Cluster:
         # configuration at startup, and a file which arrives afterwards
         # is not read until something restarts it. node_role is k3s's own
         # name for the subcommand, 'server' or 'agent', which is also how
-        # _k3s_config_commands() names a role.
+        # _k3s_config_commands() names a role. The release is passed as
+        # INSTALL_K3S_VERSION rather than INSTALL_K3S_CHANNEL, for the
+        # reason install_control_plane() gives.
         self.execute_and_await(
             instance_uuids,
             self._k3s_config_commands(md, node_role) + [
                 'sudo apt-get update',
                 (
                     'curl -sfL https://get.k3s.io | '
-                    'INSTALL_K3S_CHANNEL=%s '
+                    'INSTALL_K3S_VERSION=%s '
                     'K3S_URL=https://%s:6443 '
                     'K3S_TOKEN=%s sh -s - %s'
                     % (shlex.quote(md['k3s_version']),

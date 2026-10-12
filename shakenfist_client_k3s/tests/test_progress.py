@@ -391,14 +391,14 @@ class RedactCommandLineTestCase(testtools.TestCase):
 
     def test_the_rest_of_the_installer_line_survives(self):
         line = ('curl -sfL https://get.k3s.io | '
-                "INSTALL_K3S_CHANNEL='v1.33' "
+                'INSTALL_K3S_VERSION=v1.33.5+k3s1 '
                 'K3S_URL=https://10.0.0.4:6443 '
                 'K3S_TOKEN=K10abc::server:def sh -s - agent')
 
         redacted = progress.redact_command_line(line)
 
         self.assertNotIn('K10abc', redacted)
-        self.assertIn("INSTALL_K3S_CHANNEL='v1.33'", redacted)
+        self.assertIn('INSTALL_K3S_VERSION=v1.33.5+k3s1', redacted)
         self.assertIn('K3S_URL=https://10.0.0.4:6443', redacted)
         self.assertIn('sh -s - agent', redacted)
 

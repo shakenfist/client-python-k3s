@@ -180,7 +180,7 @@ class InstallK3sComponentTestCase(testtools.TestCase):
 
     def test_join_uses_join_address(self):
         cmds = self._install_commands({
-            'k3s_version': 'stable',
+            'k3s_version': 'v1.36.5+k3s1',
             'join_address': '10.0.0.5',
             'api_address_inner': '10.0.0.4'
         })
@@ -190,10 +190,98 @@ class InstallK3sComponentTestCase(testtools.TestCase):
         # Clusters created before join_address existed only carry the
         # older api_address_inner key in their metadata.
         cmds = self._install_commands({
-            'k3s_version': 'stable',
+            'k3s_version': 'v1.36.5+k3s1',
             'api_address_inner': '10.0.0.4'
         })
         self.assertIn('K3S_URL=https://10.0.0.4:6443', cmds)
+
+
+class InstallerIsPinnedToTheReleaseTestCase(testtools.TestCase):
+    """Every node's k3s installer is told the exact release, not a channel.
+
+    md['k3s_version'] is the release create() resolved from the release
+    channel, such as v1.36.5+k3s1. Handed to the installer as
+    INSTALL_K3S_CHANNEL, it made every node ask update.k3s.io for a
+    channel of that name, which 404s, and the install only worked because
+    the installer takes the last segment of the URL it lands on as the
+    version. INSTALL_K3S_VERSION is used as given, so the nodes no longer
+    depend on update.k3s.io at all.
+
+    Driven through install_control_plane() and install_workers(), so the
+    first server, an extra server (install_extra_control_plane()) and a
+    worker are each pinned; expand_workers() reaches the worker path
+    through install_workers(). The installer's environment is read with
+    shlex, as the node's shell would read it, rather than by substring.
+    """
+
+    RELEASE = 'v1.36.5+k3s1'
+
+    def setUp(self):
+        super(InstallerIsPinnedToTheReleaseTestCase, self).setUp()
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _installs(self):
+        """Return each node's installer environment and arguments, keyed by instance."""
+        client = fakes.FakeClusterClient()
+        client.metadata[MD_KEY] = {
+            'name': 'banana', 'namespace': 'testns', 'state': 'created',
+            'node_serial': 4, 'node_network': 'net-1',
+            'node_token': None, 'server_token': None,
+            'k3s_version': self.RELEASE,
+            'api_address_floating': '192.168.10.100',
+            'api_address_inner': '10.0.0.4', 'join_address': '10.0.0.4',
+            'control_plane_nodes': ['inst-cp1', 'inst-cp2'],
+            'worker_nodes': ['inst-w1'], 'routed_addresses': []
+        }
+        for i, instance_uuid in enumerate(['inst-cp1', 'inst-cp2', 'inst-w1']):
+            client.instances[instance_uuid] = {
+                'uuid': instance_uuid, 'name': 'k3s-banana-node-%03d' % (i + 1),
+                'state': 'created', 'agent_state': 'ready'}
+
+        cluster = _make_cluster(client)
+        cluster.install_control_plane()
+        cluster.install_workers(['inst-w1'])
+
+        installs = collections.defaultdict(list)
+        for instance_uuid, commandline in client.executed:
+            if not _is_k3s_install(commandline):
+                continue
+            # The words after the pipe: leading NAME=value assignments,
+            # which are the installer's environment, then the command.
+            words = shlex.split(commandline.split(' | ', 1)[1])
+            env = {}
+            while words and '=' in words[0]:
+                name, value = words.pop(0).split('=', 1)
+                env[name] = value
+            installs[instance_uuid].append((env, words))
+        return installs
+
+    def test_every_role_installs_the_recorded_release(self):
+        installs = self._installs()
+
+        for instance_uuid, role in [('inst-cp1', 'server'),
+                                    ('inst-cp2', 'server'),
+                                    ('inst-w1', 'agent')]:
+            self.assertEqual(1, len(installs[instance_uuid]),
+                             '%s: %r' % (instance_uuid, installs))
+            env, command = installs[instance_uuid][0]
+            self.assertEqual(['sh', '-s', '-', role], command, instance_uuid)
+            self.assertEqual(self.RELEASE, env.get('INSTALL_K3S_VERSION'),
+                             '%s: %r' % (instance_uuid, env))
+
+    def test_no_install_names_a_channel(self):
+        # A release passed as a channel is the bug this class exists for,
+        # and INSTALL_K3S_CHANNEL alongside INSTALL_K3S_VERSION would be
+        # harmless but misleading, since the installer ignores the channel
+        # once it has a version.
+        installs = self._installs()
+
+        self.assertEqual({'inst-cp1', 'inst-cp2', 'inst-w1'}, set(installs))
+        for instance_uuid, node_installs in installs.items():
+            for env, _ in node_installs:
+                self.assertNotIn('INSTALL_K3S_CHANNEL', env, instance_uuid)
 
 
 class AllocateMetallbAddressesTestCase(testtools.TestCase):
@@ -3693,7 +3781,7 @@ class ShellQuotingTestCase(testtools.TestCase):
 
     The values here are hostile in a way the real ones cannot be today --
     the Shaken Fist API refuses an instance name containing a semicolon,
-    and a k3s channel comes from a release lookup -- which is the point:
+    and a k3s release comes from a release lookup -- which is the point:
     this pins the quoting rather than the current reachability of a value
     which bypasses it.
     """
@@ -3712,16 +3800,16 @@ class ShellQuotingTestCase(testtools.TestCase):
             cluster.install_k3s_component(['inst-w1'], 'token', 'agent')
             return list(ea.call_args[0][1])
 
-    def test_the_k3s_channel_is_quoted(self):
+    def test_the_k3s_release_is_quoted(self):
         commands = self._install_commands({
             'name': 'banana', 'namespace': 'testns', 'state': 'created',
             'k3s_version': self.HOSTILE, 'join_address': '10.0.0.4',
             'api_address_inner': '10.0.0.4',
             'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1']})
 
-        installs = [c for c in commands if 'INSTALL_K3S_CHANNEL' in c]
+        installs = [c for c in commands if 'INSTALL_K3S_VERSION' in c]
         self.assertEqual(1, len(installs), commands)
-        self.assertIn("INSTALL_K3S_CHANNEL='%s'" % self.HOSTILE, installs[0])
+        self.assertIn("INSTALL_K3S_VERSION='%s'" % self.HOSTILE, installs[0])
 
     def test_the_drained_node_name_is_quoted(self):
         # The Shaken Fist API would not return an instance named this --
@@ -3800,7 +3888,7 @@ class ShellQuotingTestCase(testtools.TestCase):
         # This one comes from the Longhorn chart index rather than from
         # anything this module wrote, by way of the metadata create()
         # recorded it in, which namespace credentials can write. That is
-        # the same trust position as the k3s channel above.
+        # the same trust position as the k3s release above.
         client = mock.MagicMock()
         client.get_namespace_metadata.return_value = {MD_KEY: {
             'name': 'banana', 'namespace': 'testns', 'state': 'created',
@@ -3825,7 +3913,7 @@ class ShellQuotingTestCase(testtools.TestCase):
             'k3s_version': 'v1.33; touch pwned #', 'join_address': '10.0.0.4',
             'api_address_inner': '10.0.0.4',
             'control_plane_nodes': ['inst-cp1'], 'worker_nodes': ['inst-w1']})
-        install = [c for c in commands if 'INSTALL_K3S_CHANNEL' in c][0]
+        install = [c for c in commands if 'INSTALL_K3S_VERSION' in c][0]
 
         with tempfile.TemporaryDirectory() as tempdir:
             # curl is not going to be reached; the point is what the shell
@@ -3952,7 +4040,7 @@ class SecretRedactionTestCase(testtools.TestCase):
         self.assertIn('K3S_TOKEN=%s' % progress.REDACTED, str(e))
         # The rest of the command line is what makes the message useful,
         # so redaction must not have eaten it.
-        self.assertIn('INSTALL_K3S_CHANNEL=', str(e))
+        self.assertIn('INSTALL_K3S_VERSION=', str(e))
         self.assertIn('E: Unable to fetch some archives', str(e))
 
     def test_the_stored_attributes_carry_no_token_either(self):

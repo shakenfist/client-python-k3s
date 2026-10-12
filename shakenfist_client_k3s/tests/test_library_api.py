@@ -1580,7 +1580,7 @@ class ManifestStagingTestCase(LibraryTestCase):
         # fails the Analyze job over it, which is a fair complaint about
         # the shape even though nothing here is sanitizing anything.
         return self._index_of(
-            lambda c: ('INSTALL_K3S_CHANNEL=' in c
+            lambda c: ('INSTALL_K3S_VERSION=' in c
                        and c.endswith('sh -s - server')),
             'the k3s server install')
 
