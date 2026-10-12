@@ -1454,6 +1454,24 @@ MUTATIONS = [
         '.test_the_network_is_deleted_within_the_namespace',
         'stestr',
     ),
+    (
+        'an orphan network is deleted only if the API answered with its name',
+        PKG + '/cluster.py',
+        "            elif (network.get('name') == network_name\n",
+        '            elif (True\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_network_the_api_answered_with_another_name_is_kept',
+        'stestr',
+    ),
+    (
+        'an orphan network is deleted only if the API answered from this namespace',
+        PKG + '/cluster.py',
+        "                    and network.get('namespace', self.namespace) == self.namespace):\n",
+        '                    and True):\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_network_the_api_answered_for_another_namespace_is_kept',
+        'stestr',
+    ),
 ]
 
 

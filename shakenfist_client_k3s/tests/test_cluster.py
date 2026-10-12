@@ -2153,6 +2153,18 @@ class DeleteFreesAListedNameWithoutStateTestCase(testtools.TestCase):
         self.assertEqual([], self.client.deleted_networks)
         self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
 
+    def test_a_network_the_api_answered_with_another_name_is_kept(self):
+        # As above, for the name: the lookup asked for k3s-banana-node, and
+        # an answer carrying any other name is not the network asked for.
+        self.client.named_networks[self.NETWORK_NAME] = [
+            {'uuid': 'net-other', 'name': 'somebody-elses', 'namespace': 'testns',
+             'state': 'created'}]
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
     def test_a_network_another_cluster_records_is_kept(self):
         # The orphan was handed to cluster bar with 'create --network
         # k3s-banana-node'. It carries this cluster's name, and it is bar's
