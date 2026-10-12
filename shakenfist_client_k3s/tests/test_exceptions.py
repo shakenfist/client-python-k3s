@@ -69,9 +69,9 @@ class ClusterInterruptedErrorTestCase(testtools.TestCase):
         self.assertEqual('unknown', e.state)
         self.assertNotIn("'unknown'", str(e))
         self.assertEqual(
-            'Cluster banana has no recorded state, which is what an earlier create\n'
-            'leaves if it stopped before writing any, or an earlier delete if it\n'
-            'stopped after removing it. Free the name with\n'
+            'Cluster banana has no recorded state. An earlier create which stopped\n'
+            'before writing any leaves a name like this, as does an earlier\n'
+            'delete which stopped after removing it. Free the name with\n'
             "'sf-client k3s delete banana' and then create it again.", str(e))
 
     def test_mid_create_does_not_say_an_unknown_state_was_interrupted(self):

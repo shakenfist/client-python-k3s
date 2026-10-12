@@ -1418,6 +1418,24 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'a retried delete does not look for a network it already destroyed',
+        PKG + '/cluster.py',
+        "        elif md.get('node_network_created') and md.get('state') != 'deleted':\n",
+        "        elif md.get('node_network_created'):\n",
+        PKG + '.tests.test_cluster.DeleteInterruptedClusterTestCase'
+        '.test_a_retried_delete_does_not_warn_on_a_server_without_lookup_by_name',
+        'stestr',
+    ),
+    (
+        'the free path does not find deleted networks of its name',
+        PKG + '/tests/fakes.py',
+        "                       if n['state'] in NETWORK_ACTIVE_STATES]\n",
+        '                       ]\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_networks_earlier_clusters_of_this_name_left_deleted_are_not_found',
+        'stestr',
+    ),
+    (
         'a delete forgets the network it destroyed, so a retry does not destroy it again',
         PKG + '/cluster.py',
         "            md['node_network'] = None\n",

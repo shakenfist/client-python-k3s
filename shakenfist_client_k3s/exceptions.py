@@ -302,13 +302,14 @@ class ClusterInterruptedError(_ReasonedK3sException):
         # recorded that word, when what happened is that none recorded
         # anything. Nor is it said to have been interrupted mid-build: a
         # delete which stopped after removing the document leaves the same.
-        # The wording follows ClusterNotFoundError.listed_without_state(),
-        # which the other verbs raise for the same name.
+        # The causes are offered rather than asserted, because 'unknown'
+        # also stands for a document with no state key, which neither of
+        # them leaves; delete frees the name either way.
         if state == 'unknown':
             message = (
-                'Cluster %s has no recorded state, which is what an earlier create\n'
-                'leaves if it stopped before writing any, or an earlier delete if it\n'
-                'stopped after removing it. Free the name with\n'
+                'Cluster %s has no recorded state. An earlier create which stopped\n'
+                'before writing any leaves a name like this, as does an earlier\n'
+                'delete which stopped after removing it. Free the name with\n'
                 "'sf-client k3s delete %s' and then create it again."
             ) % (name, name)
         else:

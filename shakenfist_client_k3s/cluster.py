@@ -4939,16 +4939,16 @@ class Cluster:
             # None, not []: everywhere else this key holds a network uuid
             # string, and create_instance() reads it as one.
             md['node_network'] = None
-        elif md.get('node_network_created'):
+        elif md.get('node_network_created') and md.get('state') != 'deleted':
             # create() records the uuid of the network it allocates with the
             # write straight after allocate_network() returns, so one which
             # stopped in that round trip left a network of its own that only
-            # its name records. A delete which has already destroyed the
-            # network reaches here too, and the lookup misses: the server
-            # looks a name up only among networks in an active state
-            # (network.Network.from_db_by_ref()), so a deleted network, or
-            # several from earlier clusters of this name, is not found. Only
-            # a lookup by uuid still shows one.
+            # its name records. A delete which destroyed the network and then
+            # stopped leaves a document of the same shape, but in state
+            # 'deleted', which is written only after this branch or the one
+            # above has run: there is nothing left to look for, and on a
+            # server which cannot look a name up in a namespace the warning
+            # that something may be left behind would be wrong.
             self._delete_unrecorded_node_network(
                 self.client.get_namespace_metadata(self.namespace))
 

@@ -1997,11 +1997,7 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
         self.cluster.delete()
 
         self.assertEqual('', self.reporter.getvalue())
-
-    def _node_network(self, uuid, state='created'):
-        self.client.named_networks.setdefault('k3s-banana-node', []).append(
-            {'uuid': uuid, 'name': 'k3s-banana-node', 'namespace': 'testns',
-             'state': state})
+        self.assertNotIn(MD_KEY, self.client.metadata)
 
     def _stop_before_removing_the_document(self):
         original = self.client.delete_namespace_metadata_item
@@ -2013,21 +2009,32 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
 
         self.client.delete_namespace_metadata_item = stopping
 
+    def _record_lookups_by_name(self):
+        calls = []
+        original = self.client.get_network
+
+        def recording(network_ref, namespace=None):
+            if namespace:
+                calls.append(network_ref)
+            return original(network_ref, namespace=namespace)
+
+        self.client.get_network = recording
+        return calls
+
     def test_a_delete_stopped_after_the_network_went_finishes_when_run_again(self):
         # The last two writes are the name and then the document, so a delete
         # can stop with the network destroyed, the document saying 'deleted'
-        # with no network uuid, and the name already free. The retry takes
-        # the path for a network create() never recorded, and the lookup by
-        # name has to miss rather than find the network the first run
-        # destroyed: the server's lookup by name passes over a deleted
-        # network. An earlier cluster of the same name left another one, so
-        # a lookup which counted deleted networks would also find the name
-        # ambiguous.
+        # with no network uuid, and the name already free. That document
+        # says node_network_created with no uuid, which is also what a create
+        # stopped inside allocate_network() leaves, but 'deleted' says this
+        # delete has already been through the network, so the retry does not
+        # go looking for one by name.
         md = _interrupted_md(state='created')
         md['node_network_created'] = True
         self._seed(md)
-        self._node_network('net-0', state='deleted')
-        self._node_network('net-1')
+        self.client.named_networks['k3s-banana-node'] = [
+            {'uuid': 'net-1', 'name': 'k3s-banana-node', 'namespace': 'testns',
+             'state': 'created'}]
         self._stop_before_removing_the_document()
 
         self.assertRaises(RuntimeError, self.cluster.delete)
@@ -2038,28 +2045,31 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
         self.assertEqual(['net-1'], self.client.deleted_networks)
 
         del self.client.delete_namespace_metadata_item
-        reporter = progress.CollectingReporter()
-        Cluster(self.client, 'banana', 'testns', reporter=reporter).delete()
+        lookups = self._record_lookups_by_name()
+        Cluster(self.client, 'banana', 'testns',
+                reporter=progress.CollectingReporter()).delete()
 
+        self.assertEqual([], lookups)
         self.assertEqual(['net-1'], self.client.deleted_networks)
         self.assertNotIn(MD_KEY, self.client.metadata)
-        self.assertNotIn('Could not look up', reporter.getvalue())
 
-    def test_a_delete_stopped_after_the_network_went_and_still_listed_finishes(self):
-        # As above, for a stop between the 'deleted' write and the unlisting:
-        # the same document, with the name still held.
+    def test_a_retried_delete_does_not_warn_on_a_server_without_lookup_by_name(self):
+        # As above, for a stop between the 'deleted' write and the unlisting,
+        # on a server which cannot look a network up by name in a namespace.
+        # The network is known to be gone, so there is nothing to tell the
+        # operator to go and look for.
         md = _interrupted_md(state='deleted')
         md['node_network'] = None
         md['node_network_created'] = True
         self._seed(md)
-        self._node_network('net-1', state='deleted')
+        self.client.capabilities = set()
 
         self.cluster.delete()
 
+        self.assertNotIn('may have been left behind', self.reporter.getvalue())
         self.assertEqual([], self.client.deleted_networks)
         self.assertNotIn(MD_KEY, self.client.metadata)
         self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
-        self.assertNotIn(MD_KEY, self.client.metadata)
 
 
 class DeleteFreesAListedNameWithoutStateTestCase(testtools.TestCase):
@@ -2203,6 +2213,21 @@ class DeleteFreesAListedNameWithoutStateTestCase(testtools.TestCase):
         self._cluster().delete()
 
         self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_networks_earlier_clusters_of_this_name_left_deleted_are_not_found(self):
+        # A name an old delete left listed had its network destroyed first,
+        # and every earlier cluster of the name left a deleted network
+        # carrying it. The server's lookup by name passes over deleted
+        # networks, so none is deleted again and the name is not ambiguous.
+        for uuid in ('net-0', 'net-1'):
+            orphan = self._orphan(uuid=uuid)
+            orphan['state'] = 'deleted'
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn('Could not look up', self.reporter.getvalue())
         self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
 
     def test_a_network_the_api_answered_for_another_namespace_is_kept(self):
