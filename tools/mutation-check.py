@@ -1357,10 +1357,10 @@ MUTATIONS = [
     (
         'delete() frees a listed name which has no metadata',
         PKG + '/cluster.py',
-        '            if not self._listed():\n'
-        '                raise exceptions.ClusterNotFoundError.does_not_exist(self.name)\n',
-        '            if True:\n'
-        '                raise exceptions.ClusterNotFoundError.does_not_exist(self.name)\n',
+        '                if self.name not in primitives.cluster_list(namespace_md, self.namespace):\n'
+        '                    raise exceptions.ClusterNotFoundError.does_not_exist(self.name)\n',
+        '                if True:\n'
+        '                    raise exceptions.ClusterNotFoundError.does_not_exist(self.name)\n',
         PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase',
         'stestr',
     ),
@@ -1405,6 +1405,16 @@ MUTATIONS = [
         '    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):\n',
         '    if False:\n',
         PKG + '.tests.test_cluster.ClusterListWhichIsNotAListTestCase',
+        'stestr',
+    ),
+    (
+        'delete() decides to free a name from a fresh read, not its cache',
+        PKG + '/cluster.py',
+        '            md = namespace_md.get(md_key)\n'
+        '            self._metadata[md_key] = md\n',
+        '            md = None\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_document_written_after_a_cached_miss_is_deleted_as_a_cluster',
         'stestr',
     ),
 ]

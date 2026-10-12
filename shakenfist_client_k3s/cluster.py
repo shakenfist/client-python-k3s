@@ -4800,10 +4800,22 @@ class Cluster:
         # cleaned up rather than refused; see _free_unrecorded_name().
         md = self.get_metadata()
         if not md:
-            if not self._listed():
-                raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
-            self._free_unrecorded_name(update_kubeconfig)
-            return
+            # get_metadata() may answer from its cache, and the free path
+            # destroys things, so "no document, and listed" is decided from
+            # one fresh read rather than from two reads which a create of the
+            # same name could fall between. A document which has appeared
+            # since is a cluster like any other, and is deleted by the main
+            # path below, exactly as it would have been had the cache been
+            # cold.
+            md_key = self._metadata_key()
+            namespace_md = self.client.get_namespace_metadata(self.namespace)
+            md = namespace_md.get(md_key)
+            self._metadata[md_key] = md
+            if not md:
+                if self.name not in primitives.cluster_list(namespace_md, self.namespace):
+                    raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
+                self._free_unrecorded_name(update_kubeconfig)
+                return
 
         # Not a debug line: a delete which follows a failed create is the
         # supported recovery, and an operator running it wants to be told

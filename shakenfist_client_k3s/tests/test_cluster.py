@@ -2175,6 +2175,41 @@ class DeleteFreesAListedNameWithoutStateTestCase(testtools.TestCase):
                               self._cluster().delete)
         self.assertEqual('does_not_exist', e.reason)
 
+    def test_a_document_written_after_a_cached_miss_is_deleted_as_a_cluster(self):
+        # The cache says there is no document, and a create of this name
+        # has written one since. Freeing the name from the cached answer
+        # would destroy the new cluster's network by name and unlist it,
+        # leaving its document behind; the fresh read sees the cluster, and
+        # it is deleted like any other.
+        c = self._cluster()
+        self.assertIsNone(c.get_metadata())
+
+        md = _interrupted_md()
+        md['node_network'] = 'net-new'
+        md['node_network_created'] = True
+        self.client.metadata[MD_KEY] = md
+        self._orphan(uuid='net-new')
+
+        c.delete()
+
+        self.assertEqual(['net-new'], self.client.deleted_networks)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+        self.assertNotIn('Freeing the name', self.reporter.getvalue())
+
+    def test_a_name_unlisted_after_a_cached_miss_is_not_freed(self):
+        # The other half of the same read: the name has to be listed in the
+        # answer the decision is made from, not in an earlier one.
+        c = self._cluster()
+        self.assertIsNone(c.get_metadata())
+        self.client.metadata[primitives.CLUSTER_LIST] = ['apple']
+        self._orphan()
+
+        e = self.assertRaises(exceptions.ClusterNotFoundError, c.delete)
+
+        self.assertEqual('does_not_exist', e.reason)
+        self.assertEqual([], self.client.deleted_networks)
+
     def test_the_kubeconfig_is_left_alone_unless_asked(self):
         main_config_path = fakes.home_with_kubeconfig(self)
         self.subprocess_run.side_effect = fakes.FakeKubectl(['banana.testns'])
