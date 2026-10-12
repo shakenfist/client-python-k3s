@@ -75,7 +75,7 @@ SECRET_SSH_KEY = 'SECRET-SSH-PUBLIC-KEY'
 # real install_k3s_component().
 WORKER_INSTALL_COMMANDLINE = (
     'curl -sfL https://get.k3s.io | '
-    "INSTALL_K3S_CHANNEL='v1.33' "
+    'INSTALL_K3S_VERSION=v1.33.5+k3s1 '
     'K3S_URL=https://10.0.0.4:6443 '
     'K3S_TOKEN=%s sh -s - agent' % SECRET_NODE_TOKEN)
 

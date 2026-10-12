@@ -689,6 +689,12 @@ control plane node later installs the chart from. The lookups run where
 `sf-client` runs, so that machine needs to reach both. Each gives up
 after 30 seconds without an answer.
 
+The cluster's nodes do not ask the update API anything. Each node's
+installer is given the exact release the lookup resolved to
+(`INSTALL_K3S_VERSION`), and downloads it from GitHub's k3s release
+assets, so a node needs to reach `https://get.k3s.io` and GitHub but
+not `update.k3s.io`.
+
 ## Where cluster state lives
 
 There is no local state file. A cluster is described entirely by

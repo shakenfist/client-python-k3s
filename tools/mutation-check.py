@@ -1120,6 +1120,22 @@ MUTATIONS = [
         PKG + '.tests.test_network_guard.NumericAddressesStillResolveTestCase',
         'stestr',
     ),
+    (
+        'the first server installs the recorded release, not a channel of that name',
+        PKG + '/cluster.py',
+        "'INSTALL_K3S_VERSION=%s sh -s - server'",
+        "'INSTALL_K3S_CHANNEL=%s sh -s - server'",
+        PKG + '.tests.test_cluster.InstallerIsPinnedToTheReleaseTestCase',
+        'stestr',
+    ),
+    (
+        'every other node installs the recorded release, not a channel of that name',
+        PKG + '/cluster.py',
+        "                    'INSTALL_K3S_VERSION=%s '\n",
+        "                    'INSTALL_K3S_CHANNEL=%s '\n",
+        PKG + '.tests.test_cluster.InstallerIsPinnedToTheReleaseTestCase',
+        'stestr',
+    ),
     # Unlike every other entry, the two below reach the network while they
     # are applied. With the harness unguarded the real create() makes its
     # release lookup; with only the lookup unguarded it resolves
