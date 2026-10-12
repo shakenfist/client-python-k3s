@@ -1445,6 +1445,15 @@ MUTATIONS = [
         '.test_an_interruption_before_the_network_is_recorded_is_recoverable',
         'stestr',
     ),
+    (
+        'an orphan network is deleted within the namespace',
+        PKG + '/cluster.py',
+        "                self.client.delete_network(network['uuid'], namespace=self.namespace)\n",
+        "                self.client.delete_network(network['uuid'])\n",
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_the_network_is_deleted_within_the_namespace',
+        'stestr',
+    ),
 ]
 
 

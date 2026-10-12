@@ -2120,6 +2120,23 @@ class DeleteFreesAListedNameWithoutStateTestCase(testtools.TestCase):
 
         self.assertEqual([(self.NETWORK_NAME, 'testns')], calls)
 
+    def test_the_network_is_deleted_within_the_namespace(self):
+        # The server then refuses a network outside the namespace, which is
+        # the client's own safety check for a delete made by name.
+        self._orphan()
+        calls = []
+        original = self.client.delete_network
+
+        def recording(network_ref, namespace=None, wait=True):
+            calls.append((network_ref, namespace))
+            return original(network_ref, namespace=namespace, wait=wait)
+
+        self.client.delete_network = recording
+
+        self._cluster().delete()
+
+        self.assertEqual([('net-orphan', 'testns')], calls)
+
     def test_no_network_found_means_nothing_is_deleted(self):
         self._cluster().delete()
 

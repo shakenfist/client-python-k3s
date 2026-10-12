@@ -5064,7 +5064,9 @@ class Cluster:
                 self.reporter.write('Deleting network %s (uuid %s), which create '
                                     'allocated and never recorded.\n'
                                     % (network_name, network['uuid']))
-                self.client.delete_network(network['uuid'])
+                # The namespace makes the server refuse a network outside
+                # it, which is its own check against a delete aimed wrongly.
+                self.client.delete_network(network['uuid'], namespace=self.namespace)
             else:
                 self.reporter.debug(
                     'Leaving network %s in place: the API answered a lookup of '
