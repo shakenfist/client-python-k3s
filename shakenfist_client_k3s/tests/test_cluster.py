@@ -2115,6 +2115,39 @@ class DeleteFreesAListedNameWithoutStateTestCase(testtools.TestCase):
         self.assertEqual([], self.client.deleted_networks)
         self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
 
+    def test_a_network_another_cluster_records_is_kept(self):
+        # The orphan was handed to cluster bar with 'create --network
+        # k3s-banana-node'. It carries this cluster's name, and it is bar's
+        # node network: the server would delete it from under bar's
+        # instances. bar need not be listed -- an interrupted create's
+        # document is not -- so it is found by its document alone.
+        orphan = self._orphan()
+        self.client.metadata[cluster_module.METADATA_KEY % 'bar'] = {
+            'name': 'bar', 'state': 'created',
+            'node_network': orphan['uuid'], 'node_network_created': False}
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        out = self.reporter.getvalue()
+        self.assertIn('cluster bar records it', out)
+        self.assertIn('net-orphan', out)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_other_clusters_and_the_version_caches_do_not_keep_the_orphan(self):
+        # Only a document recording this network's uuid counts. The release
+        # caches share the cluster key prefix, and a cluster recording some
+        # other network is no claim on this one.
+        self._orphan()
+        self.client.metadata[cluster_module.METADATA_KEY % 'bar'] = {
+            'name': 'bar', 'node_network': 'net-bar'}
+        self.client.metadata[primitives.K3S_VERSION_CACHE_KEY] = {
+            'node_network': 'net-orphan'}
+
+        self._cluster().delete()
+
+        self.assertEqual(['net-orphan'], self.client.deleted_networks)
+
     def test_an_ambiguous_network_name_deletes_nothing(self):
         # The server answers a name several networks carry with a 400, and
         # which of them create() made cannot be told from the name.

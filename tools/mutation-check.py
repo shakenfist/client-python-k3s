@@ -1417,6 +1417,24 @@ MUTATIONS = [
         '.test_a_document_written_after_a_cached_miss_is_deleted_as_a_cluster',
         'stestr',
     ),
+    (
+        'an orphan network another cluster records is never deleted',
+        PKG + '/cluster.py',
+        "            recorded_by = _network_recorded_by(namespace_md, network['uuid'])\n",
+        '            recorded_by = None\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_network_another_cluster_records_is_kept',
+        'stestr',
+    ),
+    (
+        'only a cluster document can keep an orphan network',
+        PKG + '/cluster.py',
+        '        if (key.startswith(prefix) and key not in primitives.RESERVED_METADATA_KEYS\n',
+        '        if (key.startswith(prefix)\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_other_clusters_and_the_version_caches_do_not_keep_the_orphan',
+        'stestr',
+    ),
 ]
 
 

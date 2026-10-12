@@ -1959,6 +1959,26 @@ def check_k3s_release(release, channel):
             release, channel, K3S_RELEASE_FLOOR)
 
 
+def _network_recorded_by(namespace_md, network_uuid):
+    """Return the name of a cluster whose metadata records network_uuid as its node network, or None.
+
+    A network found by name alone is only this cluster's if nothing else
+    claims it. An operator can pass an orphaned k3s-<name>-node to another
+    cluster with ``create --network``, and the server deletes a network
+    with live interfaces on it, so freeing the stuck name would destroy
+    that cluster's network. Every cluster document in the namespace is
+    checked, listed or not -- an interrupted create's document need not be
+    -- by the key prefix they all share, from the one read the caller
+    already holds.
+    """
+    prefix = METADATA_KEY % ('',)
+    for key, value in sorted(namespace_md.items()):
+        if (key.startswith(prefix) and key not in primitives.RESERVED_METADATA_KEYS
+                and isinstance(value, dict) and value.get('node_network') == network_uuid):
+            return key[len(prefix):]
+    return None
+
+
 class Cluster:
     """One k3s cluster, and everything the orchestration needs to reach it.
 
@@ -4814,7 +4834,7 @@ class Cluster:
             if not md:
                 if self.name not in primitives.cluster_list(namespace_md, self.namespace):
                     raise exceptions.ClusterNotFoundError.does_not_exist(self.name)
-                self._free_unrecorded_name(update_kubeconfig)
+                self._free_unrecorded_name(namespace_md, update_kubeconfig)
                 return
 
         # Not a debug line: a delete which follows a failed create is the
@@ -4970,7 +4990,7 @@ class Cluster:
             self.client.set_namespace_metadata_item(
                 self.namespace, primitives.CLUSTER_LIST, all_clusters)
 
-    def _free_unrecorded_name(self, update_kubeconfig):
+    def _free_unrecorded_name(self, namespace_md, update_kubeconfig):
         """Free a name in the namespace's cluster list which has no metadata behind it.
 
         delete()'s path for a name stuck by an earlier version of this
@@ -4994,6 +5014,10 @@ class Cluster:
         after removing the document leaves no network to find -- delete()
         has always destroyed the network before the document -- so the
         lookup simply misses.
+
+        namespace_md is the read delete() decided to come here from. A
+        network some other cluster's document records is left in place,
+        whatever its name: see _network_recorded_by().
         """
         # Not a debug line, for the same reason as delete()'s note about an
         # interrupted cluster: this is the recovery the error messages point
@@ -5038,7 +5062,12 @@ class Cluster:
             # a delete made on the strength of a name alone, and an answer
             # which is not the network asked for -- from a server which
             # ignored the namespace, say -- must not be destroyed.
-            if (network.get('name') == network_name
+            recorded_by = _network_recorded_by(namespace_md, network['uuid'])
+            if recorded_by:
+                self.reporter.write(
+                    'Leaving network %s (uuid %s) in place: cluster %s records it '
+                    'as its node network.\n' % (network_name, network['uuid'], recorded_by))
+            elif (network.get('name') == network_name
                     and network.get('namespace', self.namespace) == self.namespace):
                 self.reporter.write('Deleting network %s (uuid %s), which create '
                                     'allocated and never recorded.\n'
