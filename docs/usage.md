@@ -321,22 +321,36 @@ rather than refusing, and `expand-workers`, `remove-worker` and
 plane node and a join token that an interrupted build may never have
 recorded.
 
-One gap in this is not yet closed: if `create` is killed in the narrow
-window after it claims the name in the namespace's cluster list but
-before it writes that cluster's own metadata document, the name is
-left claimed with nothing to report its state -- `delete NAME` says the
-cluster does not exist, because there is no metadata document for it to
-read. There is currently no supported way to free such a name from
-this plugin; see
-[shakenfist/client-python-k3s#72](https://github.com/shakenfist/client-python-k3s/issues/72).
+`create` does every check that can fail -- its arguments, the ssh key
+file, the k3s and Longhorn release lookups, and a `--network` it was
+asked to borrow -- before it writes anything. It then writes the
+cluster's own metadata document, in state `initial`, before it adds the
+name to the namespace's cluster list, and records the node network's
+uuid as soon as it has allocated one. So every way a `create` can stop
+leaves a document describing what it had built, and `sf-client k3s
+delete NAME` cleans all of them up. A `--network` that does not exist
+is refused up front, before anything is built.
 
-`delete` has the same two writes in the other order, and deliberately
-so: it releases the name from the cluster list first and removes the
-metadata document second, so a `delete` killed between them leaves a
-metadata document whose name is already free. Running `delete NAME`
-again finishes the job -- the instances and the network it had already
-removed stay removed -- which is why the window is recoverable on this
-side and not on the create side.
+`delete` writes in the other direction, and deliberately so: it
+releases the name from the cluster list first and removes the metadata
+document second, so a `delete` killed between them leaves a metadata
+document whose name is already free. Running `delete NAME` again
+finishes the job -- the instances and the network it had already
+removed stay removed.
+
+Versions of this plugin before that change could leave a name in the
+cluster list with no metadata document behind it, either because a
+`create` was killed between listing the name and writing its state, or
+because a `delete` removed the document before it released the name.
+`delete NAME` now frees such a name. Nothing records what that cluster
+had, so it deletes an orphaned `k3s-NAME-node` network if it finds one
+in the namespace by name, and if the server cannot look networks up by
+name in a namespace it says so and tells you to find the network with
+`sf-client network list` and remove it yourself. `create` refuses such
+a name as an interrupted cluster of unknown state, and `show`, `health`,
+`get-kubeconfig`, `expand-workers`, `remove-worker`, `expand-addresses`
+and `update-os` report that the name is listed without any recorded
+state and tell you to run `delete NAME`.
 
 ### `delete NAME`
 

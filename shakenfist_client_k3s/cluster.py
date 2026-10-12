@@ -4911,19 +4911,21 @@ class Cluster:
         # document. These two writes are not atomic and this is the order
         # which makes an interruption between them recoverable.
         #
-        # The other order -- which this did until now -- leaves the name
-        # in the cluster list with no metadata document behind it. That
-        # combination was unusable forever, because delete() raised
-        # ClusterNotFoundError for the missing metadata and create() raised
-        # ClusterExistsError for the listed name; delete() can now free it
-        # (_free_unrecorded_name()), but blindly, since nothing records
-        # what the cluster had. This order leaves a metadata document in state 'deleted' whose name
-        # is no longer listed, which delete() runs to completion over --
-        # the instances and the network are already gone, and the steps
-        # above tolerate that -- so the recovery is to run the delete
-        # again. That is the same recovery an interrupted create has, and
-        # the same one docs/usage.md documents for
-        # shakenfist/client-python-k3s#72.
+        # The other order -- which older versions used -- leaves the name
+        # in the cluster list with no metadata document behind it, which
+        # was unusable: delete() raised ClusterNotFoundError for the
+        # missing metadata and create() raised ClusterExistsError for the
+        # listed name. This order leaves a metadata document in state
+        # 'deleted' whose name is no longer listed, which delete() runs to
+        # completion over -- the instances and the network are already
+        # gone, and the steps above tolerate that -- so the recovery is to
+        # run the delete again. create() now writes in the recoverable
+        # order too (its metadata document, then the cluster list), so
+        # every interruption on either side is cured by delete(). Names
+        # which older versions left listed with no document are the one
+        # case with nothing to resume from; _free_unrecorded_name() frees
+        # those, blindly, because nothing records what the cluster had.
+        # docs/usage.md describes both.
         self._unlist()
         self.delete_metadata()
 

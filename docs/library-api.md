@@ -324,9 +324,9 @@ a correct caller never needs to catch it.
 | Exception | Raised when |
 |-----------|-------------|
 | `ClusterExistsError` | `create()` is called for a name already holding a finished cluster |
-| `ClusterInterruptedError` | `create()` is called for a name holding a cluster that never finished being built, or `expand_workers()`, `remove_worker()` or `expand_addresses()` is called against one |
-| `NetworkNotFoundError` | `create(network=...)` names a network that does not exist |
-| `ClusterNotFoundError` | the named cluster does not exist -- see method docstrings for which |
+| `ClusterInterruptedError` | `create()` is called for a name holding a cluster that never finished being built, or `expand_workers()`, `remove_worker()` or `expand_addresses()` is called against one; also `create()` for a name listed with no recorded state (`state` is `'unknown'`) |
+| `NetworkNotFoundError` | `create(network=...)` names a network that does not exist, checked before anything is built or the name is registered (earlier versions let the API client's `ResourceNotFoundException` escape) |
+| `ClusterNotFoundError` | the named cluster does not exist -- see method docstrings for which. Reason `listed_without_state` means the name is in the namespace's cluster list with no recorded state; every verb but `delete()` raises it, and its message names `delete` as the way to free the name |
 | `ClusterIncompleteError` | `get_kubeconfig()` is called on a cluster that exists but has not finished `create()` |
 | `WorkerNotFoundError` | `remove_worker()` is given a uuid that is not one of the cluster's workers |
 | `WorkerUnnamedError` | `remove_worker()` finds a worker whose instance record has no name, so the k3s node it became cannot be identified |
@@ -366,22 +366,26 @@ verb refused to run (`verb`); both of its messages name `sf-client k3s
 delete <name>` as the way out, because what is built is detection and
 teardown rather than a way to resume a half built cluster -- see
 decision 5 of
-`docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md`. One
-gap that decision does not close: a `create()` interrupted between
-claiming its name and writing that cluster's own metadata document
-leaves a name `delete()` reports as not found at all, with no supported
-way to free it from this library --
-[shakenfist/client-python-k3s#72](https://github.com/shakenfist/client-python-k3s/issues/72).
+`docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md`. A
+`create()` writes its metadata document, in state `initial`, before it
+adds the name to the cluster list, so every way it can stop leaves a
+document that `delete()` cleans up. Names that earlier versions left
+listed with no document at all are the other case: `create()` raises
+`ClusterInterruptedError` for one with `state` `'unknown'` (no state
+was recorded, and the message says so rather than quoting the word),
+and every other verb except `delete()` raises `ClusterNotFoundError`
+with reason `listed_without_state`, whose message names `delete`.
+`delete()` frees such a name, and deletes an orphaned `k3s-<name>-node`
+network found by name in the namespace -- or reports it, if the server
+cannot look networks up by name in a namespace.
 `health()` deliberately does not raise `ClusterInterruptedError`:
 reporting on an interrupted cluster, rather than refusing to look at
 it, is what that verb is for.
 
-`delete()` has the same two writes as `create()` in the other order --
-it releases the name from the cluster list before it removes the
-cluster's metadata document -- so an interrupted `delete()` leaves a
-document whose name is already free, and calling `delete()` again
-finishes the job. That is why #72 is a create-side gap rather than a
-gap on both sides.
+`delete()` writes in the other order from `create()` -- it releases the
+name from the cluster list before it removes the cluster's metadata
+document -- so an interrupted `delete()` leaves a document whose name
+is already free, and calling `delete()` again finishes the job.
 
 `AgentOperationError` carries the operation `state` which brought it
 about, and renders it only when it is not `error`. Shaken Fist gives
