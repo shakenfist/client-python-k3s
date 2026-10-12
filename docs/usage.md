@@ -598,8 +598,14 @@ something is wrong: the probes run on every node at once, so a
 healthy cluster waits for about as long as its slowest probe takes,
 whatever its size. The budget bounds the waiting only: on top of it
 come one Shaken Fist API round trip per node to read its instance, one
-per probe to submit it, and the reads of each probe, so on a slow Shaken
-Fist API the command can take longer than thirty seconds.
+per probe to submit it, the reads of each probe, and one more for each
+probe whose output was too long for Shaken Fist to return inline, so on
+a slow Shaken Fist API the command can take longer than thirty seconds.
+Output that long is read up to 1 MiB, which holds the 5000 nodes
+Kubernetes supports with room to spare; a probe that printed more, or
+whose output could not be read, did not answer and says why
+([Output too long to return inline](library-api.md#output-too-long-to-return-inline)
+has the details).
 
 An abandoned run leaves operations queued: up to one per probed node,
 plus the two `kubectl` reads against the control plane node. The

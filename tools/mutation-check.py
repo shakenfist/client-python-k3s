@@ -500,11 +500,111 @@ MUTATIONS = [
         'stestr',
     ),
     (
-        'a probe whose output Shaken Fist stored as a blob has not answered',
+        'a probe whose output did not come back has not answered',
         PKG + '/cluster.py',
         "        elif probe['stdout'] is None:\n",
         '        elif False:\n',
         PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'a probe whose output Shaken Fist stored as a blob is read from it',
+        PKG + '/cluster.py',
+        '        return self._read_probe_blob(blob_uuid)\n',
+        '        return None, None\n',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        # The round trip is outside the shared probe budget, so it is made
+        # only for a result which names a blob. Without the test, the read
+        # of no blob at all becomes a ResourceNotFoundException reported
+        # as the probe's error.
+        'a blob is read only when the result names one',
+        PKG + '/cluster.py',
+        '        if stdout is not None or not blob_uuid:\n',
+        '        if stdout is not None:\n',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'a blob over the read limit is not parsed',
+        PKG + '/cluster.py',
+        '        if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:\n'
+        '            return None, (\n',
+        '        if False:\n'
+        '            return None, (\n',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'the read limit is the most read, not the first size refused',
+        PKG + '/cluster.py',
+        '        if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:\n'
+        '            return None, (\n',
+        '        if len(data) >= HEALTH_PROBE_OUTPUT_LIMIT_BYTES:\n'
+        '            return None, (\n',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'a blob read stops at the limit rather than reading the whole blob',
+        PKG + '/cluster.py',
+        '                data.extend(chunk)\n'
+        '                if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:\n'
+        '                    break\n',
+        '                data.extend(chunk)\n',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'a blob which cannot be read is a probe which did not answer, not a traceback',
+        PKG + '/cluster.py',
+        '        except (apiclient.APIException, requests.exceptions.RequestException) as e:\n'
+        '            return None, (\n'
+        "                'printed more than the 10 KiB Shaken Fist returns inline, and '\n",
+        '        except ZeroDivisionError as e:\n'
+        '            return None, (\n'
+        "                'printed more than the 10 KiB Shaken Fist returns inline, and '\n",
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'a connection lost part way through a blob read is a probe which did not answer',
+        PKG + '/cluster.py',
+        '        except (apiclient.APIException, requests.exceptions.RequestException) as e:\n',
+        '        except apiclient.APIException as e:\n',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'a blob which is not UTF-8 is a probe which did not answer, not a traceback',
+        PKG + '/cluster.py',
+        '        except UnicodeDecodeError:\n'
+        '            return None, (\n'
+        "                'printed output which is not valid UTF-8",
+        '        except ZeroDivisionError:\n'
+        '            return None, (\n'
+        "                'printed output which is not valid UTF-8",
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'output stored as a blob is read whatever the exit code',
+        PKG + '/cluster.py',
+        "        probe['stdout'], unread = self._probe_stdout(result)\n",
+        "        probe['stdout'], unread = (self._probe_stdout(result) if probe['return_code'] == 0\n"
+        '                                   else (None, None))\n',
+        PKG + '.tests.test_cluster.HealthSignalsTestCase',
+        'stestr',
+    ),
+    (
+        'a failed probe whose output could not be read says so',
+        PKG + '/cluster.py',
+        '            if unread:\n'
+        "                probe['error'] += ' and ' + unread\n",
+        '',
+        PKG + '.tests.test_cluster.HealthTestCase',
         'stestr',
     ),
     (

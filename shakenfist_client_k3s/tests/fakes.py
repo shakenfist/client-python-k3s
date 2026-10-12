@@ -543,8 +543,19 @@ class HealthClient(FakeClusterClient):
         self.agent_operation_reads_by_uuid = {}
         self.max_agent_operation_reads = 60
 
-        # The blobs a stream too long to return inline was stored as.
+        # The blobs a stream too long to return inline was stored as, by
+        # uuid, as the bytes the server would serve; blob_raises, when set,
+        # is what reading any blob raises instead; blob_stream_raises, when
+        # set, is raised after the first chunk, as a connection which drops
+        # part way through a streamed read would be; and blob_bytes_served
+        # counts what get_blob_data() handed out, so a test can see that a
+        # capped read stopped early rather than reading the whole blob and
+        # then refusing it. Reads are recorded in calls as ('blob', uuid).
         self.blob_serial = 0
+        self.blobs = {}
+        self.blob_raises = None
+        self.blob_stream_raises = None
+        self.blob_bytes_served = 0
 
     def set_namespace_metadata_item(self, namespace, key, value):
         self.metadata_writes.append(key)
@@ -600,15 +611,39 @@ class HealthClient(FakeClusterClient):
         stdout_blob or stderr_blob and has no stdout or stderr key at all.
         A test which wants a probe whose output did not come back inline
         sets that output longer than the limit, as a real cluster would.
+        The server stores the stream as UTF-8, which is what get_blob_data()
+        then serves; a test which wants a blob that is not UTF-8 gives the
+        output as bytes, which are stored as they are.
         """
         result = {'return-code': return_code}
         for stream, text in (('stdout', stdout), ('stderr', stderr)):
             if text is not None and len(text) > SIDECHANNEL_INLINE_LIMIT:
                 self.blob_serial += 1
-                result['%s_blob' % stream] = 'blob-%03d' % self.blob_serial
+                blob_uuid = 'blob-%03d' % self.blob_serial
+                self.blobs[blob_uuid] = (
+                    text if isinstance(text, bytes) else text.encode('utf-8'))
+                result['%s_blob' % stream] = blob_uuid
             else:
                 result[stream] = text
         return result
+
+    def get_blob_data(self, blob_uuid):
+        # In chunks of the size the real client streams in, so that a read
+        # which stops early is seen to.
+        self.calls.append(('blob', blob_uuid))
+        if self.blob_raises:
+            raise self.blob_raises
+        if blob_uuid not in self.blobs:
+            raise apiclient.ResourceNotFoundException(
+                'blob not found', 'GET', '/blobs/%s/data' % blob_uuid, 404,
+                'blob not found')
+        data = self.blobs[blob_uuid]
+        for offset in range(0, len(data), 8192):
+            chunk = data[offset:offset + 8192]
+            self.blob_bytes_served += len(chunk)
+            yield chunk
+            if self.blob_stream_raises:
+                raise self.blob_stream_raises
 
     def get_agent_operation(self, operation_uuid):
         # A probe which is still pending stays pending: this is the node
