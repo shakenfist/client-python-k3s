@@ -148,11 +148,12 @@ def _cache_time_is_usable(updated):
     time.gmtime() in the stale copy's warning -- the path which exists to
     avoid a failure. One far in the future would never expire, pinning the
     cache to whatever it holds. A lifetime of slack allows for the clock of
-    whichever client wrote it.
+    whichever client wrote it. Zero, or no time at all (None), is not a
+    fetch this package recorded: as a stale copy it would be dated 1970.
     """
     return (isinstance(updated, (int, float)) and not isinstance(updated, bool)
             and math.isfinite(updated)
-            and 0 <= updated <= time.time() + RELEASE_CACHE_LIFETIME)
+            and 0 < updated <= time.time() + RELEASE_CACHE_LIFETIME)
 
 
 def _upstream_unavailable(error):
@@ -245,7 +246,7 @@ def get_k3s_release(client, namespace, reporter, force_cache_update=False,
         releases = version_cache.get('releases') if isinstance(version_cache, dict) else None
         if (not isinstance(releases, dict)
                 or not all(isinstance(r, str) and r for r in releases.values())
-                or not _cache_time_is_usable(version_cache.get('updated', 0))):
+                or not _cache_time_is_usable(version_cache.get('updated'))):
             reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
@@ -510,7 +511,7 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False,
         # is checked here, for the reason get_k3s_release() gives.
         if (not isinstance(version_cache, dict)
                 or not isinstance(version_cache.get('charts'), dict)
-                or not _cache_time_is_usable(version_cache.get('updated', 0))):
+                or not _cache_time_is_usable(version_cache.get('updated'))):
             reporter.debug('Version cache format invalid, clobbering')
             version_cache = {'updated': 0}
 
@@ -529,13 +530,19 @@ def get_longhorn_release(client, namespace, reporter, force_cache_update=False,
             # which has none would turn "upstream is down" into "no
             # compatible chart" and send the operator to the wrong option.
             # A forced refresh never read a copy, so has none to offer.
+            # The fetch error is raised outside the selection's handler, so
+            # that it keeps its own context (the requests exception behind
+            # request_failed) as the k3s path's bare raise does.
             if not (_upstream_unavailable(e) and version_cache.get('charts')):
                 raise
+            selected = None
             try:
                 selected = _select_longhorn_chart(
                     version_cache['charts'], k3s_version, reporter)
             except exceptions.ReleaseLookupError:
-                raise e from None
+                pass
+            if selected is None:
+                raise
             _warn_stale_copy('Longhorn', LONGHORN_CHART_INDEX_URL, updated, e,
                              reporter)
             reporter.debug(f'Selected Longhorn version: {selected}')

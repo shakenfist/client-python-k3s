@@ -859,11 +859,14 @@ class StaleCopyTestCase(testtools.TestCase):
         # The Longhorn values are the ones _select_longhorn_chart() rejects:
         # no final version, or no constraint it can read.
         tampered = []
-        for updated in [-1e20, -1, float('nan'), float('inf'), 'yesterday',
+        for updated in [-1e20, -1, 0, float('nan'), float('inf'), 'yesterday',
                         True, None]:
             tampered.append(('updated %r' % (updated,),
                              dict(STALE_K3S, updated=updated),
                              dict(STALE_LONGHORN, updated=updated)))
+        tampered.append(('no updated',
+                         {k: v for k, v in STALE_K3S.items() if k != 'updated'},
+                         {k: v for k, v in STALE_LONGHORN.items() if k != 'updated'}))
         for value, charts in [(7, {'banana': ''}), ('', {'1.5.1-rc1': ''}),
                               (None, {'1.5.1': 7}), (['v1.32.1+k3s1'], {'1.5.1': None})]:
             tampered.append(('release %r, charts %r' % (value, charts),
@@ -944,6 +947,10 @@ class StaleCopyTestCase(testtools.TestCase):
 
         self.assertEqual('request_failed', e.reason)
         self.assertEqual('Longhorn', e.product)
+        # Raised as the k3s path raises it, with the requests exception
+        # behind it still showing in the traceback.
+        self.assertIsInstance(e.__context__, requests.ConnectionError)
+        self.assertFalse(e.__suppress_context__)
         self.assertEqual('', self.reporter.getvalue())
         self._assert_untouched()
 
