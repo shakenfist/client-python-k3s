@@ -1997,6 +1997,68 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
         self.cluster.delete()
 
         self.assertEqual('', self.reporter.getvalue())
+
+    def _node_network(self, uuid, state='created'):
+        self.client.named_networks.setdefault('k3s-banana-node', []).append(
+            {'uuid': uuid, 'name': 'k3s-banana-node', 'namespace': 'testns',
+             'state': state})
+
+    def _stop_before_removing_the_document(self):
+        original = self.client.delete_namespace_metadata_item
+
+        def stopping(namespace, key):
+            if key == MD_KEY:
+                raise RuntimeError('interrupted')
+            original(namespace, key)
+
+        self.client.delete_namespace_metadata_item = stopping
+
+    def test_a_delete_stopped_after_the_network_went_finishes_when_run_again(self):
+        # The last two writes are the name and then the document, so a delete
+        # can stop with the network destroyed, the document saying 'deleted'
+        # with no network uuid, and the name already free. The retry takes
+        # the path for a network create() never recorded, and the lookup by
+        # name has to miss rather than find the network the first run
+        # destroyed: the server's lookup by name passes over a deleted
+        # network. An earlier cluster of the same name left another one, so
+        # a lookup which counted deleted networks would also find the name
+        # ambiguous.
+        md = _interrupted_md(state='created')
+        md['node_network_created'] = True
+        self._seed(md)
+        self._node_network('net-0', state='deleted')
+        self._node_network('net-1')
+        self._stop_before_removing_the_document()
+
+        self.assertRaises(RuntimeError, self.cluster.delete)
+        left = self.client.metadata[MD_KEY]
+        self.assertEqual('deleted', left['state'])
+        self.assertIsNone(left['node_network'])
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+        self.assertEqual(['net-1'], self.client.deleted_networks)
+
+        del self.client.delete_namespace_metadata_item
+        reporter = progress.CollectingReporter()
+        Cluster(self.client, 'banana', 'testns', reporter=reporter).delete()
+
+        self.assertEqual(['net-1'], self.client.deleted_networks)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+        self.assertNotIn('Could not look up', reporter.getvalue())
+
+    def test_a_delete_stopped_after_the_network_went_and_still_listed_finishes(self):
+        # As above, for a stop between the 'deleted' write and the unlisting:
+        # the same document, with the name still held.
+        md = _interrupted_md(state='deleted')
+        md['node_network'] = None
+        md['node_network_created'] = True
+        self._seed(md)
+        self._node_network('net-1', state='deleted')
+
+        self.cluster.delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
         self.assertNotIn(MD_KEY, self.client.metadata)
 
 

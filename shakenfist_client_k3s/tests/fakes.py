@@ -43,6 +43,13 @@ def not_found(instance_uuid):
         'instance not found')
 
 
+# The states in which the server's lookup of a network by name finds it:
+# baseobject.DatabaseBackedObject.ACTIVE_STATES, which
+# network.Network.from_db_by_ref() filters a name lookup to. deleting and
+# deleted are not among them.
+NETWORK_ACTIVE_STATES = ('initial', 'creating', 'created', 'error', 'delete_wait')
+
+
 def network_not_found(network_ref):
     """Build the exception the API client raises for a network it does not have.
 
@@ -251,7 +258,10 @@ class FakeClusterClient:
         # the server refuses a name which matches several, and a test of
         # that refusal needs to be able to say so. A network allocated
         # through this client is added, as the server would find it; anything
-        # else is there only if a test has put it there.
+        # else is there only if a test has put it there. A deleted network
+        # stays, in state deleted, and the lookup passes over it, because the
+        # server's lookup by name considers only networks in an active state
+        # (network.Network.from_db_by_ref()); a uuid lookup still shows one.
         self.named_networks = {}
 
         # The capabilities the fake server advertises, which the real
@@ -299,7 +309,8 @@ class FakeClusterClient:
                 'The API server version you are talking to does not support '
                 'lookup of networks with a specific namespace.')
         if namespace:
-            matches = self.named_networks.get(network_ref, [])
+            matches = [n for n in self.named_networks.get(network_ref, [])
+                       if n['state'] in NETWORK_ACTIVE_STATES]
             if not matches:
                 raise network_not_found(network_ref)
             if len(matches) > 1:
@@ -312,9 +323,10 @@ class FakeClusterClient:
 
     def delete_network(self, network_ref, namespace=None, wait=True):
         self.deleted_networks.append(network_ref)
-        for name, matches in list(self.named_networks.items()):
-            self.named_networks[name] = [
-                n for n in matches if n['uuid'] != network_ref]
+        for matches in self.named_networks.values():
+            for n in matches:
+                if n['uuid'] == network_ref:
+                    n['state'] = 'deleted'
 
     def create_instance(self, name, cpus, memory, networks, disks, sshkey,
                         userdata, side_channels=None, namespace=None):

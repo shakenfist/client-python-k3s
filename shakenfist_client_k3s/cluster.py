@@ -4944,7 +4944,11 @@ class Cluster:
             # write straight after allocate_network() returns, so one which
             # stopped in that round trip left a network of its own that only
             # its name records. A delete which has already destroyed the
-            # network reaches here too, and the lookup misses.
+            # network reaches here too, and the lookup misses: the server
+            # looks a name up only among networks in an active state
+            # (network.Network.from_db_by_ref()), so a deleted network, or
+            # several from earlier clusters of this name, is not found. Only
+            # a lookup by uuid still shows one.
             self._delete_unrecorded_node_network(
                 self.client.get_namespace_metadata(self.namespace))
 
@@ -5074,7 +5078,8 @@ class Cluster:
         holds a miss it would be deleting a document the API never had. A
         stuck create can have left a node network; a stuck delete cannot,
         because delete() has always destroyed the network before the
-        document, and for that the lookup simply misses.
+        document, and for that the lookup simply misses: the server does
+        not find a deleted network by name.
 
         namespace_md is the read delete() decided to come here from.
         """

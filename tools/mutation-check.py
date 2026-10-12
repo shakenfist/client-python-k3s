@@ -1418,6 +1418,15 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'a delete forgets the network it destroyed, so a retry does not destroy it again',
+        PKG + '/cluster.py',
+        "            md['node_network'] = None\n",
+        '            pass\n',
+        PKG + '.tests.test_cluster.DeleteInterruptedClusterTestCase'
+        '.test_a_delete_stopped_after_the_network_went_finishes_when_run_again',
+        'stestr',
+    ),
+    (
         'an orphan network another cluster records is never deleted',
         PKG + '/cluster.py',
         "            recorded_by = _network_recorded_by(namespace_md, network['uuid'])\n",

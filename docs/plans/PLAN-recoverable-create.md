@@ -762,7 +762,8 @@ chosen to defer to here, so that we do not forget them.
   `namespace=`. The new orphan path passes it, so the server refuses a
   uuid outside the namespace. Passing it on the main path too would
   harden against a tampered `node_network`, but first check that every
-  older cluster's network was allocated in the cluster's own namespace.
+  older cluster's network was allocated in the cluster's own namespace
+  (#145).
 * With a malformed cluster list, `delete()`'s main path tears down the
   instances and network before `_unlist()` refuses the list. The
   document is left in state `deleted` and recovers once the list is

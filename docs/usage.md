@@ -351,8 +351,9 @@ networks up by name in a namespace it says so and tells you to find the
 network with `sf-client network list` and remove it yourself.
 `delete NAME` on a cluster which does have recorded state also finds and
 removes a network a `create` allocated but stopped before recording, so
-a `create` stopped at any point is cleaned up by one `delete`. `create` refuses such
-a name as an interrupted cluster of unknown state, and `show`, `health`,
+a `create` stopped at any point is cleaned up by one `delete`. `create`
+refuses such a name as an interrupted cluster of unknown state, and
+`show`, `health`,
 `get-kubeconfig`, `expand-workers`, `remove-worker`, `expand-addresses`
 and `update-os` report that the name is listed without any recorded
 state and tell you to run `delete NAME`.
