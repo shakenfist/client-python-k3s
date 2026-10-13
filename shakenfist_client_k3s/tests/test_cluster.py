@@ -3028,9 +3028,9 @@ class HealthTestCase(testtools.TestCase):
         row = 'k3s-banana-node-%06d   Ready    <none>\n'
         self.client.probe_stdout = 'NAME                  STATUS   ROLES\n' + ''.join(
             row % serial for serial in range(
-                cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES // len(row % 0) + 1))
+                cluster_module.COMMAND_OUTPUT_LIMIT_BYTES // len(row % 0) + 1))
         self.assertGreater(len(self.client.probe_stdout),
-                           cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES)
+                           cluster_module.COMMAND_OUTPUT_LIMIT_BYTES)
 
         report = self.cluster.health()
 
@@ -4894,6 +4894,142 @@ class SecretRedactionTestCase(testtools.TestCase):
 
         self.assertNotIn(self.TOKEN,
                          progress.describe_agent_op(aop, max_len=None))
+
+
+class ReapExecuteBlobOutputTestCase(testtools.TestCase):
+    """A failed command's output too long to return inline (#136).
+
+    Shaken Fist returns each stream inline only up to 10 KiB and stores a
+    longer one as a blob, leaving no stdout or stderr key in the result.
+    reap_execute() subscripted both, so a failing install which printed
+    more raised KeyError rather than CommandFailedError, losing the
+    exception type callers handle and the output that explains the
+    failure. The results here are built by HealthClient's _execute_result(),
+    which splits streams out to blobs as the server does, and its blobs are
+    served through the MagicMock client the cluster talks to.
+    """
+
+    def setUp(self):
+        super(ReapExecuteBlobOutputTestCase, self).setUp()
+        self.blobs = fakes.HealthClient()
+        self.client = mock.MagicMock()
+        self.client.get_instance.return_value = {'name': 'k3s-banana-node-002'}
+        self.client.get_blob_data.side_effect = self.blobs.get_blob_data
+        self.cluster = _make_cluster(self.client)
+
+    def _failed_op(self, stdout, stderr, return_code=1):
+        return {
+            'uuid': 'aop-100',
+            'instance_uuid': 'inst-w1',
+            'state': 'complete',
+            'commands': [{'command': 'execute', 'commandline': 'apt-get install k3s'}],
+            'results': {'0': self.blobs._execute_result(return_code, stdout, stderr)},
+        }
+
+    def _long(self, line, minimum=fakes.SIDECHANNEL_INLINE_LIMIT + 1):
+        return line * (minimum // len(line) + 1)
+
+    def _reap(self, aop):
+        return self.assertRaises(exceptions.CommandFailedError,
+                                 self.cluster.reap_execute, aop)
+
+    def test_both_streams_are_read_from_their_blobs(self):
+        stdout = self._long('Get:1 http://deb.debian.org trixie InRelease\n')
+        stderr = self._long('E: Unable to fetch some archives\n')
+        aop = self._failed_op(stdout, stderr)
+        self.assertEqual({'return-code', 'stdout_blob', 'stderr_blob'},
+                         set(aop['results']['0']))
+
+        e = self._reap(aop)
+
+        self.assertEqual(stdout, e.stdout)
+        self.assertEqual(stderr, e.stderr)
+        self.assertEqual(1, e.return_code)
+        self.assertIn('E: Unable to fetch some archives', str(e))
+
+    def test_one_stream_inline_and_one_from_a_blob(self):
+        stderr = self._long('E: Unable to fetch some archives\n')
+
+        e = self._reap(self._failed_op('short\n', stderr))
+
+        self.assertEqual('short\n', e.stdout)
+        self.assertEqual(stderr, e.stderr)
+        self.assertEqual(1, self.client.get_blob_data.call_count)
+
+    def test_output_read_from_a_blob_is_redacted(self):
+        # The installer can echo its own command line, token and all, and
+        # output read from a blob reaches the same exception as inline.
+        token = 'K10SECRETNODETOKEN::server:ffffffff'
+        stdout = self._long('+ K3S_TOKEN=%s sh install.sh\n' % token)
+
+        e = self._reap(self._failed_op(stdout, ''))
+
+        self.assertNotIn(token, e.stdout)
+        self.assertNotIn(token, str(e))
+        self.assertIn('K3S_TOKEN=%s' % progress.REDACTED, e.stdout)
+
+    def test_a_stream_with_neither_output_nor_a_blob_is_empty(self):
+        # Not a KeyError either: __str__ splits both streams, so each must
+        # be a string whatever the result recorded.
+        aop = self._failed_op('', '')
+        aop['results']['0'] = {'return-code': 1}
+
+        e = self._reap(aop)
+
+        self.assertEqual('', e.stdout)
+        self.assertEqual('', e.stderr)
+        self.assertIn('exit code: 1', str(e))
+        self.client.get_blob_data.assert_not_called()
+
+    def test_a_successful_command_reads_no_blob(self):
+        # Output is only wanted to explain a failure.
+        self.cluster.reap_execute(
+            self._failed_op(self._long('ok\n'), '', return_code=0))
+
+        self.client.get_blob_data.assert_not_called()
+
+    def test_output_over_the_read_limit_is_a_note(self):
+        limit = cluster_module.COMMAND_OUTPUT_LIMIT_BYTES
+        stdout = self._long('x' * 1023 + '\n', minimum=3 * limit)
+
+        e = self._reap(self._failed_op(stdout, 'E: it broke\n'))
+
+        self.assertEqual(
+            '(stdout not shown: the command printed more than the 1 MiB '
+            'this version of the k3s plugin reads, so its output, which '
+            'Shaken Fist stored as blob blob-001, was not read)', e.stdout)
+        self.assertEqual('E: it broke\n', e.stderr)
+        self.assertLessEqual(self.blobs.blob_bytes_served, limit + 8192)
+
+    def test_a_blob_which_cannot_be_read_is_a_note(self):
+        self.blobs.blob_raises = apiclient.ResourceNotFoundException(
+            'blob not found', 'GET', '/blobs/blob-001/data', 404, 'blob not found')
+
+        e = self._reap(self._failed_op(self._long('y\n'), 'E: it broke\n'))
+
+        self.assertTrue(e.stdout.startswith(
+            '(stdout not shown: the command printed more than the 10 KiB '
+            'Shaken Fist returns inline, and its output could not be read '
+            'from blob blob-001, where it was stored: '), e.stdout)
+        self.assertEqual('E: it broke\n', e.stderr)
+
+    def test_a_connection_lost_part_way_through_a_blob_is_a_note(self):
+        self.blobs.blob_stream_raises = requests.exceptions.ChunkedEncodingError(
+            'Connection broken')
+
+        e = self._reap(self._failed_op('', self._long('z' * 9000 + '\n')))
+
+        self.assertIn('(stderr not shown: ', e.stderr)
+        self.assertIn('blob-001', e.stderr)
+
+    def test_a_blob_which_is_not_utf8_is_a_note(self):
+        stdout = self._long(b'\xff\xfe not text\n')
+
+        e = self._reap(self._failed_op(stdout, ''))
+
+        self.assertEqual(
+            '(stdout not shown: the command printed output which is not '
+            'valid UTF-8, stored as blob blob-001, so it was not read)', e.stdout)
 
 
 class HeredocDelimiterTestCase(testtools.TestCase):
@@ -8291,7 +8427,7 @@ class HealthKubernetesTestCase(testtools.TestCase):
         # The cap is the most that is read, not the first size refused.
         # The padding is a line the parser does not believe, as it would
         # any garbage, so the readings are the default output's.
-        limit = cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES
+        limit = cluster_module.COMMAND_OUTPUT_LIMIT_BYTES
         output = fakes.KUBERNETES_PROBE_OUTPUT + self._oom_lines(5000)
         self.assertLess(len(output), limit)
         self.client.kubernetes_stdout = output + 'x' * (limit - len(output) - 1) + '\n'
@@ -8308,7 +8444,7 @@ class HealthKubernetesTestCase(testtools.TestCase):
         # as fewer kills, and read as empty as no kills and no nodes. The
         # read stops at the cap rather than taking the whole blob and then
         # refusing it, because the blob's size is the node's choice.
-        limit = cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES
+        limit = cluster_module.COMMAND_OUTPUT_LIMIT_BYTES
         self.client.kubernetes_stdout = fakes.KUBERNETES_PROBE_OUTPUT + self._oom_lines(
             3 * limit // len(self._oom_lines(1)))
         self.assertGreater(len(self.client.kubernetes_stdout), 3 * limit - 100)
@@ -8384,6 +8520,35 @@ class HealthKubernetesTestCase(testtools.TestCase):
             'the Kubernetes probe printed output which is not valid UTF-8, '
             'stored as blob blob-001, so it was not read',
             report['kubernetes']['error'])
+
+    def test_api_probe_stderr_too_long_to_return_inline_is_read_from_its_blob(self):
+        # stderr is the explanation when the k3s API does not answer, and is
+        # stored as a blob past 10 KiB just as stdout is. It used to come
+        # back as nothing at all.
+        self.client.probe_return_code = 1
+        self.client.probe_stderr = 'The connection to the server was refused\n' * 300
+        self.assertGreater(len(self.client.probe_stderr),
+                           fakes.SIDECHANNEL_INLINE_LIMIT)
+
+        report = self.cluster.health()
+
+        self.assertFalse(report['api']['answered'])
+        self.assertEqual(self.client.probe_stderr, report['api']['stderr'])
+        self.assertIn(('blob', 'blob-001'), self._blob_reads())
+
+    def test_api_probe_stderr_which_cannot_be_read_says_so(self):
+        # Not shown as empty, which would read as a probe that said nothing.
+        self.client.probe_return_code = 1
+        self.client.probe_stderr = 'The connection to the server was refused\n' * 300
+        self.client.blob_raises = apiclient.ResourceNotFoundException(
+            'blob not found', 'GET', '/blobs/blob-001/data', 404, 'blob not found')
+
+        report = self.cluster.health()
+
+        self.assertTrue(report['api']['stderr'].startswith(
+            '(stderr not shown: the command printed more than the 10 KiB '
+            'Shaken Fist returns inline, and its output could not be read '
+            'from blob blob-001'), report['api']['stderr'])
 
     def test_a_result_with_no_output_reads_nothing(self):
         # Exit 0 and neither stdout nor a blob: not something Shaken Fist

@@ -129,7 +129,7 @@ AGENT_OP_KNOWN_STATES = (AGENT_OP_PENDING_STATES + AGENT_OP_FAILED_STATES
 # only: the API round trips around it -- one per node to read its
 # instance, one per probe to submit it, the reads of each operation, and
 # the read of each blob a probe's output was too long to return inline in
-# (see HEALTH_PROBE_OUTPUT_LIMIT_BYTES) -- are serial and not bounded by
+# (see COMMAND_OUTPUT_LIMIT_BYTES) -- are serial and not bounded by
 # it, so on a slow Shaken Fist API the call as a whole can take longer.
 #
 # It is a ceiling rather than a cost. Probes are collected one after
@@ -146,14 +146,15 @@ AGENT_OP_KNOWN_STATES = (AGENT_OP_PENDING_STATES + AGENT_OP_FAILED_STATES
 # which has not answered in thirty is the answer rather than a slow one.
 HEALTH_PROBE_TIMEOUT_SECONDS = 30
 
-# The most of a probe's output health() will read from a blob. Shaken Fist
-# returns a command's stdout inline only up to 10 KiB, and stores anything
-# longer as a blob which the result names as stdout_blob instead;
-# _collect_probe() reads that blob, but only this much of it, because the
-# output comes from a node and a node may be compromised. The parsers are
-# linear, but the read is not free: it is memory held and time spent
-# outside the shared probe budget, in a verb which must not be made to
-# hang or swell by what it is reporting on.
+# The most of a command's output this plugin will read from a blob. Shaken
+# Fist returns a command's stdout and stderr inline only up to 10 KiB, and
+# stores a longer stream as a blob which the result names as stdout_blob or
+# stderr_blob instead; _read_output_blob() reads that blob, but only this
+# much of it, because the output comes from a node and a node may be
+# compromised. It was sized for health(), which most of what follows is
+# about: its parsers are linear, but the read is not free -- it is memory
+# held and time spent outside the shared probe budget, in a verb which
+# must not be made to hang or swell by what it is reporting on.
 #
 # Sized for the output it has to hold. The Kubernetes probe prints about 70
 # bytes per node, up to about 90 with this plugin's longest node names, and
@@ -164,6 +165,11 @@ HEALTH_PROBE_TIMEOUT_SECONDS = 30
 # containers whose names are all at their maximum, or several thousand
 # typical ones, where 10 KiB held two dozen of the first.
 #
+# reap_execute() reads a failed command's stdout and stderr under the same
+# cap when it raises CommandFailedError (#136), because that output also
+# comes from a node, and a megabyte is far more of a failed install's
+# output than anybody reads in an error.
+#
 # Output over it is not read at all: the probe has not answered, and its
 # error says why. Truncating it and parsing what is left would be the
 # wrong answer in a way that looks right -- a pod list cut short reads as
@@ -173,7 +179,7 @@ HEALTH_PROBE_TIMEOUT_SECONDS = 30
 # long, but it takes thousands of OOM-killed containers rather than two
 # dozen, and the report then says why the probe could not be read. The
 # error states the limit in whole MiB, so keep it a multiple of one.
-HEALTH_PROBE_OUTPUT_LIMIT_BYTES = 1024 * 1024
+COMMAND_OUTPUT_LIMIT_BYTES = 1024 * 1024
 
 # The command health() runs on the first control plane node to ask whether
 # the k3s API answers. --kubeconfig explicitly, matching remove_worker():
@@ -1148,7 +1154,7 @@ def _oom_container_template(spec_containers):
 # termination was an OOM kill, and nothing for any other container. That
 # is what keeps the output proportional to what it reports rather than to
 # the number of pods, which matters because health() reads only so much
-# of a probe's output (see HEALTH_PROBE_OUTPUT_LIMIT_BYTES), and output
+# of a probe's output (see COMMAND_OUTPUT_LIMIT_BYTES), and output
 # longer than Shaken Fist returns inline costs an extra API round trip to
 # read at all.
 # $pod keeps the pod in reach from inside the ranges over its containers,
@@ -2533,14 +2539,27 @@ class Cluster:
         if aop['state'] != 'complete':
             raise self._agent_op_error(aop)
 
-        if aop['results']['0']['return-code'] != 0:
+        result = aop['results']['0']
+        if result['return-code'] != 0:
             inst = self.client.get_instance(aop['instance_uuid'])
+
+            # A failing install is the command most likely to print more
+            # than the 10 KiB Shaken Fist returns inline, and the one whose
+            # output matters most, so a stream stored as a blob is read
+            # from it, under the cap health() uses. One which cannot be
+            # read is replaced by a note naming its blob, rather than the
+            # KeyError subscripting it used to raise (#136).
+            streams = []
+            for stream in ['stdout', 'stderr']:
+                output, unread = self._command_output(result, stream)
+                if unread:
+                    output = self._unread_note(stream, unread)
+                streams.append(output or '')
+
             raise exceptions.CommandFailedError(
                 inst['name'], aop['instance_uuid'],
                 aop['commands'][0]['commandline'],
-                aop['results']['0']['return-code'],
-                aop['results']['0']['stdout'],
-                aop['results']['0']['stderr'])
+                result['return-code'], *streams)
 
     def create_and_await_instances(self, count, node_type):
         """Create count nodes of node_type, wait for them, and return their UUIDs.
@@ -2639,35 +2658,46 @@ class Cluster:
         detail = getattr(e, 'message', None) or str(e) or 'no detail given'
         return '%s: %s' % (e.__class__.__name__, detail)
 
-    def _probe_stdout(self, result):
-        """Return a probe's stdout, from its result or from the blob it was stored as.
+    def _command_output(self, result, stream):
+        """Return one stream of a command's output, from its result or the blob it was stored as.
 
-        Shaken Fist returns a command's stdout inline only up to 10 KiB.
-        Anything longer is stored as a blob, and the result then carries
-        stdout_blob and no stdout at all. The blob is read only when the
-        result names one, because reading it is one more API round trip
-        which the shared probe budget does not bound: the probes which
-        answer inline, which on a healthy cluster of ordinary size is every
-        one of them, cost exactly what they did.
+        stream is 'stdout' or 'stderr'. Shaken Fist returns each inline only
+        up to 10 KiB. Anything longer is stored as a blob, and the result
+        then carries stdout_blob or stderr_blob and no stdout or stderr at
+        all (#128, #136). The blob is read only when the result names one,
+        because reading it is one more API round trip, which for health()
+        the shared probe budget does not bound: the commands which answer
+        inline, which on a healthy cluster of ordinary size is every one of
+        them, cost exactly what they did.
 
-        Returns a tuple ``(stdout, unread)``. ``stdout`` is the output, or
+        Returns a tuple ``(output, unread)``. ``output`` is the output, or
         None when there is none to give; ``unread`` is None, or when a blob
         was named and its output is not being given, a clause saying why,
-        which _collect_probe() puts after the command's name. A result with
-        neither stdout nor a blob is ``(None, None)``: nothing was there to
-        read, and what that means depends on the exit code, which is
-        _collect_probe()'s business.
+        which the caller puts after the command's name. A result with
+        neither output nor a blob is ``(None, None)``: nothing was there to
+        read, and what that means is the caller's business.
         """
-        stdout = result.get('stdout')
-        blob_uuid = result.get('stdout_blob')
-        if stdout is not None or not blob_uuid:
-            return stdout, None
-        return self._read_probe_blob(blob_uuid)
+        output = result.get(stream)
+        blob_uuid = result.get(stream + '_blob')
+        if output is not None or not blob_uuid:
+            return output, None
+        return self._read_output_blob(blob_uuid)
 
-    def _read_probe_blob(self, blob_uuid):
-        """Read a probe's output from the blob Shaken Fist stored it as, if it is short enough.
+    @staticmethod
+    def _unread_note(stream, unread):
+        """Say in place of a stream's output why it is not there.
 
-        The read is capped at HEALTH_PROBE_OUTPUT_LIMIT_BYTES, whose comment
+        For the callers which carry output as text rather than as data --
+        CommandFailedError's stdout and stderr, and the stderr health()
+        reports -- so that output which was not read is not shown as
+        output which was empty.
+        """
+        return '(%s not shown: the command %s)' % (stream, unread)
+
+    def _read_output_blob(self, blob_uuid):
+        """Read a command's output from the blob Shaken Fist stored it as, if it is short enough.
+
+        The read is capped at COMMAND_OUTPUT_LIMIT_BYTES, whose comment
         says what that was sized for and why output over it is reported
         rather than truncated. It stops as soon as it has read past the cap,
         so a blob of any size costs at most the cap and one chunk. The cap
@@ -2676,13 +2706,15 @@ class Cluster:
         blob-data-limit capability and raises IncapableException for it on
         one without.
 
-        Returns ``(stdout, unread)`` as _probe_stdout() does: the output and
+        Returns ``(output, unread)`` as _command_output() does: the output and
         None, or None and why it was not read. Nothing here raises for an
         output which cannot be read. An apiclient error -- the blob is gone,
-        or the API refuses the read -- is the probe not answering, an honest
-        unknown, the same as the API refusing to run the command. So is a
-        requests error: get_blob_data() streams, so a connection which drops
-        part way through a read of up to the cap surfaces as one (a
+        or the API refuses the read -- is an honest unknown, the same as the
+        API refusing to run the command: for a health probe it is the probe
+        not answering, and for a failed command reap_execute() puts a note in
+        the exception in place of the output. So is a requests error:
+        get_blob_data() streams, so a connection which drops part way
+        through a read of up to the cap surfaces as one (a
         ChunkedEncodingError, say) rather than as an apiclient error. An output
         which is not UTF-8 is not something Shaken Fist's sidechannel
         writes, which encodes the command's output as UTF-8 to store it, so
@@ -2692,7 +2724,7 @@ class Cluster:
         try:
             for chunk in self.client.get_blob_data(blob_uuid):
                 data.extend(chunk)
-                if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:
+                if len(data) > COMMAND_OUTPUT_LIMIT_BYTES:
                     break
         except (apiclient.APIException, requests.exceptions.RequestException) as e:
             return None, (
@@ -2700,11 +2732,11 @@ class Cluster:
                 'its output could not be read from blob %s, where it was '
                 'stored: %s' % (blob_uuid, self._describe_api_error(e)))
 
-        if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:
+        if len(data) > COMMAND_OUTPUT_LIMIT_BYTES:
             return None, (
                 'printed more than the %d MiB this version of the k3s plugin '
                 'reads, so its output, which Shaken Fist stored as blob %s, '
-                'was not read' % (HEALTH_PROBE_OUTPUT_LIMIT_BYTES // (1024 * 1024), blob_uuid))
+                'was not read' % (COMMAND_OUTPUT_LIMIT_BYTES // (1024 * 1024), blob_uuid))
 
         try:
             return data.decode('utf-8'), None
@@ -2779,8 +2811,8 @@ class Cluster:
         long, for the same reason.
 
         Output too long for Shaken Fist to return inline is read from the
-        blob it was stored as, up to HEALTH_PROBE_OUTPUT_LIMIT_BYTES; see
-        _probe_stdout(). The deadline bounds the waiting rather than the
+        blob it was stored as, up to COMMAND_OUTPUT_LIMIT_BYTES; see
+        _command_output(). The deadline bounds the waiting rather than the
         API calls, and that read is made after the wait, so it does not
         bound the read either.
 
@@ -2859,8 +2891,10 @@ class Cluster:
         # 10 KiB of output.
         label = name or "'%s'" % command
         probe['return_code'] = result.get('return-code')
-        probe['stdout'], unread = self._probe_stdout(result)
-        probe['stderr'] = result.get('stderr')
+        probe['stdout'], unread = self._command_output(result, 'stdout')
+        probe['stderr'], stderr_unread = self._command_output(result, 'stderr')
+        if stderr_unread:
+            probe['stderr'] = self._unread_note('stderr', stderr_unread)
         probe['answered'] = probe['return_code'] == 0
         if not probe['answered']:
             probe['error'] = '%s exited %s' % (label, probe['return_code'])

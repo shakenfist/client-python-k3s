@@ -1284,9 +1284,15 @@ class CommandFailedError(K3sClusterException):
 
     Raised by ``Cluster.reap_execute()`` from its return-code check, as
     distinct from its agent operation state check, which raises
-    ``AgentOperationError``. ``stdout`` and ``stderr`` are the strings
-    from the agent operation's results; ``__str__`` re-joins each
-    on its own prefixed line exactly as the original ``print()`` calls did.
+    ``AgentOperationError``. ``stdout`` and ``stderr`` are the command's
+    output: inline from the agent operation's results, or, for a stream
+    longer than the 10 KiB Shaken Fist returns inline, read from the blob
+    it was stored as, up to ``cluster.COMMAND_OUTPUT_LIMIT_BYTES``. A
+    stream which could not be read is instead a parenthesised note,
+    ``(stdout not shown: the command ...)``, naming the blob and why, so a
+    caller parsing either should expect that it may not be output at all.
+    A stream with neither is ``''``. ``__str__`` re-joins each on its own
+    prefixed line exactly as the original ``print()`` calls did.
 
     ``commandline``, ``stdout`` and ``stderr`` are redacted on the way in,
     for the reason ``AgentOperationError`` gives: this is the exception a
