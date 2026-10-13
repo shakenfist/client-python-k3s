@@ -143,12 +143,16 @@ class CommandExceptionTestCase(ClientTestCase):
         return result.exception
 
     def test_create_name_in_cluster_list(self):
+        # Listed with no metadata behind it: an earlier version's create
+        # stopped before writing any state (#72). An interrupted create,
+        # not a name in use, so the error names the delete which frees it.
         md = dict(_version_cache())
         md[CLUSTER_LIST] = ['banana']
         e = self._assert_raises(
             shakenfist_client_k3s.k3s_create, ['banana'],
-            exceptions.ClusterExistsError, md)
+            exceptions.ClusterInterruptedError, md)
         self.assertEqual('banana', e.name)
+        self.assertEqual('unknown', e.state)
 
     def test_create_name_has_metadata(self):
         md = dict(_version_cache())
@@ -159,7 +163,7 @@ class CommandExceptionTestCase(ClientTestCase):
         self.assertEqual('banana', e.name)
 
     def test_create_network_missing(self):
-        self.client.get_network.return_value = None
+        self.client.get_network.side_effect = fakes.network_not_found('nosuch')
         e = self._assert_raises(
             shakenfist_client_k3s.k3s_create, ['banana', '--network', 'nosuch'],
             exceptions.NetworkNotFoundError, dict(_version_cache()))
@@ -323,14 +327,31 @@ class GroupHandlerTestCase(ClientTestCase):
             ['update-os', 'banana'], 'Cluster not found!\n', {})
 
     def test_create_name_taken(self):
+        # A finished cluster holds the name. A listed name with nothing
+        # behind it used to render this too, and no longer does (below).
         md = dict(_version_cache())
         md[CLUSTER_LIST] = ['banana']
+        md[MD_KEY] = {'name': 'banana', 'state': 'created'}
         self._assert_cli_failure(
             ['create', 'banana'],
             'Sorry, that cluster name is already taken\n', md)
 
+    def test_create_name_listed_without_state(self):
+        md = dict(_version_cache())
+        md[CLUSTER_LIST] = ['banana']
+        self._assert_cli_failure(
+            ['create', 'banana'],
+            '%s\n' % exceptions.ClusterInterruptedError.mid_create('banana', 'unknown'),
+            md)
+
+    def test_show_name_listed_without_state(self):
+        self._assert_cli_failure(
+            ['show', 'banana'],
+            '%s\n' % exceptions.ClusterNotFoundError.listed_without_state('banana'),
+            {CLUSTER_LIST: ['banana']})
+
     def test_create_network_missing(self):
-        self.client.get_network.return_value = None
+        self.client.get_network.side_effect = fakes.network_not_found('nosuch')
         self._assert_cli_failure(
             ['create', 'banana', '--network', 'nosuch'],
             'Specified network does not exist\n', dict(_version_cache()))

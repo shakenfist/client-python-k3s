@@ -324,9 +324,9 @@ a correct caller never needs to catch it.
 | Exception | Raised when |
 |-----------|-------------|
 | `ClusterExistsError` | `create()` is called for a name already holding a finished cluster |
-| `ClusterInterruptedError` | `create()` is called for a name holding a cluster that never finished being built, or `expand_workers()`, `remove_worker()` or `expand_addresses()` is called against one |
-| `NetworkNotFoundError` | `create(network=...)` names a network that does not exist |
-| `ClusterNotFoundError` | the named cluster does not exist -- see method docstrings for which |
+| `ClusterInterruptedError` | `create()` is called for a name holding a cluster that never finished being built, or `expand_workers()`, `remove_worker()` or `expand_addresses()` is called against one; also `create()` for a name listed with no recorded state (`state` is `'unknown'`) |
+| `NetworkNotFoundError` | `create(network=...)` names a network that does not exist, checked before anything is built or the name is registered (earlier versions let the API client's `ResourceNotFoundException` escape). `reason` is `does_not_exist`, or `ambiguous` when a network name matches several networks; pass the uuid instead |
+| `ClusterNotFoundError` | the named cluster does not exist -- see method docstrings for which. Reason `listed_without_state` means the name is in the namespace's cluster list with no recorded state; every verb but `delete()` raises it, and its message names `delete` as the way to free the name |
 | `ClusterIncompleteError` | `get_kubeconfig()` is called on a cluster that exists but has not finished `create()` |
 | `WorkerNotFoundError` | `remove_worker()` is given a uuid that is not one of the cluster's workers |
 | `WorkerUnnamedError` | `remove_worker()` finds a worker whose instance record has no name, so the k3s node it became cannot be identified |
@@ -340,7 +340,7 @@ a correct caller never needs to catch it.
 | `K3sConfigError` | `create(server_config=..., agent_config=...)` is given a mapping that cannot be used -- not a mapping, a non-string key, a key containing `=`, a value that does not survive a JSON round trip, a key the plugin owns (or k3s's alias for one), or text that collides with the heredoc marker -- or `read_k3s_config()` cannot read or parse its file, before anything is built or the name is registered |
 | `UnsupportedReleaseError` | `create()` resolves a k3s release older than `v1.21.1+k3s1`, or one it cannot parse, right after the channel lookup and before anything is built or the name is registered |
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
-| `ClusterMetadataError` | a value read back out of the namespace metadata cannot be used -- `expand_addresses()` finds something in `routed_addresses` that is not an IP address, or the API hands back one that is not. Raised before any address is routed, because the addresses are charged for and the configuration they go into is written afterwards |
+| `ClusterMetadataError` | a value read back out of the namespace metadata cannot be used -- `expand_addresses()` finds something in `routed_addresses` that is not an IP address, or the API hands back one that is not. Raised before any address is routed, because the addresses are charged for and the configuration they go into is written afterwards. Reason `not_a_cluster_list`: the namespace's `orchestrated_k3s_clusters` value is not a list of names (`sf-client namespace set-metadata` stores a string), raised by `list_clusters()` and every verb that reads the list; repair it by writing the key back through the API as a JSON list of the namespace's cluster names, or remove it with `sf-client namespace delete-metadata`, which unlists every cluster without deleting any |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable, and no expired cached copy can stand in for it |
 | `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
 | `CommandFailedError` | an agent command completes with a non-zero return code, including the wait `create()` and `expand_workers()` make for a node that does not become `Ready` |
@@ -366,22 +366,31 @@ verb refused to run (`verb`); both of its messages name `sf-client k3s
 delete <name>` as the way out, because what is built is detection and
 teardown rather than a way to resume a half built cluster -- see
 decision 5 of
-`docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md`. One
-gap that decision does not close: a `create()` interrupted between
-claiming its name and writing that cluster's own metadata document
-leaves a name `delete()` reports as not found at all, with no supported
-way to free it from this library --
-[shakenfist/client-python-k3s#72](https://github.com/shakenfist/client-python-k3s/issues/72).
+`docs/plans/PLAN-library-api-and-collection-phase-03-missing-verbs.md`. A
+`create()` writes its metadata document, in state `initial`, before it
+adds the name to the cluster list, so every way it can stop leaves a
+document that `delete()` cleans up. Names that earlier versions left
+listed with no document at all are the other case: `create()` raises
+`ClusterInterruptedError` for one with `state` `'unknown'` (no state
+was recorded, and the message says so rather than quoting the word),
+and every other verb except `delete()` raises `ClusterNotFoundError`
+with reason `listed_without_state`, whose message names `delete`.
+`delete()` frees such a name, and deletes an orphaned `k3s-<name>-node`
+network found by name in the namespace -- unless another cluster's
+metadata records that network, in which case it is left and that cluster
+is named -- or reports it, if the server cannot look networks up by name
+in a namespace. On a cluster which does have state, `delete()` also
+finds and removes a network a `create()` allocated but stopped before
+recording (`node_network` empty, `node_network_created` set), which is
+what makes every way a `create()` can stop recoverable.
 `health()` deliberately does not raise `ClusterInterruptedError`:
 reporting on an interrupted cluster, rather than refusing to look at
 it, is what that verb is for.
 
-`delete()` has the same two writes as `create()` in the other order --
-it releases the name from the cluster list before it removes the
-cluster's metadata document -- so an interrupted `delete()` leaves a
-document whose name is already free, and calling `delete()` again
-finishes the job. That is why #72 is a create-side gap rather than a
-gap on both sides.
+`delete()` writes in the other order from `create()` -- it releases the
+name from the cluster list before it removes the cluster's metadata
+document -- so an interrupted `delete()` leaves a document whose name
+is already free, and calling `delete()` again finishes the job.
 
 `AgentOperationError` carries the operation `state` which brought it
 about, and renders it only when it is not `error`. Shaken Fist gives

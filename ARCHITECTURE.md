@@ -72,7 +72,14 @@ that; this section is only the shape.
   `Cluster` fetches its own document once and caches it for its
   lifetime, writing through to the API on every change, to keep the
   number of namespace reads the same regardless of how many methods
-  are called against one instance
+  are called against one instance. A cluster is two records there: its
+  document, and its name in the `orchestrated_k3s_clusters` list. No
+  write covers both, so the order does: `create()` writes the document
+  before it lists the name, `delete()` unlists the name before it
+  removes the document, and `create()` records the uuid of a network it
+  allocates in the next write. Whatever a stop between two writes leaves
+  is recovered by running `delete()`, the one recovery path, whose
+  docstring has the detail
 - **Instance orchestration**: helpers create instances from a
   `debian:12` base image, await boot and agent-idle state via the
   Shaken Fist agent, and run installation commands through agent

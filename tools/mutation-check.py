@@ -340,7 +340,7 @@ MUTATIONS = [
     (
         'every reasoned exception answers all of its fields',
         PKG + '/exceptions.py',
-        "    FIELDS = ('name', 'key', 'value')",
+        "    FIELDS = ('name', 'namespace', 'key', 'value')",
         '    FIELDS = ()',
         PKG + '.tests.test_exceptions.TotalAttributesTestCase',
         'stestr',
@@ -1327,6 +1327,186 @@ MUTATIONS = [
         '',
         PKG + '.tests.test_network_guard.TheModuleHarnessIsGuardedTestCase',
         'tox',
+    ),
+    (
+        'create() writes the cluster state before it lists the name',
+        PKG + '/cluster.py',
+        '        self.set_metadata(md)\n'
+        '\n'
+        '        all_clusters.append(self.name)\n'
+        '        self.client.set_namespace_metadata_item(\n'
+        '            self.namespace, primitives.CLUSTER_LIST, all_clusters)\n',
+        '        all_clusters.append(self.name)\n'
+        '        self.client.set_namespace_metadata_item(\n'
+        '            self.namespace, primitives.CLUSTER_LIST, all_clusters)\n'
+        '\n'
+        '        self.set_metadata(md)\n',
+        PKG + '.tests.test_cluster.CreateWritesItsStateBeforeItsNameTestCase'
+        '.test_the_metadata_is_written_before_the_name_is_listed',
+        'stestr',
+    ),
+    (
+        'a missing borrowed network is refused as a K3sClusterException',
+        PKG + '/cluster.py',
+        '                raise exceptions.NetworkNotFoundError(network) from e\n',
+        '                raise\n',
+        PKG + '.tests.test_library_api.NetworkAndSshKeyRefusalTestCase'
+        '.test_a_missing_network_is_a_k3s_cluster_exception',
+        'stestr',
+    ),
+    (
+        'delete() frees a listed name which has no metadata',
+        PKG + '/cluster.py',
+        '                if self.name not in primitives.cluster_list(namespace_md, self.namespace):\n'
+        '                    raise exceptions.ClusterNotFoundError.does_not_exist(self.name)\n',
+        '                if True:\n'
+        '                    raise exceptions.ClusterNotFoundError.does_not_exist(self.name)\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase',
+        'stestr',
+    ),
+    (
+        'a failed orphan network delete leaves the name listed',
+        PKG + '/cluster.py',
+        "        network_name = 'k3s-%s-node' % self.name\n"
+        '        network = None\n',
+        '        self._unlist()\n'
+        "        network_name = 'k3s-%s-node' % self.name\n"
+        '        network = None\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_failed_network_delete_leaves_the_name_listed',
+        'stestr',
+    ),
+    (
+        'the Ansible module frees a listed name without state on state: absent',
+        'collection/plugins/modules/sf_k3s_cluster.py',
+        '    if (cluster.get_metadata() is None\n'
+        '            and not _listed_without_state(cluster)):\n',
+        '    if cluster.get_metadata() is None:\n',
+        PKG + '.tests.test_ansible_module.ListedWithoutStateTestCase',
+        'tox',
+    ),
+    (
+        'the Ansible module refuses a listed name without state on state: present',
+        'collection/plugins/modules/sf_k3s_cluster.py',
+        '    if _listed_without_state(cluster):\n'
+        '        module.fail_json(\n'
+        '            changed=False,\n'
+        "            msg=('Cluster %s is in the cluster list",
+        '    if False:\n'
+        '        module.fail_json(\n'
+        '            changed=False,\n'
+        "            msg=('Cluster %s is in the cluster list",
+        PKG + '.tests.test_ansible_module.ListedWithoutStateTestCase',
+        'tox',
+    ),
+    (
+        'a cluster list which is a string is refused, not searched',
+        PKG + '/primitives.py',
+        '    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):\n',
+        '    if False:\n',
+        PKG + '.tests.test_cluster.ClusterListWhichIsNotAListTestCase',
+        'stestr',
+    ),
+    (
+        'delete() decides to free a name from a fresh read, not its cache',
+        PKG + '/cluster.py',
+        '            md = namespace_md.get(md_key)\n'
+        '            self._metadata[md_key] = md\n',
+        '            md = None\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_document_written_after_a_cached_miss_is_deleted_as_a_cluster',
+        'stestr',
+    ),
+    (
+        'a retried delete does not look for a network it already destroyed',
+        PKG + '/cluster.py',
+        "        elif md.get('node_network_created') and md.get('state') != 'deleted':\n",
+        "        elif md.get('node_network_created'):\n",
+        PKG + '.tests.test_cluster.DeleteInterruptedClusterTestCase'
+        '.test_a_retried_delete_does_not_warn_on_a_server_without_lookup_by_name',
+        'stestr',
+    ),
+    (
+        'the free path does not find deleted networks of its name',
+        PKG + '/tests/fakes.py',
+        "                       if n['state'] in NETWORK_ACTIVE_STATES]\n",
+        '                       ]\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_networks_earlier_clusters_of_this_name_left_deleted_are_not_found',
+        'stestr',
+    ),
+    (
+        'a delete forgets the network it destroyed, so a retry does not destroy it again',
+        PKG + '/cluster.py',
+        "            md['node_network'] = None\n",
+        '            pass\n',
+        PKG + '.tests.test_cluster.DeleteInterruptedClusterTestCase'
+        '.test_a_delete_stopped_after_the_network_went_finishes_when_run_again',
+        'stestr',
+    ),
+    (
+        'an orphan network another cluster records is never deleted',
+        PKG + '/cluster.py',
+        "            recorded_by = _network_recorded_by(namespace_md, network['uuid'])\n",
+        '            recorded_by = None\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_network_another_cluster_records_is_kept',
+        'stestr',
+    ),
+    (
+        'only a cluster document can keep an orphan network',
+        PKG + '/cluster.py',
+        '        if (key.startswith(prefix) and key not in primitives.RESERVED_METADATA_KEYS\n',
+        '        if (key.startswith(prefix)\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_other_clusters_and_the_version_caches_do_not_keep_the_orphan',
+        'stestr',
+    ),
+    (
+        'delete() recovers a network create allocated and never recorded',
+        PKG + '/cluster.py',
+        '            self._delete_unrecorded_node_network(\n'
+        '                self.client.get_namespace_metadata(self.namespace))\n',
+        '            pass\n',
+        PKG + '.tests.test_cluster.CreateWritesItsStateBeforeItsNameTestCase'
+        '.test_an_interruption_before_the_network_is_recorded_is_recoverable',
+        'stestr',
+    ),
+    (
+        'an orphan network is deleted within the namespace',
+        PKG + '/cluster.py',
+        "                self.client.delete_network(network['uuid'], namespace=self.namespace)\n",
+        "                self.client.delete_network(network['uuid'])\n",
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_the_network_is_deleted_within_the_namespace',
+        'stestr',
+    ),
+    (
+        'an orphan network is deleted only if the API answered with its name',
+        PKG + '/cluster.py',
+        "            elif (network.get('name') == network_name\n",
+        '            elif (True\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_network_the_api_answered_with_another_name_is_kept',
+        'stestr',
+    ),
+    (
+        'an orphan network is deleted only if the API answered from this namespace',
+        PKG + '/cluster.py',
+        "                    and network.get('namespace', self.namespace) == self.namespace):\n",
+        '                    and True):\n',
+        PKG + '.tests.test_cluster.DeleteFreesAListedNameWithoutStateTestCase'
+        '.test_a_network_the_api_answered_for_another_namespace_is_kept',
+        'stestr',
+    ),
+    (
+        'an ambiguous borrowed network is refused as a K3sClusterException',
+        PKG + '/cluster.py',
+        '                raise exceptions.NetworkNotFoundError.ambiguous(network) from e\n',
+        '                raise\n',
+        PKG + '.tests.test_library_api.NetworkAndSshKeyRefusalTestCase'
+        '.test_an_ambiguous_network_registers_nothing',
+        'stestr',
     ),
 ]
 

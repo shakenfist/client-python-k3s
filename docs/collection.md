@@ -318,6 +318,16 @@ There is no partial-resume path -- `docs/library-api.md`'s exception
 table documents the same restriction at the library level, as a
 deliberate choice rather than something this module works around.
 
+`state: absent` also frees a name that an earlier version of the
+library left in the namespace's cluster list with no state recorded
+behind it (a `create` or `delete` stopped between its two writes). The
+module counts such a name as present, so the task reports `changed:
+true` and `delete()` frees the name, along with an orphaned node
+network where it can find one. `state: present` against such a name
+fails, unchanged and even in check mode, and says to run `state:
+absent` first. A `create()` run by this version writes its state before
+it lists the name, so it cannot leave a name in that condition.
+
 ## Secrets never come back in the module's output
 
 The `health` return value never carries the cluster's raw namespace

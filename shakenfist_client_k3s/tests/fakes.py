@@ -43,6 +43,27 @@ def not_found(instance_uuid):
         'instance not found')
 
 
+# The states in which the server's lookup of a network by name finds it:
+# baseobject.DatabaseBackedObject.ACTIVE_STATES, which
+# network.Network.from_db_by_ref() filters a name lookup to. deleting and
+# deleted are not among them.
+NETWORK_ACTIVE_STATES = ('initial', 'creating', 'created', 'error', 'delete_wait')
+
+
+def network_not_found(network_ref):
+    """Build the exception the API client raises for a network it does not have.
+
+    The client never answers a missing network with None: get_network()
+    returns the response body of a successful request, and the API's 404
+    is raised as this. A fake which returns None instead models a client
+    that does not exist, and a check written against it passes for the
+    wrong reason, which is how create() came to test for a falsy answer.
+    """
+    return apiclient.ResourceNotFoundException(
+        'network not found', 'GET', '/networks/%s' % network_ref, 404,
+        'network not found')
+
+
 # A minimal kubeconfig in the shape k3s writes, pointing at the loopback
 # address the way the real file does before create rewrites it.
 KUBECONFIG = """apiVersion: v1
@@ -232,6 +253,25 @@ class FakeClusterClient:
         self.deleted_networks = []
         self.unrouted_addresses = []
 
+        # What a lookup of a network by name within a namespace finds, as
+        # a name mapped to the list of networks carrying it. A list because
+        # the server refuses a name which matches several, and a test of
+        # that refusal needs to be able to say so. A network allocated
+        # through this client is added, as the server would find it; anything
+        # else is there only if a test has put it there. A deleted network
+        # stays, in state deleted, and the lookup passes over it, because the
+        # server's lookup by name considers only networks in an active state
+        # (network.Network.from_db_by_ref()); a uuid lookup still shows one.
+        self.named_networks = {}
+
+        # The capabilities the fake server advertises, which the real
+        # client reads off the API root. Only the ones a code path here
+        # asks about are listed; a test removes one to play an older server.
+        self.capabilities = {'get-network-namespace'}
+
+    def check_capability(self, capability_string):
+        return capability_string in self.capabilities
+
     def get_namespace(self, namespace):
         return {'name': namespace}
 
@@ -250,13 +290,43 @@ class FakeClusterClient:
     def allocate_network(self, netblock, provide_dhcp, provide_nat, name,
                          namespace=None):
         self.allocated_networks.append(name)
+        self.named_networks.setdefault(name, []).append(
+            {'uuid': 'net-1', 'name': name, 'namespace': namespace,
+             'state': 'created'})
         return {'uuid': 'net-1', 'name': name, 'state': 'created'}
 
-    def get_network(self, network_ref):
+    def get_network(self, network_ref, namespace=None):
+        # The real client refuses a namespace before it makes a request when
+        # the server does not advertise get-network-namespace, and the
+        # server answers a name matching several networks with a 400, which
+        # the client raises as RequestMalformedException rather than
+        # returning a list. A namespaced lookup is modelled as the by-name
+        # lookup it is used for; a lookup without one is the uuid lookup
+        # create()'s poll and _owns_node_network() make, and answers as it
+        # always has.
+        if namespace and not self.check_capability('get-network-namespace'):
+            raise apiclient.IncapableException(
+                'The API server version you are talking to does not support '
+                'lookup of networks with a specific namespace.')
+        if namespace:
+            matches = [n for n in self.named_networks.get(network_ref, [])
+                       if n['state'] in NETWORK_ACTIVE_STATES]
+            if not matches:
+                raise network_not_found(network_ref)
+            if len(matches) > 1:
+                raise apiclient.RequestMalformedException(
+                    'API request failed', 'GET', '/networks/%s' % network_ref, 400,
+                    'multiple networks have the name "%s" in namespace "%s"'
+                    % (network_ref, namespace))
+            return matches[0]
         return {'uuid': 'net-1', 'name': 'k3s-banana-node', 'state': 'created'}
 
-    def delete_network(self, network_ref):
+    def delete_network(self, network_ref, namespace=None, wait=True):
         self.deleted_networks.append(network_ref)
+        for matches in self.named_networks.values():
+            for n in matches:
+                if n['uuid'] == network_ref:
+                    n['state'] = 'deleted'
 
     def create_instance(self, name, cpus, memory, networks, disks, sshkey,
                         userdata, side_channels=None, namespace=None):

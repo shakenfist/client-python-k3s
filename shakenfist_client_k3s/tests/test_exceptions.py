@@ -14,7 +14,16 @@ class NetworkNotFoundErrorTestCase(testtools.TestCase):
     def test_str(self):
         e = exceptions.NetworkNotFoundError('mynet')
         self.assertEqual('mynet', e.network)
+        self.assertEqual('does_not_exist', e.reason)
         self.assertEqual('Specified network does not exist', str(e))
+
+    def test_ambiguous(self):
+        e = exceptions.NetworkNotFoundError.ambiguous('mynet')
+        self.assertIsInstance(e, exceptions.NetworkNotFoundError)
+        self.assertEqual('mynet', e.network)
+        self.assertEqual('ambiguous', e.reason)
+        self.assertIn('mynet matches more than one network', str(e))
+        self.assertIn("pass the network's uuid instead", str(e))
 
 
 class ClusterNotFoundErrorTestCase(testtools.TestCase):
@@ -34,6 +43,42 @@ class ClusterNotFoundErrorTestCase(testtools.TestCase):
         e = exceptions.ClusterNotFoundError.not_found('banana')
         self.assertEqual('not_found', e.reason)
         self.assertEqual('Cluster not found!', str(e))
+
+    def test_listed_without_state(self):
+        e = exceptions.ClusterNotFoundError.listed_without_state('banana')
+        self.assertEqual('listed_without_state', e.reason)
+        self.assertEqual('banana', e.name)
+        self.assertIn('banana', str(e).split('\n')[0])
+        self.assertIn("'sf-client k3s delete banana'", str(e))
+
+
+class ClusterInterruptedErrorTestCase(testtools.TestCase):
+    def test_mid_create_quotes_a_recorded_state(self):
+        e = exceptions.ClusterInterruptedError.mid_create('banana', 'initial')
+        self.assertEqual('initial', e.state)
+        self.assertEqual(
+            'Cluster banana was interrupted while it was being built: its state is\n'
+            "'initial' rather than 'created'. Resuming a half built cluster is not\n"
+            'supported, so remove what is left of it with\n'
+            "'sf-client k3s delete banana' and then create it again.", str(e))
+
+    def test_mid_create_does_not_quote_unknown_as_a_state(self):
+        # 'unknown' is what _interrupted_state() answers when nothing
+        # recorded a state, so it is not quoted as though something had.
+        e = exceptions.ClusterInterruptedError.mid_create('banana', 'unknown')
+        self.assertEqual('unknown', e.state)
+        self.assertNotIn("'unknown'", str(e))
+        self.assertEqual(
+            'Cluster banana has no recorded state. An earlier create which stopped\n'
+            'before writing any leaves a name like this, as does an earlier\n'
+            'delete which stopped after removing it. Free the name with\n'
+            "'sf-client k3s delete banana' and then create it again.", str(e))
+
+    def test_mid_create_does_not_say_an_unknown_state_was_interrupted(self):
+        # A delete which stopped after removing the document leaves a name
+        # with no state too, and nothing was being built.
+        e = exceptions.ClusterInterruptedError.mid_create('banana', 'unknown')
+        self.assertNotIn('interrupted', str(e))
 
 
 class ClusterIncompleteErrorTestCase(testtools.TestCase):
@@ -174,6 +219,20 @@ class ClusterMetadataErrorTestCase(testtools.TestCase):
 
         self.assertIn("'10.0.0.1\\nEOF\\ntouch /pwned'", str(e))
         self.assertIn('routed_addresses', str(e))
+
+    def test_not_a_cluster_list(self):
+        e = exceptions.ClusterMetadataError.not_a_cluster_list(
+            'testns', 'orchestrated_k3s_clusters', 'banana')
+
+        self.assertEqual('not_a_cluster_list', e.reason)
+        self.assertIsNone(e.name)
+        self.assertEqual('testns', e.namespace)
+        self.assertEqual('orchestrated_k3s_clusters', e.key)
+        self.assertEqual('banana', e.value)
+        self.assertIn("holds\n'banana'", str(e))
+        self.assertIn(
+            "'sf-client namespace delete-metadata testns orchestrated_k3s_clusters'",
+            str(e))
 
 
 class ReleaseLookupErrorTestCase(testtools.TestCase):

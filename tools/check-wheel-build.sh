@@ -110,8 +110,13 @@ echo "check-wheel-build: $(basename "${sdist}") OK (no build artefacts)"
 # If this trips, read the listing it prints before changing the numbers.
 # The question is always whether the biggest new entries belong in a
 # source distribution, not whether the number is too small.
+#
+# The byte bound was raised from 1850000 when the fix for #72 took the
+# sdist to 108 entries and 1.9MB. That was growth, not a jump: the
+# largest entries were the package, its tests, its docs and tools/, all
+# of which a source release carries.
 MAX_SDIST_ENTRIES=130
-MAX_SDIST_BYTES=1850000
+MAX_SDIST_BYTES=2200000
 
 sdist_entries=$(tar tzf "${sdist}" | wc -l)
 sdist_bytes=$(tar tzvf "${sdist}" | awk '{s+=$3} END {print s+0}')

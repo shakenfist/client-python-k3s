@@ -1626,10 +1626,12 @@ class CreateOverInterruptedClusterTestCase(testtools.TestCase):
     def setUp(self):
         super(CreateOverInterruptedClusterTestCase, self).setUp()
         self.client = fakes.FakeClusterClient()
-        # An interrupted create leaves the name in the namespace cluster
-        # list as well as in its own metadata document: create() registers
-        # the name before it writes anything else, which is what makes the
-        # order of create()'s two guards matter.
+        # An interrupted create usually leaves the name in the namespace
+        # cluster list as well as in its own metadata document: create()
+        # writes the document and lists the name before it builds
+        # anything, so only an interruption between those two writes leaves
+        # the document alone. Both being there is what makes the order of
+        # create()'s two guards matter.
         self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
 
         # create() looks up the k3s release and the Longhorn chart before
@@ -1682,12 +1684,218 @@ class CreateOverInterruptedClusterTestCase(testtools.TestCase):
             _interrupted_md(state='created'))
         self.assertEqual('Sorry, that cluster name is already taken', str(e))
 
-    def test_a_name_in_the_cluster_list_with_no_metadata_is_still_taken(self):
-        # The second of create()'s two original checks. There is no
-        # metadata to read a state out of, so there is nothing more useful
-        # to say than that the name is taken.
-        self.assertRaises(exceptions.ClusterExistsError, self.cluster.create,
-                          1, 1, 1)
+    def test_a_name_in_the_cluster_list_with_no_metadata_is_interrupted(self):
+        # The second of create()'s two original checks, which used to say
+        # only that the name was taken (#72). Earlier versions left a name
+        # this way when a create stopped before writing any state, so it is
+        # an interrupted create, and delete() is the way out. There is no
+        # state to quote, so the state is 'unknown' and the message says
+        # none was recorded rather than quoting that word.
+        before = copy.deepcopy(self.client.metadata)
+        e = self.assertRaises(exceptions.ClusterInterruptedError,
+                              self.cluster.create, 1, 1, 1)
+
+        self.assertEqual('mid_create', e.reason)
+        self.assertEqual('banana', e.name)
+        self.assertEqual('unknown', e.state)
+        message = str(e)
+        self.assertIn("'sf-client k3s delete banana'", message)
+        self.assertIn('has no recorded state', message)
+        self.assertNotIn("'unknown'", message)
+
+        # And it is refused before anything is written or built.
+        self.assertEqual(before, self.client.metadata)
+        self.assertEqual([], self.client.allocated_networks)
+        self.assertEqual({}, self.client.instances)
+
+
+class CreateInterrupted(Exception):
+    """What CreateWriteLogClient raises to stand in for a create being killed.
+
+    Not KeyboardInterrupt, which the test runner treats as the operator
+    stopping the run, and not anything in the K3sClusterException hierarchy,
+    which create() could conceivably catch: a killed process is caught by
+    nothing.
+    """
+
+
+class CreateWriteLogClient(ActionLogClient):
+    """An ActionLogClient which also logs create()'s writes and network calls.
+
+    Metadata writes are logged with a deep copy of the value written, so a
+    test can see what each write carried at the time rather than the
+    dictionary create() went on to change. interrupt, when set, is a
+    predicate over each logged action; the first action it accepts raises
+    CreateInterrupted before the call has any effect, which is what a
+    process killed while that request was in flight looks like from the
+    namespace's side.
+    """
+
+    def __init__(self):
+        super(CreateWriteLogClient, self).__init__()
+        self.interrupt = None
+
+    def _log(self, action):
+        self.actions.append(action)
+        if self.interrupt is not None and self.interrupt(action):
+            self.interrupt = None
+            raise CreateInterrupted(repr(action))
+
+    def set_namespace_metadata_item(self, namespace, key, value):
+        # Stored as a copy too, as a server stores what it was sent: the
+        # dictionary create() goes on changing is not the namespace's, and
+        # an interruption has to leave what the last write carried.
+        self._log(('set_metadata', key, copy.deepcopy(value)))
+        return super(CreateWriteLogClient, self).set_namespace_metadata_item(
+            namespace, key, copy.deepcopy(value))
+
+    def allocate_network(self, netblock, provide_dhcp, provide_nat, name,
+                         namespace=None):
+        self._log(('allocate_network', name, None))
+        return super(CreateWriteLogClient, self).allocate_network(
+            netblock, provide_dhcp, provide_nat, name, namespace=namespace)
+
+    def get_network(self, network_ref, namespace=None):
+        self._log(('get_network', network_ref, None))
+        return super(CreateWriteLogClient, self).get_network(
+            network_ref, namespace=namespace)
+
+
+class CreateWritesItsStateBeforeItsNameTestCase(CreateEnvironmentTestCase):
+    """create() writes its metadata document before it lists the name, and records its network at once.
+
+    shakenfist/client-python-k3s#72. create() used to append the name to
+    the namespace's cluster list first and write the cluster's metadata
+    document second, with the node network's allocation and poll in
+    between. Anything which stopped it there -- an interruption, a borrowed
+    network that did not exist, an sshkey it could not read -- left a
+    listed name with no document: create() said the name was taken,
+    delete() said there was no such cluster, and an allocated network was
+    recorded nowhere.
+
+    The order is now delete()'s reversed (see
+    DeleteReleasesTheNameBeforeTheMetadataTestCase): the document first,
+    in state 'initial', then the list entry, and the uuid of a network
+    create allocates is written into the document as soon as the API
+    returns it, before the poll waits for it to be created. The last two
+    tests here are the reason, run through: an interruption at either
+    point leaves something delete() clears.
+    """
+
+    def setUp(self):
+        super(CreateWritesItsStateBeforeItsNameTestCase, self).setUp()
+        self.client = CreateWriteLogClient()
+
+    def _cluster(self):
+        return _make_cluster(self.client)
+
+    def _index(self, predicate):
+        for i, action in enumerate(self.client.actions):
+            if predicate(action):
+                return i
+        self.fail('no such action in %r' % (self.client.actions,))
+
+    def _metadata_writes(self):
+        return [(i, value) for i, (kind, key, value)
+                in enumerate(self.client.actions)
+                if kind == 'set_metadata' and key == MD_KEY]
+
+    def test_the_metadata_is_written_before_the_name_is_listed(self):
+        self._cluster().create(1, 1, 1)
+
+        listed = self._index(
+            lambda a: a[:2] == ('set_metadata', primitives.CLUSTER_LIST))
+        first_md, first_value = self._metadata_writes()[0]
+        self.assertLess(first_md, listed)
+        self.assertEqual('initial', first_value['state'])
+
+    def test_an_allocated_network_is_recorded_before_it_is_polled(self):
+        self._cluster().create(1, 1, 1)
+
+        allocated = self._index(lambda a: a[0] == 'allocate_network')
+        polled = self._index(lambda a: a[0] == 'get_network')
+        self.assertLess(allocated, polled)
+
+        # The first write predates the network, and already says it will
+        # be this cluster's own.
+        first_md, first_value = self._metadata_writes()[0]
+        self.assertLess(first_md, allocated)
+        self.assertIsNone(first_value['node_network'])
+        self.assertIs(True, first_value['node_network_created'])
+
+        # And the uuid is written between the allocation and the poll.
+        between = [value for i, value in self._metadata_writes()
+                   if allocated < i < polled]
+        self.assertEqual(['net-1'],
+                         [value['node_network'] for value in between])
+
+    def test_a_borrowed_network_is_in_the_first_metadata_write(self):
+        self._cluster().create(1, 1, 1, network='borrowed')
+
+        # Looked up before either write, so a borrowed network which does
+        # not exist registers nothing (test_library_api has that refusal).
+        looked_up = self._index(lambda a: a[:2] == ('get_network', 'borrowed'))
+        listed = self._index(
+            lambda a: a[:2] == ('set_metadata', primitives.CLUSTER_LIST))
+        first_md, first_value = self._metadata_writes()[0]
+        self.assertLess(looked_up, first_md)
+        self.assertLess(looked_up, listed)
+        self.assertEqual('net-1', first_value['node_network'])
+        self.assertIs(False, first_value['node_network_created'])
+        self.assertEqual([], self.client.allocated_networks)
+
+    def test_an_interruption_before_the_name_is_listed_is_recoverable(self):
+        # Killed while the list write was in flight: the document exists,
+        # in state 'initial', and the name is not listed.
+        self.client.interrupt = (
+            lambda a: a[:2] == ('set_metadata', primitives.CLUSTER_LIST))
+        self.assertRaises(CreateInterrupted, self._cluster().create, 1, 1, 1)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+        self.assertEqual('initial', self.client.metadata[MD_KEY]['state'])
+
+        # A fresh create, as the operator's next attempt would be, is told
+        # the cluster was interrupted and where the way out is...
+        e = self.assertRaises(exceptions.ClusterInterruptedError,
+                              self._cluster().create, 1, 1, 1)
+        self.assertEqual('initial', e.state)
+
+        # ...and that way out works, and frees the name.
+        self._cluster().delete()
+        self.assertEqual({}, self.client.metadata)
+        self._cluster().create(1, 1, 1)
+        self.assertEqual('created', self.client.metadata[MD_KEY]['state'])
+
+    def test_an_interruption_during_the_network_poll_is_recoverable(self):
+        # Killed while waiting for the allocated network: the name is
+        # listed, and the document records the network, so delete()
+        # destroys it rather than leaking it.
+        self.client.interrupt = lambda a: a[0] == 'get_network'
+        self.assertRaises(CreateInterrupted, self._cluster().create, 1, 1, 1)
+        self.assertEqual(['banana'],
+                         self.client.metadata[primitives.CLUSTER_LIST])
+        self.assertEqual('net-1',
+                         self.client.metadata[MD_KEY]['node_network'])
+
+        self._cluster().delete()
+        self.assertEqual(['net-1'], self.client.deleted_networks)
+        self.assertEqual({}, self.client.metadata)
+
+    def test_an_interruption_before_the_network_is_recorded_is_recoverable(self):
+        # Killed while the write recording the allocated network's uuid was
+        # in flight: the network exists, and the document says only that
+        # this create allocates its own. delete() finds it by name rather
+        # than leaking it, and a second create of the name would otherwise
+        # have made another network with the same name.
+        self.client.interrupt = (
+            lambda a: a[:2] == ('set_metadata', MD_KEY) and a[2]['node_network'])
+        self.assertRaises(CreateInterrupted, self._cluster().create, 1, 1, 1)
+        self.assertEqual(['k3s-banana-node'], self.client.allocated_networks)
+        self.assertIsNone(self.client.metadata[MD_KEY]['node_network'])
+        self.assertIs(True, self.client.metadata[MD_KEY]['node_network_created'])
+
+        self._cluster().delete()
+        self.assertEqual(['net-1'], self.client.deleted_networks)
+        self.assertEqual({}, self.client.metadata)
 
 
 class DeleteInterruptedClusterTestCase(testtools.TestCase):
@@ -1790,6 +1998,533 @@ class DeleteInterruptedClusterTestCase(testtools.TestCase):
 
         self.assertEqual('', self.reporter.getvalue())
         self.assertNotIn(MD_KEY, self.client.metadata)
+
+    def _stop_before_removing_the_document(self):
+        original = self.client.delete_namespace_metadata_item
+
+        def stopping(namespace, key):
+            if key == MD_KEY:
+                raise RuntimeError('interrupted')
+            original(namespace, key)
+
+        self.client.delete_namespace_metadata_item = stopping
+
+    def _record_lookups_by_name(self):
+        calls = []
+        original = self.client.get_network
+
+        def recording(network_ref, namespace=None):
+            if namespace:
+                calls.append(network_ref)
+            return original(network_ref, namespace=namespace)
+
+        self.client.get_network = recording
+        return calls
+
+    def test_a_delete_stopped_after_the_network_went_finishes_when_run_again(self):
+        # The last two writes are the name and then the document, so a delete
+        # can stop with the network destroyed, the document saying 'deleted'
+        # with no network uuid, and the name already free. That document
+        # says node_network_created with no uuid, which is also what a create
+        # stopped inside allocate_network() leaves, but 'deleted' says this
+        # delete has already been through the network, so the retry does not
+        # go looking for one by name.
+        md = _interrupted_md(state='created')
+        md['node_network_created'] = True
+        self._seed(md)
+        self.client.named_networks['k3s-banana-node'] = [
+            {'uuid': 'net-1', 'name': 'k3s-banana-node', 'namespace': 'testns',
+             'state': 'created'}]
+        self._stop_before_removing_the_document()
+
+        self.assertRaises(RuntimeError, self.cluster.delete)
+        left = self.client.metadata[MD_KEY]
+        self.assertEqual('deleted', left['state'])
+        self.assertIsNone(left['node_network'])
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+        self.assertEqual(['net-1'], self.client.deleted_networks)
+
+        del self.client.delete_namespace_metadata_item
+        lookups = self._record_lookups_by_name()
+        Cluster(self.client, 'banana', 'testns',
+                reporter=progress.CollectingReporter()).delete()
+
+        self.assertEqual([], lookups)
+        self.assertEqual(['net-1'], self.client.deleted_networks)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+
+    def test_a_retried_delete_does_not_warn_on_a_server_without_lookup_by_name(self):
+        # As above, for a stop between the 'deleted' write and the unlisting,
+        # on a server which cannot look a network up by name in a namespace.
+        # The network is known to be gone, so there is nothing to tell the
+        # operator to go and look for.
+        md = _interrupted_md(state='deleted')
+        md['node_network'] = None
+        md['node_network_created'] = True
+        self._seed(md)
+        self.client.capabilities = set()
+
+        self.cluster.delete()
+
+        self.assertNotIn('may have been left behind', self.reporter.getvalue())
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+
+class DeleteFreesAListedNameWithoutStateTestCase(testtools.TestCase):
+    """delete() frees a name which is in the cluster list with no metadata behind it.
+
+    shakenfist/client-python-k3s#72. Earlier versions of create() listed
+    the name before writing any state, and earlier versions of delete()
+    removed the state before unlisting the name, so a run of either which
+    stopped in between left a listed name with no document. create() said
+    the name was taken and delete() said there was no such cluster, so only
+    an edit of the namespace metadata by hand got it back. Names stuck that
+    way exist in namespaces now, and nothing create() does differently
+    frees them, so delete() has to.
+
+    The only thing such a create can have built is the node network it
+    allocated after listing the name, recorded nowhere. delete() looks for
+    it by the name create() gives it, and destroys it if exactly one is
+    found.
+    """
+
+    NETWORK_NAME = 'k3s-banana-node'
+
+    def setUp(self):
+        super(DeleteFreesAListedNameWithoutStateTestCase, self).setUp()
+        self.client = ActionLogClient()
+        self.client.metadata[primitives.CLUSTER_LIST] = ['banana']
+
+        patcher = mock.patch('time.sleep', lambda seconds: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # As in DeleteInterruptedClusterTestCase: no test here asks for the
+        # kubeconfig cleanup unless it says so, and the mock stays so that a
+        # regression fails rather than edits the operator's own
+        # ~/.kube/config.
+        self.subprocess_run = mock.MagicMock()
+        self.subprocess_run.return_value.returncode = 0
+        patcher = mock.patch('subprocess.run', self.subprocess_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.reporter = progress.CollectingReporter()
+
+    def _cluster(self):
+        return Cluster(self.client, 'banana', 'testns', reporter=self.reporter)
+
+    def _orphan(self, uuid='net-orphan', name=NETWORK_NAME, namespace='testns'):
+        network = {'uuid': uuid, 'name': name, 'namespace': namespace,
+                   'state': 'created'}
+        self.client.named_networks.setdefault(name, []).append(network)
+        return network
+
+    def test_the_last_name_takes_the_list_key_with_it(self):
+        self._cluster().delete()
+
+        # As delete()'s main path does: an empty list is removed rather than
+        # left as an empty value.
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+
+    def test_other_names_in_the_list_are_kept(self):
+        self.client.metadata[primitives.CLUSTER_LIST] = [
+            'apple', 'banana', 'cherry']
+
+        self._cluster().delete()
+
+        self.assertEqual(['apple', 'cherry'],
+                         self.client.metadata[primitives.CLUSTER_LIST])
+
+    def test_no_metadata_document_is_written(self):
+        # There is no document, and writing one -- a state 'deleted', say,
+        # as the main path does -- would leave behind exactly what this is
+        # cleaning up, in reverse.
+        writes = []
+        original = self.client.set_namespace_metadata_item
+
+        def recording(namespace, key, value):
+            writes.append(key)
+            return original(namespace, key, value)
+
+        self.client.set_namespace_metadata_item = recording
+        self.client.metadata[primitives.CLUSTER_LIST] = ['banana', 'cherry']
+
+        self._cluster().delete()
+
+        self.assertEqual([primitives.CLUSTER_LIST], writes)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+
+    def test_the_operator_is_told_what_is_being_freed(self):
+        self._cluster().delete()
+
+        out = self.reporter.getvalue()
+        self.assertIn('Cluster banana', out)
+        self.assertIn('no recorded state', out)
+        self.assertIn('Freeing the name', out)
+
+    def test_an_orphaned_node_network_is_deleted(self):
+        self._orphan()
+
+        self._cluster().delete()
+
+        self.assertEqual(['net-orphan'], self.client.deleted_networks)
+        self.assertIn('Deleting network %s (uuid net-orphan)' % self.NETWORK_NAME,
+                      self.reporter.getvalue())
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_the_network_is_looked_up_by_name_within_the_namespace(self):
+        # Within the namespace, rather than across every namespace the
+        # caller can see, which for an admin is all of them.
+        calls = []
+        original = self.client.get_network
+
+        def recording(network_ref, namespace=None):
+            calls.append((network_ref, namespace))
+            return original(network_ref, namespace=namespace)
+
+        self.client.get_network = recording
+
+        self._cluster().delete()
+
+        self.assertEqual([(self.NETWORK_NAME, 'testns')], calls)
+
+    def test_the_network_is_deleted_within_the_namespace(self):
+        # The server then refuses a network outside the namespace, which is
+        # the client's own safety check for a delete made by name.
+        self._orphan()
+        calls = []
+        original = self.client.delete_network
+
+        def recording(network_ref, namespace=None, wait=True):
+            calls.append((network_ref, namespace))
+            return original(network_ref, namespace=namespace, wait=wait)
+
+        self.client.delete_network = recording
+
+        self._cluster().delete()
+
+        self.assertEqual([('net-orphan', 'testns')], calls)
+
+    def test_no_network_found_means_nothing_is_deleted(self):
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_networks_earlier_clusters_of_this_name_left_deleted_are_not_found(self):
+        # A name an old delete left listed had its network destroyed first,
+        # and every earlier cluster of the name left a deleted network
+        # carrying it. The server's lookup by name passes over deleted
+        # networks, so none is deleted again and the name is not ambiguous.
+        for uuid in ('net-0', 'net-1'):
+            orphan = self._orphan(uuid=uuid)
+            orphan['state'] = 'deleted'
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn('Could not look up', self.reporter.getvalue())
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_a_network_the_api_answered_for_another_namespace_is_kept(self):
+        # The server refuses this itself; the check is for one which did
+        # not, because the delete is made on a name alone.
+        self._orphan(namespace='someone-else')
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_a_network_the_api_answered_with_another_name_is_kept(self):
+        # As above, for the name: the lookup asked for k3s-banana-node, and
+        # an answer carrying any other name is not the network asked for.
+        self.client.named_networks[self.NETWORK_NAME] = [
+            {'uuid': 'net-other', 'name': 'somebody-elses', 'namespace': 'testns',
+             'state': 'created'}]
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_a_network_another_cluster_records_is_kept(self):
+        # The orphan was handed to cluster bar with 'create --network
+        # k3s-banana-node'. It carries this cluster's name, and it is bar's
+        # node network: the server would delete it from under bar's
+        # instances. bar need not be listed -- an interrupted create's
+        # document is not -- so it is found by its document alone.
+        orphan = self._orphan()
+        self.client.metadata[cluster_module.METADATA_KEY % 'bar'] = {
+            'name': 'bar', 'state': 'created',
+            'node_network': orphan['uuid'], 'node_network_created': False}
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        out = self.reporter.getvalue()
+        self.assertIn('cluster bar records it', out)
+        self.assertIn('net-orphan', out)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_other_clusters_and_the_version_caches_do_not_keep_the_orphan(self):
+        # Only a document recording this network's uuid counts. The release
+        # caches share the cluster key prefix, and a cluster recording some
+        # other network is no claim on this one.
+        self._orphan()
+        self.client.metadata[cluster_module.METADATA_KEY % 'bar'] = {
+            'name': 'bar', 'node_network': 'net-bar'}
+        self.client.metadata[primitives.K3S_VERSION_CACHE_KEY] = {
+            'node_network': 'net-orphan'}
+
+        self._cluster().delete()
+
+        self.assertEqual(['net-orphan'], self.client.deleted_networks)
+
+    def test_an_ambiguous_network_name_deletes_nothing(self):
+        # The server answers a name several networks carry with a 400, and
+        # which of them create() made cannot be told from the name.
+        self._orphan(uuid='net-a')
+        self._orphan(uuid='net-b')
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        out = self.reporter.getvalue()
+        self.assertIn(self.NETWORK_NAME, out)
+        self.assertIn('sf-client network delete', out)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_a_server_without_namespaced_lookup_still_frees_the_name(self):
+        # The name is the point. A network which may be left behind is
+        # reported, by name, with the commands that remove it.
+        self.client.capabilities.discard('get-network-namespace')
+        self._orphan()
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+        out = self.reporter.getvalue()
+        self.assertIn('network named %s' % self.NETWORK_NAME, out)
+        self.assertIn("'sf-client network list'", out)
+        self.assertIn("'sf-client network delete <uuid>'", out)
+
+    def test_a_failed_network_delete_leaves_the_name_listed(self):
+        # The name goes last, as on delete()'s main path, so a delete which
+        # fails part way can be run again rather than leaving a network
+        # nothing will look for.
+        self._orphan()
+        failure = apiclient.InternalServerError(
+            'API request failed', 'DELETE', '/networks/net-orphan', 500, 'boom')
+        self.client.delete_network = mock.MagicMock(side_effect=failure)
+
+        self.assertRaises(apiclient.InternalServerError, self._cluster().delete)
+        self.assertEqual(['banana'], self.client.metadata[primitives.CLUSTER_LIST])
+
+    def test_an_unlisted_name_without_metadata_still_does_not_exist(self):
+        self.client.metadata[primitives.CLUSTER_LIST] = ['apple']
+        self._orphan()
+
+        e = self.assertRaises(exceptions.ClusterNotFoundError,
+                              self._cluster().delete)
+
+        self.assertEqual('does_not_exist', e.reason)
+        self.assertEqual(['apple'], self.client.metadata[primitives.CLUSTER_LIST])
+        self.assertEqual([], self.client.deleted_networks)
+        self.assertEqual('', self.reporter.getvalue())
+
+    def test_no_list_at_all_still_does_not_exist(self):
+        del self.client.metadata[primitives.CLUSTER_LIST]
+
+        e = self.assertRaises(exceptions.ClusterNotFoundError,
+                              self._cluster().delete)
+        self.assertEqual('does_not_exist', e.reason)
+
+    def test_a_document_written_after_a_cached_miss_is_deleted_as_a_cluster(self):
+        # The cache says there is no document, and a create of this name
+        # has written one since. Freeing the name from the cached answer
+        # would destroy the new cluster's network by name and unlist it,
+        # leaving its document behind; the fresh read sees the cluster, and
+        # it is deleted like any other.
+        c = self._cluster()
+        self.assertIsNone(c.get_metadata())
+
+        md = _interrupted_md()
+        md['node_network'] = 'net-new'
+        md['node_network_created'] = True
+        self.client.metadata[MD_KEY] = md
+        self._orphan(uuid='net-new')
+
+        c.delete()
+
+        self.assertEqual(['net-new'], self.client.deleted_networks)
+        self.assertNotIn(MD_KEY, self.client.metadata)
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+        self.assertNotIn('Freeing the name', self.reporter.getvalue())
+
+    def test_a_name_unlisted_after_a_cached_miss_is_not_freed(self):
+        # The other half of the same read: the name has to be listed in the
+        # answer the decision is made from, not in an earlier one.
+        c = self._cluster()
+        self.assertIsNone(c.get_metadata())
+        self.client.metadata[primitives.CLUSTER_LIST] = ['apple']
+        self._orphan()
+
+        e = self.assertRaises(exceptions.ClusterNotFoundError, c.delete)
+
+        self.assertEqual('does_not_exist', e.reason)
+        self.assertEqual([], self.client.deleted_networks)
+
+    def test_the_kubeconfig_is_left_alone_unless_asked(self):
+        main_config_path = fakes.home_with_kubeconfig(self)
+        self.subprocess_run.side_effect = fakes.FakeKubectl(['banana.testns'])
+
+        self._cluster().delete()
+
+        self.assertEqual([], self.subprocess_run.call_args_list)
+        self.assertTrue(os.path.exists(main_config_path))
+
+    def test_kubeconfig_entries_an_old_delete_left_are_removed_when_asked(self):
+        # A delete by an earlier version removed the document first and the
+        # kubeconfig entries last, so one which stopped in between left a
+        # stuck name and the entries both. Asked to, this removes them.
+        main_config_path = fakes.home_with_kubeconfig(self)
+        self.subprocess_run.side_effect = fakes.FakeKubectl(['banana.testns'])
+
+        self._cluster().delete(update_kubeconfig=True)
+
+        self.assertEqual(
+            [fakes.cleanup_kubectl(main_config_path, args) for args in (
+                fakes.KUBECTL_CONFIG_VIEW_JSON,
+                ['config', 'delete-context', 'banana.testns'],
+                ['config', 'delete-user', 'banana.testns'],
+                ['config', 'delete-cluster', 'banana.testns'])],
+            [call.args[0] for call in self.subprocess_run.call_args_list])
+        self.assertNotIn(primitives.CLUSTER_LIST, self.client.metadata)
+
+    def test_kubeconfig_with_no_entries_for_the_name_is_not_changed(self):
+        # The usual case: a create which stopped before writing any state
+        # never got as far as writing kubeconfig either.
+        main_config_path = fakes.home_with_kubeconfig(self)
+        self.subprocess_run.side_effect = fakes.FakeKubectl(['other.testns'])
+
+        self._cluster().delete(update_kubeconfig=True)
+
+        self.assertEqual(
+            [fakes.cleanup_kubectl(main_config_path, fakes.KUBECTL_CONFIG_VIEW_JSON)],
+            [call.args[0] for call in self.subprocess_run.call_args_list])
+
+    def test_the_name_can_be_created_again_afterwards(self):
+        # End to end on the fake: the stuck name, its orphaned network, the
+        # create refused and pointed at delete, the delete, and a create
+        # which now works.
+        fakes.stub_release_lookups(self)
+        self._orphan()
+
+        e = self.assertRaises(exceptions.ClusterInterruptedError,
+                              self._cluster().create, 1, 1, 1)
+        self.assertEqual('unknown', e.state)
+
+        self._cluster().delete()
+        self.assertEqual(['net-orphan'], self.client.deleted_networks)
+        self.assertEqual({}, self.client.metadata)
+
+        self._cluster().create(1, 1, 1)
+        self.assertEqual('created', self.client.metadata[MD_KEY]['state'])
+        self.assertEqual(['banana'], self.client.metadata[primitives.CLUSTER_LIST])
+
+
+class ListedNameWithoutStateTestCase(testtools.TestCase):
+    """The other verbs say how to free a listed name with no metadata, rather than only that it does not exist.
+
+    `k3s list` prints such a name, and every other verb used to say there was
+    no such cluster, so the operator was told two contradictory things and
+    how to reconcile them neither. Each verb now raises
+    ClusterNotFoundError.listed_without_state() for that case, which names
+    the delete that frees it, and keeps its own historical reason for a name
+    nobody has heard of. The class is unchanged, so a caller which catches
+    ClusterNotFoundError is unaffected.
+    """
+
+    # Each verb, with what it is called with and the reason it has always
+    # raised for a name which is neither listed nor recorded.
+    VERBS = [
+        ('show', (), 'does_not_exist'),
+        ('health', (), 'does_not_exist'),
+        ('get_kubeconfig', (), 'unknown_cluster'),
+        ('expand_workers', (1,), 'not_found'),
+        ('remove_worker', (['inst-001'],), 'not_found'),
+        ('expand_addresses', (1,), 'not_found'),
+        ('update_os', (), 'not_found'),
+    ]
+
+    def _raised(self, cluster_list, verb, args):
+        client = fakes.FakeClusterClient()
+        if cluster_list is not None:
+            client.metadata[primitives.CLUSTER_LIST] = cluster_list
+        cluster = Cluster(client, 'banana', 'testns',
+                          reporter=progress.CollectingReporter())
+        return self.assertRaises(exceptions.ClusterNotFoundError,
+                                 getattr(cluster, verb), *args)
+
+    def test_a_listed_name_is_told_how_to_free_it(self):
+        for verb, args, _ in self.VERBS:
+            e = self._raised(['apple', 'banana'], verb, args)
+            self.assertEqual('listed_without_state', e.reason, verb)
+            self.assertEqual('banana', e.name, verb)
+            self.assertIn("'sf-client k3s delete banana'", str(e), verb)
+
+    def test_an_unlisted_name_keeps_its_old_reason(self):
+        for verb, args, reason in self.VERBS:
+            for cluster_list in (None, ['apple']):
+                e = self._raised(cluster_list, verb, args)
+                self.assertEqual(reason, e.reason, (verb, cluster_list))
+
+
+class ClusterListWhichIsNotAListTestCase(testtools.TestCase):
+    """A cluster list which is a string is refused, not searched for substrings.
+
+    'sf-client namespace set-metadata' can only write a string, and 'ana' in
+    'banana' is True. Before every reader went through
+    primitives.cluster_list(), show('ana') answered as though 'ana' were
+    listed, and delete('ana') destroyed k3s-ana-node and then failed on the
+    list's .remove().
+    """
+
+    def setUp(self):
+        super(ClusterListWhichIsNotAListTestCase, self).setUp()
+        self.client = fakes.FakeClusterClient()
+        self.client.metadata[primitives.CLUSTER_LIST] = 'banana'
+        self.client.named_networks['k3s-ana-node'] = [
+            {'uuid': 'net-ana', 'name': 'k3s-ana-node', 'namespace': 'testns',
+             'state': 'created'}]
+        self.before = copy.deepcopy(self.client.metadata)
+        self.cluster = Cluster(self.client, 'ana', 'testns',
+                               reporter=progress.CollectingReporter())
+
+    def _refused(self, verb, *args):
+        e = self.assertRaises(exceptions.ClusterMetadataError,
+                              getattr(self.cluster, verb), *args)
+        self.assertEqual('not_a_cluster_list', e.reason)
+        self.assertEqual(self.before, self.client.metadata)
+        return e
+
+    def test_show_does_not_find_a_substring(self):
+        self._refused('show')
+
+    def test_delete_does_not_free_a_substring(self):
+        self._refused('delete')
+        self.assertEqual([], self.client.deleted_networks)
+
+    def test_create_refuses_before_writing_anything(self):
+        fakes.stub_release_lookups(self)
+        self._refused('create', 1, 1, 1)
+        self.assertEqual([], self.client.allocated_networks)
 
 
 class ShowReportsStateTestCase(testtools.TestCase):
@@ -8283,8 +9018,9 @@ class StagedManifestsAreWhatWasValidatedTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # create() looks up the k3s release before it reads the sshkey or
-        # stages a manifest, and the Longhorn release after (#133).
+        # create() reads the sshkey and the manifests before it looks up
+        # either release, but a create which gets past those still looks up
+        # both (#133).
         fakes.stub_release_lookups(self)
 
         self.client = fakes.FakeClusterClient()
@@ -8388,8 +9124,9 @@ class SshKeyIsReadThroughTheHierarchyTestCase(testtools.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # create() looks up the k3s release before it reads the sshkey or
-        # stages a manifest, and the Longhorn release after (#133).
+        # create() reads the sshkey and the manifests before it looks up
+        # either release, but a create which gets past those still looks up
+        # both (#133).
         fakes.stub_release_lookups(self)
 
         self.client = fakes.FakeClusterClient()
