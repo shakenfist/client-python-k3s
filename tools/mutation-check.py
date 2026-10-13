@@ -680,7 +680,7 @@ MUTATIONS = [
     (
         'a probe whose output Shaken Fist stored as a blob is read from it',
         PKG + '/cluster.py',
-        '        return self._read_probe_blob(blob_uuid)\n',
+        '        return self._read_output_blob(blob_uuid)\n',
         '        return None, None\n',
         PKG + '.tests.test_cluster.HealthKubernetesTestCase',
         'stestr',
@@ -692,8 +692,8 @@ MUTATIONS = [
         # as the probe's error.
         'a blob is read only when the result names one',
         PKG + '/cluster.py',
-        '        if stdout is not None or not blob_uuid:\n',
-        '        if stdout is not None:\n',
+        '        if output is not None or not blob_uuid:\n',
+        '        if output is not None:\n',
         PKG + '.tests.test_cluster.HealthKubernetesTestCase',
         'stestr',
     ),
@@ -760,10 +760,52 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'a failed command\'s output stored as a blob is read for its error (#136)',
+        PKG + '/cluster.py',
+        '                output, unread = self._command_output(result, stream)\n',
+        '                output, unread = result.get(stream), None\n',
+        PKG + '.tests.test_cluster.ReapExecuteBlobOutputTestCase',
+        'stestr',
+    ),
+    (
+        'a failed command\'s output which could not be read is a note, not empty',
+        PKG + '/cluster.py',
+        '                if unread:\n'
+        '                    output = self._unread_note(stream, unread)\n',
+        '',
+        PKG + '.tests.test_cluster.ReapExecuteBlobOutputTestCase',
+        'stestr',
+    ),
+    (
+        'a stderr stored as a blob is found under stderr_blob',
+        PKG + '/cluster.py',
+        "        blob_uuid = result.get(stream + '_blob')\n",
+        "        blob_uuid = result.get('stdout_blob')\n",
+        PKG + '.tests.test_cluster.ReapExecuteBlobOutputTestCase',
+        'stestr',
+    ),
+    (
+        'a probe\'s stderr stored as a blob is read',
+        PKG + '/cluster.py',
+        "        probe['stderr'], stderr_unread = self._command_output(result, 'stderr')\n",
+        "        probe['stderr'], stderr_unread = result.get('stderr'), None\n",
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
+        'a probe\'s stderr which could not be read is a note, not empty',
+        PKG + '/cluster.py',
+        "        if stderr_unread:\n"
+        "            probe['stderr'] = self._unread_note('stderr', stderr_unread)\n",
+        '',
+        PKG + '.tests.test_cluster.HealthKubernetesTestCase',
+        'stestr',
+    ),
+    (
         'output stored as a blob is read whatever the exit code',
         PKG + '/cluster.py',
-        "        probe['stdout'], unread = self._probe_stdout(result)\n",
-        "        probe['stdout'], unread = (self._probe_stdout(result) if probe['return_code'] == 0\n"
+        "        probe['stdout'], unread = self._command_output(result, 'stdout')\n",
+        "        probe['stdout'], unread = (self._command_output(result, 'stdout') if probe['return_code'] == 0\n"
         '                                   else (None, None))\n',
         PKG + '.tests.test_cluster.HealthSignalsTestCase',
         'stestr',
