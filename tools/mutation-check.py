@@ -700,7 +700,7 @@ MUTATIONS = [
     (
         'a blob over the read limit is not parsed',
         PKG + '/cluster.py',
-        '        if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:\n'
+        '        if len(data) > COMMAND_OUTPUT_LIMIT_BYTES:\n'
         '            return None, (\n',
         '        if False:\n'
         '            return None, (\n',
@@ -710,9 +710,9 @@ MUTATIONS = [
     (
         'the read limit is the most read, not the first size refused',
         PKG + '/cluster.py',
-        '        if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:\n'
+        '        if len(data) > COMMAND_OUTPUT_LIMIT_BYTES:\n'
         '            return None, (\n',
-        '        if len(data) >= HEALTH_PROBE_OUTPUT_LIMIT_BYTES:\n'
+        '        if len(data) >= COMMAND_OUTPUT_LIMIT_BYTES:\n'
         '            return None, (\n',
         PKG + '.tests.test_cluster.HealthKubernetesTestCase',
         'stestr',
@@ -721,7 +721,7 @@ MUTATIONS = [
         'a blob read stops at the limit rather than reading the whole blob',
         PKG + '/cluster.py',
         '                data.extend(chunk)\n'
-        '                if len(data) > HEALTH_PROBE_OUTPUT_LIMIT_BYTES:\n'
+        '                if len(data) > COMMAND_OUTPUT_LIMIT_BYTES:\n'
         '                    break\n',
         '                data.extend(chunk)\n',
         PKG + '.tests.test_cluster.HealthKubernetesTestCase',

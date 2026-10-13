@@ -3028,9 +3028,9 @@ class HealthTestCase(testtools.TestCase):
         row = 'k3s-banana-node-%06d   Ready    <none>\n'
         self.client.probe_stdout = 'NAME                  STATUS   ROLES\n' + ''.join(
             row % serial for serial in range(
-                cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES // len(row % 0) + 1))
+                cluster_module.COMMAND_OUTPUT_LIMIT_BYTES // len(row % 0) + 1))
         self.assertGreater(len(self.client.probe_stdout),
-                           cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES)
+                           cluster_module.COMMAND_OUTPUT_LIMIT_BYTES)
 
         report = self.cluster.health()
 
@@ -4968,6 +4968,19 @@ class ReapExecuteBlobOutputTestCase(testtools.TestCase):
         self.assertNotIn(token, str(e))
         self.assertIn('K3S_TOKEN=%s' % progress.REDACTED, e.stdout)
 
+    def test_a_stream_with_neither_output_nor_a_blob_is_empty(self):
+        # Not a KeyError either: __str__ splits both streams, so each must
+        # be a string whatever the result recorded.
+        aop = self._failed_op('', '')
+        aop['results']['0'] = {'return-code': 1}
+
+        e = self._reap(aop)
+
+        self.assertEqual('', e.stdout)
+        self.assertEqual('', e.stderr)
+        self.assertIn('exit code: 1', str(e))
+        self.client.get_blob_data.assert_not_called()
+
     def test_a_successful_command_reads_no_blob(self):
         # Output is only wanted to explain a failure.
         self.cluster.reap_execute(
@@ -4976,7 +4989,7 @@ class ReapExecuteBlobOutputTestCase(testtools.TestCase):
         self.client.get_blob_data.assert_not_called()
 
     def test_output_over_the_read_limit_is_a_note(self):
-        limit = cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES
+        limit = cluster_module.COMMAND_OUTPUT_LIMIT_BYTES
         stdout = self._long('x' * 1023 + '\n', minimum=3 * limit)
 
         e = self._reap(self._failed_op(stdout, 'E: it broke\n'))
@@ -8414,7 +8427,7 @@ class HealthKubernetesTestCase(testtools.TestCase):
         # The cap is the most that is read, not the first size refused.
         # The padding is a line the parser does not believe, as it would
         # any garbage, so the readings are the default output's.
-        limit = cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES
+        limit = cluster_module.COMMAND_OUTPUT_LIMIT_BYTES
         output = fakes.KUBERNETES_PROBE_OUTPUT + self._oom_lines(5000)
         self.assertLess(len(output), limit)
         self.client.kubernetes_stdout = output + 'x' * (limit - len(output) - 1) + '\n'
@@ -8431,7 +8444,7 @@ class HealthKubernetesTestCase(testtools.TestCase):
         # as fewer kills, and read as empty as no kills and no nodes. The
         # read stops at the cap rather than taking the whole blob and then
         # refusing it, because the blob's size is the node's choice.
-        limit = cluster_module.HEALTH_PROBE_OUTPUT_LIMIT_BYTES
+        limit = cluster_module.COMMAND_OUTPUT_LIMIT_BYTES
         self.client.kubernetes_stdout = fakes.KUBERNETES_PROBE_OUTPUT + self._oom_lines(
             3 * limit // len(self._oom_lines(1)))
         self.assertGreater(len(self.client.kubernetes_stdout), 3 * limit - 100)
