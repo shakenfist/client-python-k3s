@@ -45,6 +45,6 @@ repos:
         description: Checks the Ansible collection for practices and behavior that could be improved
         entry: ansible-lint --config-file collection/.ansible-lint collection/
         language: python
-        additional_dependencies: ['ansible-lint==26.10.0']
+        additional_dependencies: ['ansible-lint==26.10.1']
         files: ^collection/
         pass_filenames: false
