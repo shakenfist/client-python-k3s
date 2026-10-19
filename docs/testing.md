@@ -120,7 +120,10 @@ passes; the queue then runs `functional-tests.yml` again, merge tier
 included, on the commit it is about to merge, and merges only when
 `can_merge` passes. That queue run is the one a release counts, so a
 change merged around the queue, by an administrator bypassing it,
-cannot be released until a later commit has gone through the queue.
+cannot be released until a later queue entry that changes something
+outside `docs/` has gone through the queue. The gate reads only the
+tagged commit's own runs, and a docs-only entry skips the lanes, so its
+successful run would vouch for the bypassed change without testing it.
 
 The queue builds one entry at a time (`max_entries_to_build: 1` in the
 `develop` ruleset). The concurrency groups of `sanity_checks` and
@@ -149,9 +152,13 @@ because the gate judges each run at its latest attempt. Then use
 "Re-run failed jobs" on it. "Re-run all jobs" also works, because
 `check_paths` compares against the `develop` commit recorded in the
 run's event payload rather than the branch, which by then already
-contains the queued commit. A queue entry that
+contains the queued commit. A re-run uses the workflow file of the
+run's own commit, so both hold only for commits that already include
+that comparison and the per-attempt concurrency groups above; for an
+older commit, tag a newer one instead of re-running. A queue entry that
 touched only `docs/` still counts: its lanes are skipped by
-`check_paths`, but the run concludes successfully.
+`check_paths`, but the run concludes successfully. That is also why a
+docs-only entry does not make a bypassed change before it releasable.
 
 `build` and `build-collection` run only if the gate passed. `build`
 checks the wheel twice before uploading it: with the fleet's shared
