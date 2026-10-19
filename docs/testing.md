@@ -112,6 +112,71 @@ entries; each is skipped for the other event, which GitHub treats as
 success. Both pass when every job they depend on either succeeded or
 was skipped.
 
+## Merging and releasing
+
+Pull requests merge to `develop` through the merge queue, not with the
+merge button directly. A pull request can be queued once `can_enqueue`
+passes; the queue then runs `functional-tests.yml` again, merge tier
+included, on the commit it is about to merge, and merges only when
+`can_merge` passes. That queue run is the one a release counts, so a
+change merged around the queue, by an administrator bypassing it,
+cannot be released until a later queue entry that changes something
+outside `docs/` has gone through the queue. The gate reads only the
+tagged commit's own runs, and a docs-only entry skips the lanes, so its
+successful run would vouch for the bypassed change without testing it.
+
+The queue builds one entry at a time (`max_entries_to_build: 1` in the
+`develop` ruleset). The concurrency groups of `sanity_checks` and
+`cluster_deploy` depend on that: a queue run shares a group with
+whatever the queue builds next, so that a superseded run is cancelled,
+while a re-run of an old queue run keeps a group of its own. Raising
+the setting would make each entry cancel the one ahead of it, so
+revisit those groups first.
+
+Pushing a `v*` tag runs `release.yml`. Its first job, `ci-gate`,
+checks that `functional-tests.yml` succeeded on the tagged commit, in
+its merge queue run. How the gate decides is documented with the
+action, as
+[`require-ci-success`](https://github.com/shakenfist/actions/blob/main/docs/actions.md#require-ci-success),
+and it has no override. A run dispatched by the retest comment (see
+"Re-running CI on a pull request" below) does not count.
+
+The queue merges an entry only once `can_merge` passes, so a commit
+that merged through the queue already has a successful run. A queue
+run that fails, flaky or not, gets its entry ejected, and the commit
+it built never reaches `develop`: re-running that run cannot make any
+tag pass. Re-queue the pull request instead, and tag the commit that
+merges. Re-running a queue run matters only when the tagged commit's
+own run was re-run after it merged and that later attempt failed,
+because the gate judges each run at its latest attempt. Then use
+"Re-run failed jobs" on it. "Re-run all jobs" also works, because
+`check_paths` compares against the `develop` commit recorded in the
+run's event payload rather than the branch, which by then already
+contains the queued commit. A re-run uses the workflow file of the
+run's own commit, so both hold only for commits that already include
+that comparison and the per-attempt concurrency groups above; for an
+older commit, tag a newer one instead of re-running. A queue entry that
+touched only `docs/` still counts: its lanes are skipped by
+`check_paths`, but the run concludes successfully. That is also why a
+docs-only entry does not make a bypassed change before it releasable.
+
+`build` and `build-collection` run only if the gate passed. `build`
+checks the wheel twice before uploading it: with the fleet's shared
+[`check-dist`](https://github.com/shakenfist/actions/blob/main/docs/actions.md#check-dist)
+action, and with `tools/check-dist.sh`, which also holds the wheel to
+its member ceiling. The publishing jobs then wait for approval in the
+`release` environment.
+
+So tag a commit on `develop` that went through the merge queue, and
+wait for its run to finish first. A gate failure means nothing was
+signed or published, so every failure is recoverable: the template's
+[recovery table](https://github.com/shakenfist/development/blob/main/templates/release-automation/README.md#recovering-from-a-gate-failure)
+says what to do for each cause, which is usually moving the tag, or
+re-running CI and then the `ci-gate` job. Running `release.yml` by
+hand with `workflow_dispatch` skips the gate and the publishing jobs,
+and only builds and checks the packages. The one-time setup is in
+`RELEASE-SETUP.md`.
+
 ## Path filtering
 
 Both tiers are gated on a `check_paths` job which uses
@@ -121,7 +186,7 @@ changed. A documentation-only pull request or queue entry skips
 the automated reviewer -- so it does not spend ephemeral VM capacity
 the whole fleet shares on lanes that exercise none of what it touched.
 
-Two details are load bearing:
+Three details are load bearing:
 
 * It is a filter job, not trigger-level `paths-ignore`. A required
   status check inside a `paths-ignore`'d workflow never reports on a
@@ -130,6 +195,11 @@ Two details are load bearing:
 * `predicate-quantifier: 'every'` is set. `dorny/paths-filter`
   defaults to ANY-match semantics, under which the `'**'` pattern
   matches everything and silently defeats the `'!docs/**'` exclusion.
+* On `merge_group`, `base` is the event payload's `base_sha`, not the
+  `develop` branch. Once the queue merges an entry, `develop` contains
+  it, so a re-run diffing against the branch would find no changes,
+  skip both lanes, and pass having tested nothing -- a run the release
+  gate would then accept, as described above.
 
 `check_paths` is in the `needs:` of both collection jobs. Without
 that, a failure of the filter itself would skip the lanes and leave

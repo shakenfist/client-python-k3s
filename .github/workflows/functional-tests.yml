@@ -64,17 +64,20 @@ jobs:
         id: filter
         if: github.event_name != 'workflow_dispatch'
         with:
-          # On merge_group there is no pull request payload, so make
-          # the comparison base explicit rather than letting the action
-          # infer one. develop is the queue's target branch, which by
-          # definition does not yet contain the queued changes, so a
-          # wrong code_changed=false -- the outcome that would let "Can
-          # merge" go green having tested nothing -- is structurally
-          # impossible; if develop advances mid-queue the diff only
-          # grows, erring toward running the tier. On pull_request
-          # events the action ignores base and compares against the
-          # pull request's base branch.
-          base: develop
+          # On merge_group, compare against the base_sha fixed in the
+          # event payload, the develop commit the queue built this
+          # entry on, not against the develop branch itself. The
+          # branch moves: once the queue has merged this entry, develop
+          # contains the queued commit, so a "Re-run all jobs" of the
+          # run -- the release recovery in docs/testing.md -- would
+          # diff against a base already holding HEAD, find nothing, and
+          # let "Can merge" go green having tested nothing. A re-run
+          # keeps its original payload, so it sees the same diff as
+          # the first attempt. On pull_request events the action
+          # ignores base and compares against the pull request's base
+          # branch; develop is only the fallback for an event with no
+          # merge_group payload.
+          base: ${{ github.event.merge_group.base_sha || 'develop' }}
           # By default a file matches if it matches ANY listed pattern,
           # which makes '**' match everything and silently defeats the
           # exclusions. 'every' requires a file to match ALL patterns,
@@ -113,15 +116,19 @@ jobs:
     # audits/merge-group-cancellation.md.
     #
     # Cancelling is safe because this queue is serial
-    # (max_entries_to_build: 1), so any other in-flight merge_group run
-    # is by definition superseded and its queue branch already
-    # abandoned. The merge_group- prefix keeps a queue run from sharing
-    # a group with a workflow_dispatch run on develop, whose github.ref
-    # is the same string.
+    # (max_entries_to_build: 1): any other first attempt of a
+    # merge_group run has already been abandoned. A re-run is not a
+    # queue build, though. It keeps its original event, so with the
+    # base-branch key a "Re-run jobs" on an old queue run, the release
+    # recovery in docs/testing.md, would cancel the live queue entry
+    # or be cancelled by it. Re-runs therefore keep their own queue
+    # branch's group. The merge_group- prefix keeps a queue run out of a
+    # workflow_dispatch run's group on develop, whose github.ref is the
+    # same string.
     concurrency:
       group: >-
         ${{ github.workflow }}-lint-${{
-        github.event_name == 'merge_group'
+        github.event_name == 'merge_group' && github.run_attempt == '1'
         && format('merge_group-{0}', github.event.merge_group.base_ref)
         || github.ref }}
       cancel-in-progress: true
@@ -241,10 +248,11 @@ jobs:
     # per-phase timeouts; agent operation failures abort within one poll
     # interval, so this is a backstop rather than an expected duration.
     timeout-minutes: 90
+    # Keyed as sanity_checks' is, for the reasons given there.
     concurrency:
       group: >-
         ${{ github.workflow }}-cluster-deploy-${{
-        github.event_name == 'merge_group'
+        github.event_name == 'merge_group' && github.run_attempt == '1'
         && format('merge_group-{0}', github.event.merge_group.base_ref)
         || github.ref }}
       cancel-in-progress: true
