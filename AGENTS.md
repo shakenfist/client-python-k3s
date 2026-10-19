@@ -81,7 +81,6 @@ Both tiers skip a change touching only `docs/`. See
   it: a release tag is only accepted on a commit whose queue run of
   `functional-tests.yml` passed. See "Merging and releasing" in
   `docs/testing.md`
-
 - Run the unit tests with `tox -epy3` and add coverage for new
   parsing or error-handling behavior, especially around external API
   responses which can change shape over time

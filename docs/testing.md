@@ -137,7 +137,10 @@ action, as
 [`require-ci-success`](https://github.com/shakenfist/actions/blob/main/docs/actions.md#require-ci-success),
 and it has no override. A run dispatched by the retest comment
 described above does not count, so to recover from a flaky queue run use
-"Re-run jobs" on that merge queue run itself. A queue entry that
+"Re-run failed jobs" on that merge queue run itself. "Re-run all jobs"
+also works, because `check_paths` compares against the `develop`
+commit recorded in the run's event payload rather than the branch,
+which by then already contains the queued commit. A queue entry that
 touched only `docs/` still counts: its lanes are skipped by
 `check_paths`, but the run concludes successfully.
 
@@ -167,7 +170,7 @@ changed. A documentation-only pull request or queue entry skips
 the automated reviewer -- so it does not spend ephemeral VM capacity
 the whole fleet shares on lanes that exercise none of what it touched.
 
-Two details are load bearing:
+Three details are load bearing:
 
 * It is a filter job, not trigger-level `paths-ignore`. A required
   status check inside a `paths-ignore`'d workflow never reports on a
@@ -176,6 +179,11 @@ Two details are load bearing:
 * `predicate-quantifier: 'every'` is set. `dorny/paths-filter`
   defaults to ANY-match semantics, under which the `'**'` pattern
   matches everything and silently defeats the `'!docs/**'` exclusion.
+* On `merge_group`, `base` is the event payload's `base_sha`, not the
+  `develop` branch. Once the queue merges an entry, `develop` contains
+  it, so a re-run diffing against the branch would find no changes,
+  skip both lanes, and pass having tested nothing -- and that re-run
+  is the release recovery described above.
 
 `check_paths` is in the `needs:` of both collection jobs. Without
 that, a failure of the filter itself would skip the lanes and leave
