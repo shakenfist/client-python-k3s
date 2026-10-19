@@ -57,7 +57,9 @@ jobs:
     # publishes nothing. A tag push always runs the gate, and this job
     # then needs its success. A workflow_dispatch skips the gate by
     # design, and never reaches a publishing job. The ${{ }} wrapper
-    # is required: YAML reads a bare value starting with "!" as a tag.
+    # is kept because GitHub requires it for an expression starting
+    # with "!" written as a plain scalar, which YAML would read as a
+    # tag, so it stays correct if this is ever reflowed onto one line.
     # build-collection carries the same guard, because it is the other
     # root of the build graph and leads to publish-collection.
     if: >-

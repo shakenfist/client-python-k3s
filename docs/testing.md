@@ -135,12 +135,21 @@ checks that `functional-tests.yml` succeeded on the tagged commit, in
 its merge queue run. How the gate decides is documented with the
 action, as
 [`require-ci-success`](https://github.com/shakenfist/actions/blob/main/docs/actions.md#require-ci-success),
-and it has no override. A run dispatched by the retest comment
-described above does not count, so to recover from a flaky queue run use
-"Re-run failed jobs" on that merge queue run itself. "Re-run all jobs"
-also works, because `check_paths` compares against the `develop`
-commit recorded in the run's event payload rather than the branch,
-which by then already contains the queued commit. A queue entry that
+and it has no override. A run dispatched by the retest comment (see
+"Re-running CI on a pull request" below) does not count.
+
+The queue merges an entry only once `can_merge` passes, so a commit
+that merged through the queue already has a successful run. A queue
+run that fails, flaky or not, gets its entry ejected, and the commit
+it built never reaches `develop`: re-running that run cannot make any
+tag pass. Re-queue the pull request instead, and tag the commit that
+merges. Re-running a queue run matters only when the tagged commit's
+own run was re-run after it merged and that later attempt failed,
+because the gate judges each run at its latest attempt. Then use
+"Re-run failed jobs" on it. "Re-run all jobs" also works, because
+`check_paths` compares against the `develop` commit recorded in the
+run's event payload rather than the branch, which by then already
+contains the queued commit. A queue entry that
 touched only `docs/` still counts: its lanes are skipped by
 `check_paths`, but the run concludes successfully.
 
@@ -182,8 +191,8 @@ Three details are load bearing:
 * On `merge_group`, `base` is the event payload's `base_sha`, not the
   `develop` branch. Once the queue merges an entry, `develop` contains
   it, so a re-run diffing against the branch would find no changes,
-  skip both lanes, and pass having tested nothing -- and that re-run
-  is the release recovery described above.
+  skip both lanes, and pass having tested nothing -- a run the release
+  gate would then accept, as described above.
 
 `check_paths` is in the `needs:` of both collection jobs. Without
 that, a failure of the filter itself would skip the lanes and leave
