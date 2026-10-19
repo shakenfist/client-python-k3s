@@ -112,6 +112,52 @@ entries; each is skipped for the other event, which GitHub treats as
 success. Both pass when every job they depend on either succeeded or
 was skipped.
 
+## Merging and releasing
+
+Pull requests merge to `develop` through the merge queue, not with the
+merge button directly. A pull request can be queued once `can_enqueue`
+passes; the queue then runs `functional-tests.yml` again, merge tier
+included, on the commit it is about to merge, and merges only when
+`can_merge` passes. That queue run is the one a release counts, so a
+change merged around the queue, by an administrator bypassing it,
+cannot be released until a later commit has gone through the queue.
+
+The queue builds one entry at a time (`max_entries_to_build: 1` in the
+`develop` ruleset). The concurrency groups of `sanity_checks` and
+`cluster_deploy` depend on that: a queue run shares a group with
+whatever the queue builds next, so that a superseded run is cancelled,
+while a re-run of an old queue run keeps a group of its own. Raising
+the setting would make each entry cancel the one ahead of it, so
+revisit those groups first.
+
+Pushing a `v*` tag runs `release.yml`. Its first job, `ci-gate`,
+checks that `functional-tests.yml` succeeded on the tagged commit, in
+its merge queue run. How the gate decides is documented with the
+action, as
+[`require-ci-success`](https://github.com/shakenfist/actions/blob/main/docs/actions.md#require-ci-success),
+and it has no override. A run dispatched by the retest comment
+described above does not count, so to recover from a flaky queue run use
+"Re-run jobs" on that merge queue run itself. A queue entry that
+touched only `docs/` still counts: its lanes are skipped by
+`check_paths`, but the run concludes successfully.
+
+`build` and `build-collection` run only if the gate passed. `build`
+checks the wheel twice before uploading it: with the fleet's shared
+[`check-dist`](https://github.com/shakenfist/actions/blob/main/docs/actions.md#check-dist)
+action, and with `tools/check-dist.sh`, which also holds the wheel to
+its member ceiling. The publishing jobs then wait for approval in the
+`release` environment.
+
+So tag a commit on `develop` that went through the merge queue, and
+wait for its run to finish first. A gate failure means nothing was
+signed or published, so every failure is recoverable: the template's
+[recovery table](https://github.com/shakenfist/development/blob/main/templates/release-automation/README.md#recovering-from-a-gate-failure)
+says what to do for each cause, which is usually moving the tag, or
+re-running CI and then the `ci-gate` job. Running `release.yml` by
+hand with `workflow_dispatch` skips the gate and the publishing jobs,
+and only builds and checks the packages. The one-time setup is in
+`RELEASE-SETUP.md`.
+
 ## Path filtering
 
 Both tiers are gated on a `check_paths` job which uses
