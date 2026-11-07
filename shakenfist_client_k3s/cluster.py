@@ -121,12 +121,19 @@ STALL_WARNING_SECONDS = 300
 # this release has never heard of is waited for although it is over. Not
 # forever -- the server's hard delete sweep eventually removes the
 # operation and the listing then stops reporting it -- but for that
-# sweep's delay, an hour by default, and an hour of silence inside a
-# cluster install is a hang as far as the operator is concerned. 'abort'
-# is named here for that reason: Shaken Fist ends an operation that way
-# when something the operation depended on failed, so the command never
-# ran. That is a failure of the install rather than a completion of it,
-# and 'error' would claim the command itself was broken.
+# sweep's delay, which is the server's CLEANER_DELAY, 3600 seconds by
+# default, and an hour of silence inside a cluster install is a hang as
+# far as the operator is concerned. 'abort' is named here for that
+# reason: Shaken Fist ends an operation that way when something the
+# operation depended on failed, so the command never ran. That is a
+# failure of the install rather than a completion of it, and 'error'
+# would claim the command itself was broken.
+#
+# The spelling is the server's own rather than this plugin's guess:
+# BaseOperation.STATE_ABORT in shakenfist/operations/baseoperation.py,
+# which AgentOperation inherits, and one of that repository's
+# constants.FINAL_OBJECT_STATES -- which is what makes an aborted
+# operation hard-delete swept where an errored one is not.
 AGENT_OP_PENDING_STATES = ('initial', 'preflight', 'queued', 'executing')
 AGENT_OP_FAILED_STATES = ('error', 'expired', 'abort')
 AGENT_OP_FINISHED_STATES = ('complete', 'deleted')

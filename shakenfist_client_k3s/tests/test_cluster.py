@@ -7158,6 +7158,15 @@ class AgentOperationEndingsTestCase(testtools.TestCase):
         with mock.patch('time.sleep', lambda seconds: None):
             cluster.await_idle(['inst-001'], ['aop-ours'])
 
+    def test_abort_is_classified_as_an_ending_that_failed(self):
+        # Asserted directly rather than only through the behaviour of the
+        # waits: which tuple a state is in is the whole of this, and the
+        # other tests reach it one wait at a time.
+        self.assertIn('abort', cluster_module.AGENT_OP_FAILED_STATES)
+        self.assertIn('abort', cluster_module.AGENT_OP_KNOWN_STATES)
+        self.assertNotIn('abort', cluster_module.AGENT_OP_PENDING_STATES)
+        self.assertNotIn('abort', cluster_module.AGENT_OP_FINISHED_STATES)
+
     def test_await_execute_returns_an_aborted_operation(self):
         client, cluster = self._cluster('abort')
         with mock.patch('time.sleep', lambda seconds: None):

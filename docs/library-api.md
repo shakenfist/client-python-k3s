@@ -420,8 +420,8 @@ is waited for although it is over, and a wait for an instance to become
 idle covers every operation on the instance, including ones another
 client submitted. That wait is not permanent -- Shaken Fist's hard
 delete sweep eventually removes the operation, and the listing then
-stops reporting it -- but it lasts until the sweep runs, an hour by
-default. A released version of this plugin therefore has to learn each
+stops reporting it -- but it lasts until the sweep runs, which is the
+server's `CLEANER_DELAY`, an hour by default. A released version of this plugin therefore has to learn each
 of Shaken Fist's endings before the server emits it, which is why
 `abort` is recognised here.
 

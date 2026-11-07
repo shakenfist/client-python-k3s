@@ -346,6 +346,33 @@ class AgentOperationErrorTestCase(testtools.TestCase):
             "'sf-client instance events node-1'",
             str(e))
 
+    def test_an_aborted_operation_names_its_dependency_not_a_bad_start(self):
+        # An aborted operation records no result either, so it took the
+        # "probably failed to start" line, which points at this command
+        # when the thing to look at is the operation this one depended on.
+        e = exceptions.AgentOperationError(
+            'node-1', 'inst-uuid', 'op-uuid', 'helm install banana', {},
+            state='abort')
+        self.assertEqual(
+            "Agent operation failed!\n"
+            "  instance: node-1 (uuid inst-uuid)\n"
+            "  operation: op-uuid\n"
+            "  state: abort\n"
+            "  command: helm install banana\n"
+            "  the operation was aborted because something it depended on "
+            "failed, so the command never ran\n"
+            "  the server side event log may have more detail: "
+            "'sf-client instance events node-1'",
+            str(e))
+
+    def test_another_ending_without_results_keeps_the_start_line(self):
+        # The branch is on 'abort' alone: an expired operation with no
+        # result still reads the way it did.
+        e = exceptions.AgentOperationError(
+            'node-1', 'inst-uuid', 'op-uuid', None, {}, state='expired')
+        self.assertIn('probably failed to start', str(e))
+        self.assertNotIn('depended on', str(e))
+
 
 class CommandFailedErrorTestCase(testtools.TestCase):
     def test_str(self):
