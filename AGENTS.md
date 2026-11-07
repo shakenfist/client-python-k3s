@@ -67,6 +67,14 @@ Both tiers skip a change touching only `docs/`. See
   `time.time()`. The exception is the release caches in
   `primitives.py`, which record when something happened and have to
   survive a restart
+- A new Shaken Fist agent operation ending goes into the state tuples
+  at the top of `cluster.py`, and is released, *before* the server
+  emits it. `await_idle()` reads every operation on an instance,
+  other clients' included, and waits on an ending it does not
+  recognise as though the command were still running -- which for a
+  terminal state ends only when the server's hard delete sweep removes
+  the operation, an hour later by default. The reasoning is on the
+  constants
 
 ## Planning and Pre-push Review
 

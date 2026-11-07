@@ -185,10 +185,14 @@ rather than naming the two endings they expect, because Shaken Fist
 gives every operation a wall clock budget and moves one that overruns
 it to `expired` rather than `error`, and because `deleted` is reachable
 from any state -- so a loop waiting for `complete` or `error` by name
-spun forever on either. The states themselves, what each means, and why
-a wait for an instance to go idle treats an unrecognised state
-differently from a wait for a command's output are documented on the
-constants at the top of `cluster.py`, which is where they are used.
+spun forever on either. The cost of that treatment is an ordering
+obligation: an ending a release has never heard of is waited for until
+the server's hard delete sweep removes the operation, so each new ending
+has to be learned here, and released, before the server emits it. The
+states themselves, what each means, and why a wait for an instance to go
+idle treats an unrecognised state differently from a wait for a
+command's output are documented on the constants at the top of
+`cluster.py`, which is where they are used.
 
 This section is only the shape. `docs/library-api.md` is the reference
 for what a caller sees: the reporter interface, the two output modes,

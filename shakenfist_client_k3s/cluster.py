@@ -107,16 +107,35 @@ STALL_WARNING_SECONDS = 300
 # purpose. await_idle() asks "may this instance be given another command",
 # and waits, because an unrecognised state is far more likely to be a new
 # way of being in flight than a new ending, and running the next install
-# step over a command which is still executing corrupts the node. It cannot
-# wedge the way 'expired' and 'deleted' did, because the server moves every
-# operation out of whatever state it is in within its deadline. await_fetch()
-# and reap_execute() ask "did this command run", and raise, because the
-# answer they need is only available from 'complete' and anything else is a
-# command whose output does not exist. Waiting is the safe default for the
-# first question and refusing is the safe default for the second, which is
-# why the asymmetry is deliberate rather than an oversight.
+# step over a command which is still executing corrupts the node.
+# await_fetch() and reap_execute() ask "did this command run", and raise,
+# because the answer they need is only available from 'complete' and
+# anything else is a command whose output does not exist. Waiting is the
+# safe default for the first question and refusing is the safe default for
+# the second, which is why the asymmetry is deliberate rather than an
+# oversight.
+#
+# What that costs is an ordering obligation: a new *ending* has to reach
+# these tuples before the server emits it, not after. await_idle() reads
+# every operation on an instance, other clients' included, so an ending
+# this release has never heard of is waited for although it is over. Not
+# forever -- the server's hard delete sweep eventually removes the
+# operation and the listing then stops reporting it -- but for that
+# sweep's delay, which is the server's CLEANER_DELAY, 3600 seconds by
+# default, and an hour of silence inside a cluster install is a hang as
+# far as the operator is concerned. 'abort' is named here for that
+# reason: Shaken Fist ends an operation that way when something the
+# operation depended on failed, so the command never ran. That is a
+# failure of the install rather than a completion of it, and 'error'
+# would claim the command itself was broken.
+#
+# The spelling is the server's own rather than this plugin's guess:
+# BaseOperation.STATE_ABORT in shakenfist/operations/baseoperation.py,
+# which AgentOperation inherits, and one of that repository's
+# constants.FINAL_OBJECT_STATES -- which is what makes an aborted
+# operation hard-delete swept where an errored one is not.
 AGENT_OP_PENDING_STATES = ('initial', 'preflight', 'queued', 'executing')
-AGENT_OP_FAILED_STATES = ('error', 'expired')
+AGENT_OP_FAILED_STATES = ('error', 'expired', 'abort')
 AGENT_OP_FINISHED_STATES = ('complete', 'deleted')
 AGENT_OP_KNOWN_STATES = (AGENT_OP_PENDING_STATES + AGENT_OP_FAILED_STATES
                          + AGENT_OP_FINISHED_STATES)

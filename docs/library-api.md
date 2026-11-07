@@ -342,7 +342,7 @@ a correct caller never needs to catch it.
 | `ComponentNotInstalledError` | a verb needs an optional component the cluster was built without -- `expand_addresses()` against a cluster created with `install_metallb=False` |
 | `ClusterMetadataError` | a value read back out of the namespace metadata cannot be used -- `expand_addresses()` finds something in `routed_addresses` that is not an IP address, or the API hands back one that is not. Raised before any address is routed, because the addresses are charged for and the configuration they go into is written afterwards. Reason `not_a_cluster_list`: the namespace's `orchestrated_k3s_clusters` value is not a list of names (`sf-client namespace set-metadata` stores a string), raised by `list_clusters()` and every verb that reads the list; repair it by writing the key back through the API as a JSON list of the namespace's cluster names, or remove it with `sf-client namespace delete-metadata`, which unlists every cluster without deleting any |
 | `ReleaseLookupError` | the k3s or Longhorn release lookup fails or returns nothing usable, and no expired cached copy can stand in for it |
-| `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, or `expired` when Shaken Fist took its wall clock budget away |
+| `AgentOperationError` | a Shaken Fist agent operation finishes without doing its work -- `error`, `expired` when Shaken Fist took its wall clock budget away, or `abort` when something the operation depended on failed and the command was never run |
 | `CommandFailedError` | an agent command completes with a non-zero return code, including the wait `create()` and `expand_workers()` make for a node that does not become `Ready`. `stdout` and `stderr` are the command's output, read from the blob Shaken Fist stored it as when it was longer than the 10 KiB returned inline, up to 1 MiB (`COMMAND_OUTPUT_LIMIT_BYTES`, the cap `health()` uses); a stream which could not be read is a note naming its blob and why, such as `(stdout not shown: the command printed more than the 1 MiB ...)`. Before 0.3.0, output stored as a blob raised `KeyError` instead |
 | `KubeconfigError` | a local `~/.kube/config` merge fails (`merge_failed`), or `delete()`'s cleanup cannot read `~/.kube/config` (`view_failed`, `view_unparseable`) or remove an entry from it (`delete_failed`), or either needs a local `kubectl` and there is none (`missing_kubectl`, `missing_kubectl_on_delete`), or `delete()`'s finds one it cannot start (`kubectl_unrunnable`, carrying the `OSError`'s text as `detail`). The five cleanup reasons are raised after the cluster has gone, so a retry of `delete()` raises `ClusterNotFoundError`; each carries `main_config_path` and `entry_name`, and its message gives the `kubectl` commands that remove the entries by hand. A failed write of the file itself is an `OSError`. Before 0.3.0 the cleanup ran `kubectl config unset`, and a failure there was `unset_failed` carrying `config_elem`; from 0.3.0 both are gone, replaced by `delete_failed` and `entry_name` alongside the new `view_failed`, `view_unparseable`, `missing_kubectl_on_delete` and `kubectl_unrunnable` reasons |
 
@@ -398,9 +398,12 @@ every agent operation a deadline (600 seconds unless the creator asked
 for something else) and moves one that overruns it to `expired`, which
 it documents as deliberately distinct from `error`: "run it again with
 a longer deadline" and "the command is broken" are different next
-steps. Every wait in this library enumerates the states an operation
-can be in, rather than naming the two endings it used to expect, so
-`expired` and `deleted` end a wait instead of spinning in one.
+steps. `abort` is a third distinction: Shaken Fist ends an operation
+that way when something the operation depended on failed, so the
+command never ran at all. Every wait in this library enumerates the
+states an operation can be in, rather than naming the two endings it
+used to expect, so `expired`, `abort` and `deleted` end a wait instead
+of spinning in one.
 
 A state this library has never heard of is handled differently by the
 two kinds of wait, which is worth knowing if you are reading the
@@ -408,11 +411,19 @@ source. A wait for an instance to become idle keeps waiting and says
 so, because an unrecognised state is more likely a new way of being in
 flight than a new ending, and starting the next command over one that
 is still running would corrupt the node. A wait for a command's output
-raises, because that output exists only for `complete`. Neither can
-wedge: the server moves every operation out of whatever state it is in
-within its deadline. `health()`'s probe names the state too, rather
-than reporting an ending it does not recognise as a completion with no
-result.
+raises, because that output exists only for `complete`. `health()`'s
+probe names the state too, rather than reporting an ending it does not
+recognise as a completion with no result.
+
+What waiting costs is that an *ending* this release has never heard of
+is waited for although it is over, and a wait for an instance to become
+idle covers every operation on the instance, including ones another
+client submitted. That wait is not permanent -- Shaken Fist's hard
+delete sweep eventually removes the operation, and the listing then
+stops reporting it -- but it lasts until the sweep runs, which is the
+server's `CLEANER_DELAY`, an hour by default. A released version of this plugin therefore has to learn each
+of Shaken Fist's endings before the server emits it, which is why
+`abort` is recognised here.
 
 `health()` is the exception to all of that, in the other direction: its
 `kubectl` probe carries a timeout, and it is skipped altogether when

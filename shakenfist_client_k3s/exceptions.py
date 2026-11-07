@@ -1229,8 +1229,9 @@ class AgentOperationError(K3sClusterException):
     ``progress.describe_agent_op(aop, max_len=None)`` returns, and is
     only rendered when truthy. ``results``
     is the agent operation's results dict; when it is empty (or falsy) a
-    fixed "no results were recorded" line is rendered instead of a JSON
-    dump.
+    fixed line is rendered instead of a JSON dump, naming the dependency
+    for an aborted operation and otherwise saying the command probably
+    failed to start.
 
     ``command_description`` and ``results`` are redacted on the way in,
     not on the way out: an agent command carries a credential when the
@@ -1271,6 +1272,12 @@ class AgentOperationError(K3sClusterException):
             lines.append('  command: %s' % self.command_description)
         if self.results:
             lines.append('  results: %s' % json.dumps(self.results, indent=4, sort_keys=True))
+        elif self.state == 'abort':
+            # An aborted operation records no result either, but "probably
+            # failed to start" points the reader at this command when the
+            # thing to look at is the operation this one depended on.
+            lines.append('  the operation was aborted because something it depended on failed, '
+                         'so the command never ran')
         else:
             lines.append('  no results were recorded, so the command probably failed to start')
         lines.append(
