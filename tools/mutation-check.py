@@ -896,6 +896,15 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'an aborted operation ends a wait for an instance to go idle',
+        PKG + '/cluster.py',
+        "AGENT_OP_FAILED_STATES = ('error', 'expired', 'abort')",
+        "AGENT_OP_FAILED_STATES = ('error', 'expired')",
+        PKG + '.tests.test_cluster.AgentOperationEndingsTestCase.'
+        'test_a_preexisting_aborted_operation_does_not_wedge_the_wait',
+        'stestr',
+    ),
+    (
         'the health renderer shows a reading which is not an int as unknown',
         PKG + '/__init__.py',
         '    return isinstance(reading, int) and not isinstance(reading, bool)',

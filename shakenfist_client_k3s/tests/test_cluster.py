@@ -7158,6 +7158,63 @@ class AgentOperationEndingsTestCase(testtools.TestCase):
         with mock.patch('time.sleep', lambda seconds: None):
             cluster.await_idle(['inst-001'], ['aop-ours'])
 
+    def test_await_execute_returns_an_aborted_operation(self):
+        client, cluster = self._cluster('abort')
+        with mock.patch('time.sleep', lambda seconds: None):
+            aop = cluster.await_execute(_pending_aop())
+        self.assertEqual('abort', aop['state'])
+
+    def test_reap_execute_raises_for_an_aborted_operation(self):
+        client, cluster = self._cluster('abort')
+        with mock.patch('time.sleep', lambda seconds: None):
+            e = self.assertRaises(exceptions.AgentOperationError,
+                                  cluster.reap_execute, _pending_aop())
+        self.assertEqual('abort', e.state)
+        self.assertIn('state: abort', str(e))
+
+    def test_await_fetch_raises_for_an_aborted_operation(self):
+        client, cluster = self._cluster('abort')
+        with mock.patch('time.sleep', lambda seconds: None):
+            self.assertRaises(exceptions.AgentOperationError,
+                              cluster.await_fetch, _pending_aop())
+
+    def test_await_idle_raises_for_an_aborted_operation(self):
+        # Shaken Fist aborts an operation whose dependency failed, so the
+        # command never ran: a failure of the install this wait is part of,
+        # on the same footing as 'error' and 'expired'.
+        self.assertRaises(exceptions.AgentOperationError,
+                          self._await_idle, ['abort'])
+
+    def test_a_preexisting_aborted_operation_does_not_wedge_the_wait(self):
+        # The reason this state had to be known before the server could
+        # emit it. await_idle() reads every operation on the instance,
+        # including ones another client submitted, and an ending it does
+        # not recognise is waited for as though the command were still
+        # running -- which for a terminal state ends only when the server's
+        # hard delete sweep removes the operation, an hour later by
+        # default. Somebody else's aborted operation must end this wait
+        # without aborting the command in hand, exactly as an expired one
+        # does.
+        client = mock.MagicMock()
+        client.get_instance.return_value = {
+            'uuid': 'inst-001', 'name': 'k3s-banana-node-001',
+            'state': 'created', 'agent_state': 'ready'}
+        theirs = [{'uuid': 'aop-theirs', 'instance_uuid': 'inst-001',
+                   'state': 'abort', 'commands': [], 'results': {}}]
+        # Bounded, for the reason the class docstring gives.
+        client.get_instance_agentoperations.side_effect = [theirs] * 20
+
+        reporter = progress.CollectingReporter()
+        cluster = Cluster(client, 'banana', 'testns', reporter=reporter)
+        with mock.patch('time.sleep', lambda seconds: None):
+            cluster.await_idle(['inst-001'], ['aop-ours'])
+
+        # One read, and no note: the state is recognised, so it is not
+        # reported as one this version of the plugin has never heard of.
+        self.assertEqual(1, client.get_instance_agentoperations.call_count)
+        self.assertNotIn('not one this version',
+                         '\n'.join(reporter.lines))
+
 
 class AwaitExecuteTimeoutTestCase(testtools.TestCase):
     """await_execute's timeout, which is health()'s probe and nothing else.
@@ -7501,6 +7558,18 @@ class HealthProbeIsSkippedTestCase(testtools.TestCase):
         self.assertTrue(report['api']['probed'])
         self.assertFalse(report['api']['answered'])
         self.assertIn('expired state', report['api']['error'])
+
+    def test_an_aborted_probe_is_a_finding_and_names_the_state(self):
+        # Not "a state this version does not recognise", which is where an
+        # unknown ending lands, and not a completion with no result.
+        self.client.probe_state = 'abort'
+
+        report = self.cluster.health()
+
+        self.assertTrue(report['api']['probed'])
+        self.assertFalse(report['api']['answered'])
+        self.assertIn('abort state', report['api']['error'])
+        self.assertNotIn('does not recognise', report['api']['error'])
 
 
 def _kubernetes_node_lines(names, ready='True', oom=''):
