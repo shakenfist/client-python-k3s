@@ -249,10 +249,30 @@ jobs:
         with:
           subject-path: 'dist/*'
 
+      # skip-existing makes a re-run possible at all. Without it, PyPI
+      # answers an upload of a version it already holds with a hard
+      # "400 File already exists", which fails this job -- and
+      # publish-collection and github-release both have publish-pypi in
+      # their needs list, so they skip behind it. The ordering below is
+      # deliberate and stays, but combined with a non-idempotent publish
+      # step it meant that once PyPI held a version, every later run of
+      # the release failed here and the other two indexes could never be
+      # caught up. v0.4.0 wedged exactly that way (issue #168): PyPI had
+      # it, Galaxy did not, and re-pushing the tag could not fix it
+      # because this step 400ed before publish-collection was reachable.
+      #
+      # What it does not hide: this is only reached when the version on
+      # PyPI is already the one being published. Burning a version and
+      # tagging the next one is this repository's recovery for a failed
+      # publish (see publish-collection's comment), so the same version
+      # is never deliberately re-tagged with different contents -- which
+      # is the one case where skipping an existing file would ship a
+      # release whose PyPI artifact is not the one just built.
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          skip-existing: true
 
   publish-collection:
     name: Publish ansible collection to Galaxy
