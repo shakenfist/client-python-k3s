@@ -444,6 +444,46 @@ named are left alone entirely.
 Removing the last worker of a cluster is allowed -- a k3s server node
 is schedulable, so a cluster with no workers still works.
 
+`--only-if-empty` refuses a worker that still has work on it instead of
+draining it. It is off by default, because `remove-worker` is an
+imperative verb: asked to remove a worker, it removes that worker. A
+caller shrinking a pool of workers wants the other answer, and the
+drain does not provide it -- an unforced `kubectl drain` declines only a
+pod no controller owns, and a pod owned by a ReplicaSet, a Job or a
+custom resource is evicted and the drain exits 0.
+
+What counts as work is any pod that is not managed by a DaemonSet and
+has not already reached `Succeeded` or `Failed`. A DaemonSet's pod goes
+with the node, and a finished pod -- the `helm-install-*` Job pods a
+k3s cluster leaves behind, most often -- is a record of work rather
+than work. Everything else counts, including a pod that is running
+nothing at the time, because nothing a node's pod list shows
+distinguishes an idle pod from one that has just been given something
+to do.
+
+The node is cordoned before its pods are listed, and that order is the
+point of the option. Kubernetes will not schedule a new pod onto a
+cordoned node, so a node that is empty once it has been cordoned stays
+empty; a caller that checks for itself and then calls `remove-worker`
+has no way to close the gap between the two, which is why this is an
+option here rather than something to do outside. A refusal uncordons
+the node again, exactly as a refused drain does, and prints what it
+found:
+
+```
+sf-client k3s remove-worker mycluster --only-if-empty \
+    --worker 3fa85f64-5717-4562-b3fc-2c963f66afa6
+Worker k3s-mycluster-node-002 (instance 3fa85f64-5717-4562-b3fc-2c963f66afa6)
+of cluster mycluster still has a pod on it, so it was not removed:
+arc-runners/runner-lxj65 (Running). ...
+```
+
+An answer the check cannot read is also a refusal, and is not read as
+an empty node: output `kubectl` printed too much of to be read back,
+no output at all, or a line that is not one the Kubernetes API would
+have printed. Each says so and removes nothing. A `kubectl` that exits
+non-zero fails the command, as the drain's would.
+
 A drain that cannot finish is bounded and undone. If a pod on the
 worker has nowhere else to go -- a PodDisruptionBudget refuses the
 eviction, an unmanaged pod would need `--force`, or the cluster has no

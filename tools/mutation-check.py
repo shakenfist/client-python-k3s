@@ -1559,6 +1559,47 @@ MUTATIONS = [
         '.test_an_ambiguous_network_registers_nothing',
         'stestr',
     ),
+    (
+        'the emptiness check cordons the node before it lists its pods',
+        PKG + '/cluster.py',
+        """                    self.execute_and_await(
+                        [md['control_plane_nodes'][0]],
+                        ['kubectl cordon %s '
+                         '--kubeconfig /etc/rancher/k3s/k3s.yaml' % quoted])
+""",
+        '',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_the_node_is_cordoned_before_its_pods_are_listed',
+        'stestr',
+    ),
+    (
+        'a pod in the way refuses the removal',
+        PKG + '/cluster.py',
+        '                    if pods:\n',
+        '                    if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_live_pod_refuses_the_removal',
+        'stestr',
+    ),
+    (
+        "a DaemonSet's pod and a finished pod are not in the way",
+        PKG + '/cluster.py',
+        """    return [pod for pod in pods
+            if not pod['daemonset']
+            and pod['phase'] not in KUBERNETES_FINISHED_POD_PHASES]""",
+        '    return list(pods)',
+        PKG + '.tests.test_cluster.PodsInTheWayTestCase',
+        'stestr',
+    ),
+    (
+        'a pod listing with a line nobody can read is not an empty node',
+        PKG + '/cluster.py',
+        "        if readings['unreadable_lines']:\n",
+        '        if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_line_which_cannot_be_read_refuses_rather_than_assuming',
+        'stestr',
+    ),
 ]
 
 
