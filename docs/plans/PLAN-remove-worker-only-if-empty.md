@@ -164,6 +164,78 @@ listing is the whole of the option's value, and the pod listing is a
 new parser of output from a node which may be unwell -- both areas this
 project's guidance names as high effort.
 
+### Push audit result
+
+Run on 2026-11-16 over `4bd0696..f0debdf`, the whole of phase 1, by two
+reviewers: code quality and correctness, and tests, security and
+documentation. Both ran `tox -epy3` themselves. They raised two
+blocking findings and seventeen advisory ones; the fixes landed on this
+branch before the push.
+
+* **The reasoning behind one refusal was wrong, in three places.**
+  Both reviewers found it, independently. The `no_output` refusal
+  argued that a command which printed nothing has not answered,
+  "because a node always has at least its DaemonSet pods". That claim
+  is false -- a worker which has just joined has no pods until its
+  DaemonSets' are scheduled, and a cluster running no DaemonSets never
+  has any -- and the code never implemented it either: an empty answer
+  is read as a node with no pods, and only a result carrying neither
+  output nor a blob refuses. The behaviour is right, because refusing
+  an empty answer would refuse such a worker for good, which is worse
+  for a pool-scaling caller than not having the option. So the
+  docstring, `docs/usage.md` and `docs/library-api.md` now say what the
+  code does, and a test asserts the empty answer is believed, named for
+  the decision. One reviewer established from the server's own
+  sidechannel that `no_output` guards a result shape Shaken Fist does
+  not produce; it stays, described as the guard it is.
+* **The plan claimed a push audit it had not run.** The row below said
+  `Complete` with no result recorded, which is the one thing the
+  `plan-push-audit-phase` block this plan carries requires.
+* **The live tier asserted less than its comment claimed.** Everything
+  which lands on the worker the functional tier removes is a DaemonSet
+  pod, so the branch CI actually takes was the accepted removal, and it
+  checked only the exit code -- a listing which always answered "empty"
+  would have passed. It now greps for the check's own progress note, so
+  the live tier says the template rendered, the output parsed and a
+  verdict was reached. An unreadable answer also now fails with an
+  accurate message rather than "failed, and not by refusing", which it
+  had not.
+* **A comment stated a mechanism Go does not have.** The guard around
+  the ownership column was explained as text/template refusing to range
+  over a missing field. One reviewer rendered the template with Go
+  1.24, the way kubectl's printer does, over twenty API shapes: a range
+  over a missing field is an empty range. The guard stays, for the
+  reason the module actually has -- every nested read sits inside a
+  test of its parent, which a reader can check by eye -- and the false
+  sentence is gone. That rendering also confirmed the template parses
+  and prints the columns the parser expects, which is what no unit test
+  here can do.
+* **Weak tests and a fragile fake.** The pod-listing fake
+  reimplemented its parent's bookkeeping, so `failing_command` silently
+  did not apply to the listing, and its per-node dispatch fell back to
+  an empty node on a miss -- which is the assertion most of those tests
+  are making. It delegates and raises on a miss now. Four assertions
+  which could not have failed were strengthened or replaced, and tests
+  added for a drain which fails after the check, for the refusal
+  message with two pods and a pod with no phase, and for neither parser
+  reading the other's lines.
+* **Unreachable defences and duplicated prose.** The listing's result
+  read had two fallbacks `reap_execute()` has already made impossible;
+  it says what is true instead. The seventeen-line comment above the
+  cordon was cut to eight, and `node_pods_command()`'s docstring stopped
+  re-deriving the quoting and output-limit reasoning the constants it
+  cites already carry.
+* **`docs/usage.md` misquoted the refusal it shows.** Both reviewers
+  caught it; the example is now the message `__str__` produces, with
+  the exit code.
+
+Nothing was declined. Security found nothing blocking in either review:
+the node name is quoted once, the template is a module constant, the
+only API-derived values printed are ones the API server validates and
+the parser revalidates, a phase or an owner kind is compared against
+this module's literals rather than printed, and a forged line reaches
+`unreadable_lines` and refuses rather than reading as an empty node.
+
 ### Phase 1 steps
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
@@ -628,6 +700,24 @@ chosen to defer to here, so that we do not forget them.
   caller removing workers one at a time that is the right trade, but a
   caller removing several would pay it per worker; there is no batching
   here and none is needed yet.
+* **The live tier's refusal branch is about twenty-five lines of shell
+  which will not run.** Because the worker it removes holds only
+  DaemonSet pods, CI takes the accepted-removal branch; the refusal
+  branch, its node-name extraction and its uncordon assertion were read
+  by hand rather than executed. The tier which could force a refusal
+  above would run them.
+* **`cluster.py` is near six thousand lines, and this change made the
+  seam clearer.** The Kubernetes reading layer -- the go-templates, the
+  name, phase and status validators, and the two parsers -- is now
+  roughly seven hundred lines of pure functions with no `Cluster`
+  dependency and test cases of their own, which would move to a module
+  of their own without touching a call site beyond an import. A split is
+  its own change and its own review.
+* **A pod whose DaemonSet has since been deleted reads as not in the
+  way.** The check believes the owner reference; the drain resolves it,
+  finds nothing and refuses to evict the pod unforced, so the removal
+  fails with an uncordon rather than a destructive misread. Worth
+  knowing rather than worth fixing here.
 
 ### Bugs fixed during this work
 

@@ -662,9 +662,24 @@ refusal=/tmp/k3s-ci-only-if-empty
 if sf-client k3s remove-worker "${CLUSTER}" --worker "${new_worker}" \
         --only-if-empty > "${refusal}" 2>&1; then
     cat "${refusal}"
+    # The note is the check's own verdict, so this is what tells an
+    # accepted removal apart from a flag which was parsed and ignored --
+    # which is the whole of what the success branch could otherwise claim.
+    if ! grep -qF 'found nothing on it which a drain would evict' "${refusal}"; then
+        echo 'remove-worker --only-if-empty removed the worker without'
+        echo 'reporting that it checked it first'
+        exit 1
+    fi
     echo "The worker held nothing a drain would evict, so it was removed"
 else
     cat "${refusal}"
+    if grep -qF 'the pods on it could not be read' "${refusal}"; then
+        # The third refusal: the listing ran and its answer could not be
+        # read. On a healthy cluster that is a defect in the check rather
+        # than a busy worker, so it fails here rather than falling back.
+        echo 'remove-worker --only-if-empty could not read the node pods'
+        exit 1
+    fi
     if ! grep -qF 'it was not removed' "${refusal}"; then
         echo 'remove-worker --only-if-empty failed, and not by refusing'
         exit 1

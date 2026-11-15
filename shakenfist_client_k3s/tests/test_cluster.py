@@ -6515,8 +6515,12 @@ class NodePodsCommandTestCase(testtools.TestCase):
 
     def test_only_a_controlling_daemonset_owner_counts(self):
         # A pod which merely references a DaemonSet, without that owner
-        # being the controller, is not a DaemonSet's pod.
-        self.assertIn('{{if .controller}}', cluster_module.NODE_PODS_TEMPLATE)
+        # being the controller, is not a DaemonSet's pod -- so the test of
+        # the kind has to be inside the test of .controller, and an
+        # assertion that both appear somewhere would not say that.
+        self.assertIn(
+            '{{if .controller}}{{if .kind}}{{if eq .kind "DaemonSet"}}',
+            cluster_module.NODE_PODS_TEMPLATE)
 
 
 class NodePodsCommandRunsTestCase(testtools.TestCase):
@@ -6643,6 +6647,16 @@ class ParseNodePodsTestCase(testtools.TestCase):
         # The health probe's lines, or anything else which reached stdout.
         self.assertUnreadable('node\tk3s-banana-node-002\tTrue\t\t\t\t')
         self.assertUnreadable('oh dear')
+
+    def test_neither_parser_reads_the_other_s_lines(self):
+        # Which is why the record tables are separate. A 'pod' line read
+        # as the health probe's output would otherwise be filed as an OOM
+        # kill, since that parser treats anything not a node as one.
+        self.assertEqual(
+            {'nodes': {}, 'oom_killed': {}},
+            cluster_module.parse_kubernetes_readings(NODE_PODS_OUTPUT))
+        self.assertEqual(
+            0, len(self.parse(KUBERNETES_PROBE_OUTPUT)['pods']))
 
     def test_the_wrong_number_of_fields_is_counted(self):
         self.assertUnreadable('pod\tdefault\tweb\tRunning')
@@ -9453,23 +9467,37 @@ class ActionLogPodListingClient(ActionLogClient):
         self.pods_result = pods_result
 
     def instance_execute(self, instance_ref, commandline):
+        # The parent keeps the books -- the action log, the executed list,
+        # the operation serial and failing_command -- so the listing goes
+        # through it too and only its result is replaced. Reimplementing
+        # that here made failing_command silently not apply to the one
+        # command this class exists to script.
+        aop = super(ActionLogPodListingClient, self).instance_execute(
+            instance_ref, commandline)
         if not commandline.startswith('kubectl get pods'):
-            return super(ActionLogPodListingClient, self).instance_execute(
-                instance_ref, commandline)
+            return aop
 
-        self.actions.append(('execute', instance_ref, commandline))
-        self.executed.append((instance_ref, commandline))
-        result = self.pods_result
-        if result is None:
-            pods = self.pods
-            if isinstance(pods, dict):
-                pods = next(
-                    (answer for node, answer in pods.items()
-                     if 'spec.nodeName=%s ' % node in commandline), '')
-            result = {'return-code': 0, 'stdout': pods, 'stderr': ''}
-        return self._complete_aop(
-            instance_ref, [{'command': 'execute', 'commandline': commandline}],
-            {'0': result})
+        if self.pods_result is not None:
+            aop['results']['0'] = dict(self.pods_result)
+            return aop
+        if aop['results']['0']['return-code'] == 0:
+            aop['results']['0']['stdout'] = self._pods_for(commandline)
+        return aop
+
+    def _pods_for(self, commandline):
+        """The scripted answer for the node this command line names."""
+        if not isinstance(self.pods, dict):
+            return self.pods
+        for node, answer in self.pods.items():
+            # The command interpolates the quoted name, so the needle is
+            # quoted too: a name quote() decides to quote would otherwise
+            # miss and read as a node with nothing on it.
+            if 'spec.nodeName=%s ' % shlex.quote(node) in commandline:
+                return answer
+        raise AssertionError(
+            'no pods were scripted for the node in %r. This fake would '
+            'otherwise answer with an empty node, which is the assertion '
+            'most of these tests are making.' % commandline)
 
 
 class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
@@ -9596,7 +9624,49 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
 
         cluster.remove_worker(['inst-w1'], only_if_empty=True)
 
+        # The drain ran, which is the half an assertion on the metadata
+        # alone would also get from the option being ignored entirely.
+        self.assertEqual(
+            ['kubectl cordon k3s-banana-node-002',
+             'kubectl get pods',
+             'kubectl drain k3s-banana-node-002',
+             'kubectl delete node'],
+            self._kubectls(client))
         self.assertEqual(['inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_a_node_with_no_pods_at_all_is_removed(self):
+        # An empty answer is believed, deliberately: it is what the
+        # listing prints for a worker which has just joined and has not
+        # been given its DaemonSets' pods yet, and for a cluster running
+        # no DaemonSets at all. Refusing it would refuse those workers
+        # for good, which is worse than not having the option.
+        client, _, cluster = self._cluster(pods='')
+
+        cluster.remove_worker(['inst-w1'], only_if_empty=True)
+
+        self.assertEqual(['inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_a_drain_which_fails_after_the_check_uncordons_once(self):
+        # The check's own cordon and the drain's are the same cordon, so
+        # the one uncordon in the handler undoes both. A drain which fails
+        # after the node was found empty still has to leave it
+        # schedulable.
+        client, _, cluster = self._cluster()
+        client.failing_command = 'kubectl drain'
+
+        self.assertRaises(exceptions.CommandFailedError,
+                          cluster.remove_worker, ['inst-w1'],
+                          only_if_empty=True)
+
+        self.assertEqual(
+            ['kubectl cordon k3s-banana-node-002',
+             'kubectl get pods',
+             'kubectl drain k3s-banana-node-002',
+             'kubectl uncordon k3s-banana-node-002'],
+            self._kubectls(client))
+        self.assertEqual(['inst-w1', 'inst-w2'],
                          client.metadata[MD_KEY]['worker_nodes'])
 
     def test_an_idle_runner_pod_does_stop_a_removal(self):
@@ -9630,6 +9700,7 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
         # a refusal on the second must leave the first gone and the
         # metadata saying so.
         client, _, cluster = self._cluster(pods={
+            'k3s-banana-node-002': '',
             'k3s-banana-node-003': NODE_PODS_OUTPUT})
 
         self.assertRaises(exceptions.WorkerNotEmptyError,
@@ -9664,9 +9735,13 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
         self.assertEqual(['inst-w1', 'inst-w2'],
                          client.metadata[MD_KEY]['worker_nodes'])
 
-    def test_no_output_at_all_is_not_an_empty_node(self):
-        # A node always has at least the pods of its DaemonSets, so a
-        # command which printed nothing has not answered.
+    def test_a_result_recording_no_output_is_not_an_empty_node(self):
+        # Not the same thing as a command which printed nothing, which is
+        # a node with no pods and is believed
+        # (test_a_node_with_no_pods_at_all_is_removed above). This
+        # is a result carrying neither output nor a blob, which Shaken
+        # Fist does not produce today and which this refuses to read as
+        # an answer rather than guessing which it was.
         client, _, cluster = self._cluster(
             pods_result={'return-code': 0, 'stderr': ''})
 
@@ -9761,14 +9836,34 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
     def test_an_already_gone_instance_is_still_just_unlisted(self):
         # There is no node to cordon and no pods to list, so the check has
         # nothing to check; the entry goes, as it does without the flag.
-        client, _, cluster = self._cluster()
+        client, reporter, cluster = self._cluster()
         del client.instances['inst-w1']
 
         cluster.remove_worker(['inst-w1'], only_if_empty=True)
 
         self.assertEqual([], client.actions)
+        self.assertIn('no longer exists', '\n'.join(reporter.lines))
         self.assertEqual(['inst-w2'],
                          client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_the_refusal_names_every_pod_it_found(self):
+        # The message is what an operator reads, and a caller which
+        # removes a busy worker wants to know what was on it rather than
+        # that something was.
+        client, _, cluster = self._cluster(pods='\n'.join([
+            _pod_line('arc-runners', 'runner-lxj65', 'Running'),
+            _pod_line('default', 'web', ''),
+        ]))
+
+        e = self.assertRaises(exceptions.WorkerNotEmptyError,
+                              cluster.remove_worker, ['inst-w1'],
+                              only_if_empty=True)
+
+        self.assertEqual(
+            'arc-runners/runner-lxj65 (Running), '
+            'default/web (no phase reported)', e.describe_pods())
+        self.assertIn('has pods on it', str(e))
+        self.assertIn('default/web', str(e))
 
 
 class ExpandAddressesChecksTheDocumentFirstTestCase(testtools.TestCase):

@@ -471,18 +471,33 @@ the node again, exactly as a refused drain does, and prints what it
 found:
 
 ```
-sf-client k3s remove-worker mycluster --only-if-empty \
+$ sf-client k3s remove-worker mycluster --only-if-empty \
     --worker 3fa85f64-5717-4562-b3fc-2c963f66afa6
-Worker k3s-mycluster-node-002 (instance 3fa85f64-5717-4562-b3fc-2c963f66afa6)
-of cluster mycluster still has a pod on it, so it was not removed:
-arc-runners/runner-lxj65 (Running). ...
+Worker k3s-mycluster-node-002 (instance 3fa85f64-5717-4562-b3fc-2c963f66afa6) of cluster mycluster still has a pod on it, so
+it was not removed: arc-runners/runner-lxj65 (Running). Nothing on that node was changed,
+and any worker removed before it still was.
+$ echo $?
+1
 ```
 
 An answer the check cannot read is also a refusal, and is not read as
-an empty node: output `kubectl` printed too much of to be read back,
-no output at all, or a line that is not one the Kubernetes API would
-have printed. Each says so and removes nothing. A `kubectl` that exits
-non-zero fails the command, as the drain's would.
+an empty node: output `kubectl` printed too much of to be read back, a
+result that recorded no output at all, or a line that is not one the
+Kubernetes API would have printed. Each says so and removes nothing. A
+`kubectl` that exits non-zero fails the command, as the drain's would.
+
+A listing that ran and printed nothing is believed, and means a node
+with no pods on it -- which is what a worker that has just joined has
+until its DaemonSets' pods are scheduled, and what a cluster running
+no DaemonSets has for good. Refusing an empty answer would refuse
+those workers forever.
+
+"Managed by a DaemonSet" means the pod says so: it carries an owner
+reference of kind `DaemonSet` marked as its controller. Kubernetes does
+not check that such a reference names an object that exists, so a pod
+can claim one and be passed over. That is the same thing
+`drain --ignore-daemonsets` trusts, and anyone able to create a pod on
+the cluster is already inside the cluster.
 
 A drain that cannot finish is bounded and undone. If a pod on the
 worker has nowhere else to go -- a PodDisruptionBudget refuses the

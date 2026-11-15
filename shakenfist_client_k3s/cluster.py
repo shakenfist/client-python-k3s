@@ -1485,9 +1485,10 @@ _KUBERNETES_POD_PHASE = (
 # and testing .controller prints the literal once at most. The literal is
 # this module's, not the cluster's: the kind is compared with eq rather
 # than printed, so nothing from the API reaches the output of this column.
-# The 'if' on the list as well as the 'range' over it is needed, not
-# tidiness -- text/template refuses to range over a field an object does
-# not have, which would fail the whole command for a pod with no owner.
+# The 'if' on the list as well as the 'range' over it is this module's
+# rule that every nested read sits inside a test of its parent, which is
+# what a reader can check by eye; text/template would itself treat a
+# range over a field the pod does not have as an empty one.
 _KUBERNETES_POD_DAEMONSET = (
     '{{if .metadata}}{{if .metadata.ownerReferences}}'
     '{{range .metadata.ownerReferences}}'
@@ -1521,20 +1522,16 @@ def node_pods_command(node_name):
     remove_worker(only_if_empty=True) runs it, after cordoning the node, to
     decide whether removing the node would take work with it.
 
-    The node name is the only value interpolated here which is not this
-    module's own, so it is quoted once, per rule 1 at the top of this
-    module. The template is quoted as well, for the reason
-    K3S_KUBERNETES_PROBE_COMMAND gives: it is full of braces and double
-    quotes the shell must not touch, and contains no single quote of its
-    own, so quote() single quotes it without escaping anything.
+    The node name is quoted per rule 1 at the top of this module, and the
+    template for the reason K3S_KUBERNETES_PROBE_COMMAND gives.
 
     --field-selector rather than listing every pod and picking this node's
-    out: the API server does the matching, so the output is proportional to
-    one node's pods rather than to the cluster's, which keeps it inside
-    what Shaken Fist returns inline (see COMMAND_OUTPUT_LIMIT_BYTES, and
-    WorkerPodsUnreadableError for what happens when it does not). The
-    phases and the ownership are judged here rather than selected on,
-    because a refusal has to say what it found.
+    out. The API server does the matching, which is what 'kubectl drain'
+    itself selects the node's pods with, so the check sees the set the
+    drain will act on and the output is proportional to one node rather
+    than to the cluster (COMMAND_OUTPUT_LIMIT_BYTES). The phases and the
+    ownership are judged here rather than selected on, because a refusal
+    has to say what it found.
 
     --kubeconfig explicitly, as the other kubectl commands here do.
     """
@@ -1645,7 +1642,13 @@ def pods_in_the_way(pods):
     """The pods from parse_node_pods() which draining the node would evict.
 
     A DaemonSet's pod is not in the way: it exists because the node does,
-    the drain is told to ignore it, and it goes when the node goes. Nor is
+    the drain is told to ignore it, and it goes when the node goes. What
+    makes it one is its own metadata -- an owner reference of kind
+    DaemonSet marked as its controller -- and the API server does not
+    check that such a reference names an object which exists, so a pod
+    can claim one and be passed over here. That is what
+    'drain --ignore-daemonsets' trusts as well, and anyone who can create
+    a pod on the cluster is already inside it. Nor is
     a pod which has already reached Succeeded or Failed -- a finished
     installer Job, most often -- which is a record of work rather than
     work. Everything else is, including a pod which is idle, because
@@ -5744,23 +5747,14 @@ class Cluster:
             quoted = shlex.quote(node_name)
             try:
                 if only_if_empty:
-                    # Cordon, then look, and in that order: the cordon is
-                    # what makes the answer durable. Reversed, this would
-                    # be the race it exists to close -- the scheduler can
-                    # place a pod on an uncordoned node between the listing
-                    # and the drain, and the drain would then evict it.
-                    #
-                    # A separate 'kubectl cordon' rather than relying on
-                    # the drain's, which is the drain's first act but
-                    # happens after the only moment this could look. The
-                    # drain below cordons a node which is already cordoned,
-                    # which it treats as a no-op and reports as "already
-                    # cordoned".
-                    #
-                    # Inside the same guard as the drain, so a refusal
-                    # leaves the node schedulable: the cordon is undone by
-                    # the uncordon in the handler below, for exactly the
-                    # reason a refused drain is.
+                    # Cordon, then look, in that order: the cordon is what
+                    # makes the answer durable. Reversed, the scheduler
+                    # can place a pod on the node between the listing and
+                    # the drain, and the drain evicts it. A 'kubectl
+                    # cordon' of its own rather than the drain's, which
+                    # happens after the only moment this could look, and
+                    # which then finds the node already cordoned and says
+                    # so.
                     self.execute_and_await(
                         [md['control_plane_nodes'][0]],
                         ['kubectl cordon %s '
@@ -5793,7 +5787,8 @@ class Cluster:
                 # cordoned is a no-op, so covering both costs one
                 # harmless command in the case which does not need it.
                 #
-                # Both commands are inside the guard, because a drain
+                # Every command is inside the guard, the emptiness
+                # check's cordon and refusal among them, because a drain
                 # which succeeded has already cordoned the node and
                 # evicted every pod on it. A 'kubectl delete node' which
                 # then fails would otherwise leave the cluster one
@@ -5856,12 +5851,21 @@ class Cluster:
 
         That decision is to refuse, with WorkerPodsUnreadableError, in
         every case where the pods are not known: output which could not be
-        read, no output at all, and output holding a line the parser could
-        not read. Reading any of those as an empty list would say "nothing
-        is running here" about a node nobody looked at, on the one verb
-        where that answer destroys something. A non-zero exit raises
-        CommandFailedError from reap_execute(), as every other command here
-        does, which is the same refusal by a different name.
+        read, a result which recorded no output at all, and output holding
+        a line the parser could not read. Reading any of those as an empty
+        list would say "nothing is running here" about a node nobody looked
+        at, on the one verb where that answer destroys something. A
+        non-zero exit raises CommandFailedError from reap_execute(), as
+        every other command here does, which is the same refusal by a
+        different name.
+
+        A command which ran and printed nothing is a different matter, and
+        is believed: that is what the listing prints for a node with no
+        pods on it, which a worker which has just joined has until its
+        DaemonSets' pods are scheduled, and a cluster running no DaemonSets
+        has for good. Refusing an empty answer would refuse those nodes
+        forever, which is the one outcome worse for a pool-scaling caller
+        than not having the option.
 
         The command is submitted and reaped directly rather than through
         execute_and_await(), which discards the output this exists to read.
@@ -5874,7 +5878,9 @@ class Cluster:
         self.await_idle([control_plane_uuid], own_operations=[aop['uuid']])
         aop = self.reap_execute(aop)
 
-        result = (aop.get('results') or {}).get('0') or {}
+        # reap_execute() has already read this result's return code, so
+        # subscripting it here cannot fail where that did not.
+        result = aop['results']['0']
         stdout, unread = self._command_output(result, 'stdout')
         if unread:
             raise exceptions.WorkerPodsUnreadableError.not_read(

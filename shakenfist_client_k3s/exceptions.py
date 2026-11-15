@@ -418,10 +418,11 @@ class WorkerNotEmptyError(K3sClusterException):
     nothing visible from outside the cluster distinguishes a pod waiting
     for work from one about to be given some.
 
-    ``pods`` is what was found, each entry a dict with ``namespace``,
-    ``pod`` and ``phase`` (``None`` for a pod whose phase Kubernetes did
-    not report), so a caller can log what stopped the removal without
-    parsing the message. It is a refusal rather than a failure: nothing
+    ``pods`` is what was found, each entry as ``parse_node_pods()`` read
+    it: ``namespace``, ``pod``, ``phase`` (``None`` for a pod whose phase
+    Kubernetes did not report) and ``daemonset``, which is ``False`` for
+    every pod which is in the way. A caller can log what stopped the
+    removal without parsing the message. It is a refusal rather than a failure: nothing
     was removed, the node is left as it was found, and a caller which
     scales a pool treats this as "not this time" rather than as an error.
     That is why it is its own class -- a scaler has to tell it apart from
@@ -471,9 +472,12 @@ class WorkerPodsUnreadableError(_ReasonedK3sException):
       is itself a node nothing should be draining unexamined.
     - ``no_output(name, instance_uuid, node_name)``: the agent operation
       completed, with a zero exit code, and recorded no output for the
-      command at all. The command prints a line per pod and a node always
-      has at least its DaemonSet pods, so no output is not an empty
-      cluster; it is an answer this package does not understand.
+      command at all -- neither output nor the blob long output is stored
+      as. This is a guard rather than a case anybody has met: Shaken
+      Fist's sidechannel sets one or the other for every execute reply,
+      and a command which printed nothing arrives as output which is
+      empty, which is not this. An empty answer is believed, because it
+      is what a node with no pods on it gives.
     - ``unreadable_lines(name, instance_uuid, node_name, lines)``: the
       output held lines the parser could not read. A pod's namespace, name
       and phase are all values the Kubernetes API validates, so a line
