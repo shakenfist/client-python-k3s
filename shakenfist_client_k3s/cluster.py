@@ -1513,6 +1513,14 @@ NODE_PODS_TEMPLATE = (
     '{{end}}')
 
 
+# The progress note remove_worker() writes when the emptiness check found
+# nothing in the way. A constant rather than a literal in the note because
+# tools/ci_deploy_test.sh greps for this text to tell a check that ran from
+# a flag that was parsed and ignored, and a unit test asserts it, so that
+# rewording it fails the fast tier rather than the merge queue.
+NOTHING_IN_THE_WAY_NOTE = 'found nothing on it which a drain would evict'
+
+
 def node_pods_command(node_name):
     """Build the command which lists the pods Kubernetes has on one node.
 
@@ -5635,6 +5643,35 @@ class Cluster:
         no Kubernetes access cannot make that sequence at all, and one with
         it would be duplicating the cordon this method already does.
 
+        What the cordon closes is the scheduler's window, which is the one
+        a caller outside the cluster cannot close for itself. It is not a
+        lock on the node: a pod created with ``spec.nodeName`` already set
+        bypasses scheduling, and a pod tolerating the
+        ``node.kubernetes.io/unschedulable`` taint is placed there anyway,
+        so either can still arrive between the listing and the drain. Both
+        are narrow and neither is reachable by a workload which did not set
+        out to do it, and the drain which follows evicts what it finds
+        exactly as it always did.
+
+        The check is made per worker, inside the loop, rather than for all
+        of them up front. So a refusal on the third of three uuids leaves
+        the first two removed, which is unlike the validation this method
+        does first: the uuids and the node names are all resolved before
+        anything is touched, because those are answers which cannot change
+        while the call runs, and whether a node is in use is an answer
+        which can. ``WorkerNotEmptyError`` names the worker it stopped on,
+        and a caller scaling a pool reads it as "that many came out this
+        time".
+
+        A refusal leaves the node schedulable, through the same uncordon
+        every unfinished removal goes through. That is unconditional: a
+        node an operator had cordoned deliberately before the call is
+        uncordoned too, because nothing here reads the node's state before
+        cordoning it and so nothing can tell the two apart. Before this
+        option existed the case was rare, since only a failed drain reached
+        the uncordon; a caller which refuses as a matter of course meets it
+        every cycle, so it is written down here rather than discovered.
+
         What counts as in the way is deliberately generous: any pod which
         is not DaemonSet-managed and has not reached Succeeded or Failed,
         with no view on what the pod is for. See ``pods_in_the_way()`` for
@@ -5764,8 +5801,8 @@ class Cluster:
                     if pods:
                         raise exceptions.WorkerNotEmptyError(
                             self.name, instance_uuid, node_name, pods)
-                    p.note('cordoned %s and found nothing on it which a drain '
-                           'would evict' % node_name)
+                    p.note('cordoned %s and %s'
+                           % (node_name, NOTHING_IN_THE_WAY_NOTE))
 
                 self.execute_and_await(
                     [md['control_plane_nodes'][0]],
@@ -5851,8 +5888,9 @@ class Cluster:
 
         That decision is to refuse, with WorkerPodsUnreadableError, in
         every case where the pods are not known: output which could not be
-        read, a result which recorded no output at all, and output holding
-        a line the parser could not read. Reading any of those as an empty
+        read, a result which recorded no output at all, a result which
+        recorded both an inline stream and a blob, and output holding a
+        line the parser could not read. Reading any of those as an empty
         list would say "nothing is running here" about a node nobody looked
         at, on the one verb where that answer destroys something. A
         non-zero exit raises CommandFailedError from reap_execute(), as
@@ -5881,6 +5919,17 @@ class Cluster:
         # reap_execute() has already read this result's return code, so
         # subscripting it here cannot fail where that did not.
         result = aop['results']['0']
+        # Before _command_output(), because it resolves the ambiguity by
+        # preferring the inline stream: a result carrying stdout '' and a
+        # stdout_blob would come back as output which is empty, and an
+        # empty listing is believed. Shaken Fist sets one or the other, so
+        # this is a guard rather than a case anybody has met, and it is
+        # here rather than in _command_output() because what an unknown
+        # means is the caller's business and health() reads the same
+        # helper to report what it could.
+        if result.get('stdout') is not None and result.get('stdout_blob'):
+            raise exceptions.WorkerPodsUnreadableError.ambiguous_output(
+                self.name, instance_uuid, node_name)
         stdout, unread = self._command_output(result, 'stdout')
         if unread:
             raise exceptions.WorkerPodsUnreadableError.not_read(

@@ -1592,6 +1592,39 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'a result recording no output at all is not an empty node',
+        PKG + '/cluster.py',
+        '        if stdout is None:\n',
+        '        if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_result_recording_no_output_is_not_an_empty_node',
+        'stestr',
+    ),
+    (
+        'output which could not be read is not an empty node',
+        PKG + '/cluster.py',
+        # The whole statement, because '        if unread:' alone is a
+        # substring of the same line at a deeper indent elsewhere in this
+        # file and the search is not anchored to a line start.
+        """        if unread:
+            raise exceptions.WorkerPodsUnreadableError.not_read(""",
+        """        if False:
+            raise exceptions.WorkerPodsUnreadableError.not_read(""",
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_output_which_could_not_be_read_is_not_an_empty_node',
+        'stestr',
+    ),
+    (
+        'a result recording both output and a blob is not an empty node',
+        PKG + '/cluster.py',
+        "        if result.get('stdout') is not None and "
+        "result.get('stdout_blob'):\n",
+        '        if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_result_recording_output_and_a_blob_is_not_an_empty_node',
+        'stestr',
+    ),
+    (
         'a pod listing with a line nobody can read is not an empty node',
         PKG + '/cluster.py',
         "        if readings['unreadable_lines']:\n",

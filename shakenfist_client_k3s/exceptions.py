@@ -422,9 +422,10 @@ class WorkerNotEmptyError(K3sClusterException):
     it: ``namespace``, ``pod``, ``phase`` (``None`` for a pod whose phase
     Kubernetes did not report) and ``daemonset``, which is ``False`` for
     every pod which is in the way. A caller can log what stopped the
-    removal without parsing the message. It is a refusal rather than a failure: nothing
-    was removed, the node is left as it was found, and a caller which
-    scales a pool treats this as "not this time" rather than as an error.
+    removal without parsing the message. It is a refusal rather than a
+    failure: nothing was removed, the node is left as this call found it,
+    and a caller which scales a pool treats this as "not this time" rather
+    than as an error.
     That is why it is its own class -- a scaler has to tell it apart from
     a drain which broke, and a type is the only way to do that which does
     not depend on the message.
@@ -478,6 +479,15 @@ class WorkerPodsUnreadableError(_ReasonedK3sException):
       and a command which printed nothing arrives as output which is
       empty, which is not this. An empty answer is believed, because it
       is what a node with no pods on it gives.
+    - ``ambiguous_output(name, instance_uuid, node_name)``: the result
+      carried an inline stream *and* the blob long output is stored as.
+      ``_command_output()`` returns the inline one whenever it is not
+      None, so an empty inline stream beside a blob would otherwise read
+      as a node with no pods while the real answer sat unread in the blob.
+      Shaken Fist sets one or the other and not both, so this is the same
+      kind of guard as ``no_output``: unreachable against the documented
+      result shape, and a refusal rather than a guess because this is the
+      verb on which a wrong "empty" destroys work.
     - ``unreadable_lines(name, instance_uuid, node_name, lines)``: the
       output held lines the parser could not read. A pod's namespace, name
       and phase are all values the Kubernetes API validates, so a line
@@ -516,8 +526,17 @@ class WorkerPodsUnreadableError(_ReasonedK3sException):
         return cls._refusal(
             'no_output', name, instance_uuid, node_name,
             'The command listing them exited 0 and the agent operation\n'
-            'recorded no output for it, and a node always has at least the\n'
-            'pods of its DaemonSets.')
+            'recorded neither output nor the blob long output is stored as,\n'
+            'which is not the same as a command which printed nothing, so\n'
+            'what it found is unknown.')
+
+    @classmethod
+    def ambiguous_output(cls, name, instance_uuid, node_name):
+        return cls._refusal(
+            'ambiguous_output', name, instance_uuid, node_name,
+            'The agent operation recorded both an inline stream and the\n'
+            'blob long output is stored as, so which of the two the command\n'
+            'printed is unknown.')
 
     @classmethod
     def unreadable_lines(cls, name, instance_uuid, node_name, lines):

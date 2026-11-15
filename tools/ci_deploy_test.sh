@@ -665,6 +665,9 @@ if sf-client k3s remove-worker "${CLUSTER}" --worker "${new_worker}" \
     # The note is the check's own verdict, so this is what tells an
     # accepted removal apart from a flag which was parsed and ignored --
     # which is the whole of what the success branch could otherwise claim.
+    # The text is cluster.NOTHING_IN_THE_WAY_NOTE, which a unit test
+    # asserts as well, so a rewording fails the fast tier before it
+    # reaches this one.
     if ! grep -qF 'found nothing on it which a drain would evict' "${refusal}"; then
         echo 'remove-worker --only-if-empty removed the worker without'
         echo 'reporting that it checked it first'

@@ -236,6 +236,51 @@ the parser revalidates, a phase or an owner kind is compared against
 this module's literals rather than printed, and a forged line reaches
 `unreadable_lines` and refuses rather than reading as an empty node.
 
+### Review round 1
+
+The automated reviewer raised 1 fix, 3 document, 5 consider and 2 none
+on `55f0571`. Everything but one `consider` was taken.
+
+The `fix` was a documentation drift this plan's own push audit created:
+the audit corrected the false claim that a node always has at least its
+DaemonSets' pods in the docstring and both documents, and missed the
+same sentence inside `WorkerPodsUnreadableError.no_output`'s message,
+where it contradicted the class docstring forty lines above it. The
+existing test asserted only `reason`, which is why the drift survived;
+it now asserts a phrase of the message and the absence of the old
+claim.
+
+Three documentation items, all taken. The cordon's durability claim is
+qualified -- a cordon stops the scheduler, not a pod created with
+`spec.nodeName` already set nor one tolerating the unschedulable taint,
+and the drain evicts those as it always did. The per-worker nature of
+the check is stated in both documents, because `docs/usage.md` promises
+fifteen lines earlier that validation is hoisted so a bad last uuid
+removes nothing, and a reader carries that promise into a section where
+it does not hold. And `unreadable_lines` is described as a count rather
+than as the lines themselves.
+
+Four `consider` items taken: a result carrying both an inline stream
+and a blob now refuses as `ambiguous_output` rather than resolving to
+an empty node (unreachable against Shaken Fist's documented result
+shape, and the same guard as `no_output` for the same reason); the
+progress note the live tier greps is a module constant a unit test
+asserts, so rewording it fails the fast tier rather than the merge
+queue; two more mutation entries cover the two refusals the push audit
+had reasoned about wrongly, and a third covers the new one; and one
+docstring line is re-wrapped.
+
+The `consider` not taken is the unconditional uncordon. A refusal
+uncordons the node through the guard every unfinished removal uses, and
+that guard cannot tell this method's cordon from one an operator made
+first, so a loop refusing every cycle returns a deliberately cordoned
+worker to service every cycle. The blindness is pre-existing -- only
+the frequency is new -- and the correct fix costs a read of
+`spec.unschedulable` before the cordon plus a branch in a guard shared
+with the drain path, which is a behaviour change to the default verb as
+well. Documented in `remove_worker()`'s docstring, `docs/usage.md` and
+`docs/library-api.md`, and filed as its own issue.
+
 ### Phase 1 steps
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |

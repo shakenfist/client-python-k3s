@@ -9582,7 +9582,7 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
         # The whole point. Listing first and cordoning afterwards would
         # leave a window in which the scheduler can place a pod on the
         # node, which the drain would then evict.
-        client, _, cluster = self._cluster()
+        client, reporter, cluster = self._cluster()
 
         cluster.remove_worker(['inst-w1'], only_if_empty=True)
 
@@ -9592,6 +9592,12 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
              'kubectl drain k3s-banana-node-002',
              'kubectl delete node'],
             self._kubectls(client))
+
+        # tools/ci_deploy_test.sh greps this text to tell a check which ran
+        # from a flag which was parsed and ignored, so asserting it here
+        # makes a rewording fail the fast tier rather than the merge queue.
+        self.assertIn(cluster_module.NOTHING_IN_THE_WAY_NOTE,
+                      '\n'.join(reporter.lines))
 
     def test_the_listing_is_of_this_node_on_the_control_plane_node(self):
         client, _, cluster = self._cluster()
@@ -9750,6 +9756,33 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
                               only_if_empty=True)
 
         self.assertEqual('no_output', e.reason)
+        # The wording as well as the reason: the explanation this message
+        # carries once said a node always has at least its DaemonSets'
+        # pods, which is false for a worker which has just joined and is
+        # the opposite of what the empty listing above is believed on.
+        self.assertIn('neither output nor the blob', str(e))
+        self.assertNotIn('always has at least', str(e))
+        self.assertEqual(['inst-w1', 'inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_a_result_recording_output_and_a_blob_is_not_an_empty_node(self):
+        # _command_output() prefers the inline stream whenever it is not
+        # None, so stdout '' beside a stdout_blob would resolve to output
+        # which is empty -- a node with no pods -- while the real answer
+        # sat in the blob. Shaken Fist sets one or the other, so this is a
+        # guard on the verb where reading an unknown as empty destroys
+        # work.
+        client, _, cluster = self._cluster(
+            pods_result={'return-code': 0, 'stdout': '',
+                         'stdout_blob': 'blob-1', 'stderr': ''})
+
+        e = self.assertRaises(exceptions.WorkerPodsUnreadableError,
+                              cluster.remove_worker, ['inst-w1'],
+                              only_if_empty=True)
+
+        self.assertEqual('ambiguous_output', e.reason)
+        self.assertEqual([], [a for a in client.actions
+                              if a[0] == 'delete_instance'])
         self.assertEqual(['inst-w1', 'inst-w2'],
                          client.metadata[MD_KEY]['worker_nodes'])
 

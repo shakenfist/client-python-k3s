@@ -452,6 +452,11 @@ drain does not provide it -- an unforced `kubectl drain` declines only a
 pod no controller owns, and a pod owned by a ReplicaSet, a Job or a
 custom resource is evicted and the drain exits 0.
 
+The check is made per worker, as each one comes to be removed, not for
+all of them up front like the uuid and node name validation above. So a
+refusal on the third of three `--worker` options leaves the first two
+removed; the message names the worker it stopped on and says so.
+
 What counts as work is any pod that is not managed by a DaemonSet and
 has not already reached `Succeeded` or `Failed`. A DaemonSet's pod goes
 with the node, and a finished pod -- the `helm-install-*` Job pods a
@@ -462,13 +467,28 @@ distinguishes an idle pod from one that has just been given something
 to do.
 
 The node is cordoned before its pods are listed, and that order is the
-point of the option. Kubernetes will not schedule a new pod onto a
+point of the option. The scheduler will not place a new pod on a
 cordoned node, so a node that is empty once it has been cordoned stays
-empty; a caller that checks for itself and then calls `remove-worker`
-has no way to close the gap between the two, which is why this is an
-option here rather than something to do outside. A refusal uncordons
-the node again, exactly as a refused drain does, and prints what it
-found:
+empty as far as scheduling is concerned; a caller that checks for
+itself and then calls `remove-worker` has no way to close that gap,
+which is why this is an option here rather than something to do
+outside.
+
+A cordon is not a lock, and two kinds of pod can still arrive: one
+created with `spec.nodeName` already set, which never goes through the
+scheduler, and one that tolerates the
+`node.kubernetes.io/unschedulable` taint. Neither happens to a workload
+that did not set out to do it, and the drain that follows evicts what
+it finds, as it did before this option existed.
+
+A refusal uncordons the node again, exactly as a refused drain does,
+and prints what it found. That uncordon is unconditional: a worker an
+operator had cordoned on purpose before the call is put back into
+service by a refusal, because `remove-worker` does not read the node's
+state before cordoning it and cannot tell its own cordon from somebody
+else's. A caller that refuses as a matter of course -- a loop shrinking
+a pool -- meets that every cycle, so do not cordon a worker to hold it
+out of service while such a loop is running.
 
 ```
 $ sf-client k3s remove-worker mycluster --only-if-empty \
@@ -482,8 +502,9 @@ $ echo $?
 
 An answer the check cannot read is also a refusal, and is not read as
 an empty node: output `kubectl` printed too much of to be read back, a
-result that recorded no output at all, or a line that is not one the
-Kubernetes API would have printed. Each says so and removes nothing. A
+result that recorded no output at all, a result that recorded both an
+inline stream and the blob long output is stored as, or a line that is
+not one the Kubernetes API would have printed. Each says so and removes nothing. A
 `kubectl` that exits non-zero fails the command, as the drain's would.
 
 A listing that ran and printed nothing is believed, and means a node

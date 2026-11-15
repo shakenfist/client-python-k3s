@@ -331,7 +331,7 @@ a correct caller never needs to catch it.
 | `WorkerNotFoundError` | `remove_worker()` is given a uuid that is not one of the cluster's workers |
 | `WorkerUnnamedError` | `remove_worker()` finds a worker whose instance record has no name, so the k3s node it became cannot be identified |
 | `WorkerNotEmptyError` | `remove_worker(only_if_empty=True)` finds a pod on the worker which is neither DaemonSet-managed nor already `Succeeded` or `Failed`. `pods` is what was found, each a dict with `namespace`, `pod`, `phase` (`None` when Kubernetes reported none) and `daemonset`, which is `False` for every pod that is in the way. A refusal rather than a failure: nothing was removed and the node was left as it was found |
-| `WorkerPodsUnreadableError` | `remove_worker(only_if_empty=True)` could not read the worker's pods, so it would not judge the node empty: `not_read` (the output was not available to read, `detail` saying why), `no_output` (a zero exit code and a result recording no output at all, which is not the same as a command that printed nothing -- an empty listing is a node with no pods, and is believed) or `unreadable_lines` (`lines` of the output are not lines the Kubernetes API would have printed) |
+| `WorkerPodsUnreadableError` | `remove_worker(only_if_empty=True)` could not read the worker's pods, so it would not judge the node empty: `not_read` (the output was not available to read, `detail` saying why), `no_output` (a zero exit code and a result recording no output at all, which is not the same as a command that printed nothing -- an empty listing is a node with no pods, and is believed), `ambiguous_output` (the result recorded both an inline stream and the blob long output is stored as, so which of the two the command printed is unknown) or `unreadable_lines` (`lines` is how many of the lines it printed are not lines the Kubernetes API would have printed; the lines themselves are not carried) |
 | `NodeUnnamedError` | `create()` or `expand_workers()` finds a node it just added whose instance record has no name, so it cannot wait for that node to become `Ready` |
 | `ManifestError` | `create(manifests=...)` is given a path that cannot be staged: wrong suffix, a basename that is not a plain filename, a duplicate basename, unreadable or not decodable as UTF-8, not valid YAML or JSON, or a line colliding with the staging marker |
 | `GuestFileError` | a file this library writes onto a cluster node carries a line equal to the heredoc marker used to write it, so writing it would run the rest as commands on the node. The values that reach these bodies come from the namespace metadata document, which is third-party writable |
@@ -480,6 +480,15 @@ a pod before it acts, and cordoning first is what closes that gap. The
 other exceptions a removal raises, `WorkerPodsUnreadableError` among
 them, are failures in the ordinary way. `docs/usage.md` has what counts
 as empty and why an idle pod does not.
+
+Two things that matter to such a caller more than to the command line.
+The check is made per worker inside the removal loop, not for the whole
+list up front like the uuid validation, so passing several uuids and
+catching `WorkerNotEmptyError` means the workers ahead of the one named
+in the exception were removed; read `node_name` and `instance_uuid` off
+it rather than assuming the call was atomic. And the uncordon a refusal
+performs is unconditional, so a worker an operator had cordoned
+deliberately is returned to service by a refused removal.
 
 Every elapsed time this library measures -- the probe's timeout, the
 stall notes, the progress reporting -- is taken from `time.monotonic()`,
