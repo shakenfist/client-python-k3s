@@ -279,7 +279,8 @@ the frequency is new -- and the correct fix costs a read of
 `spec.unschedulable` before the cordon plus a branch in a guard shared
 with the drain path, which is a behaviour change to the default verb as
 well. Documented in `remove_worker()`'s docstring, `docs/usage.md` and
-`docs/library-api.md`, and filed as its own issue.
+`docs/library-api.md`, and filed as
+[#173](https://github.com/shakenfist/client-python-k3s/issues/173).
 
 ### Phase 1 steps
 
