@@ -334,6 +334,52 @@ Ten mutations now cover this change, each applied and caught. The two
 `none` items were the already-filed uncordon (#173) and a security read
 that found no new class of untrusted input.
 
+### Review round 3
+
+No `fix` items: 1 document, 7 consider and 3 none on `5e65cdd`. The
+document item and five considers are taken, one consider is documented
+and filed, and one is declined. This is where the rounds stop -- the
+exit is no `fix` items, not the reviewer running out of things to say.
+
+The document item is the refusal transcript in `docs/usage.md`, which
+showed the exception alone while the command also writes a progress
+phase line and the uncordon's own reporter line. The transcript now
+says progress output is elided and shows the line that proves the prose
+two paragraphs above it.
+
+The sharpest consider is a mirror pod. `kubectl drain` skips one
+unconditionally, whatever flags it was given, but a mirror pod's
+controlling owner reference is of kind `Node` rather than `DaemonSet`,
+so this check counts it as work and a worker carrying a static pod is
+refused for as long as it carries one. The behaviour is the safe
+direction to be wrong in and is not reachable on a k3s worker unless
+somebody has put a manifest in the kubelet's directory, so the three
+places which claimed the set is what a drain would evict now say it is
+not, and detecting a mirror pod is filed as
+[#174](https://github.com/shakenfist/client-python-k3s/issues/174).
+
+The others. The three refusal messages `ambiguous_output`,
+`unreadable_lines` and `not_read` were asserted only through `reason`,
+which is exactly how round 1's `fix` survived; they now have a
+`WorkerPodsUnreadableErrorTestCase` of their own, which also closes the
+placement item from round 2. The live tier's `grep -qF 'it was not
+removed'` was satisfied by the uncordon's reporter line rather than by
+the exception, and round 2 had already reworded that line once, so it
+greps a phrase unique to `WorkerNotEmptyError.__str__` now. The
+future-work note above undercounted the cost of the option. And two
+style items, both artefacts of the round-2 edit, are fixed.
+
+Declined: a sentence in `ARCHITECTURE.md` about the reading layer. The
+success criteria below ask for it on a change which "adds or modifies
+modules or CLI commands", which this does, but the global
+documentation-discipline rule is narrower -- `ARCHITECTURE.md` changes
+when the shape of the system changes, meaning the component inventory
+or how data moves between components. A flag on an existing verb and a
+third template/parser pair inside an existing module is neither. The
+criterion is the thing phrased too broadly, and the note about the
+seam is recorded in *Future work* above, where the deferred module
+split can pick it up.
+
 ### Phase 1 steps
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
@@ -794,10 +840,17 @@ chosen to defer to here, so that we do not forget them.
   oldest kubectl this plugin supports, and neither is rendered by that
   kubectl in CI. This is the same gap as
   shakenfist/client-python-k3s#82 rather than a new one.
-* **The listing is one more agent operation per worker removed.** For a
-  caller removing workers one at a time that is the right trade, but a
-  caller removing several would pay it per worker; there is no batching
-  here and none is needed yet.
+* **The option costs two more agent operations per worker, not one.**
+  The cordon and the listing are separate `instance_execute()`
+  submissions, each with its own `await_idle()` poll, and a refusal pays
+  both and then a third for the uncordon. For a caller removing workers
+  one at a time that is the right trade, but a caller removing several
+  pays it per worker; there is no batching here and none is needed yet.
+  The two could be one command (`kubectl cordon ... > /dev/null &&
+  kubectl get pods ...`), which keeps the ordering guarantee and halves
+  them, at the cost of no longer knowing which of the two failed and of
+  having to discard the cordon's own stdout so it cannot reach
+  `parse_node_pods()`.
 * **The live tier's refusal branch is about twenty-five lines of shell
   which will not run.** Because the worker it removes holds only
   DaemonSet pods, CI takes the accepted-removal branch; the refusal
@@ -806,7 +859,7 @@ chosen to defer to here, so that we do not forget them.
   above would run them.
 * **`cluster.py` is near six thousand lines, and this change made the
   seam clearer.** The Kubernetes reading layer -- the go-templates, the
-  name, phase and status validators, and the two parsers -- is now
+  name, phase and status validators, and the three parsers -- is now
   roughly seven hundred lines of pure functions with no `Cluster`
   dependency and test cases of their own, which would move to a module
   of their own without touching a call site beyond an import. A split is

@@ -424,16 +424,23 @@ class WorkerNotEmptyError(K3sClusterException):
     every pod which is in the way. A caller can log what stopped the
     removal without parsing the message. The message names the first
     ``DESCRIBED_PODS`` of them and then how many more there were, because
-    a node at Kubernetes' default limit of 110 pods would otherwise render
-    one line of tens of kilobytes into every log which catches this; the
-    attribute is the whole answer and the message is a sample of it. It is a refusal rather than a
-    failure: nothing was removed, the node is left as this call found it,
-    and a caller which scales a pool treats this as "not this time" rather
-    than as an error.
-    That is why it is its own class -- a scaler has to tell it apart from
-    a drain which broke, and a type is the only way to do that which does
-    not depend on the message.
+    a node at Kubernetes' default limit of 110 pods would otherwise
+    render one line of tens of kilobytes into every log which catches
+    this; the attribute is the whole answer and the message is a sample
+    of it.
+
+    It is a refusal rather than a failure: nothing was removed, the node
+    is left as this call found it, and a caller which scales a pool
+    treats this as "not this time" rather than as an error. That is why
+    it is its own class -- a scaler has to tell it apart from a drain
+    which broke, and a type is the only way to do that which does not
+    depend on the message.
     """
+
+    #: How many pods the message names before it starts counting instead.
+    #: Ten is enough to see what kind of workload stopped the removal,
+    #: which is what an operator reads the message for.
+    DESCRIBED_PODS = 10
 
     def __init__(self, name, instance_uuid, node_name, pods):
         self.name = name
@@ -441,11 +448,6 @@ class WorkerNotEmptyError(K3sClusterException):
         self.node_name = node_name
         self.pods = [dict(pod) for pod in pods]
         super(WorkerNotEmptyError, self).__init__(name)
-
-    #: How many pods the message names before it starts counting instead.
-    #: Ten is enough to see what kind of workload stopped the removal,
-    #: which is what an operator reads the message for.
-    DESCRIBED_PODS = 10
 
     def describe_pods(self):
         """The pods which stopped the removal, as 'namespace/name (phase)'.

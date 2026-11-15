@@ -492,9 +492,14 @@ else's. A caller that refuses as a matter of course -- a loop shrinking
 a pool -- meets that every cycle, so do not cordon a worker to hold it
 out of service while such a loop is running.
 
+The reporter line below is the one that proves it. Progress output is
+elided from this transcript; what is shown is that line and the error:
+
 ```
 $ sf-client k3s remove-worker mycluster --only-if-empty \
     --worker 3fa85f64-5717-4562-b3fc-2c963f66afa6
+...
+k3s-mycluster-node-002 still has work on it, so it was not removed. Putting it back in service.
 Worker k3s-mycluster-node-002 (instance 3fa85f64-5717-4562-b3fc-2c963f66afa6) of cluster mycluster still has a pod on it, so
 it was not removed: arc-runners/runner-lxj65 (Running). Nothing on that node was changed,
 and any worker removed before it still was.
@@ -515,6 +520,16 @@ with no pods on it -- which is what a worker that has just joined has
 until its DaemonSets' pods are scheduled, and what a cluster running
 no DaemonSets has for good. Refusing an empty answer would refuse
 those workers forever.
+
+This is not quite the same set a `kubectl drain` would evict, and is
+stricter in one known way: a drain skips a mirror pod -- the copy the
+API server holds of a static pod the kubelet runs from a manifest on
+disk -- whatever flags it was given, while `--only-if-empty` counts one
+as work, because a mirror pod's controlling owner reference is of kind
+`Node` rather than `DaemonSet`. A worker carrying a static pod is
+therefore refused for as long as it carries one. That is the safe
+direction to be wrong in, and a k3s worker has no static pods unless
+somebody put a manifest in the kubelet's directory.
 
 "Managed by a DaemonSet" means the pod says so: it carries an owner
 reference of kind `DaemonSet` marked as its controller. Kubernetes does

@@ -1651,7 +1651,7 @@ def parse_node_pods(stdout):
 
 
 def pods_in_the_way(pods):
-    """The pods from parse_node_pods() which draining the node would evict.
+    """The pods from parse_node_pods() which count as work on the node.
 
     A DaemonSet's pod is not in the way: it exists because the node does,
     the drain is told to ignore it, and it goes when the node goes. What
@@ -1666,6 +1666,18 @@ def pods_in_the_way(pods):
     work. Everything else is, including a pod which is idle, because
     nothing a node's pod list shows distinguishes a pod waiting for work
     from one which has just been given some.
+
+    This is deliberately not the same set as the one an unforced
+    ``kubectl drain`` would evict, and is stricter than it in one known
+    way: a drain skips a mirror pod -- the read-only copy the API server
+    holds of a static pod the kubelet runs from a manifest on disk --
+    unconditionally, and whether ``--ignore-daemonsets`` was passed or
+    not. A mirror pod's controlling owner reference is of kind ``Node``
+    rather than ``DaemonSet``, so it is counted here as being in the way
+    and a worker carrying one is refused for as long as it carries it.
+    That is the safe direction to be wrong in, and it is not reachable on
+    a k3s worker unless somebody has put a manifest in the kubelet's
+    directory, which is why it is written down rather than detected (#174).
     """
     return [pod for pod in pods
             if not pod['daemonset']
@@ -5883,7 +5895,7 @@ class Cluster:
             progress.count_str(len(wanted), 'worker'), self.name))
 
     def _pods_in_the_way(self, control_plane_uuid, instance_uuid, node_name):
-        """List the pods on a node which draining it would evict.
+        """List the pods on a node which count as work on it.
 
         remove_worker(only_if_empty=True)'s emptiness check, run on the
         node it is about to remove and only once that node is cordoned, so
@@ -5891,7 +5903,9 @@ class Cluster:
         order is what makes this worth asking at all.
 
         Returns the pods which are in the way, which is the empty list for
-        a node holding nothing but DaemonSet pods and finished ones. The
+        a node holding nothing but DaemonSet pods and finished ones. See
+        ``pods_in_the_way()`` for the one way that set is stricter than
+        what an unforced drain would evict. The
         judgement is pods_in_the_way()'s and the parsing is
         parse_node_pods()'s; this is the part which has to decide what to
         do about an answer it cannot read.

@@ -683,7 +683,12 @@ else
         echo 'remove-worker --only-if-empty could not read the node pods'
         exit 1
     fi
-    if ! grep -qF 'it was not removed' "${refusal}"; then
+    # A phrase unique to WorkerNotEmptyError.__str__, not one the
+    # uncordon's own reporter line also contains: both say 'it was not
+    # removed', and this assertion is meant to say the library refused
+    # rather than that it put the node back. The sed below reads the same
+    # message's first line, so the two agree on what they are reading.
+    if ! grep -qF 'Nothing on that node was changed' "${refusal}"; then
         echo 'remove-worker --only-if-empty failed, and not by refusing'
         exit 1
     fi
