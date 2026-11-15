@@ -467,19 +467,21 @@ distinguishes an idle pod from one that has just been given something
 to do.
 
 The node is cordoned before its pods are listed, and that order is the
-point of the option. The scheduler will not place a new pod on a
-cordoned node, so a node that is empty once it has been cordoned stays
-empty as far as scheduling is concerned; a caller that checks for
-itself and then calls `remove-worker` has no way to close that gap,
-which is why this is an option here rather than something to do
+point of the option. A cordon closes the window for everything the
+scheduler has not yet decided, which is the window a caller that
+checks for itself and then calls `remove-worker` cannot close at all;
+that is why this is an option here rather than something to do
 outside.
 
-A cordon is not a lock, and two kinds of pod can still arrive: one
+A cordon is not a lock, and three kinds of pod can still arrive: one
 created with `spec.nodeName` already set, which never goes through the
-scheduler, and one that tolerates the
-`node.kubernetes.io/unschedulable` taint. Neither happens to a workload
-that did not set out to do it, and the drain that follows evicts what
-it finds, as it did before this option existed.
+scheduler; one that tolerates the `node.kubernetes.io/unschedulable`
+taint; and one the scheduler had already picked this node for when the
+cordon landed, since it filters against a cache snapshot and the API
+server does not re-check `spec.unschedulable` when it accepts the
+binding. None of the three happens to a workload that did not set out
+to do it, and the drain that follows evicts what it finds, as it did
+before this option existed.
 
 A refusal uncordons the node again, exactly as a refused drain does,
 and prints what it found. That uncordon is unconditional: a worker an
@@ -504,8 +506,9 @@ An answer the check cannot read is also a refusal, and is not read as
 an empty node: output `kubectl` printed too much of to be read back, a
 result that recorded no output at all, a result that recorded both an
 inline stream and the blob long output is stored as, or a line that is
-not one the Kubernetes API would have printed. Each says so and removes nothing. A
-`kubectl` that exits non-zero fails the command, as the drain's would.
+not one the Kubernetes API would have printed. Each says so and
+removes nothing. A `kubectl` that exits non-zero fails the command, as
+the drain's would.
 
 A listing that ran and printed nothing is believed, and means a node
 with no pods on it -- which is what a worker that has just joined has

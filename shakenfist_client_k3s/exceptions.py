@@ -422,7 +422,11 @@ class WorkerNotEmptyError(K3sClusterException):
     it: ``namespace``, ``pod``, ``phase`` (``None`` for a pod whose phase
     Kubernetes did not report) and ``daemonset``, which is ``False`` for
     every pod which is in the way. A caller can log what stopped the
-    removal without parsing the message. It is a refusal rather than a
+    removal without parsing the message. The message names the first
+    ``DESCRIBED_PODS`` of them and then how many more there were, because
+    a node at Kubernetes' default limit of 110 pods would otherwise render
+    one line of tens of kilobytes into every log which catches this; the
+    attribute is the whole answer and the message is a sample of it. It is a refusal rather than a
     failure: nothing was removed, the node is left as this call found it,
     and a caller which scales a pool treats this as "not this time" rather
     than as an error.
@@ -438,12 +442,25 @@ class WorkerNotEmptyError(K3sClusterException):
         self.pods = [dict(pod) for pod in pods]
         super(WorkerNotEmptyError, self).__init__(name)
 
+    #: How many pods the message names before it starts counting instead.
+    #: Ten is enough to see what kind of workload stopped the removal,
+    #: which is what an operator reads the message for.
+    DESCRIBED_PODS = 10
+
     def describe_pods(self):
-        """The pods which stopped the removal, as 'namespace/name (phase)'."""
-        return ', '.join(
+        """The pods which stopped the removal, as 'namespace/name (phase)'.
+
+        Capped at DESCRIBED_PODS, with a count of the rest after it. The
+        full list is the ``pods`` attribute, which this never shortens.
+        """
+        described = ', '.join(
             '%s/%s (%s)' % (pod.get('namespace'), pod.get('pod'),
                             pod.get('phase') or 'no phase reported')
-            for pod in self.pods)
+            for pod in self.pods[:self.DESCRIBED_PODS])
+        remaining = len(self.pods) - self.DESCRIBED_PODS
+        if remaining > 0:
+            return '%s, and %d more' % (described, remaining)
+        return described
 
     def __str__(self):
         return ('Worker %s (instance %s) of cluster %s still has %s on it, so\n'

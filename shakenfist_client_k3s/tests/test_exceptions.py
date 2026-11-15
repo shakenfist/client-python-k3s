@@ -520,6 +520,66 @@ class KubeconfigErrorTestCase(testtools.TestCase):
             "'foo; touch /tmp/pwned.testns'", str(e))
 
 
+class WorkerNotEmptyErrorTestCase(testtools.TestCase):
+    """The refusal only_if_empty raises, and what its message renders.
+
+    remove_worker()'s own tests cover when it is raised; these cover what
+    it says, which is where the other exceptions' message tests live.
+    """
+
+    @staticmethod
+    def _pods(count, phase='Running'):
+        return [{'namespace': 'arc-runners', 'pod': 'runner-%03d' % n,
+                 'phase': phase, 'daemonset': False}
+                for n in range(count)]
+
+    def test_one_pod(self):
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(1))
+        self.assertEqual('k3s-banana-node-002', e.node_name)
+        self.assertEqual('inst-w1', e.instance_uuid)
+        self.assertIn('still has a pod on it', str(e))
+        self.assertIn('arc-runners/runner-000 (Running)', str(e))
+
+    def test_several_pods_are_plural(self):
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(2))
+        self.assertIn('still has pods on it', str(e))
+
+    def test_a_pod_with_no_phase_says_so(self):
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002',
+            self._pods(1, phase=None))
+        self.assertIn('arc-runners/runner-000 (no phase reported)', str(e))
+
+    def test_the_rendered_list_is_capped_and_the_rest_counted(self):
+        # A node at Kubernetes' default limit of 110 pods would otherwise
+        # render one line of tens of kilobytes into every log which catches
+        # this.
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(13))
+
+        described = e.describe_pods()
+        self.assertEqual(10, described.count('arc-runners/'))
+        self.assertIn('and 3 more', described)
+        self.assertIn('runner-009', described)
+        self.assertNotIn('runner-010', described)
+
+    def test_the_pods_attribute_is_never_shortened(self):
+        # The message is a sample; this is the whole answer, and a caller
+        # which logs what stopped the removal reads it rather than the
+        # message.
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(13))
+        self.assertEqual(13, len(e.pods))
+        self.assertEqual('runner-012', e.pods[-1]['pod'])
+
+    def test_exactly_the_cap_counts_nothing_more(self):
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(10))
+        self.assertNotIn('more', e.describe_pods())
+
+
 class TotalAttributesTestCase(testtools.TestCase):
     """The two **fields exceptions answer every field, whoever built them.
 

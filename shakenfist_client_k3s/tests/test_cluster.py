@@ -9511,8 +9511,8 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
     outside looks can be given a pod before they act on what they saw.
     """
 
-    def _cluster(self, **kwargs):
-        client = ActionLogPodListingClient(**kwargs)
+    def _cluster(self, client=None, **kwargs):
+        client = client or ActionLogPodListingClient(**kwargs)
         client.metadata[MD_KEY] = {
             'name': 'banana', 'namespace': 'testns', 'state': 'created',
             'node_serial': 3, 'node_network': 'net-1', 'node_token': 'tok',
@@ -9576,7 +9576,12 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
              'kubectl get pods',
              'kubectl uncordon k3s-banana-node-002'],
             self._kubectls(client))
-        self.assertIn('Uncordoning', '\n'.join(reporter.lines))
+        # Reported as the refusal it is, not as a removal which broke: for
+        # a caller which refuses every cycle, the incident wording is the
+        # line an operator learns to ignore.
+        written = '\n'.join(reporter.lines)
+        self.assertIn('still has work on it, so it was not removed', written)
+        self.assertNotIn('did not finish', written)
 
     def test_the_node_is_cordoned_before_its_pods_are_listed(self):
         # The whole point. Listing first and cordoning afterwards would
@@ -9593,11 +9598,16 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
              'kubectl delete node'],
             self._kubectls(client))
 
-        # tools/ci_deploy_test.sh greps this text to tell a check which ran
-        # from a flag which was parsed and ignored, so asserting it here
-        # makes a rewording fail the fast tier rather than the merge queue.
+        # Two assertions, because they pin different things and only the
+        # pair makes the claim in the constant's comment true. The first
+        # says the note is built from the constant; the second says what
+        # the constant says, which is the literal tools/ci_deploy_test.sh
+        # greps for and cannot import. Without the second, rewording the
+        # constant passes here and fails only the merge queue.
         self.assertIn(cluster_module.NOTHING_IN_THE_WAY_NOTE,
                       '\n'.join(reporter.lines))
+        self.assertEqual('found nothing on it which a drain would evict',
+                         cluster_module.NOTHING_IN_THE_WAY_NOTE)
 
     def test_the_listing_is_of_this_node_on_the_control_plane_node(self):
         client, _, cluster = self._cluster()
@@ -9762,6 +9772,70 @@ class RemoveWorkerOnlyIfEmptyTestCase(testtools.TestCase):
         # the opposite of what the empty listing above is believed on.
         self.assertIn('neither output nor the blob', str(e))
         self.assertNotIn('always has at least', str(e))
+        self.assertEqual(['inst-w1', 'inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_the_listing_is_read_from_the_operation_as_it_completed(self):
+        # Against the real server instance_execute() returns the operation
+        # as submitted -- 'queued', with no results at all -- and only
+        # get_agent_operation() reports what the command did, which is why
+        # reap_execute() returns the operation it re-read. The stock fake
+        # hands back a completed operation, so every other test here would
+        # also pass if the check read the submitted one, which would
+        # KeyError on a live cluster. This fake answers the way the server
+        # does; fakes.HealthClient's docstring records the same shape and
+        # the same reason.
+        class QueuedSubmissionClient(ActionLogPodListingClient):
+            def __init__(self, **kwargs):
+                super(QueuedSubmissionClient, self).__init__(**kwargs)
+                self.completed = {}
+
+            def instance_execute(self, instance_ref, commandline):
+                aop = super(QueuedSubmissionClient, self).instance_execute(
+                    instance_ref, commandline)
+                self.completed[aop['uuid']] = aop
+                return {'uuid': aop['uuid'],
+                        'instance_uuid': aop['instance_uuid'],
+                        'state': 'queued'}
+
+            def get_agent_operation(self, operation_uuid):
+                return self.completed[operation_uuid]
+
+        client = QueuedSubmissionClient(pods=NODE_PODS_OUTPUT)
+        _, _, cluster = self._cluster(client=client)
+
+        e = self.assertRaises(exceptions.WorkerNotEmptyError,
+                              cluster.remove_worker, ['inst-w1'],
+                              only_if_empty=True)
+
+        self.assertIn('k3s-static-hunkydory-runner-lxj65', str(e))
+        self.assertEqual(['inst-w1', 'inst-w2'],
+                         client.metadata[MD_KEY]['worker_nodes'])
+
+    def test_a_listing_read_back_from_a_blob_is_parsed(self):
+        # The realistic shape for the busy node this check exists to
+        # refuse: output over the 10 KiB Shaken Fist returns inline is
+        # stored as a blob, and this is the only path on which
+        # _read_output_blob()'s result reaches parse_node_pods(). The
+        # unreadable-blob case is covered below; this is the readable one.
+        client, _, cluster = self._cluster(
+            pods_result={'return-code': 0, 'stdout_blob': 'blob-1',
+                         'stderr': ''})
+
+        def get_blob_data(blob_uuid):
+            # In two chunks, because the read accumulates them.
+            encoded = NODE_PODS_OUTPUT.encode('utf-8')
+            half = len(encoded) // 2
+            yield encoded[:half]
+            yield encoded[half:]
+
+        client.get_blob_data = get_blob_data
+
+        e = self.assertRaises(exceptions.WorkerNotEmptyError,
+                              cluster.remove_worker, ['inst-w1'],
+                              only_if_empty=True)
+
+        self.assertIn('k3s-static-hunkydory-runner-lxj65', str(e))
         self.assertEqual(['inst-w1', 'inst-w2'],
                          client.metadata[MD_KEY]['worker_nodes'])
 

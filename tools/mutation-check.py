@@ -1625,6 +1625,33 @@ MUTATIONS = [
         'stestr',
     ),
     (
+        'the pod listing is read from the operation as it completed',
+        PKG + '/cluster.py',
+        '        aop = self.reap_execute(aop)\n',
+        '        self.reap_execute(aop)\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_the_listing_is_read_from_the_operation_as_it_completed',
+        'stestr',
+    ),
+    (
+        "the refusal's message caps the pods it renders",
+        PKG + '/exceptions.py',
+        '            for pod in self.pods[:self.DESCRIBED_PODS])',
+        '            for pod in self.pods)',
+        PKG + '.tests.test_exceptions.WorkerNotEmptyErrorTestCase'
+        '.test_the_rendered_list_is_capped_and_the_rest_counted',
+        'stestr',
+    ),
+    (
+        'a refusal is reported as a refusal, not as a removal which broke',
+        PKG + '/cluster.py',
+        '        if refused:\n',
+        '        if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_refusal_leaves_the_node_schedulable',
+        'stestr',
+    ),
+    (
         'a pod listing with a line nobody can read is not an empty node',
         PKG + '/cluster.py',
         "        if readings['unreadable_lines']:\n",

@@ -1515,9 +1515,13 @@ NODE_PODS_TEMPLATE = (
 
 # The progress note remove_worker() writes when the emptiness check found
 # nothing in the way. A constant rather than a literal in the note because
-# tools/ci_deploy_test.sh greps for this text to tell a check that ran from
-# a flag that was parsed and ignored, and a unit test asserts it, so that
-# rewording it fails the fast tier rather than the merge queue.
+# tools/ci_deploy_test.sh greps for this text to tell a check which ran
+# from a flag which was parsed and ignored. That script cannot import this
+# module -- it drives an installed sf-client over a real cluster -- so the
+# literal is duplicated there, and a unit test asserts this constant's
+# exact text as well as the note being built from it. Rewording it
+# therefore fails the fast tier rather than the merge queue, which is a
+# failure a long way from its cause.
 NOTHING_IN_THE_WAY_NOTE = 'found nothing on it which a drain would evict'
 
 
@@ -5643,15 +5647,19 @@ class Cluster:
         no Kubernetes access cannot make that sequence at all, and one with
         it would be duplicating the cordon this method already does.
 
-        What the cordon closes is the scheduler's window, which is the one
-        a caller outside the cluster cannot close for itself. It is not a
-        lock on the node: a pod created with ``spec.nodeName`` already set
-        bypasses scheduling, and a pod tolerating the
-        ``node.kubernetes.io/unschedulable`` taint is placed there anyway,
-        so either can still arrive between the listing and the drain. Both
-        are narrow and neither is reachable by a workload which did not set
-        out to do it, and the drain which follows evicts what it finds
-        exactly as it always did.
+        What the cordon closes is the window for everything the scheduler
+        has not yet decided, which is the window a caller outside the
+        cluster cannot close at all. It is not a lock on the node. Three
+        kinds of pod can still arrive: one created with ``spec.nodeName``
+        already set, which never goes through the scheduler; one tolerating
+        the ``node.kubernetes.io/unschedulable`` taint; and one the
+        scheduler had already selected this node for when the cordon
+        landed, because its ``NodeUnschedulable`` filter runs against a
+        cache snapshot and the API server does not re-check
+        ``spec.unschedulable`` when it accepts the binding. All three are
+        narrow, none is reachable by a workload which did not set out to do
+        it, and the drain which follows evicts what it finds exactly as it
+        always did.
 
         The check is made per worker, inside the loop, rather than for all
         of them up front. So a refusal on the third of three uuids leaves
@@ -5815,7 +5823,7 @@ class Cluster:
                     ['kubectl delete node %s --kubeconfig /etc/rancher/k3s/k3s.yaml'
                      % quoted])
             except (exceptions.K3sClusterException,
-                    apiclient.APIException):
+                    apiclient.APIException) as e:
                 # Both hierarchies, because the question is whether the
                 # node might now be cordoned rather than which kind of
                 # failure stopped the command. An APIException from the
@@ -5837,7 +5845,9 @@ class Cluster:
                 # execute_and_await() submits everything it is given and
                 # only then reads the return codes, which would delete a
                 # node still running the pods the drain could not move.
-                self._uncordon(md['control_plane_nodes'][0], node_name, quoted)
+                self._uncordon(
+                    md['control_plane_nodes'][0], node_name, quoted,
+                    refused=isinstance(e, exceptions.WorkerNotEmptyError))
                 raise
 
             p.note('drained %s and removed it from k3s' % node_name)
@@ -5945,7 +5955,8 @@ class Cluster:
                 readings['unreadable_lines'])
         return pods_in_the_way(readings['pods'])
 
-    def _uncordon(self, control_plane_uuid, node_name, quoted_node_name):
+    def _uncordon(self, control_plane_uuid, node_name, quoted_node_name,
+                  refused=False):
         """Put a node back in service after a removal which did not finish.
 
         ``kubectl drain`` cordons before it evicts, so every way the drain
@@ -5964,10 +5975,24 @@ class Cluster:
         either is expected -- apiclient's exceptions do not descend from
         K3sClusterException, so catching only ours would let an
         unreachable API mask the original explanation.
+
+        ``refused`` says the removal stopped because
+        ``only_if_empty`` found work on the node, which changes only what
+        is reported: the command is the same, and so is the reason for
+        running it. A caller which refuses as a matter of course -- a loop
+        shrinking a pool of workers -- would otherwise have the normal
+        outcome announced to its operator in the vocabulary of an incident
+        on every cycle, which trains the reader to ignore the line that
+        means something.
         """
-        self.reporter.write(
-            'The removal of %s did not finish, so it may still be cordoned. '
-            'Uncordoning it.\n' % node_name)
+        if refused:
+            self.reporter.write(
+                '%s still has work on it, so it was not removed. Putting it '
+                'back in service.\n' % node_name)
+        else:
+            self.reporter.write(
+                'The removal of %s did not finish, so it may still be '
+                'cordoned. Uncordoning it.\n' % node_name)
         try:
             self.execute_and_await(
                 [control_plane_uuid],

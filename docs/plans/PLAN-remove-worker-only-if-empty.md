@@ -282,6 +282,58 @@ well. Documented in `remove_worker()`'s docstring, `docs/usage.md` and
 `docs/library-api.md`, and filed as
 [#173](https://github.com/shakenfist/client-python-k3s/issues/173).
 
+### Review round 2
+
+1 fix, 1 document, 6 consider and 2 none on `bf379da`. The fix and five
+of the six considers are addressed; the sixth was already answered.
+
+The fix was round 1's own doing. Three comments -- on the constant, in
+the test and in `tools/ci_deploy_test.sh` -- claimed a unit test pinned
+`NOTHING_IN_THE_WAY_NOTE`'s text, so that rewording it would fail the
+fast tier. The assertion was `assertIn(constant, lines)`, which pins
+that the note is built from the constant and says nothing about what the
+constant says: rewording it passed `tox -epy3` and broke only the shell
+script's literal `grep -qF`, which is exactly the failure the comments
+claimed was prevented. A second assertion pins the text, and the
+comments now say which assertion pins what.
+
+The document item is the third way a pod can arrive behind the cordon,
+and it is the sharpest of the round: the scheduler's `NodeUnschedulable`
+filter runs against a cache snapshot and the API server does not
+re-check `spec.unschedulable` when it accepts a binding, so a pod the
+scheduler had already selected the node for lands after both the cordon
+and the listing. The consequence is the one the other two bypasses have
+-- the drain evicts it -- but the text had read as a guarantee
+Kubernetes does not make, on the one property the option rests on.
+
+Considers taken. `reap_execute()`'s new return value had no test that
+could tell it from the submitted operation, because the stock fake
+answers `instance_execute()` with a completed operation while the real
+server answers 'queued' with no results at all; a fake modelled on
+`fakes.HealthClient` now proves the check reads the operation as it
+completed, and a mutation confirms the test fails against the submitted
+one. A listing read back from a blob and then parsed had no test either,
+which is the realistic shape for the busy node the check exists to
+refuse. `WorkerNotEmptyError`'s message is capped at ten pods with a
+count of the rest, since a node at Kubernetes' default limit of 110
+would have rendered one line of tens of kilobytes into every log that
+caught it, while the `pods` attribute stays complete. A refusal is now
+reported as a refusal rather than through the uncordon's "the removal
+did not finish" wording, which for a loop that refuses every cycle
+announced the normal outcome as an incident. And one `docs/usage.md`
+line is re-wrapped.
+
+The consider partly taken is where exception message tests live. The
+existing assertions are not moved -- they are made through
+`remove_worker()`, which is where the behaviour is -- but the new
+message tests are a `WorkerNotEmptyErrorTestCase` in
+`tests/test_exceptions.py` beside the other eighteen, so a reader
+looking for an exception's message finds it where the convention says.
+
+Ten mutations now cover this change, each applied and caught. The two
+`none` items were the already-filed uncordon (#173) and a security read
+that found no new class of untrusted input.
+
 ### Phase 1 steps
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
