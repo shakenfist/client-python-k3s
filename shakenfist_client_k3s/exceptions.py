@@ -39,8 +39,8 @@ class K3sClusterException(Exception):
 class _ReasonedK3sException(K3sClusterException):
     """Base for the exceptions built through classmethods rather than directly.
 
-    Ten of the classes below describe several distinct failures that read
-    the same way to a caller: a manifest cannot be staged, a release
+    Eleven of the classes below describe several distinct failures that
+    read the same way to a caller: a manifest cannot be staged, a release
     lookup failed. Each is built through a classmethod per failure, each
     records which one ran in ``reason``, each renders a message its
     classmethod composed, and each carries the failure's details as
@@ -55,6 +55,8 @@ class _ReasonedK3sException(K3sClusterException):
     this base from the start, and so were the ninth and tenth,
     ``ClusterNameError`` and ``ShapeError``, which refuse an unusable
     cluster name and an unusable node or address count.
+    The eleventh, ``WorkerPodsUnreadableError``, refuses a worker removal
+    whose emptiness check could not be made.
     ``UnsupportedReleaseError`` named its three fields in its own
     ``__init__`` rather than taking ``**fields``; it declares them in
     ``FIELDS`` like the others now.
@@ -392,6 +394,134 @@ class WorkerUnnamedError(K3sClusterException):
                 'has no name, so the k3s node it became cannot be identified\n'
                 'and it cannot be drained.'
                 % (self.name, self.instance_uuid))
+
+
+class WorkerNotEmptyError(K3sClusterException):
+    """Raised when ``remove_worker(only_if_empty=True)`` finds work on the node.
+
+    ``only_if_empty`` exists because a drain is not a refusal. ``kubectl
+    drain`` without ``--force`` declines only a pod no controller owns: its
+    filter asks whether a ``controllerRef`` exists, not what kind it names,
+    so a pod owned by any controller -- a ReplicaSet, a Job, a custom
+    resource -- is evicted, and the drain exits 0 having done it. A caller
+    which removes a worker to shrink a pool therefore has to decide for
+    itself whether the node is in use, and that decision is made here
+    because this is where the cordon is: the pods are listed after the node
+    has been cordoned, so a node which was empty when it was looked at
+    cannot have been given new work by the time it is drained.
+
+    What is in the way is any pod which is not managed by a DaemonSet and
+    has not already reached ``Succeeded`` or ``Failed``. A DaemonSet pod
+    goes with the node and the drain is already told to ignore it; a
+    finished pod is a record of work rather than work. Everything else
+    counts, including a pod which is merely registered and idle, because
+    nothing visible from outside the cluster distinguishes a pod waiting
+    for work from one about to be given some.
+
+    ``pods`` is what was found, each entry a dict with ``namespace``,
+    ``pod`` and ``phase`` (``None`` for a pod whose phase Kubernetes did
+    not report), so a caller can log what stopped the removal without
+    parsing the message. It is a refusal rather than a failure: nothing
+    was removed, the node is left as it was found, and a caller which
+    scales a pool treats this as "not this time" rather than as an error.
+    That is why it is its own class -- a scaler has to tell it apart from
+    a drain which broke, and a type is the only way to do that which does
+    not depend on the message.
+    """
+
+    def __init__(self, name, instance_uuid, node_name, pods):
+        self.name = name
+        self.instance_uuid = instance_uuid
+        self.node_name = node_name
+        self.pods = [dict(pod) for pod in pods]
+        super(WorkerNotEmptyError, self).__init__(name)
+
+    def describe_pods(self):
+        """The pods which stopped the removal, as 'namespace/name (phase)'."""
+        return ', '.join(
+            '%s/%s (%s)' % (pod.get('namespace'), pod.get('pod'),
+                            pod.get('phase') or 'no phase reported')
+            for pod in self.pods)
+
+    def __str__(self):
+        return ('Worker %s (instance %s) of cluster %s still has %s on it, so\n'
+                'it was not removed: %s. Nothing on that node was changed,\n'
+                'and any worker removed before it still was.'
+                % (self.node_name, self.instance_uuid, self.name,
+                   'a pod' if len(self.pods) == 1 else 'pods',
+                   self.describe_pods()))
+
+
+class WorkerPodsUnreadableError(_ReasonedK3sException):
+    """Raised when ``remove_worker(only_if_empty=True)`` cannot read the node's pods.
+
+    The emptiness check is a guard on a destructive operation, so output it
+    cannot read is not output which was empty. Read as empty it would say
+    "nothing is running here" about a node nobody looked at, which is the
+    one answer that loses the work the guard exists to protect. Each of
+    these refuses instead, and the removal does not happen.
+
+    - ``not_read(name, instance_uuid, node_name, detail)``: ``kubectl``
+      exited 0 and its output was not available to read. Shaken Fist
+      returns a command's output inline only up to 10 KiB and stores
+      anything longer as a blob, which this package reads up to a cap of
+      its own (``COMMAND_OUTPUT_LIMIT_BYTES`` in ``cluster.py``); ``detail``
+      is that read's own account of why it did not happen. A pod list long
+      enough to reach either limit is thousands of pods on one node, which
+      is itself a node nothing should be draining unexamined.
+    - ``no_output(name, instance_uuid, node_name)``: the agent operation
+      completed, with a zero exit code, and recorded no output for the
+      command at all. The command prints a line per pod and a node always
+      has at least its DaemonSet pods, so no output is not an empty
+      cluster; it is an answer this package does not understand.
+    - ``unreadable_lines(name, instance_uuid, node_name, lines)``: the
+      output held lines the parser could not read. A pod's namespace, name
+      and phase are all values the Kubernetes API validates, so a line
+      which fails validation is not a line the API printed, and the pod it
+      was about is a pod this check cannot account for.
+
+    A different class from ``WorkerNotEmptyError`` because the outcomes are
+    different: that one says the node is in use, which a caller scaling a
+    pool expects to see; these say the check could not be made, which it
+    does not.
+    """
+
+    #: The union of the fields the classmethods below set. See
+    #: ``_ReasonedK3sException`` for why this is not left implicit.
+    FIELDS = ('name', 'instance_uuid', 'node_name', 'detail', 'lines')
+
+    @classmethod
+    def _refusal(cls, reason, name, instance_uuid, node_name, explanation,
+                 **fields):
+        """Compose the message every reason here shares, around its own middle."""
+        message = (
+            'Worker %s (instance %s) of cluster %s was not removed, because\n'
+            'the pods on it could not be read, and an unreadable answer is not\n'
+            'an empty node. %s' % (node_name, instance_uuid, name, explanation))
+        return cls(reason, message, name=name, instance_uuid=instance_uuid,
+                   node_name=node_name, **fields)
+
+    @classmethod
+    def not_read(cls, name, instance_uuid, node_name, detail):
+        return cls._refusal(
+            'not_read', name, instance_uuid, node_name,
+            'The command listing them %s.' % detail, detail=detail)
+
+    @classmethod
+    def no_output(cls, name, instance_uuid, node_name):
+        return cls._refusal(
+            'no_output', name, instance_uuid, node_name,
+            'The command listing them exited 0 and the agent operation\n'
+            'recorded no output for it, and a node always has at least the\n'
+            'pods of its DaemonSets.')
+
+    @classmethod
+    def unreadable_lines(cls, name, instance_uuid, node_name, lines):
+        return cls._refusal(
+            'unreadable_lines', name, instance_uuid, node_name,
+            '%d of the lines it printed are not lines the Kubernetes API\n'
+            'would have printed, so the pods they were about cannot be\n'
+            'accounted for.' % lines, lines=lines)
 
 
 class NodeUnnamedError(K3sClusterException):
