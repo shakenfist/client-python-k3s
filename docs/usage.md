@@ -444,6 +444,100 @@ named are left alone entirely.
 Removing the last worker of a cluster is allowed -- a k3s server node
 is schedulable, so a cluster with no workers still works.
 
+`--only-if-empty` refuses a worker that still has work on it instead of
+draining it. It is off by default, because `remove-worker` is an
+imperative verb: asked to remove a worker, it removes that worker. A
+caller shrinking a pool of workers wants the other answer, and the
+drain does not provide it -- an unforced `kubectl drain` declines only a
+pod no controller owns, and a pod owned by a ReplicaSet, a Job or a
+custom resource is evicted and the drain exits 0.
+
+The check is made per worker, as each one comes to be removed, not for
+all of them up front like the uuid and node name validation above. So a
+refusal on the third of three `--worker` options leaves the first two
+removed; the message names the worker it stopped on and says so.
+
+What counts as work is any pod that is not managed by a DaemonSet and
+has not already reached `Succeeded` or `Failed`. A DaemonSet's pod goes
+with the node, and a finished pod -- the `helm-install-*` Job pods a
+k3s cluster leaves behind, most often -- is a record of work rather
+than work. Everything else counts, including a pod that is running
+nothing at the time, because nothing a node's pod list shows
+distinguishes an idle pod from one that has just been given something
+to do.
+
+The node is cordoned before its pods are listed, and that order is the
+point of the option. A cordon closes the window for everything the
+scheduler has not yet decided, which is the window a caller that
+checks for itself and then calls `remove-worker` cannot close at all;
+that is why this is an option here rather than something to do
+outside.
+
+A cordon is not a lock, and three kinds of pod can still arrive: one
+created with `spec.nodeName` already set, which never goes through the
+scheduler; one that tolerates the `node.kubernetes.io/unschedulable`
+taint; and one the scheduler had already picked this node for when the
+cordon landed, since it filters against a cache snapshot and the API
+server does not re-check `spec.unschedulable` when it accepts the
+binding. None of the three happens to a workload that did not set out
+to do it, and the drain that follows evicts what it finds, as it did
+before this option existed.
+
+A refusal uncordons the node again, exactly as a refused drain does,
+and prints what it found. That uncordon is unconditional: a worker an
+operator had cordoned on purpose before the call is put back into
+service by a refusal, because `remove-worker` does not read the node's
+state before cordoning it and cannot tell its own cordon from somebody
+else's. A caller that refuses as a matter of course -- a loop shrinking
+a pool -- meets that every cycle, so do not cordon a worker to hold it
+out of service while such a loop is running.
+
+The reporter line below is the one that proves it. Progress output is
+elided from this transcript; what is shown is that line and the error:
+
+```
+$ sf-client k3s remove-worker mycluster --only-if-empty \
+    --worker 3fa85f64-5717-4562-b3fc-2c963f66afa6
+...
+k3s-mycluster-node-002 still has work on it, so it was not removed. Putting it back in service.
+Worker k3s-mycluster-node-002 (instance 3fa85f64-5717-4562-b3fc-2c963f66afa6) of cluster mycluster still has a pod on it, so
+it was not removed: arc-runners/runner-lxj65 (Running). Nothing on that node was changed,
+and any worker removed before it still was.
+$ echo $?
+1
+```
+
+An answer the check cannot read is also a refusal, and is not read as
+an empty node: output `kubectl` printed too much of to be read back, a
+result that recorded no output at all, a result that recorded both an
+inline stream and the blob long output is stored as, or a line that is
+not one the Kubernetes API would have printed. Each says so and
+removes nothing. A `kubectl` that exits non-zero fails the command, as
+the drain's would.
+
+A listing that ran and printed nothing is believed, and means a node
+with no pods on it -- which is what a worker that has just joined has
+until its DaemonSets' pods are scheduled, and what a cluster running
+no DaemonSets has for good. Refusing an empty answer would refuse
+those workers forever.
+
+This is not quite the same set a `kubectl drain` would evict, and is
+stricter in one known way: a drain skips a mirror pod -- the copy the
+API server holds of a static pod the kubelet runs from a manifest on
+disk -- whatever flags it was given, while `--only-if-empty` counts one
+as work, because a mirror pod's controlling owner reference is of kind
+`Node` rather than `DaemonSet`. A worker carrying a static pod is
+therefore refused for as long as it carries one. That is the safe
+direction to be wrong in, and a k3s worker has no static pods unless
+somebody put a manifest in the kubelet's directory.
+
+"Managed by a DaemonSet" means the pod says so: it carries an owner
+reference of kind `DaemonSet` marked as its controller. Kubernetes does
+not check that such a reference names an object that exists, so a pod
+can claim one and be passed over. That is the same thing
+`drain --ignore-daemonsets` trusts, and anyone able to create a pod on
+the cluster is already inside the cluster.
+
 A drain that cannot finish is bounded and undone. If a pod on the
 worker has nowhere else to go -- a PodDisruptionBudget refuses the
 eviction, an unmanaged pod would need `--force`, or the cluster has no

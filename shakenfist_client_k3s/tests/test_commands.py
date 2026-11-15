@@ -454,15 +454,28 @@ class CommandWiringTestCase(testtools.TestCase):
 
 
 class DeleteRecordingClient(fakes.FakeClusterClient):
-    """A scripted client which also records the instances it was asked to delete."""
+    """A scripted client which also records the instances it was asked to delete.
+
+    ``pods`` is what a pod listing answers with, for the one command whose
+    output is read rather than only checked: remove-worker's emptiness
+    check. The default, no pods at all, is a node holding nothing.
+    """
 
     def __init__(self):
         super(DeleteRecordingClient, self).__init__()
         self.deleted_instances = []
+        self.pods = ''
 
     def delete_instance(self, instance_ref):
         self.deleted_instances.append(instance_ref)
         return super(DeleteRecordingClient, self).delete_instance(instance_ref)
+
+    def instance_execute(self, instance_ref, commandline):
+        aop = super(DeleteRecordingClient, self).instance_execute(
+            instance_ref, commandline)
+        if commandline.startswith('kubectl get pods'):
+            aop['results']['0']['stdout'] = self.pods
+        return aop
 
 
 class RemoveWorkerCommandTestCase(testtools.TestCase):
@@ -541,6 +554,52 @@ class RemoveWorkerCommandTestCase(testtools.TestCase):
         self.assertEqual([], self.client.deleted_instances)
         self.assertEqual(['inst-w1', 'inst-w2', 'inst-w3'],
                          self._md()['worker_nodes'])
+
+    def test_only_if_empty_removes_a_worker_with_nothing_on_it(self):
+        # The fake answers the pod listing with no pods, which is a node
+        # holding nothing, so the flag changes which commands run and not
+        # the outcome.
+        result = self._invoke(['remove-worker', 'banana',
+                               '--worker', 'inst-w2', '--only-if-empty'])
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(['inst-w2'], self.client.deleted_instances)
+        self.assertEqual(
+            ['kubectl cordon', 'kubectl get', 'kubectl drain',
+             'kubectl delete'],
+            [' '.join(command.split()[:2])
+             for _, command in self.client.executed])
+
+    def test_only_if_empty_refuses_a_worker_with_work_on_it(self):
+        # Turning the library's refusal into an exit code is the Click
+        # layer's job, as it is for WorkerNotFoundError above.
+        self.client.pods = (
+            'pod\tarc-runners\tk3s-static-hunkydory-runner-lxj65\tRunning\t\n')
+
+        result = self._invoke(['remove-worker', 'banana',
+                               '--worker', 'inst-w2', '--only-if-empty'])
+
+        self.assertEqual(1, result.exit_code, result.output)
+        self.assertIn('k3s-static-hunkydory-runner-lxj65', result.output)
+        self.assertEqual([], self.client.deleted_instances)
+        self.assertEqual(['inst-w1', 'inst-w2', 'inst-w3'],
+                         self._md()['worker_nodes'])
+
+    def test_the_flag_is_off_unless_it_is_given(self):
+        # The default has to stay what it was for every caller which does
+        # not ask, so nothing is cordoned and no pods are listed.
+        self.client.pods = (
+            'pod\tarc-runners\tk3s-static-hunkydory-runner-lxj65\tRunning\t\n')
+
+        result = self._invoke(['remove-worker', 'banana',
+                               '--worker', 'inst-w2'])
+
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(['inst-w2'], self.client.deleted_instances)
+        self.assertEqual(
+            ['kubectl drain', 'kubectl delete'],
+            [' '.join(command.split()[:2])
+             for _, command in self.client.executed])
 
 
 class HealthCommandTestCase(testtools.TestCase):

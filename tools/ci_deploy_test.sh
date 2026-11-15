@@ -649,9 +649,66 @@ fi
 assert_instance_size 'new worker' "${new_worker}" \
     "${WORKER_CPUS}" "${WORKER_MEMORY}" "${WORKER_DISK}"
 
-status 'Remove the worker which was just added'
+status 'Remove the worker which was just added, emptiness checked first'
 echo "Removing worker ${new_worker}"
-sf-client k3s remove-worker "${CLUSTER}" --worker "${new_worker}"
+# --only-if-empty cordons the node, lists its pods through a go-template
+# and refuses if anything a drain would evict is still there. Both answers
+# are correct for this cluster -- which pods are on a given worker depends
+# on where the scheduler put Longhorn's and Traefik's, which nothing here
+# pins -- and both prove what only a real kubectl can: that the template
+# rendered and its output parsed. The unit tests check the template's
+# shape because no Go template engine is available to them.
+refusal=/tmp/k3s-ci-only-if-empty
+if sf-client k3s remove-worker "${CLUSTER}" --worker "${new_worker}" \
+        --only-if-empty > "${refusal}" 2>&1; then
+    cat "${refusal}"
+    # The note is the check's own verdict, so this is what tells an
+    # accepted removal apart from a flag which was parsed and ignored --
+    # which is the whole of what the success branch could otherwise claim.
+    # The text is cluster.NOTHING_IN_THE_WAY_NOTE, which a unit test
+    # asserts as well, so a rewording fails the fast tier before it
+    # reaches this one.
+    if ! grep -qF 'found nothing on it which a drain would evict' "${refusal}"; then
+        echo 'remove-worker --only-if-empty removed the worker without'
+        echo 'reporting that it checked it first'
+        exit 1
+    fi
+    echo "The worker held nothing a drain would evict, so it was removed"
+else
+    cat "${refusal}"
+    if grep -qF 'the pods on it could not be read' "${refusal}"; then
+        # The third refusal: the listing ran and its answer could not be
+        # read. On a healthy cluster that is a defect in the check rather
+        # than a busy worker, so it fails here rather than falling back.
+        echo 'remove-worker --only-if-empty could not read the node pods'
+        exit 1
+    fi
+    # A phrase unique to WorkerNotEmptyError.__str__, not one the
+    # uncordon's own reporter line also contains: both say 'it was not
+    # removed', and this assertion is meant to say the library refused
+    # rather than that it put the node back. The sed below reads the same
+    # message's first line, so the two agree on what they are reading.
+    if ! grep -qF 'Nothing on that node was changed' "${refusal}"; then
+        echo 'remove-worker --only-if-empty failed, and not by refusing'
+        exit 1
+    fi
+    # A refusal has to have put the node back in service: the check's own
+    # cordon is the one thing it changes, and leaving it would cost the
+    # cluster a node's worth of capacity for saying no.
+    refused_node=$(sed -n 's/^Worker \([^ ]*\) .*/\1/p' "${refusal}" | sed -n 1p)
+    if [ -z "${refused_node}" ]; then
+        echo 'The refusal does not name the node it refused'
+        exit 1
+    fi
+    unschedulable=$(kubectl get "node/${refused_node}" \
+        -o jsonpath='{.spec.unschedulable}')
+    if [ -n "${unschedulable}" ]; then
+        echo "Node ${refused_node} is still cordoned after a refusal"
+        exit 1
+    fi
+    echo "The worker was in use, so the removal was refused; removing it anyway"
+    sf-client k3s remove-worker "${CLUSTER}" --worker "${new_worker}"
+fi
 
 # The node object has to be gone, not merely NotReady: remove-worker
 # drains and then deletes it, and a NotReady node left behind is the

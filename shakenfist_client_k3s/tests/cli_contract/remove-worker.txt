@@ -5,6 +5,10 @@ Usage: k3s remove-worker [OPTIONS] NAME
 Options:
   --worker TEXT     The instance UUID of a worker to remove. Repeat the option
                     to remove more than one.  [required]
+  --only-if-empty   Refuse to remove a worker which still has pods on it, other
+                    than those of a DaemonSet and those which have already
+                    finished. The node is cordoned before its pods are listed,
+                    so nothing can be scheduled onto it between the two.
   --namespace TEXT  If you are an admin, you can alter clusters in a different
                     namespace.
   --help            Show this message and exit.

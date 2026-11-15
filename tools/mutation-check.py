@@ -1559,6 +1559,107 @@ MUTATIONS = [
         '.test_an_ambiguous_network_registers_nothing',
         'stestr',
     ),
+    (
+        'the emptiness check cordons the node before it lists its pods',
+        PKG + '/cluster.py',
+        """                    self.execute_and_await(
+                        [md['control_plane_nodes'][0]],
+                        ['kubectl cordon %s '
+                         '--kubeconfig /etc/rancher/k3s/k3s.yaml' % quoted])
+""",
+        '',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_the_node_is_cordoned_before_its_pods_are_listed',
+        'stestr',
+    ),
+    (
+        'a pod in the way refuses the removal',
+        PKG + '/cluster.py',
+        '                    if pods:\n',
+        '                    if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_live_pod_refuses_the_removal',
+        'stestr',
+    ),
+    (
+        "a DaemonSet's pod and a finished pod are not in the way",
+        PKG + '/cluster.py',
+        """    return [pod for pod in pods
+            if not pod['daemonset']
+            and pod['phase'] not in KUBERNETES_FINISHED_POD_PHASES]""",
+        '    return list(pods)',
+        PKG + '.tests.test_cluster.PodsInTheWayTestCase',
+        'stestr',
+    ),
+    (
+        'a result recording no output at all is not an empty node',
+        PKG + '/cluster.py',
+        '        if stdout is None:\n',
+        '        if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_result_recording_no_output_is_not_an_empty_node',
+        'stestr',
+    ),
+    (
+        'output which could not be read is not an empty node',
+        PKG + '/cluster.py',
+        # The whole statement, because '        if unread:' alone is a
+        # substring of the same line at a deeper indent elsewhere in this
+        # file and the search is not anchored to a line start.
+        """        if unread:
+            raise exceptions.WorkerPodsUnreadableError.not_read(""",
+        """        if False:
+            raise exceptions.WorkerPodsUnreadableError.not_read(""",
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_output_which_could_not_be_read_is_not_an_empty_node',
+        'stestr',
+    ),
+    (
+        'a result recording both output and a blob is not an empty node',
+        PKG + '/cluster.py',
+        "        if result.get('stdout') is not None and "
+        "result.get('stdout_blob'):\n",
+        '        if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_result_recording_output_and_a_blob_is_not_an_empty_node',
+        'stestr',
+    ),
+    (
+        'the pod listing is read from the operation as it completed',
+        PKG + '/cluster.py',
+        '        aop = self.reap_execute(aop)\n',
+        '        self.reap_execute(aop)\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_the_listing_is_read_from_the_operation_as_it_completed',
+        'stestr',
+    ),
+    (
+        "the refusal's message caps the pods it renders",
+        PKG + '/exceptions.py',
+        '            for pod in self.pods[:self.DESCRIBED_PODS])',
+        '            for pod in self.pods)',
+        PKG + '.tests.test_exceptions.WorkerNotEmptyErrorTestCase'
+        '.test_the_rendered_list_is_capped_and_the_rest_counted',
+        'stestr',
+    ),
+    (
+        'a refusal is reported as a refusal, not as a removal which broke',
+        PKG + '/cluster.py',
+        '        if refused:\n',
+        '        if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_refusal_leaves_the_node_schedulable',
+        'stestr',
+    ),
+    (
+        'a pod listing with a line nobody can read is not an empty node',
+        PKG + '/cluster.py',
+        "        if readings['unreadable_lines']:\n",
+        '        if False:\n',
+        PKG + '.tests.test_cluster.RemoveWorkerOnlyIfEmptyTestCase'
+        '.test_a_line_which_cannot_be_read_refuses_rather_than_assuming',
+        'stestr',
+    ),
 ]
 
 

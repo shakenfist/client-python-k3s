@@ -724,15 +724,23 @@ def k3s_expand_workers(ctx, name=None, worker_count=None, namespace=None):
               required=True,
               help=('The instance UUID of a worker to remove. Repeat the '
                     'option to remove more than one.'))
+@click.option('--only-if-empty', is_flag=True, default=False,
+              help=('Refuse to remove a worker which still has pods on it, '
+                    'other than those of a DaemonSet and those which have '
+                    'already finished. The node is cordoned before its pods '
+                    'are listed, so nothing can be scheduled onto it between '
+                    'the two.'))
 @click.option('--namespace', type=click.STRING,
               help=('If you are an admin, you can alter clusters in a '
                     'different namespace.'))
 @click.pass_context
-def k3s_remove_worker(ctx, name=None, workers=None, namespace=None):
+def k3s_remove_worker(ctx, name=None, workers=None, only_if_empty=False,
+                      namespace=None):
     # workers is a tuple, because the option is multiple=True. The library
     # API takes a list, so that a caller reading one back out of a result
     # and passing it straight in does the obvious thing.
-    _bind_cluster_context(ctx, name, namespace).remove_worker(list(workers))
+    _bind_cluster_context(ctx, name, namespace).remove_worker(
+        list(workers), only_if_empty=only_if_empty)
 
 
 @k3s.command(name='expand-addresses',

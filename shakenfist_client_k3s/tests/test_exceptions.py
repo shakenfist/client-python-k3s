@@ -520,7 +520,150 @@ class KubeconfigErrorTestCase(testtools.TestCase):
             "'foo; touch /tmp/pwned.testns'", str(e))
 
 
+class WorkerNotEmptyErrorTestCase(testtools.TestCase):
+    """The refusal only_if_empty raises, and what its message renders.
+
+    remove_worker()'s own tests cover when it is raised; these cover what
+    it says, which is where the other exceptions' message tests live.
+    """
+
+    @staticmethod
+    def _pods(count, phase='Running'):
+        return [{'namespace': 'arc-runners', 'pod': 'runner-%03d' % n,
+                 'phase': phase, 'daemonset': False}
+                for n in range(count)]
+
+    def test_one_pod(self):
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(1))
+        self.assertEqual('k3s-banana-node-002', e.node_name)
+        self.assertEqual('inst-w1', e.instance_uuid)
+        self.assertIn('still has a pod on it', str(e))
+        self.assertIn('arc-runners/runner-000 (Running)', str(e))
+
+    def test_several_pods_are_plural(self):
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(2))
+        self.assertIn('still has pods on it', str(e))
+
+    def test_a_pod_with_no_phase_says_so(self):
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002',
+            self._pods(1, phase=None))
+        self.assertIn('arc-runners/runner-000 (no phase reported)', str(e))
+
+    def test_the_rendered_list_is_capped_and_the_rest_counted(self):
+        # A node at Kubernetes' default limit of 110 pods would otherwise
+        # render one line of tens of kilobytes into every log which catches
+        # this.
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(13))
+
+        described = e.describe_pods()
+        self.assertEqual(10, described.count('arc-runners/'))
+        self.assertIn('and 3 more', described)
+        self.assertIn('runner-009', described)
+        self.assertNotIn('runner-010', described)
+
+    def test_the_pods_attribute_is_never_shortened(self):
+        # The message is a sample; this is the whole answer, and a caller
+        # which logs what stopped the removal reads it rather than the
+        # message.
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(13))
+        self.assertEqual(13, len(e.pods))
+        self.assertEqual('runner-012', e.pods[-1]['pod'])
+
+    def test_exactly_the_cap_counts_nothing_more(self):
+        e = exceptions.WorkerNotEmptyError(
+            'banana', 'inst-w1', 'k3s-banana-node-002', self._pods(10))
+        self.assertNotIn('more', e.describe_pods())
+
+
+class WorkerPodsUnreadableErrorTestCase(testtools.TestCase):
+    """Each reason's message, not only its reason.
+
+    Round 1 of this change's review found that no_output's explanation
+    still carried a claim the rest of the change had corrected, and that
+    it survived because the only assertion anywhere was on ``reason``.
+    These messages each restate reasoning which also lives in the class
+    docstring, docs/usage.md and docs/library-api.md, so they have the
+    same drift surface and get the same treatment.
+    """
+
+    SHARED = ('Worker k3s-banana-node-002 (instance inst-w1) of cluster '
+              'banana was not removed, because')
+
+    def test_not_read(self):
+        e = exceptions.WorkerPodsUnreadableError.not_read(
+            'banana', 'inst-w1', 'k3s-banana-node-002',
+            'printed more than the 10 KiB Shaken Fist returns inline')
+        self.assertEqual('not_read', e.reason)
+        self.assertEqual('printed more than the 10 KiB Shaken Fist returns '
+                         'inline', e.detail)
+        self.assertIn(self.SHARED, str(e).replace('\n', ' '))
+        self.assertIn('an unreadable answer is not', str(e).replace('\n', ' '))
+        self.assertIn('The command listing them printed more than the 10 KiB',
+                      str(e).replace('\n', ' '))
+
+    def test_no_output(self):
+        e = exceptions.WorkerPodsUnreadableError.no_output(
+            'banana', 'inst-w1', 'k3s-banana-node-002')
+        self.assertEqual('no_output', e.reason)
+        self.assertIsNone(e.detail)
+        flat = str(e).replace('\n', ' ')
+        self.assertIn(self.SHARED, flat)
+        self.assertIn('recorded neither output nor the blob long output is '
+                      'stored as', flat)
+        # The claim the push audit removed from the docstring and both
+        # documents, which survived here through round 1 because nothing
+        # asserted the text. A node which has just joined has no pods.
+        self.assertNotIn('always has at least', flat)
+
+    def test_ambiguous_output(self):
+        e = exceptions.WorkerPodsUnreadableError.ambiguous_output(
+            'banana', 'inst-w1', 'k3s-banana-node-002')
+        self.assertEqual('ambiguous_output', e.reason)
+        flat = str(e).replace('\n', ' ')
+        self.assertIn(self.SHARED, flat)
+        self.assertIn('recorded both an inline stream and the blob long '
+                      'output is stored as', flat)
+        self.assertIn('which of the two the command printed is unknown', flat)
+
+    def test_unreadable_lines(self):
+        e = exceptions.WorkerPodsUnreadableError.unreadable_lines(
+            'banana', 'inst-w1', 'k3s-banana-node-002', 3)
+        self.assertEqual('unreadable_lines', e.reason)
+        self.assertEqual(3, e.lines)
+        flat = str(e).replace('\n', ' ')
+        self.assertIn(self.SHARED, flat)
+        self.assertIn('3 of the lines it printed are not lines the Kubernetes '
+                      'API would have printed', flat)
+
+    def test_every_reason_names_the_worker_and_the_cluster(self):
+        # The fields a caller logs, on every reason, since the message is
+        # composed around a shared middle and a per-reason explanation.
+        built = [
+            exceptions.WorkerPodsUnreadableError.not_read(
+                'banana', 'inst-w1', 'k3s-banana-node-002', 'went wrong'),
+            exceptions.WorkerPodsUnreadableError.no_output(
+                'banana', 'inst-w1', 'k3s-banana-node-002'),
+            exceptions.WorkerPodsUnreadableError.ambiguous_output(
+                'banana', 'inst-w1', 'k3s-banana-node-002'),
+            exceptions.WorkerPodsUnreadableError.unreadable_lines(
+                'banana', 'inst-w1', 'k3s-banana-node-002', 1),
+        ]
+        self.assertEqual(
+            ['not_read', 'no_output', 'ambiguous_output', 'unreadable_lines'],
+            [e.reason for e in built])
+        for e in built:
+            self.assertEqual('banana', e.name)
+            self.assertEqual('inst-w1', e.instance_uuid)
+            self.assertEqual('k3s-banana-node-002', e.node_name)
+
+
 class TotalAttributesTestCase(testtools.TestCase):
+
     """The two **fields exceptions answer every field, whoever built them.
 
     ReleaseLookupError and KubeconfigError take **fields and setattr them,
