@@ -13,7 +13,7 @@ phase 4,
 [developer_guide/agent_operations](https://shakenfist.com/developer_guide/agent_operations/),
 and in this repository read `Cluster.execute_and_await()`,
 `Cluster.await_idle()` and `Cluster.reap_execute()` in
-`shakenfist_client_k3s/cluster.py`, every one of the nine
+`shakenfist_client_k3s/cluster.py`, every one of the eleven
 `execute_and_await()` call sites, and
 `exceptions.CommandFailedError`/`AgentOperationFailed` in
 `shakenfist_client_k3s/exceptions.py`. Ground answers in what the code
@@ -137,22 +137,26 @@ this repository is now outstanding.
 The master plan's row names one: `execute_and_await()` submits its
 second command whether or not the first succeeded, so `apt-get
 dist-upgrade` runs against a stale index when `apt-get update` failed.
-That is true -- `instance_os_update()` at `cluster.py:3157` passes
+That is true -- `instance_os_update()` at `cluster.py:3450` passes
 exactly those two commands -- but it is not the only one. Six of the
-nine `execute_and_await()` call sites pass a multi-command list whose
-commands are strictly sequential:
+eleven `execute_and_await()` call sites pass a multi-command list
+whose commands are strictly sequential:
 
 | Site | What it submits | What a failed early command currently does |
 |------|-----------------|--------------------------------------------|
-| `cluster.py:3157` `instance_os_update()` | `apt-get update`, `apt-get dist-upgrade -y` | upgrades against a stale package index |
-| `cluster.py:3405` first control plane install | installer commands then `apt-get install -y helm` | installs helm onto a node with no k3s |
-| `cluster.py:3442` node join | `_k3s_config_commands()`, `sudo apt-get update`, the `get.k3s.io` installer | runs the installer with configuration files missing |
-| `cluster.py:3632` metallb rollout | two `kubectl rollout status`, `mkdir -p /etc/sf`, the config write, `kubectl apply` | applies an address range to a metallb which never came up |
-| `cluster.py:3651` metallb install | `kubectl create ns`, `helm repo add`, `helm repo update`, `helm upgrade --install` | installs a chart from a repository it failed to add |
-| `cluster.py:3687` longhorn install | `helm repo add`, `helm repo update`, `kubectl create namespace`, `helm install`, `kubectl patch storageclass` | patches a storage class for a chart which did not install |
+| `cluster.py:3451` `instance_os_update()` | `apt-get update`, `apt-get dist-upgrade -y` | upgrades against a stale package index |
+| `cluster.py:3698` first control plane install | installer commands then `sudo apt-get install -y helm` | installs helm onto a node with no k3s |
+| `cluster.py:3735` node join | `_k3s_config_commands()`, `sudo apt-get update`, the `get.k3s.io` installer | runs the installer with configuration files missing |
+| `cluster.py:3925` metallb rollout | two `kubectl rollout status`, `mkdir -p /etc/sf`, the config write, `kubectl apply` | applies an address range to a metallb which never came up |
+| `cluster.py:3944` metallb install | `kubectl create ns`, `helm repo add`, `helm repo update`, `helm upgrade --install` | installs a chart from a repository it failed to add |
+| `cluster.py:3980` longhorn install | `helm repo add`, `helm repo update`, `kubectl create namespace`, `helm install`, `kubectl patch storageclass` | patches a storage class for a chart which did not install |
 
-The remaining three sites (`3546`, `5499`/`5505`, `5590`) pass a
-single command each and gain nothing. A chain in the one function
+The remaining five sites (`3839`, `5861`, `5873`, `5879`, `6057`) pass
+a single command each and gain nothing. Three of those five -- the
+cordon, drain and delete inside `remove_worker()` -- are a sequence,
+but they are three separate calls rather than one list, so Python's
+own control flow already fate shares them: an exception from the
+cordon means the drain is never submitted. A chain in the one function
 therefore fixes six paths, which makes this a better example
 application than the master plan expected, not a worse one.
 
@@ -166,7 +170,7 @@ in `v0.4.0`. That work went further than the prerequisite required:
 - `cluster.py:138` already reads `AGENT_OP_FAILED_STATES = ('error',
   'expired', 'abort')`, so `await_idle()` already fails on an aborted
   operation rather than waiting it out.
-- `exceptions.py:1275-1279` already carries a dedicated arm for
+- `exceptions.py:1447-1452` already carries a dedicated arm for
   `state == 'abort'` which says "the operation was aborted because
   something it depended on failed" instead of the "probably did not
   run" wording the other terminal states get.
@@ -177,7 +181,8 @@ should not rewrite it.
 
 ### 5. The obvious chain is wrong, because of the loop order
 
-`execute_and_await()` (`cluster.py:2612-2626`) is:
+`execute_and_await()` (`cluster.py:2859`, as it stood before this
+phase) was:
 
 ```python
 aops = []
@@ -193,7 +198,7 @@ operation to its predecessor **in `aops` order** would make
 operations which have nothing to do with each other, on every
 multi-instance call. Two of the six sites in finding 3 are
 multi-instance (`instance_os_update()` over every node, and the node
-join at `3442`), so this is not a corner case.
+join at `3735`), so this is not a corner case.
 
 It matters beyond tidiness. Phase 4's decision 4, corrected at source
 during that phase's execution, established that a same-instance edge
@@ -208,7 +213,7 @@ and serialise a fan-out which is deliberately concurrent.
 
 ### 6. The failure which gets reported is already the root cause
 
-`reap_execute()` is called in `aops` order (`cluster.py:2625-2626`),
+`reap_execute()` is called in `aops` order (`cluster.py:2918`),
 which by finding 5 is every instance's `cmd1` before any instance's
 `cmd2`. So when `cmd1@A` fails and aborts `cmd2@A`, the exception
 raised is `cmd1@A`'s -- the real non-zero exit code with its command
@@ -234,7 +239,7 @@ chain would mean `sf-client k3s create` raises `IncapableException`
 and builds nothing at all against any cluster older than phases 1 and
 2 -- a hard break of a released verb, to add a safety property. This
 repository already has an idiom for a capability it cannot have
-(`cluster.py:5079-5087`, where a server which cannot look a network up
+(`cluster.py:5372-5380`, where a server which cannot look a network up
 within a namespace produces a written explanation and the delete
 continues), and that idiom is to degrade, not to raise. Decision 4
 follows it, and says why the reasoning phase 3 used does not transfer.
@@ -269,8 +274,9 @@ it is in the same pull request as step 5a for that reason.
 
 ### 9. The master plan's worked example does not exist here
 
-`update_os()` (`cluster.py:5651-5668`) calls
-`instance_os_update(md['control_plane_nodes'] + md['worker_nodes'])`,
+`update_os()` (`cluster.py:6118-6135`) calls
+`instance_os_update(md['control_plane_nodes'] + md['worker_nodes'])`
+at `:6134`,
 one `execute_and_await()` over every node at once. There is no
 rolling update in this repository to adopt edges into, exactly as
 phase 4's survey reported. Confirmed rather than re-derived.
@@ -362,7 +368,7 @@ caller declared the edge and can be told the cluster cannot honour it;
 this plugin declares the edge on its caller's behalf, for a caller who
 asked for a k3s cluster and never mentioned dependencies. Refusing to
 build a cluster because an optimisation is unavailable is the wrong
-answer to give that caller, and `cluster.py:5079-5087` is this
+answer to give that caller, and `cluster.py:5372-5380` is this
 repository already having reached that conclusion once.
 
 The note matters: a silent degrade would make "my upgrade ran against
@@ -407,7 +413,7 @@ not submission order, so it may see `cmd2@A`'s abort before
 `cmd1@A`'s error and raise about the abort -- about an operation whose
 own command never ran.
 
-This is not worth changing. `exceptions.py:1275-1279` already explains
+This is not worth changing. `exceptions.py:1447-1452` already explains
 an abort as "aborted because something it depended on failed", so the
 message is not misleading, merely one hop from the cause; and the
 alternative -- teaching `await_idle()` to prefer a non-abort failure
@@ -479,7 +485,7 @@ installed client predates `0.8.5` (survey findings 1 and 8).
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 5a | high | opus | none | Chain `Cluster.execute_and_await()` (`shakenfist_client_k3s/cluster.py:2612`) so each command submitted to an instance declares a `depends_on` edge on the previous command submitted to **that same instance**. Keep the existing loop order (`for cmd: for instance_uuid:`) exactly as it is -- it is load bearing for which failure `reap_execute()` reports first, see the plan's survey finding 6 -- and track predecessors in a dict keyed by instance UUID rather than by reading back through `aops`, because `aops` order is cross-instance and a cross-instance edge spends the server's dependency wait budget (survey finding 5). Build each edge with `apiclient.agent_dependency(previous_op)`, imported from `shakenfist_client`, not as a hand-built dict. Gate the whole thing on `self.client.check_capability('agentoperation-dependencies')`, evaluated once per call, not once per submission: when it is false, submit exactly as today and write one line through `self.reporter` saying the commands are not fate shared because the cluster does not advertise the capability. Do **not** raise `IncapableException` -- the plan's decision 4 explains at length why this inverts `client-python`'s choice, and the existing idiom to follow is `cluster.py:5079-5087`. Do not touch `await_idle()`, `reap_execute()` or anything in `exceptions.py`: survey finding 4 establishes that `AGENT_OP_FAILED_STATES` at `cluster.py:138` already contains `abort` and that `exceptions.py:1275-1279` already explains an abort as a failed dependency, so the reporting half is done. Add unit coverage in `shakenfist_client_k3s/tests/` in the existing testtools/stestr style with the API mocked, asserting: a two-command two-instance call produces exactly two chains of length two and no edge between instances; a single-command call declares no edges at all; the capability being false produces no `depends_on` keyword in any call and one reporter line. Verifiable by unit tests alone; there is no cluster here. |
+| 5a | high | opus | none | Chain `Cluster.execute_and_await()` (`shakenfist_client_k3s/cluster.py:2859`) so each command submitted to an instance declares a `depends_on` edge on the previous command submitted to **that same instance**. Keep the existing loop order (`for cmd: for instance_uuid:`) exactly as it is -- it is load bearing for which failure `reap_execute()` reports first, see the plan's survey finding 6 -- and track predecessors in a dict keyed by instance UUID rather than by reading back through `aops`, because `aops` order is cross-instance and a cross-instance edge spends the server's dependency wait budget (survey finding 5). Build each edge with `apiclient.agent_dependency(previous_op)`, imported from `shakenfist_client`, not as a hand-built dict. Gate the whole thing on `self.client.check_capability('agentoperation-dependencies')`, evaluated once per call, not once per submission: when it is false, submit exactly as today and write one line through `self.reporter` saying the commands are not fate shared because the cluster does not advertise the capability. Do **not** raise `IncapableException` -- the plan's decision 4 explains at length why this inverts `client-python`'s choice, and the existing idiom to follow is `cluster.py:5372-5380`. Do not touch `await_idle()`, `reap_execute()` or anything in `exceptions.py`: survey finding 4 establishes that `AGENT_OP_FAILED_STATES` at `cluster.py:138` already contains `abort` and that `exceptions.py:1447-1452` already explains an abort as a failed dependency, so the reporting half is done. Add unit coverage in `shakenfist_client_k3s/tests/` in the existing testtools/stestr style with the API mocked, asserting: a two-command two-instance call produces exactly two chains of length two and no edge between instances; a single-command call declares no edges at all; the capability being false produces no `depends_on` keyword in any call and one reporter line. Verifiable by unit tests alone; there is no cluster here. |
 | 5b | low | haiku | none | Raise this repository's `shakenfist_client` floor to `0.8.5`, the release carrying `client-python` commit `a2c9d0d1f4`. Edit `pyproject.toml:58` (`"shakenfist_client >= 0.7.7",  # apache2`), keeping the trailing licence comment. Check `collection/requirements.txt` and `tools/mutation-check.py`'s fixture strings for a floor on the same package and raise any that names `shakenfist_client` rather than `shakenfist_client_k3s` -- line 33 of the requirements file and lines 1186-1187 of the mutation helper are `shakenfist_client_k3s` floors, which are this plugin's own version and must **not** be touched. The release is `v0.8.5`, so the new floor is `shakenfist_client >= 0.8.5`; confirm that rather than trusting it, with `git -C ../client-python fetch --tags origin` then `git -C ../client-python merge-base --is-ancestor a2c9d0d1f4 v0.8.5`, and stop if it does not succeed. Fetch first: the clone this plan was surveyed in was three weeks stale and the survey's first finding was wrong because of it. |
 | 5c | medium | sonnet | none | Document what step 5a did, in two places. First, `Cluster.execute_and_await()`'s docstring -- which it does not currently have -- gains one: what the call does, that commands submitted to one instance are fate shared with `depends_on` while commands on different instances are independent, that the chain is per instance deliberately because a cross-instance edge would spend the server's dependency wait budget, and that the capability gate degrades rather than raises. It must also record the asymmetry the plan's decision 7 declines to fix: `await_idle()` raises on the first failed operation it sees while polling, which may be a cascaded `abort` rather than the error which caused it, while `reap_execute()` walks submission order and so reports the cause -- so the two can name different operations for the same incident, and that is understood rather than broken. Second, find where this repository's own documentation describes how commands are run on nodes (search `docs/` for `execute_and_await` and for agent operations) and add fate sharing there if there is a natural home; if there is not, say so in the step report rather than inventing a page. Do not restate any configuration default value -- the server's wait budget has a number and this repository is not where it is published. |
 | 5d | medium | sonnet | none | **In `shakenfist/shakenfist`, as a second pull request after the first has merged.** Update the example index in `docs/developer_guide/agent_operations.md:348-368`. Its `client-python-k3s` bullet currently ends "It does not declare dependency edges today; the fate sharing above is what a chain would buy it", which stops being true when step 5a ships. Replace that clause with what the plugin now does: each command `Cluster.execute_and_await()` submits to a node declares a `depends_on` edge on the previous command submitted to that same node, so a failed `apt-get update` abandons the `dist-upgrade` behind it instead of upgrading against a stale index; edges are never declared across nodes, so a fan-out stays concurrent and no dependency wait budget is spent; and a cluster which does not advertise the capability gets unchained submission with a note rather than a refusal. Name the released plugin version which carries it. Keep the bullet the length it is -- this is an index, not a second model page -- and do not restate the budget's value. Run `tox -e docs` as well as `pre-commit run --all-files`: the mkdocs build is a separate CI job and not a pre-commit hook, which phase 4 corrected the hard way. |
@@ -587,6 +593,59 @@ An item which cannot be checked is reported as such, not ticked.
   `docs/plans/index.md` agrees. Check, in that repository:
   `python3 tools/check-plan-status.py`.
 
+## Execution notes
+
+Departures from the plan, recorded as they happened. Dates are AEDT.
+
+1. **2026-11-26. Back brief answered.** All four questions put to
+   Michael confirmed the plan as written: the floor goes to `0.8.5`; a
+   cluster without the capability degrades with a note rather than
+   raising (decision 4); no new functional test (decision 8); and the
+   `await_idle()`/`reap_execute()` asymmetry is documented rather than
+   fixed (decision 7). The plan's question about declining a rolling
+   `update_os()` was not put to him, because phase 4's survey and the
+   master plan row had already declined it twice and re-asking would
+   have re-litigated a settled decision.
+
+2. **Every line number in this plan was wrong, and the survey was
+   read from a stale clone.** The survey was run in the main
+   `client-python-k3s` checkout, which was sixteen commits behind
+   `origin/develop`; the worktree is at `origin/develop`. Step 5a's
+   agent found it immediately, because the function the brief placed
+   at `cluster.py:2612` is at `:2859`. Every line number in the
+   findings, decisions and step briefs has been corrected against the
+   worktree, and the correction changed one substantive count: there
+   are **eleven** `execute_and_await()` call sites, not nine. The two
+   new ones are single-command, so finding 3's six multi-command sites
+   are unchanged -- "six of nine" became "six of eleven". The new
+   `kubectl cordon` call at `:5861` is `remove_worker()`'s, from
+   [#172](https://github.com/shakenfist/client-python-k3s/pull/172).
+
+   This is the second time in this phase that a stale clone has
+   produced a wrong finding: the first was the release in finding 1.
+   The lesson recorded for the next reader is to fetch before
+   surveying a repository, including the one the worktree is cut from.
+
+3. **Step 5a's note is emitted only when there is more than one
+   command**, which the brief did not ask for and which is kept. With
+   a single command there is nothing to fate share, so the line would
+   be noise on every call against an older cluster, and there is a
+   test for the silence. The Definition of done's "exactly one
+   reporter line" is checked with a two-command call, so it is
+   unaffected.
+
+4. **The existing suite exercises the degraded path, not the chained
+   one.** Step 5a tried teaching `fakes.FakeClusterClient` to
+   advertise the capability so the lifecycle and smoke tests would
+   chain, and reverted it: `agent_dependency()` validates a real
+   UUID4 and the fake's operation handles are `aop-001`, which broke
+   126 tests. `fakes.py` is therefore unchanged and those tests take
+   the unchained branch. The chained branch is covered directly by
+   the new test class, and end to end by the cluster-deploy tier per
+   decision 8, so this is a gap in breadth rather than in coverage of
+   the change. Recorded in Future work rather than fixed here,
+   because giving the fake real UUIDs is a fake-wide change.
+
 ## Future work
 
 - **The per-link dependency wait budget.** Phase 4 recorded this and
@@ -601,6 +660,13 @@ An item which cannot be checked is reported as such, not ticked.
   concrete, and it will want its own plan.
 - **`client-python`'s index row for phase 3** still reads
   `In progress` (survey finding 10). One line in a third repository.
+- **The test fakes cannot carry a dependency edge.**
+  `fakes.FakeClusterClient` hands out operation handles like
+  `aop-001`, which `apiclient.agent_dependency()` rejects because it
+  validates a real UUID4. So the lifecycle and smoke tests cannot
+  exercise the chained path, as execution note 4 records. Giving the
+  fake real UUIDs is a change across every test that reads a handle,
+  and is worth doing on its own rather than inside this phase.
 
 ## Back brief
 
