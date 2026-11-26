@@ -54,8 +54,11 @@ classifiers = [
 requires-python = ">=3.7"
 dependencies = [
     "click >= 8.0.0",           # bsd
-    # 0.7.7 is the first release which supports the sf-agent2 side channel.
-    "shakenfist_client >= 0.7.7",  # apache2
+    # 0.8.5 is the first release carrying agent_dependency() and the
+    # depends_on keyword on instance_execute(), which execute_and_await()
+    # declares its edges with. The floor before it was 0.7.7, the first
+    # release to support the sf-agent2 side channel.
+    "shakenfist_client >= 0.8.5",  # apache2
     "packaging",                # apache2 and bsd
     "pyyaml",                   # mit
     "requests",                 # apache2
