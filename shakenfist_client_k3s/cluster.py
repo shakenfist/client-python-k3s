@@ -2857,6 +2857,62 @@ class Cluster:
         return new_nodes
 
     def execute_and_await(self, instance_uuids, cmds):
+        """Run each command on every instance, wait for them to finish, and raise on any failure.
+
+        Submits every command in cmds to every instance in instance_uuids,
+        then waits for those instances to be idle and turns any failure into
+        an exception. Nothing is returned.
+
+        The commands submitted to one instance are fate shared: each declares
+        a depends_on edge on the command submitted to that instance just
+        before it, so the rest of that instance's sequence is abandoned
+        rather than run when the one before it comes to nothing. Commands on
+        different instances are independent of each other, so a failure on
+        one instance abandons nothing on another.
+
+        Read "comes to nothing" precisely, because the edge is about the
+        earlier operation's fate and not about its command's exit status. The
+        rest of the sequence is abandoned when the operation before it
+        errored, expired, was aborted or was deleted -- a side channel which
+        wedged, a deadline or progress timeout which fired, a cascade from
+        further up the chain. A command which ran to completion and exited
+        non-zero is not one of those: its operation is complete, which
+        satisfies the edge, so the commands behind it still run. That case is
+        reported rather than prevented, by reap_execute() below, exactly as it
+        was before any edge existed. Preventing it needs the server to offer
+        an edge which tests the command's success and not just the
+        operation's, which it does not today.
+
+        The chain is per instance deliberately, and not one chain through
+        every submission. An edge between instances would spend the server's
+        dependency wait budget, which an edge inside one instance never
+        starts, and it would serialise a fan out which is meant to be
+        concurrent. The comments in the body explain how the loop below keeps
+        the two apart.
+
+        A cluster which does not advertise agentoperation-dependencies gets
+        the same commands submitted unchained, and one note through the
+        reporter, rather than a refusal. This is the opposite choice to the
+        one the underlying client makes, because a caller of this method has
+        no way to opt out of a sequence: raising would stop every command this
+        plugin runs against an older cluster, which ran them perfectly well,
+        if without protection, before edges existed.
+
+        The two halves of the failure reporting can name different operations
+        for one incident, and that is understood rather than broken.
+        await_idle() runs first and raises on the first failed operation it
+        notices while polling, and polling order is not submission order, so
+        it may notice a cascaded abort before the error which caused it.
+        reap_execute() walks the operations in submission order, so its first
+        failure is the cause -- and it is the half which carries the failing
+        command's own exit code, command line and output. It is reached only
+        for what await_idle() did not raise about. An abort is still an honest
+        message, because it says the command never ran because something it
+        depended on failed, but it is one hop from the cause. await_idle() is
+        left alone because changing a wait loop to prefer a non-abort failure
+        is a larger risk than a better message in a case which already has an
+        intelligible one.
+        """
         # Asked once for the whole call, not once per submission. The answer
         # cannot change while a sequence is being submitted -- a cluster does
         # not learn a capability mid call -- and asking inside the loop would
