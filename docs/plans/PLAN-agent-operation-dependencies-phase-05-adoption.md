@@ -646,9 +646,14 @@ An item which cannot be checked is reported as such, not ticked.
   develop | grep -nE '300 seconds|\b300\b.*budget|86400'` finds
   nothing in an added line.
 - The plan of record's example index no longer says the plugin
-  declares no edges. Check, in `shakenfist/shakenfist`: `grep -n 'does
-  not declare dependency edges'
-  docs/developer_guide/agent_operations.md` finds nothing.
+  declares no edges. Check, in `shakenfist/shakenfist`:
+  `tr '\n' ' ' < docs/developer_guide/agent_operations.md | grep -c
+  'does not declare *dependency edges'` reports `0`. The single-line
+  `grep` this item used to name could never pass or fail honestly: the
+  clause is wrapped across two lines at
+  `docs/developer_guide/agent_operations.md:362`, so the grep finds
+  nothing while the clause is still there, and reports the item met
+  before step 5d has run. See execution note 6.
 - This file is registered in `docs/plans/index.md`, in a table whose
   first two columns are `Date` and `Plan`, with a status from the
   shared vocabulary. Check: read, against
@@ -742,6 +747,25 @@ Departures from the plan, recorded as they happened. Dates are AEDT.
    *describe* the behaviour rather than to implement it, which is an
    argument for keeping a documentation step in a phase even when the
    code looks self-evident.
+
+6. **2026-11-27. A definition-of-done check was broken, and would
+   have passed before the step it gates had run.** The item for step
+   5d greps the plan of record's example index for "does not declare
+   dependency edges". That clause is there, at
+   `docs/developer_guide/agent_operations.md:362`, but it is wrapped
+   across two lines, so a single-line `grep` for it reports nothing
+   found -- which this item reads as the clause having been removed.
+   Run against the unmodified page it reports the item met. The check
+   now flattens newlines before matching, and counts, so it fails
+   while the clause is present and passes only when it is gone.
+
+   This is the second time in this plan's phases that a definition-of-
+   done grep has been wrong in exactly this way: phase 4's four-page
+   check also looked for text a line wrap had split, and this session
+   wrongly read phase 4 as incomplete because of it before checking
+   the file. A grep over prose is a check of the grep as much as of
+   the tree, and these plans should prefer one that cannot be fooled
+   by a wrap.
 
 ## Future work
 
