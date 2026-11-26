@@ -10264,6 +10264,210 @@ class SshKeyIsReadThroughTheHierarchyTestCase(testtools.TestCase):
         self.assertEqual([content], sorted(set(self.client.instance_sshkeys)))
 
 
+class ExecuteAndAwaitFateSharingTestCase(testtools.TestCase):
+    """The dependency edges execute_and_await() declares, and the ones it must not.
+
+    Commands submitted to one instance are chained, so a command which
+    fails abandons the rest of that instance's sequence instead of running
+    against a state its predecessor failed to produce. Commands submitted
+    to different instances are never chained to each other: such an edge
+    joins two commands with nothing to do with one another, it serialises
+    a fan out which is deliberately concurrent, and it spends a server
+    side dependency wait budget which an edge inside one instance never
+    starts.
+
+    The submission order makes that easy to get wrong, which is why these
+    tests are mostly about what is absent. execute_and_await() submits
+    every instance's first command before any instance's second, so the
+    operation submitted immediately before a given one usually belongs to
+    a different instance; chaining each submission to the one before it in
+    submission order would declare a cross-instance edge on every
+    multi-instance call.
+
+    The API is mocked: these are claims about the requests made, and
+    await_idle() and reap_execute() are stubbed because what comes back is
+    not the subject here.
+    """
+
+    # Instance UUIDs are the keys the chain is built on and operation
+    # UUIDs end up inside an edge, so both have to be real UUIDs:
+    # apiclient.agent_dependency() refuses a handle which is not one,
+    # which is also why this fixture cannot borrow
+    # fakes.FakeClusterClient and its 'aop-001' handles.
+    INSTANCE_A = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa'
+    INSTANCE_B = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb'
+
+    def setUp(self):
+        super().setUp()
+        self.submitted = []
+        for name in ('await_idle', 'reap_execute'):
+            patcher = mock.patch.object(Cluster, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _cluster(self, capable=True):
+        """A cluster whose client records every submission and its edges."""
+        client = mock.MagicMock()
+        client.check_capability.return_value = capable
+
+        def instance_execute(instance_uuid, commandline, **kwargs):
+            aop = {
+                'uuid': '%08d-0000-4000-8000-000000000000' % (len(self.submitted) + 1),
+                'instance_uuid': instance_uuid,
+                'state': 'queued'
+            }
+            self.submitted.append({
+                'instance': instance_uuid,
+                'commandline': commandline,
+                'operation': aop,
+                # Absent and None are different claims. Absent is the call
+                # this has always made, which is what a cluster that cannot
+                # accept an edge has to keep receiving.
+                'declared': 'depends_on' in kwargs,
+                'depends_on': kwargs.get('depends_on')
+            })
+            return aop
+
+        client.instance_execute.side_effect = instance_execute
+        return client, _make_cluster(client)
+
+    def _instance_of(self, op_uuid):
+        """Which instance the operation with this UUID was submitted to."""
+        for submission in self.submitted:
+            if submission['operation']['uuid'] == op_uuid:
+                return submission['instance']
+        self.fail('an edge names %s, which this call never submitted' % op_uuid)
+
+    def test_two_commands_on_two_instances_are_two_chains(self):
+        client, cluster = self._cluster()
+
+        cluster.execute_and_await([self.INSTANCE_A, self.INSTANCE_B],
+                                  ['apt-get update', 'apt-get dist-upgrade -y'])
+
+        # Submission order is unchanged: commands outside, instances
+        # inside. It is load bearing -- reap_execute() walks it, so the
+        # command which actually failed is reported ahead of the abort it
+        # caused -- and the chains below are built without disturbing it.
+        self.assertEqual(
+            [(self.INSTANCE_A, 'apt-get update'),
+             (self.INSTANCE_B, 'apt-get update'),
+             (self.INSTANCE_A, 'apt-get dist-upgrade -y'),
+             (self.INSTANCE_B, 'apt-get dist-upgrade -y')],
+            [(s['instance'], s['commandline']) for s in self.submitted])
+
+        first_a, first_b, second_a, second_b = self.submitted
+
+        # Each instance's first command starts a chain, so it declares
+        # nothing.
+        self.assertFalse(first_a['declared'])
+        self.assertFalse(first_b['declared'])
+
+        # Each instance's second command names that instance's own first
+        # command, and exactly one edge. This is the assertion the keying
+        # rests on: the operation submitted immediately before 'dist-upgrade
+        # on A' is 'update on B', so a chain built by reading back through
+        # the submitted operations rather than per instance would name
+        # first_b here.
+        self.assertEqual([{'op_uuid': first_a['operation']['uuid']}],
+                         second_a['depends_on'])
+        self.assertEqual([{'op_uuid': first_b['operation']['uuid']}],
+                         second_b['depends_on'])
+
+        # Said once more as a property rather than as a transcript, so that
+        # it holds for a call of any shape: no edge anywhere reaches out of
+        # the instance which declared it.
+        for submission in self.submitted:
+            for edge in submission['depends_on'] or []:
+                self.assertEqual(
+                    submission['instance'], self._instance_of(edge['op_uuid']),
+                    'command %r on %s is chained to an operation on another instance'
+                    % (submission['commandline'], submission['instance']))
+
+    def test_a_chain_on_one_instance_is_as_long_as_the_command_list(self):
+        client, cluster = self._cluster()
+
+        cluster.execute_and_await([self.INSTANCE_A], ['one', 'two', 'three'])
+
+        self.assertFalse(self.submitted[0]['declared'])
+        self.assertEqual([{'op_uuid': self.submitted[0]['operation']['uuid']}],
+                         self.submitted[1]['depends_on'])
+        self.assertEqual([{'op_uuid': self.submitted[1]['operation']['uuid']}],
+                         self.submitted[2]['depends_on'])
+
+    def test_no_settle_is_asked_for(self):
+        # An edge is satisfied as soon as its dependency finishes. Nothing
+        # in this repository waits for a guest to settle afterwards, and an
+        # unsatisfiable settle is worse than none.
+        client, cluster = self._cluster()
+
+        cluster.execute_and_await([self.INSTANCE_A], ['one', 'two', 'three'])
+
+        for submission in self.submitted:
+            for edge in submission['depends_on'] or []:
+                self.assertEqual(['op_uuid'], list(edge.keys()))
+
+    def test_a_single_command_declares_no_edges(self):
+        # Three of this repository's call sites pass one command, and a
+        # single command has nothing to be fate shared with.
+        client, cluster = self._cluster()
+
+        cluster.execute_and_await([self.INSTANCE_A, self.INSTANCE_B],
+                                  ['systemctl restart k3s'])
+
+        self.assertEqual(2, len(self.submitted))
+        for submission in self.submitted:
+            self.assertFalse(submission['declared'])
+
+    def test_the_capability_is_asked_about_once_per_call(self):
+        # Not once per submission. The client caches the answer, so asking
+        # repeatedly would be correct, but a cluster does not learn a
+        # capability halfway through a sequence and code which asks inside
+        # the loop reads as though it might.
+        client, cluster = self._cluster()
+
+        cluster.execute_and_await([self.INSTANCE_A, self.INSTANCE_B],
+                                  ['one', 'two', 'three'])
+
+        client.check_capability.assert_called_once_with(
+            'agentoperation-dependencies')
+
+    def test_a_cluster_without_the_capability_submits_unchained_with_a_note(self):
+        # A published plugin cannot refuse to build a cluster because an
+        # improvement is unavailable: unchained submission is what every
+        # released version of this plugin has always done, so an older
+        # cluster keeps it. The note is what stops the difference being
+        # invisible -- without it, a dist-upgrade which ran against the
+        # stale index of a failed update has nothing explaining why it was
+        # allowed to.
+        client, cluster = self._cluster(capable=False)
+
+        cluster.execute_and_await([self.INSTANCE_A, self.INSTANCE_B],
+                                  ['apt-get update', 'apt-get dist-upgrade -y'])
+
+        self.assertEqual(4, len(self.submitted))
+        for submission in self.submitted:
+            self.assertFalse(
+                submission['declared'],
+                'command %r declared depends_on against a cluster which cannot '
+                'accept it' % submission['commandline'])
+
+        self.assertEqual(
+            ['Not fate sharing these commands: this Shaken Fist does not '
+             'advertise agentoperation-dependencies.'],
+            cluster.reporter.lines)
+
+    def test_a_single_command_against_an_older_cluster_says_nothing(self):
+        # The note is about commands which would otherwise have been fate
+        # shared with each other. A lone command has none, so there is
+        # nothing to explain and a line per call would be noise on every
+        # older cluster.
+        client, cluster = self._cluster(capable=False)
+
+        cluster.execute_and_await([self.INSTANCE_A], ['systemctl restart k3s'])
+
+        self.assertEqual([], cluster.reporter.lines)
+
+
 def _repository_python_files():
     """Every .py file this repository ships, not only the package's.
 
