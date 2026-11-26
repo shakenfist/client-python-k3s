@@ -2922,7 +2922,7 @@ class Cluster:
         # Said once, and only where it makes a difference: with a single
         # command there is nothing to fate share and the note would be
         # noise. A silent degrade is what must not happen, because then a
-        # dist-upgrade which ran against the stale index of a failed update
+        # sequence which kept running on a node whose side channel had wedged
         # has nothing anywhere explaining why it was allowed to.
         if not fate_share and len(cmds) > 1:
             self.reporter.write(

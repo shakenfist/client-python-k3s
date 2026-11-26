@@ -91,10 +91,14 @@ accept it, is not.
 
 ## What the survey found
 
-Ten findings. Three correct the master plan's phase 5 row, one
+Eleven findings. Three correct the master plan's phase 5 row, one
 corrects what the plan assumed about this repository's readiness, one
-is a trap the obvious implementation falls into, and one blocks the
-live proof as well as the code.
+is a trap the obvious implementation falls into, and one blocked the
+live proof as well as the code until the release it waited on landed.
+The eleventh was found while the phase was being executed rather than
+while it was being planned, and it contradicts the premise the phase
+was built on; it is recorded here with the rest because that is where
+a reader looks for what is true about the edge.
 
 ### 1. The gate was met while this phase was being planned
 

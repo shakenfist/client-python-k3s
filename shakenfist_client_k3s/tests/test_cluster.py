@@ -10436,8 +10436,8 @@ class ExecuteAndAwaitFateSharingTestCase(testtools.TestCase):
         # improvement is unavailable: unchained submission is what every
         # released version of this plugin has always done, so an older
         # cluster keeps it. The note is what stops the difference being
-        # invisible -- without it, a dist-upgrade which ran against the
-        # stale index of a failed update has nothing explaining why it was
+        # invisible -- without it, a sequence which kept running on a node
+        # whose side channel had wedged has nothing explaining why it was
         # allowed to.
         client, cluster = self._cluster(capable=False)
 
