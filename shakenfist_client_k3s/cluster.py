@@ -2857,11 +2857,115 @@ class Cluster:
         return new_nodes
 
     def execute_and_await(self, instance_uuids, cmds):
+        """Run each command on every instance, wait for them to finish, and raise on any failure.
+
+        Submits every command in cmds to every instance in instance_uuids,
+        then waits for those instances to be idle and turns any failure into
+        an exception. Nothing is returned.
+
+        The commands submitted to one instance are fate shared: each declares
+        a depends_on edge on the command submitted to that instance just
+        before it, so the rest of that instance's sequence is abandoned
+        rather than run when the one before it comes to nothing. Commands on
+        different instances are independent of each other, so a failure on
+        one instance abandons nothing on another.
+
+        Read "comes to nothing" precisely, because the edge is about the
+        earlier operation's fate and not about its command's exit status. The
+        rest of the sequence is abandoned when the operation before it
+        errored, expired, was aborted or was deleted -- a side channel which
+        wedged, a deadline or progress timeout which fired, a cascade from
+        further up the chain. A command which ran to completion and exited
+        non-zero is not one of those: its operation is complete, which
+        satisfies the edge, so the commands behind it still run. That case is
+        reported rather than prevented, by reap_execute() below, exactly as it
+        was before any edge existed. Preventing it needs the server to offer
+        an edge which tests the command's success and not just the
+        operation's, which it does not today.
+
+        The chain is per instance deliberately, and not one chain through
+        every submission. An edge between instances would spend the server's
+        dependency wait budget, which an edge inside one instance never
+        starts, and it would serialise a fan out which is meant to be
+        concurrent. The comments in the body explain how the loop below keeps
+        the two apart.
+
+        A cluster which does not advertise agentoperation-dependencies gets
+        the same commands submitted unchained, and one note through the
+        reporter, rather than a refusal. This is the opposite choice to the
+        one the underlying client makes, because a caller of this method has
+        no way to opt out of a sequence: raising would stop every command this
+        plugin runs against an older cluster, which ran them perfectly well,
+        if without protection, before edges existed.
+
+        The two halves of the failure reporting can name different operations
+        for one incident, and that is understood rather than broken.
+        await_idle() runs first and raises on the first failed operation it
+        notices while polling, and polling order is not submission order, so
+        it may notice a cascaded abort before the error which caused it.
+        reap_execute() walks the operations in submission order, so its first
+        failure is the cause -- and it is the half which carries the failing
+        command's own exit code, command line and output. It is reached only
+        for what await_idle() did not raise about. An abort is still an honest
+        message, because it says the command never ran because something it
+        depended on failed, but it is one hop from the cause. await_idle() is
+        left alone because changing a wait loop to prefer a non-abort failure
+        is a larger risk than a better message in a case which already has an
+        intelligible one.
+        """
+        # Asked once for the whole call, not once per submission. The answer
+        # cannot change while a sequence is being submitted -- a cluster does
+        # not learn a capability mid call -- and asking inside the loop would
+        # read as though it could.
+        fate_share = self.client.check_capability('agentoperation-dependencies')
+
+        # Said once, and only where it makes a difference. With a single
+        # command there is nothing to fate share, and with no instances
+        # nothing is submitted at all, so in both cases the note would be
+        # noise rather than an explanation. A silent degrade is what must
+        # not happen when there is something to explain, because then a
+        # sequence which kept running on a node whose side channel had
+        # wedged has nothing anywhere saying why it was allowed to.
+        if instance_uuids and not fate_share and len(cmds) > 1:
+            self.reporter.write(
+                'Not fate sharing these commands: this Shaken Fist does not advertise '
+                'agentoperation-dependencies.\n')
+
+        # The most recently submitted operation for each instance, keyed by
+        # instance UUID. It is kept here rather than read back out of aops
+        # because aops is not in per instance order: the loops below submit
+        # every instance's first command before any instance's second, so
+        # aops runs cmd1@A, cmd1@B, cmd2@A, cmd2@B, and chaining on aops[-1]
+        # would make cmd1@B depend on cmd1@A. Those two commands have
+        # nothing to do with each other. An edge between instances would
+        # serialise a fan out which is deliberately concurrent, and it
+        # spends the server's dependency wait budget, which an edge inside
+        # one instance never starts at all -- a dependent queued behind its
+        # own dependency on one instance is not looked at until that
+        # dependency is terminal, by which time its edge is satisfied.
+        previous_op = {}
+
+        # The loop order is deliberate and must not be inverted. Iterating
+        # instances outside commands would build exactly these chains and
+        # read more naturally, but it would also change the order
+        # reap_execute() walks below, and submission order is what makes
+        # this raise about the command which actually failed rather than
+        # about an abort that failure caused.
         aops = []
         for cmd in cmds:
             for instance_uuid in instance_uuids:
-                aops.append(self.client.instance_execute(
-                    instance_uuid, cmd))
+                # The keyword is absent rather than None when there is no
+                # edge to declare, so that a submission which is not
+                # chained -- the first command on an instance, or every
+                # command when the capability is missing -- is the call this
+                # has always made.
+                edge = {}
+                if fate_share and instance_uuid in previous_op:
+                    edge['depends_on'] = [apiclient.agent_dependency(
+                        previous_op[instance_uuid])]
+                aop = self.client.instance_execute(instance_uuid, cmd, **edge)
+                previous_op[instance_uuid] = aop
+                aops.append(aop)
 
         # Wait for instances to be idle and check results. The operations
         # this call submitted are named, so a failure among them aborts here

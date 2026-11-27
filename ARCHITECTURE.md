@@ -87,10 +87,19 @@ that; this section is only the shape.
   side channel, which the current in-guest agent requires: without
   it the agent never connects, the instance's `agent_state` never
   reaches `ready`, and the `await_boot()` polling loop waits
-  forever. Clusters therefore require `shakenfist_client` >= 0.7.7
-  and a Shaken Fist server and guest image recent enough to speak
-  `sf-agent2`; there is no fallback to the legacy `sf-agent`
-  channel
+  forever. Clusters therefore require a Shaken Fist server and
+  guest image recent enough to speak `sf-agent2`; there is no
+  fallback to the legacy `sf-agent` channel. The `shakenfist_client`
+  floor is >= 0.8.5 rather than the 0.7.7 which `sf-agent2` alone
+  would need, because the commands `execute_and_await()` sends to one
+  node are fate shared: each declares a dependency edge on the
+  previous command submitted to that same node, so the rest of a
+  node's sequence is abandoned when the operation before it never
+  completed, and 0.8.5 is the first release which can declare such an
+  edge. Edges are never declared between nodes, so a fan out stays
+  concurrent, and a server which does not advertise
+  `agentoperation-dependencies` gets unchained submission and a note
+  through the reporter rather than a refusal
 - **Cluster assembly**: every node has its k3s configuration files
   written before its installer runs (see "k3s configuration" in
   `docs/usage.md`), the first control plane node is installed

@@ -19,9 +19,11 @@ The plugin registers itself with `sf-client` via an entry point, so once
 installed the commands appear automatically.
 
 Cluster nodes communicate with Shaken Fist over the `sf-agent2` side
-channel, so clusters require `shakenfist_client` >= 0.7.7 (installed
-automatically) and a Shaken Fist server and guest image recent enough
-to speak `sf-agent2`.
+channel, so clusters require a Shaken Fist server and guest image
+recent enough to speak `sf-agent2`. They also require
+`shakenfist_client` >= 0.8.5 (installed automatically), which is the
+first release able to declare the agent operation dependency edges
+this plugin uses to fate share each node's command sequence.
 
 ## Usage
 

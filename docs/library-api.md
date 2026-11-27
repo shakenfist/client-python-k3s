@@ -490,6 +490,32 @@ it rather than assuming the call was atomic. And the uncordon a refusal
 performs is unconditional, so a worker an operator had cordoned
 deliberately is returned to service by a refused removal.
 
+The commands `execute_and_await()` submits to one instance are fate
+shared. Each declares a dependency on the command submitted to that
+instance before it, so the rest of that instance's sequence ends as
+`abort` rather than running when the command before it comes to nothing.
+
+That last phrase is exact, and it is narrower than it sounds. The
+dependency is on the earlier *operation's* fate, not on its command's
+exit status, so the sequence is abandoned when the operation before it
+errored, expired, was aborted or was deleted: a side channel which
+wedged, a deadline or progress timeout which fired, a cascade from
+further up the chain. A command which ran and exited non-zero leaves a
+`complete` operation, which satisfies the dependency, so the commands
+behind it still run -- a failed `apt-get update` does not stop the
+`dist-upgrade` behind it. That failure is still reported, with its exit
+code and output, once the wait finishes; it is not prevented.
+
+Commands on different instances are independent: a failure on one node
+abandons nothing on another, because an edge between instances would
+spend the server's dependency wait budget and serialise what is meant to
+run concurrently. A Shaken Fist which does not advertise
+`agentoperation-dependencies` gets the same commands unchained and one
+note through the reporter. The exception raised is usually, but not
+always, for the failing command itself: the wait may notice an `abort`
+first, so an `AgentOperationError` with state `abort` means look for the
+earlier failure on that instance.
+
 Every elapsed time this library measures -- the probe's timeout, the
 stall notes, the progress reporting -- is taken from `time.monotonic()`,
 so a wall clock adjustment during a long create cannot shorten a

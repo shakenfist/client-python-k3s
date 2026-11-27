@@ -253,6 +253,16 @@ def build_fake_client(spec):
             spec['params'].get('name', CLUSTER_NAME)]
 
     client = mock.MagicMock()
+
+    # Said explicitly, because the default is wrong here rather than
+    # merely unset. check_capability() on a MagicMock answers every
+    # capability with a truthy Mock, and the mutating Cluster methods
+    # below are wrapped rather than replaced, so a scenario reaching
+    # execute_and_await() would take its chained branch and fail inside
+    # the real client's UUID validation on this mock's operation handles.
+    # False is also what this harness did before edges existed.
+    client.check_capability.return_value = False
+
     client.get_namespace_metadata.return_value = namespace_md
     # Kept where the diagnostics can read it without going through a mock
     # which a scenario may have told to raise.

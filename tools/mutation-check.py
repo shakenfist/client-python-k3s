@@ -1660,6 +1660,48 @@ MUTATIONS = [
         '.test_a_line_which_cannot_be_read_refuses_rather_than_assuming',
         'stestr',
     ),
+    (
+        "a command's dependency edge names the previous command on its own "
+        'instance',
+        PKG + '/cluster.py',
+        "                if fate_share and instance_uuid in previous_op:\n"
+        "                    edge['depends_on'] = [apiclient.agent_dependency(\n"
+        '                        previous_op[instance_uuid])]\n',
+        '                if fate_share and aops:\n'
+        "                    edge['depends_on'] = [apiclient.agent_dependency(\n"
+        '                        aops[-1])]\n',
+        PKG + '.tests.test_cluster.ExecuteAndAwaitFateSharingTestCase'
+        '.test_two_commands_on_two_instances_are_two_chains',
+        'stestr',
+    ),
+    (
+        'a cluster which cannot accept an edge is not sent one',
+        PKG + '/cluster.py',
+        "        fate_share = self.client.check_capability("
+        "'agentoperation-dependencies')\n",
+        '        fate_share = True\n',
+        PKG + '.tests.test_cluster.ExecuteAndAwaitFateSharingTestCase'
+        '.test_a_cluster_without_the_capability_submits_unchained_with_a_note',
+        'stestr',
+    ),
+    (
+        'the degrade note is written only when something was submitted',
+        PKG + '/cluster.py',
+        '        if instance_uuids and not fate_share and len(cmds) > 1:\n',
+        '        if not fate_share and len(cmds) > 1:\n',
+        PKG + '.tests.test_cluster.ExecuteAndAwaitFateSharingTestCase'
+        '.test_a_call_with_no_instances_says_nothing',
+        'stestr',
+    ),
+    (
+        'the degrade note is written only when the edges were not declared',
+        PKG + '/cluster.py',
+        '        if instance_uuids and not fate_share and len(cmds) > 1:\n',
+        '        if instance_uuids and len(cmds) > 1:\n',
+        PKG + '.tests.test_cluster.ExecuteAndAwaitFateSharingTestCase'
+        '.test_a_capable_cluster_is_told_nothing_about_fate_sharing',
+        'stestr',
+    ),
 ]
 
 
