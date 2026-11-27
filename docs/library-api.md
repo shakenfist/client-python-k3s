@@ -466,6 +466,30 @@ which the server later expires would abort an unrelated
 `expand_workers()` with an `AgentOperationError` naming a `kubectl get
 nodes` the caller never ran.
 
+`remove_worker([])` is likewise an accepted no-op, so a caller computing
+the removal list programmatically does not need to guard the call.
+
+A caller which computes that list to shrink a pool of workers wants
+`remove_worker(uuids, only_if_empty=True)`, and should treat
+`WorkerNotEmptyError` as a normal outcome rather than a failure: it
+means work landed on that worker, so the worker stays and the next
+cycle decides again. The check is made after this library has cordoned
+the node, which is why it lives here. A caller cannot make the same
+guarantee from outside: a node that is empty when it looks can be given
+a pod before it acts, and cordoning first is what closes that gap. The
+other exceptions a removal raises, `WorkerPodsUnreadableError` among
+them, are failures in the ordinary way. `docs/usage.md` has what counts
+as empty and why an idle pod does not.
+
+Two things that matter to such a caller more than to the command line.
+The check is made per worker inside the removal loop, not for the whole
+list up front like the uuid validation, so passing several uuids and
+catching `WorkerNotEmptyError` means the workers ahead of the one named
+in the exception were removed; read `node_name` and `instance_uuid` off
+it rather than assuming the call was atomic. And the uncordon a refusal
+performs is unconditional, so a worker an operator had cordoned
+deliberately is returned to service by a refused removal.
+
 The commands `execute_and_await()` submits to one instance are fate
 shared. Each declares a dependency on the command submitted to that
 instance before it, so the rest of that instance's sequence ends as
@@ -491,30 +515,6 @@ note through the reporter. The exception raised is usually, but not
 always, for the failing command itself: the wait may notice an `abort`
 first, so an `AgentOperationError` with state `abort` means look for the
 earlier failure on that instance.
-
-`remove_worker([])` is likewise an accepted no-op, so a caller computing
-the removal list programmatically does not need to guard the call.
-
-A caller which computes that list to shrink a pool of workers wants
-`remove_worker(uuids, only_if_empty=True)`, and should treat
-`WorkerNotEmptyError` as a normal outcome rather than a failure: it
-means work landed on that worker, so the worker stays and the next
-cycle decides again. The check is made after this library has cordoned
-the node, which is why it lives here. A caller cannot make the same
-guarantee from outside: a node that is empty when it looks can be given
-a pod before it acts, and cordoning first is what closes that gap. The
-other exceptions a removal raises, `WorkerPodsUnreadableError` among
-them, are failures in the ordinary way. `docs/usage.md` has what counts
-as empty and why an idle pod does not.
-
-Two things that matter to such a caller more than to the command line.
-The check is made per worker inside the removal loop, not for the whole
-list up front like the uuid validation, so passing several uuids and
-catching `WorkerNotEmptyError` means the workers ahead of the one named
-in the exception were removed; read `node_name` and `instance_uuid` off
-it rather than assuming the call was atomic. And the uncordon a refusal
-performs is unconditional, so a worker an operator had cordoned
-deliberately is returned to service by a refused removal.
 
 Every elapsed time this library measures -- the probe's timeout, the
 stall notes, the progress reporting -- is taken from `time.monotonic()`,

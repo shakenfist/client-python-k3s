@@ -2919,12 +2919,14 @@ class Cluster:
         # read as though it could.
         fate_share = self.client.check_capability('agentoperation-dependencies')
 
-        # Said once, and only where it makes a difference: with a single
-        # command there is nothing to fate share and the note would be
-        # noise. A silent degrade is what must not happen, because then a
-        # sequence which kept running on a node whose side channel had wedged
-        # has nothing anywhere explaining why it was allowed to.
-        if not fate_share and len(cmds) > 1:
+        # Said once, and only where it makes a difference. With a single
+        # command there is nothing to fate share, and with no instances
+        # nothing is submitted at all, so in both cases the note would be
+        # noise rather than an explanation. A silent degrade is what must
+        # not happen when there is something to explain, because then a
+        # sequence which kept running on a node whose side channel had
+        # wedged has nothing anywhere saying why it was allowed to.
+        if instance_uuids and not fate_share and len(cmds) > 1:
             self.reporter.write(
                 'Not fate sharing these commands: this Shaken Fist does not advertise '
                 'agentoperation-dependencies.\n')

@@ -10467,6 +10467,19 @@ class ExecuteAndAwaitFateSharingTestCase(testtools.TestCase):
 
         self.assertEqual([], cluster.reporter.lines)
 
+    def test_a_call_with_no_instances_says_nothing(self):
+        # A caller computing its instance list can legitimately arrive with
+        # an empty one, and then nothing is submitted anywhere. There is no
+        # degraded sequence to explain, so the note would name a difference
+        # which did not happen.
+        client, cluster = self._cluster(capable=False)
+
+        cluster.execute_and_await([], ['apt-get update',
+                                       'apt-get dist-upgrade -y'])
+
+        self.assertEqual([], cluster.reporter.lines)
+        self.assertEqual([], self.submitted)
+
 
 def _repository_python_files():
     """Every .py file this repository ships, not only the package's.

@@ -267,6 +267,16 @@ class FakeClusterClient:
         # The capabilities the fake server advertises, which the real
         # client reads off the API root. Only the ones a code path here
         # asks about are listed; a test removes one to play an older server.
+        #
+        # 'agentoperation-dependencies' is deliberately absent, so every
+        # test using this fake takes execute_and_await()'s unchained branch.
+        # Chaining needs operation handles apiclient.agent_dependency()
+        # accepts, and this fake hands out 'aop-001' rather than a UUID4, so
+        # advertising it here would fail inside the client rather than in the
+        # code under test. A bare mock.MagicMock() client is the opposite
+        # trap: check_capability() returns a truthy Mock whatever it is
+        # asked, so such a test opts into chaining by accident and should set
+        # check_capability.return_value explicitly.
         self.capabilities = {'get-network-namespace'}
 
     def check_capability(self, capability_string):

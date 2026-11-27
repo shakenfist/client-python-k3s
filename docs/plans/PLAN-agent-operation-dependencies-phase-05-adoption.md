@@ -662,9 +662,16 @@ An item which cannot be checked is reported as such, not ticked.
   `shakenfist/shakenfist` for step 5d, where `tox -e docs` is also run
   and must end in `congratulations` with no line naming a file this
   phase changed.
-- The cluster-deploy functional tier is green on the pull request
-  carrying 5a and 5b. This is the live proof per decision 8. If the
-  tier was not run, that is reported as unchecked rather than ticked.
+- The cluster-deploy functional tier is green on the run which
+  carries 5a and 5b. This is the live proof per decision 8, and it is
+  **not** a pull request check: `.github/workflows/functional-tests.yml`
+  gates that job on `merge_group || workflow_dispatch`, and a pull
+  request runs the smoke tier only. So the proof is either a
+  `workflow_dispatch` run on the phase branch before the pull request
+  is queued, or the merge-queue run which lands it, and either way the
+  run's result goes in the execution notes. Until one of those has
+  happened the item is reported as unchecked rather than ticked. See
+  execution note 7.
 - Phase 4 reads `Complete` in the plan of record's Execution table
   with merge commit `fa6c8e1515`, and `shakenfist`'s
   `docs/plans/index.md` agrees. Check, in that repository:
@@ -766,6 +773,54 @@ Departures from the plan, recorded as they happened. Dates are AEDT.
    the file. A grep over prose is a check of the grep as much as of
    the tree, and these plans should prefer one that cannot be fooled
    by a wrap.
+
+7. **2026-11-27. The second broken definition-of-done item, found by
+   the review rather than by running it.** The item for the live proof
+   said the cluster-deploy functional tier is "green on the pull
+   request carrying 5a and 5b". It cannot be:
+   `.github/workflows/functional-tests.yml:218-220` gates that job on
+   `merge_group || workflow_dispatch`, and a pull request runs the
+   smoke tier only. So the item named a check which never runs where
+   it said, and would have been reported unchecked forever. It now
+   names the two runs which can actually carry the proof -- a
+   `workflow_dispatch` run on the branch, or the merge-queue run which
+   lands it -- and asks for the result here.
+
+   Both this and execution note 6 are the same mistake in different
+   clothes: a criterion written from what the author believed about the
+   tooling rather than from the tooling. Three of this phase's
+   fourteen criteria were wrong when first run.
+
+8. **2026-11-27. Review round 1 on
+   [#177](https://github.com/shakenfist/client-python-k3s/pull/177)**
+   (1 fix, 2 document, 9 consider). The `fix` was that the
+   cross-instance keying this plan calls the one assertion worth
+   mutation testing had not been registered in
+   `tools/mutation-check.py`, so the proof existed only in a session
+   transcript. Three entries are now registered -- the per-instance
+   keying, the capability gate and the degrade note's guard -- taking
+   that harness from 178 mutations to 181, and all three are caught.
+   Registering the first one found a second defect: the test id written
+   from memory did not exist, which the harness would have reported as
+   an error rather than as a pass.
+
+   Three `consider` items were taken because they are defects in code
+   this phase added: the degrade note was written even when no
+   instances were passed and so nothing was submitted, which is now
+   guarded and tested; `fakes.FakeClusterClient` says why it omits the
+   capability and warns that a bare `MagicMock` client advertises
+   everything and so opts a future test into chaining by accident; and
+   `docs/library-api.md`'s new paragraphs had been inserted between a
+   sentence and the one it says "likewise" about, and are moved below
+   that discussion. The stale `0.7.7` floor in `README.md` and
+   `ARCHITECTURE.md` was the `document` item, and
+   `docs/plans/audit/findings-docs.md:392` had already recorded those
+   two files as the places that floor is published, which is what made
+   it findable. The floor's statement in two unexecuted plans
+   (`PLAN-airgap-install.md:161` and
+   `PLAN-cumulative-health-signals-phase-01-agent-signals.md:135`) is
+   left alone: those are dated premises, and each plan's own survey
+   re-verifies its premises before it runs.
 
 ## Future work
 
