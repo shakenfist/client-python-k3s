@@ -17,6 +17,29 @@ pass there. The root `--async` has no effect on `k3s` commands: each
 one runs its own wait loops and reports progress as it goes, so the
 client is always asked not to block on the command's behalf.
 
+Where a command runs several things on one node, they are fate shared.
+Each is submitted with a dependency on the one before it, so the rest
+of that node's sequence is abandoned rather than run when the operation
+before it never finished -- a side channel which wedged, a deadline or
+progress timeout which fired, or a cascade from further up the
+sequence. Read that precisely: a command which ran and exited non-zero
+*did* finish, so the commands behind it still run, and the failure is
+reported when the wait ends, with its exit code and output, as it
+always was. Nodes are independent of each other, so a failure on one
+abandons nothing on another and a fan out across a cluster stays
+concurrent.
+
+Against a Shaken Fist which does not advertise
+`agentoperation-dependencies` the commands are run exactly as earlier
+releases ran them, unchained, and a line says so once per command list:
+
+```
+Not fate sharing these commands: this Shaken Fist does not advertise agentoperation-dependencies.
+```
+
+That is a note rather than a failure. The cluster is built the way it
+always was; what is missing is the abandonment above.
+
 ## Cluster lifecycle
 
 ### `create NAME`

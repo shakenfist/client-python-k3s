@@ -1693,6 +1693,15 @@ MUTATIONS = [
         '.test_a_call_with_no_instances_says_nothing',
         'stestr',
     ),
+    (
+        'the degrade note is written only when the edges were not declared',
+        PKG + '/cluster.py',
+        '        if instance_uuids and not fate_share and len(cmds) > 1:\n',
+        '        if instance_uuids and len(cmds) > 1:\n',
+        PKG + '.tests.test_cluster.ExecuteAndAwaitFateSharingTestCase'
+        '.test_a_capable_cluster_is_told_nothing_about_fate_sharing',
+        'stestr',
+    ),
 ]
 
 

@@ -10404,7 +10404,7 @@ class ExecuteAndAwaitFateSharingTestCase(testtools.TestCase):
 
         for submission in self.submitted:
             for edge in submission['depends_on'] or []:
-                self.assertEqual(['op_uuid'], list(edge.keys()))
+                self.assertNotIn('settle_seconds', edge)
 
     def test_a_single_command_declares_no_edges(self):
         # Three of this repository's call sites pass one command, and a
@@ -10430,6 +10430,18 @@ class ExecuteAndAwaitFateSharingTestCase(testtools.TestCase):
 
         client.check_capability.assert_called_once_with(
             'agentoperation-dependencies')
+
+    def test_a_capable_cluster_is_told_nothing_about_fate_sharing(self):
+        # The note explains a degrade, and there is no degrade to explain
+        # when the edges were declared. Every current cluster takes this
+        # branch, so a line here would be noise on every call.
+        client, cluster = self._cluster()
+
+        cluster.execute_and_await([self.INSTANCE_A, self.INSTANCE_B],
+                                  ['apt-get update',
+                                   'apt-get dist-upgrade -y'])
+
+        self.assertEqual([], cluster.reporter.lines)
 
     def test_a_cluster_without_the_capability_submits_unchained_with_a_note(self):
         # A published plugin cannot refuse to build a cluster because an

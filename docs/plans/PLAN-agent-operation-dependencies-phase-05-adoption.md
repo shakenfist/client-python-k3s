@@ -822,6 +822,44 @@ Departures from the plan, recorded as they happened. Dates are AEDT.
    left alone: those are dated premises, and each plan's own survey
    re-verifies its premises before it runs.
 
+9. **2026-11-27. Review round 2** (0 fix, 1 document, 8 consider, 2
+   none), which is the exit condition, so the round was addressed and
+   then the loop stopped rather than asking for a third.
+
+   The round found a live instance of a trap round 1 had only
+   documented, which is the useful thing in it.
+   `tests/module_harness.py` builds a bare `mock.MagicMock()` client,
+   and it *wraps* the mutating `Cluster` methods rather than replacing
+   them, so a module scenario reaching `execute_and_await()` would
+   take the chained branch -- a `MagicMock` advertises every capability
+   -- and fail inside the real client's UUID validation on a handle the
+   mock invented. Round 1 wrote a warning about this shape into
+   `fakes.py`; the harness now sets `check_capability.return_value =
+   False`, which is both the fix and what the harness did before edges
+   existed. The lesson is the one the review skill states: when a
+   finding names a shape, enumerate the shape's instances rather than
+   annotating the one you were shown.
+
+   Also taken: `docs/usage.md` now carries the behaviour for the CLI
+   audience, including the note's exact text, because step 5c's agent
+   put it in `docs/library-api.md` and a `sf-client k3s create` user
+   reads neither that nor `ARCHITECTURE.md`; a test asserts the note is
+   silent when the capability *is* present, which nothing checked; and
+   `test_no_settle_is_asked_for` asserted
+   `list(edge.keys()) == ['op_uuid']`, which couples this repository's
+   suite to `agent_dependency()`'s exact output, and now asserts the
+   property it is named for instead. The two new note properties are
+   registered as mutations, taking the harness to 182.
+
+   Declined, with the one worth recording: the reviewer asked twice
+   whether `shakenfist-client` 0.8.5 still supports this package's
+   declared Python floor. It does -- 0.8.5 publishes
+   `requires_python ">=3.7"` -- which is checked on PyPI's JSON rather
+   than asserted. The rest are observations about code which predates
+   this phase, a measurement the parent plan already carries, and a
+   fallback for the capability gate disagreeing with the server, where
+   the server's refusal is the honest outcome.
+
 ## Future work
 
 - **The per-link dependency wait budget.** Phase 4 recorded this and
