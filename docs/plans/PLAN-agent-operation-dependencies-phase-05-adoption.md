@@ -671,7 +671,9 @@ An item which cannot be checked is reported as such, not ticked.
   is queued, or the merge-queue run which lands it, and either way the
   run's result goes in the execution notes. Until one of those has
   happened the item is reported as unchecked rather than ticked. See
-  execution note 7.
+  execution notes 7 and 10: it was the merge-queue run, it failed on
+  under-cloud capacity rather than on this change, and the item is
+  **unmet**.
 - Phase 4 reads `Complete` in the plan of record's Execution table
   with merge commit `fa6c8e1515`, and `shakenfist`'s
   `docs/plans/index.md` agrees. Check, in that repository:
@@ -860,6 +862,58 @@ Departures from the plan, recorded as they happened. Dates are AEDT.
    fallback for the capability gate disagreeing with the server, where
    the server's refusal is the honest outcome.
 
+10. **2026-11-27. The live proof did not go green, and the phase
+    landed anyway.** Execution note 7 established that the
+    cluster-deploy tier can only carry the proof on a
+    `workflow_dispatch` run or on the merge-queue run which lands the
+    change. It was the merge-queue run, and it
+    [failed](https://github.com/shakenfist/client-python-k3s/actions/runs/45943905826):
+    `Cluster deployment` was refused a worker node with
+    `Insufficient Resources: No nodes remaining at scheduling stage
+    sufficient_idle_disk` on the under-cloud. That was triaged on
+    [#177](https://github.com/shakenfist/client-python-k3s/pull/177) as
+    systemic rather than caused by the change -- it is the capacity
+    family the parent cluster's own plans track, and nothing in it
+    touches an agent operation -- and Michael merged on that triage.
+
+    So the definition-of-done item is **not met**, and is recorded
+    unmet rather than ticked. What the phase has instead is the unit
+    coverage, the three registered mutations, and the smoke tier, which
+    between them exercise the keying, the capability gate and the
+    degrade note but not a real chain against a real agent. The first
+    cluster-deploy run which passes on a `develop` containing
+    `b233e21` is the proof, and it costs nothing to wait for: the tier
+    runs on every merge into this repository. Reported in the phase's
+    close-out rather than left for the parent plan's push audit to
+    rediscover.
+
+11. **2026-11-27, after the phase merged. The gap this phase filed was
+    implemented within hours, outside the plan.**
+    [shakenfist#5091](https://github.com/shakenfist/shakenfist/issues/5091),
+    filed by execution note 5 as the per-edge opt-in which would make
+    finding 11's case work, was closed by
+    [shakenfist#5099](https://github.com/shakenfist/shakenfist/pull/5099)
+    (merge `1e4cad5665`) through that repository's automated issue-fix
+    workflow. A `depends_on` edge now takes an optional
+    `require_success`, which makes the edge satisfied only if every
+    result the dependency recorded reports a zero return code, and
+    cascades the dependent to `abort` with a `dependency_failure` of
+    `nonzero-exit` otherwise.
+
+    This phase cannot adopt it yet, and the reason is not appetite:
+    `apiclient.agent_dependency()` has no such keyword, and
+    `AGENT_DEPENDENCY_KEYS` is `op_uuid` and `settle_seconds`, so the
+    client raises on the key rather than sending it
+    ([client-python#462](https://github.com/shakenfist/client-python/issues/462)).
+    So the statement this plan's documentation and the plan of record
+    both now make -- that `execute_and_await()` abandons a node's
+    sequence for an operation which never completed and not for a
+    command which ran and failed -- stays true, and stays true until
+    that client gap closes and something here opts in. Michael's
+    decision on 2026-11-28 was to record it and not to build it, so
+    adoption moves to Future work below rather than reopening this
+    phase.
+
 ## Future work
 
 - **The per-link dependency wait budget.** Phase 4 recorded this and
@@ -872,14 +926,20 @@ Departures from the plan, recorded as they happened. Dates are AEDT.
 - **A rolling `update_os()`.** Declined above with reasons. If it is
   ever built it is where the per-link budget question becomes
   concrete, and it will want its own plan.
-- **A `depends_on` edge which requires the command to have
-  succeeded**, which is what would make finding 11's case work. Filed
-  as
-  [shakenfist#5091](https://github.com/shakenfist/shakenfist/issues/5091).
-  Until it exists, `execute_and_await()` abandons a node's sequence for
-  an operation which never completed and not for a command which ran
-  and failed, and both this repository's documentation and the plan of
-  record say so.
+- **Adopting `require_success`**, which is what would make finding
+  11's case work. The server half exists: it was filed as
+  [shakenfist#5091](https://github.com/shakenfist/shakenfist/issues/5091)
+  and implemented hours later by
+  [shakenfist#5099](https://github.com/shakenfist/shakenfist/pull/5099),
+  as execution note 11 records. The client half does not --
+  `apiclient.agent_dependency()` cannot declare the field and the edge
+  normaliser refuses the key
+  ([client-python#462](https://github.com/shakenfist/client-python/issues/462))
+  -- so nothing here can opt in yet. Until it does,
+  `execute_and_await()` abandons a node's sequence for an operation
+  which never completed and not for a command which ran and failed,
+  and both this repository's documentation and the plan of record say
+  so.
 - **`client-python`'s index row for phase 3** still reads
   `In progress` (survey finding 10). One line in a third repository.
 - **The test fakes cannot carry a dependency edge.**
